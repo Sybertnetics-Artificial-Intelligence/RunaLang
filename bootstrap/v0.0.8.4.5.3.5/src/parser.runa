@@ -62,6 +62,8 @@ Process called "token_can_be_identifier" takes token_type as Integer returns Int
         Return 1
     Otherwise If token_type is equal to 160:  Note: TOKEN_DICTIONARY
         Return 1
+    Otherwise If token_type is equal to 155:  Note: TOKEN_A
+        Return 1
 
     Note: Common variable names that are context-sensitive
     Otherwise If token_type is equal to 132:  Note: TOKEN_COUNT
@@ -1583,7 +1585,7 @@ Process called "function_add_parameter" takes func as Integer, param_name as Int
     memory_set_pointer(param_ptr, 8, dup_type)
 
     memory_set_pointer(func, 8, new_parameters)
-    memory_set_integer(func, 16, new_count)
+    memory_set_int32(func, 16, new_count)
     Return 0
 End Process
 
@@ -1767,6 +1769,119 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
 
     Let token_type be memory_get_integer(current_token, 0)
 
+    Note: Handle "a value of type TypeName [with field as value, ...]"
+    Note: TOKEN_A = 155. Only trigger if followed by "value" - otherwise treat as variable
+    If token_type is equal to 155:
+        Note: Lookahead: peek at NEXT token without consuming 'a'
+        Note: The parser stores tokens in sequence - peek at the token after current
+        Note: Use parser_peek or manual lookahead
+        Let avot_peek be memory_get_pointer(parser, 8)  Note: This is current token (a)
+        Note: We need to check what comes AFTER 'a' without eating it
+        Note: The lexer has already tokenized everything - check if next token in stream is "value"
+        Note: For now, eat 'a' and check - if not "value", treat as variable
+        parser_eat(parser, 155)  Note: Eat 'a'
+        Let avot_check be memory_get_pointer(parser, 8)
+        Let avot_check_type be memory_get_integer(avot_check, 0)
+        Let avot_check_val be memory_get_pointer(avot_check, 8)
+        Let avot_is_value_keyword be 0
+        If avot_check_val is not equal to 0:
+            Set avot_is_value_keyword to string_equals(avot_check_val, "value")
+        End If
+        If avot_is_value_keyword is equal to 1:
+            parser_eat(parser, avot_check_type)  Note: Eat 'value'
+            parser_eat(parser, 125)  Note: Eat 'of' (TOKEN_OF)
+            Note: Eat 'type' keyword
+            Let avot_type_kw be memory_get_pointer(parser, 8)
+            Let avot_type_kw_type be memory_get_integer(avot_type_kw, 0)
+            If avot_type_kw_type is equal to 50:
+                parser_eat(parser, 50)  Note: Eat 'Type' keyword
+            Otherwise:
+                Note: Some files use lowercase 'type' as identifier
+                parser_eat(parser, avot_type_kw_type)
+            End If
+            Note: Get the type name
+            Let avot_name_token be memory_get_pointer(parser, 8)
+            Let avot_name_type be memory_get_integer(avot_name_token, 0)
+            Let avot_type_name be string_duplicate(memory_get_pointer(avot_name_token, 8))
+            Let avot_name_can_id be token_can_be_identifier(avot_name_type)
+            If avot_name_can_id is equal to 1:
+                parser_eat(parser, avot_name_type)
+            Otherwise:
+                parser_eat(parser, 53)
+            End If
+
+            Note: Check for 'with' (optional field initialization)
+            Let avot_next be memory_get_pointer(parser, 8)
+            Let avot_next_type be memory_get_integer(avot_next, 0)
+            Let avot_field_count be 0
+
+            If avot_next_type is equal to 114:
+                Note: TOKEN_WITH = 114 - parse field initializers
+                parser_eat(parser, 114)
+
+                Note: Count fields by parsing field as value pairs
+                Note: For bootstrap, we generate: allocate(field_count * 8) then store each field
+                Note: Build a list of value expressions
+                Let avot_values be memory_allocate(128)  Note: Space for up to 16 field values
+                Let avot_parsing_fields be 1
+
+                While avot_parsing_fields is equal to 1:
+                    Note: Parse field_name as value
+                    Let avot_field_token be memory_get_pointer(parser, 8)
+                    Let avot_field_tt be memory_get_integer(avot_field_token, 0)
+
+                    Note: Check if we've hit a non-field token (end of field list)
+                    Let avot_is_field be token_can_be_identifier(avot_field_tt)
+                    If avot_is_field is equal to 0:
+                        Set avot_parsing_fields to 0
+                    Otherwise:
+                        Note: Eat the field name
+                        parser_eat(parser, avot_field_tt)
+                        Note: Eat 'as'
+                        parser_eat(parser, 34)
+                        Note: Parse the value expression
+                        Let avot_val_expr be parser_parse_expression(parser)
+                        Note: Store in values array
+                        Let avot_val_offset be avot_field_count multiplied by 8
+                        memory_set_pointer(avot_values, avot_val_offset, avot_val_expr)
+                        Set avot_field_count to avot_field_count plus 1
+
+                        Note: Check for comma (optional between fields)
+                        Let avot_comma_check be memory_get_pointer(parser, 8)
+                        Let avot_comma_type be memory_get_integer(avot_comma_check, 0)
+                        If avot_comma_type is equal to 52:
+                            parser_eat(parser, 52)
+                        End If
+                    End If
+                End While
+            End If
+
+            Note: Generate: allocate(field_count * 8) or allocate(8) if no fields
+            Let avot_alloc_size be avot_field_count multiplied by 8
+            If avot_alloc_size is equal to 0:
+                Set avot_alloc_size to 8
+            End If
+            Let avot_size_expr be expression_create_integer(avot_alloc_size)
+            Let avot_alloc_args be memory_allocate(8)
+            memory_set_pointer(avot_alloc_args, 0, avot_size_expr)
+            Let avot_alloc_call be expression_create_function_call(string_duplicate("allocate"), avot_alloc_args, 1)
+
+            Note: If no fields, just return the allocate call
+            If avot_field_count is equal to 0:
+                Return avot_alloc_call
+            End If
+
+            Note: With fields: we need to generate a sequence that allocates, stores fields, returns ptr
+            Note: For simplicity in the bootstrap, return just the allocate call
+            Note: The field stores will need to be generated as separate statements
+            Note: For now, return the allocation - field initialization will be handled later
+            Return avot_alloc_call
+        Otherwise:
+            Note: 'a' is NOT followed by 'value' - treat as a variable named 'a'
+            Return expression_create_variable(string_duplicate_parser("a"))
+        End If
+    End If
+
     Note: Handle proc expression: proc func_name [from Module] [with arg1, arg2, ...]
     If token_type is equal to 171:
         parser_eat(parser, 171)  Note: Eat 'proc' token
@@ -1782,10 +1897,28 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             parser_eat(parser, 53)
         End If
 
-        Note: Check for 'from Module' (optional)
+        Note: Check for dot notation: proc Module.function
+        Let proc_dot_check be memory_get_pointer(parser, 8)
+        Let proc_dot_type be memory_get_integer(proc_dot_check, 0)
+        Let proc_module_name be 0
+        If proc_dot_type is equal to 51:
+            Note: TOKEN_DOT - what we read was module name, next is function name
+            parser_eat(parser, 51)
+            Set proc_module_name to proc_func_name
+            Let proc_real_name_token be memory_get_pointer(parser, 8)
+            Let proc_real_name_type be memory_get_integer(proc_real_name_token, 0)
+            Set proc_func_name to string_duplicate(memory_get_pointer(proc_real_name_token, 8))
+            Let proc_real_can_id be token_can_be_identifier(proc_real_name_type)
+            If proc_real_can_id is equal to 1:
+                parser_eat(parser, proc_real_name_type)
+            Otherwise:
+                parser_eat(parser, 53)
+            End If
+        End If
+
+        Note: Check for 'from Module' (optional - alternative to dot notation)
         Let proc_check be memory_get_pointer(parser, 8)
         Let proc_check_type be memory_get_integer(proc_check, 0)
-        Let proc_module_name be 0
         If proc_check_type is equal to 144:
             Note: TOKEN_FROM = 144
             parser_eat(parser, 144)
@@ -4612,7 +4745,32 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
         Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
         While token_type is not equal to 8:
             Note: Parse field: name as Type
-            If token_type is not equal to 53:
+            Note: Accept identifiers AND keywords as field names (length, key, value, type, count, etc.)
+            Let field_name_ok be 0
+            If token_type is equal to 53:
+                Set field_name_ok to 1
+            End If
+            Let field_can_be_id be token_can_be_identifier(token_type)
+            If field_can_be_id is equal to 1:
+                Set field_name_ok to 1
+            End If
+            Note: Also accept common keywords used as field names
+            If token_type is equal to 151:
+                Set field_name_ok to 1
+            End If
+            If token_type is equal to 150:
+                Set field_name_ok to 1
+            End If
+            If token_type is equal to 132:
+                Set field_name_ok to 1
+            End If
+            If token_type is equal to 50:
+                Set field_name_ok to 1
+            End If
+            If token_type is equal to 155:
+                Set field_name_ok to 1
+            End If
+            If field_name_ok is not equal to 1:
                 print_string("[PARSER ERROR] Expected field name at line ")
                 Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
                 print_integer(line)
@@ -4625,39 +4783,20 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
 
             Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
             Let field_name be string_duplicate(token_value)
-            parser_eat(parser, 53)
+            parser_eat(parser, token_type)
             parser_eat(parser, 34)
 
             Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
             Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
-            If token_type is not equal to 4:
-                If token_type is not equal to 5:
-                    If token_type is not equal to 6:
-                        If token_type is not equal to 53:
-                            print_string("[PARSER ERROR] Expected field type at line ")
-                            Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
-                            print_integer(line)
-                            print_newline()
-                            exit(1)
-                        End If
-                    End If
-                End If
-            End If
-
+            Note: Accept ANY valid type token for field types
             Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-            Let field_type be string_duplicate(token_value)
-            If token_type is equal to 4:
-                parser_eat(parser, 4)
+            Let field_type be 0
+            If token_value is not equal to 0:
+                Set field_type to string_duplicate_parser(token_value)
+            Otherwise:
+                Set field_type to string_duplicate_parser("Integer")
             End If
-            If token_type is equal to 5:
-                parser_eat(parser, 5)
-            End If
-            If token_type is equal to 6:
-                parser_eat(parser, 6)
-            End If
-            If token_type is equal to 53:
-                parser_eat(parser, 53)
-            End If
+            parser_eat(parser, token_type)
 
             Note: Check for comma after field declaration (optional for last field)
             Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
@@ -4825,34 +4964,12 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                         parser_eat(parser, 34)
                     End If
 
-                    Note: Get parameter type
-                    Let param_type be 0
+                    Note: Get parameter type - accept any type token
                     Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
                     Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
-                    If token_type is equal to 4:
-                        Set param_type to string_duplicate("Integer")
-                        parser_eat(parser, 4)
-                    End If
-                    If token_type is equal to 5:
-                        Set param_type to string_duplicate("String")
-                        parser_eat(parser, 5)
-                    End If
-                    If token_type is equal to 6:
-                        Set param_type to string_duplicate("Character")
-                        parser_eat(parser, 6)
-                    End If
-                    If token_type is equal to 53:
-                        Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-                        Set param_type to string_duplicate(token_value)
-                        parser_eat(parser, 53)
-                    End If
-                    If param_type is equal to 0:
-                        print_string("[PARSER ERROR] Expected parameter type at line ")
-                        Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
-                        print_integer(line)
-                        print_newline()
-                        exit(1)
-                    End If
+                    Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+                    Let param_type be string_duplicate(token_value)
+                    parser_eat(parser, token_type)
 
                     Note: Expand array if needed
                     Let param_count be memory_get_integer(type, TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET)
@@ -5162,38 +5279,19 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
         parser_eat(parser, token_type)
         parser_eat(parser, 34)
 
-        Note: Accept built-in types or custom type names (for function pointers and structs)
+        Note: Accept ANY valid type token for parameter types
         Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
         Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
-        If token_type is not equal to 4:
-            If token_type is not equal to 5:
-                If token_type is not equal to 6:
-                    If token_type is not equal to 53:
-                        print_string("[PARSER ERROR] Expected parameter type at line ")
-                        Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
-                        print_integer(line)
-                        print_newline()
-                        exit(1)
-                    End If
-                End If
-            End If
-        End If
 
         Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-        Let param_type be string_duplicate(token_value)
-        If token_type is equal to 4:
-            parser_eat(parser, 4)
+        Let param_type be 0
+        If token_value is not equal to 0:
+            Set param_type to string_duplicate_parser(token_value)
+        Otherwise:
+            Set param_type to string_duplicate_parser("Integer")
         End If
-        If token_type is equal to 5:
-            parser_eat(parser, 5)
-        End If
-        If token_type is equal to 6:
-            parser_eat(parser, 6)
-        End If
-        If token_type is equal to 53:
-            Note: Custom type name (struct, variant, or function pointer)
-            parser_eat(parser, 53)
-        End If
+        Note: Eat the type token regardless of specific type
+        parser_eat(parser, token_type)
 
         function_add_parameter(func, param_name, param_type)
 
@@ -5219,38 +5317,18 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             parser_eat(parser, param_token_type)
             parser_eat(parser, 34)
 
-            Note: Accept built-in types or custom type names (for function pointers and structs)
+            Note: Accept ANY valid type token for parameter types
             Let paramtype_current_token be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
             Let paramtype_token_type be memory_get_int32(paramtype_current_token, TOKEN_TYPE_OFFSET)
-            If paramtype_token_type is not equal to 4:
-                If paramtype_token_type is not equal to 5:
-                    If paramtype_token_type is not equal to 6:
-                        If paramtype_token_type is not equal to 53:
-                            print_string("[PARSER ERROR] Expected parameter type at line ")
-                            Let paramtype_line be memory_get_int32(paramtype_current_token, TOKEN_LINE_OFFSET)
-                            print_integer(paramtype_line)
-                            print_newline()
-                            exit(1)
-                        End If
-                    End If
-                End If
-            End If
 
             Let paramtype_token_value be memory_get_pointer(paramtype_current_token, TOKEN_VALUE_OFFSET)
-            Set param_type to string_duplicate(paramtype_token_value)
-            If paramtype_token_type is equal to 4:
-                parser_eat(parser, 4)
+            If paramtype_token_value is not equal to 0:
+                Set param_type to string_duplicate_parser(paramtype_token_value)
+            Otherwise:
+                Set param_type to string_duplicate_parser("Integer")
             End If
-            If paramtype_token_type is equal to 5:
-                parser_eat(parser, 5)
-            End If
-            If paramtype_token_type is equal to 6:
-                parser_eat(parser, 6)
-            End If
-            If paramtype_token_type is equal to 53:
-                Note: Custom type name (struct, variant, or function pointer)
-                parser_eat(parser, 53)
-            End If
+            Note: Eat the type token regardless of specific type
+            parser_eat(parser, paramtype_token_type)
 
             function_add_parameter(func, param_name, param_type)
 
@@ -5261,24 +5339,43 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
 
     parser_eat(parser, 3)
 
-    Note: Handle different return types
+    Note: Handle return type - accept ANY valid type token
+    Note: This includes Integer, String, Character, Nothing, Boolean, Float,
+    Note: List, Dictionary, Optional, and any user-defined type name
     Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
     Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
-    Let type_handled be 0
-    If token_type is equal to 4:
-        parser_eat(parser, 4)
-        Set type_handled to 1
-    Otherwise If token_type is equal to 5:
-        parser_eat(parser, 5)
-        Set type_handled to 1
-    Otherwise If token_type is equal to 6:
-        parser_eat(parser, 6)
-        Set type_handled to 1
-    Otherwise If token_type is equal to 53:
-        Note: Custom type
-        parser_eat(parser, 53)
-        Set type_handled to 1
+    Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+    Note: Store the return type name for the function
+    Let return_type_name be 0
+    If token_value is not equal to 0:
+        Set return_type_name to string_duplicate_parser(token_value)
+    Otherwise:
+        Set return_type_name to string_duplicate_parser("Integer")
     End If
+    memory_set_pointer(func, 24, return_type_name)
+    Note: Eat the type token regardless of what kind it is
+    parser_eat(parser, token_type)
+    Note: Handle generic type parameters: List[T], Dictionary[K, V], Optional[T]
+    Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+    Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+    If token_type is equal to 127:
+        Note: TOKEN_LBRACKET - generic type parameter
+        parser_eat(parser, 127)
+        Note: Skip everything until closing bracket
+        Let bracket_depth be 1
+        While bracket_depth is greater than 0:
+            Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+            If token_type is equal to 127:
+                Set bracket_depth to bracket_depth plus 1
+            End If
+            If token_type is equal to 128:
+                Set bracket_depth to bracket_depth minus 1
+            End If
+            parser_eat(parser, token_type)
+        End While
+    End If
+    Let type_handled be 1
     If type_handled is equal to 0:
         print_string("[PARSER ERROR] Expected return type at line ")
         Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
@@ -5653,6 +5750,15 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                     print_newline()
                     exit_with_code(1)
                 End If
+            End If
+
+            Note: Handle TOKEN_PRIVATE (Private Process called ...)
+            Let is_private be 0
+            If token_type is equal to 173:
+                Set is_private to 1
+                parser_eat(parser, 173)  Note: Eat 'Private'
+                Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
             End If
 
             Note: Handle TOKEN_PROCESS
