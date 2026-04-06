@@ -38,8 +38,14 @@ print_integer:
     movq %rsp, %rbp
     subq $32, %rsp  # Space for string buffer (20 digits + null)
 
-    # Convert integer to string
+    # Convert integer to string (signed)
     movq %rdi, %rax  # integer value
+    xorq %r8, %r8    # r8 = 0 (negative flag)
+    testq %rax, %rax
+    jns .pi_not_negative
+    movq $1, %r8     # mark as negative
+    negq %rax        # make positive for conversion
+.pi_not_negative:
     leaq -32(%rbp), %rsi  # buffer pointer
     addq $19, %rsi  # point to end of buffer (for reverse building)
     movb $0, (%rsi)  # null terminator
@@ -65,6 +71,12 @@ print_integer:
 
 .convert_done:
     incq %rsi  # point to first character
+    # Prepend minus sign if negative
+    testq %r8, %r8
+    jz .pi_not_neg_print
+    decq %rsi
+    movb $45, (%rsi)  # '-' character
+.pi_not_neg_print:
 
     # Calculate string length
     movq %rsi, %rcx  # Counter for strlen
@@ -101,13 +113,14 @@ print_integer:
     .byte 10  # newline character
 .STR0:    .string "[MAIN ERROR] Could not open input file '"
 .STR1:    .string "'"
-.STR2:    .string "Usage: "
-.STR3:    .string " <input.runa> <output.s>"
-.STR4:    .string "[ERROR] Failed to read source file"
-.STR5:    .string "[ERROR] Failed to create arena allocator"
-.STR6:    .string "[ERROR] main: Parsing failed - program is NULL"
-.STR7:    .string "Successfully compiled '"
-.STR8:    .string "' to '"
+.STR2:    .string "compiler/"
+.STR3:    .string "Usage: "
+.STR4:    .string " <input.runa> <output.s>"
+.STR5:    .string "[ERROR] Failed to read source file"
+.STR6:    .string "[ERROR] Failed to create arena allocator"
+.STR7:    .string "[ERROR] main: Parsing failed - program is NULL"
+.STR8:    .string "Successfully compiled '"
+.STR9:    .string "' to '"
 .text
 
 
@@ -170,6 +183,85 @@ read_file_internal:
     movq %rbp, %rsp
     popq %rbp
     ret
+
+
+.globl extract_base_dir
+extract_base_dir:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L11
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L12
+.L11:
+.L12:
+    leaq .STR2(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_find@PLT
+    movq %rax, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L21
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L22
+.L21:
+.L22:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L31
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L32
+.L31:
+.L32:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call string_substring@PLT
+    movq %rax, -24(%rbp)
+    movq -24(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
 .globl main
 
 
@@ -194,7 +286,7 @@ main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L11
+    jz .L41
     movq $0, %rax
     pushq %rax
     popq %rdi
@@ -202,13 +294,13 @@ main:
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rax
     pushq %rax
-    leaq .STR2(%rip), %rax
+    leaq .STR3(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
     movq %rax, -32(%rbp)
-    leaq .STR3(%rip), %rax
+    leaq .STR4(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -236,9 +328,9 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L12
-.L11:
-.L12:
+    jmp .L42
+.L41:
+.L42:
     movq $1, %rax
     pushq %rax
     popq %rdi
@@ -262,8 +354,8 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L21
-    leaq .STR4(%rip), %rax
+    jz .L51
+    leaq .STR5(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -279,9 +371,9 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L22
-.L21:
-.L22:
+    jmp .L52
+.L51:
+.L52:
     movq $65536, %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
@@ -297,8 +389,8 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L31
-    leaq .STR5(%rip), %rax
+    jz .L61
+    leaq .STR6(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -318,9 +410,9 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L32
-.L31:
-.L32:
+    jmp .L62
+.L61:
+.L62:
     movq -80(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -350,8 +442,8 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L41
-    leaq .STR6(%rip), %rax
+    jz .L71
+    leaq .STR7(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -383,16 +475,13 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L42
-.L41:
-.L42:
-    movq -80(%rbp), %rax
-    pushq %rax
-    movq -104(%rbp), %rax
+    jmp .L72
+.L71:
+.L72:
+    movq -48(%rbp), %rax
     pushq %rax
     popq %rdi
-    popq %rsi
-    call process_imports_recursive
+    call extract_base_dir
     movq %rax, -112(%rbp)
     movq -112(%rbp), %rax
     pushq %rax
@@ -402,7 +491,97 @@ main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L51
+    jz .L81
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call set_import_base_dir
+    jmp .L82
+.L81:
+.L82:
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -120(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L91
+    movq -112(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L101
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -128(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -136(%rbp)
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq -128(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L111
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq -128(%rbp), %rax
+    pushq %rax
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call string_substring@PLT
+    movq %rax, -144(%rbp)
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call set_import_source_dir
+    jmp .L112
+.L111:
+.L112:
+    jmp .L102
+.L101:
+.L102:
+    jmp .L92
+.L91:
+.L92:
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call process_imports_recursive
+    movq %rax, -152(%rbp)
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L121
     movq -104(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -435,9 +614,9 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L52
-.L51:
-.L52:
+    jmp .L122
+.L121:
+.L122:
     movq -80(%rbp), %rax
     pushq %rax
     movq -56(%rbp), %rax
@@ -445,8 +624,8 @@ main:
     popq %rdi
     popq %rsi
     call codegen_create
-    movq %rax, -120(%rbp)
-    movq -120(%rbp), %rax
+    movq %rax, -160(%rbp)
+    movq -160(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -454,7 +633,7 @@ main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L61
+    jz .L131
     movq -80(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -487,81 +666,81 @@ main:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L62
-.L61:
-.L62:
+    jmp .L132
+.L131:
+.L132:
     movq -104(%rbp), %rax
     pushq %rax
-    movq -120(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call codegen_generate
     movq $0, %rax
     pushq %rax
-    movq -120(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -128(%rbp)
-    movq -128(%rbp), %rax
+    movq %rax, -168(%rbp)
+    movq -168(%rbp), %rax
     pushq %rax
     popq %rdi
     call file_close_buffered@PLT
     movq -48(%rbp), %rax
     pushq %rax
-    leaq .STR7(%rip), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    movq %rax, -136(%rbp)
     leaq .STR8(%rip), %rax
     pushq %rax
-    movq -136(%rbp), %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -176(%rbp)
+    leaq .STR9(%rip), %rax
+    pushq %rax
+    movq -176(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -144(%rbp)
-    movq -136(%rbp), %rax
+    movq %rax, -184(%rbp)
+    movq -176(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     movq -56(%rbp), %rax
     pushq %rax
-    movq -144(%rbp), %rax
+    movq -184(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -152(%rbp)
-    movq -144(%rbp), %rax
+    movq %rax, -192(%rbp)
+    movq -184(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
     leaq .STR1(%rip), %rax
     pushq %rax
-    movq -152(%rbp), %rax
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_concat@PLT
-    movq %rax, -160(%rbp)
-    movq -152(%rbp), %rax
+    movq %rax, -200(%rbp)
+    movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -160(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -160(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -120(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call codegen_destroy

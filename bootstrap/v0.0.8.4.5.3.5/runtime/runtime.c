@@ -499,6 +499,29 @@ int64_t list_set(int64_t list_ptr, int64_t index, int64_t value) {
     return 0;
 }
 
+// Check if list contains a value (linear search)
+// For integer values: direct comparison
+// For string values: compare by string_equals
+int64_t list_contains(int64_t list_ptr, int64_t value) {
+    RunaList* list = (RunaList*)list_ptr;
+    for (int64_t i = 0; i < list->length; i++) {
+        if (list->data[i] == value) {
+            return 1;
+        }
+        // Also try string comparison if both look like pointers
+        if (list->data[i] > 65536 && value > 65536) {
+            char* a = (char*)list->data[i];
+            char* b = (char*)value;
+            int match = 1;
+            for (int j = 0; a[j] != 0 || b[j] != 0; j++) {
+                if (a[j] != b[j]) { match = 0; break; }
+            }
+            if (match) return 1;
+        }
+    }
+    return 0;
+}
+
 // Insert element at index, shifting elements right
 int64_t list_insert(int64_t list_ptr, int64_t index, int64_t value) {
     RunaList* list = (RunaList*)list_ptr;

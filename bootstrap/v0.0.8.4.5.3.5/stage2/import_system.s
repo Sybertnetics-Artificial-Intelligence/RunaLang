@@ -1,3 +1,13 @@
+.section .data
+.globl IMPORT_BASE_DIR
+IMPORT_BASE_DIR:    .quad 0
+.globl IMPORT_SOURCE_DIR
+IMPORT_SOURCE_DIR:    .quad 0
+.globl IMPORT_DEPTH
+IMPORT_DEPTH:    .quad 0
+.globl IMPORT_MAX_DEPTH
+IMPORT_MAX_DEPTH:    .quad 2
+
 .text
 print_string:
     pushq %rbp
@@ -38,8 +48,14 @@ print_integer:
     movq %rsp, %rbp
     subq $32, %rsp  # Space for string buffer (20 digits + null)
 
-    # Convert integer to string
+    # Convert integer to string (signed)
     movq %rdi, %rax  # integer value
+    xorq %r8, %r8    # r8 = 0 (negative flag)
+    testq %rax, %rax
+    jns .pi_not_negative
+    movq $1, %r8     # mark as negative
+    negq %rax        # make positive for conversion
+.pi_not_negative:
     leaq -32(%rbp), %rsi  # buffer pointer
     addq $19, %rsi  # point to end of buffer (for reverse building)
     movb $0, (%rsi)  # null terminator
@@ -65,6 +81,12 @@ print_integer:
 
 .convert_done:
     incq %rsi  # point to first character
+    # Prepend minus sign if negative
+    testq %r8, %r8
+    jz .pi_not_neg_print
+    decq %rsi
+    movb $45, (%rsi)  # '-' character
+.pi_not_neg_print:
 
     # Calculate string length
     movq %rsi, %rcx  # Counter for strlen
@@ -102,30 +124,209 @@ print_integer:
 .STR0:    .string "[IMPORT ERROR] Too many imported files (capacity exceeded)"
 .STR1:    .string "  Import chain:"
 .STR2:    .string "    -> "
-.STR3:    .string ""
-.STR4:    .string ".runa"
-.STR5:    .string ".r"
-.STR6:    .string ".ru"
-.STR7:    .string "r"
-.STR8:    .string "[IMPORT ERROR] Failed to create import context"
-.STR9:    .string "[IMPORT ERROR] No imports array found"
-.STR10:    .string "[IMPORT ERROR] Null import statement at index "
-.STR11:    .string "[IMPORT ERROR] Null filename in import statement"
-.STR12:    .string "[IMPORT ERROR] Circular import detected!"
-.STR13:    .string "  Attempting to import: "
-.STR14:    .string "  This would create a circular dependency."
-.STR15:    .string "[IMPORT ERROR] Failed to mark file as visited"
-.STR16:    .string "[IMPORT ERROR] Import stack overflow"
-.STR17:    .string "[IMPORT ERROR] Failed to resolve import: "
-.STR18:    .string "[IMPORT ERROR] Failed to read import file: "
-.STR19:    .string "[IMPORT ERROR] Failed to create lexer for: "
-.STR20:    .string "[IMPORT ERROR] Failed to create parser for: "
-.STR21:    .string "[IMPORT ERROR] Failed to parse import file: "
-.STR22:    .string "[IMPORT ERROR] Failed to merge functions from: "
-.STR23:    .string "[IMPORT ERROR] Failed to merge types from: "
-.STR24:    .string "[IMPORT SUCCESS] Processed "
-.STR25:    .string " imports successfully"
+.STR3:    .string ".runa"
+.STR4:    .string "r"
+.STR5:    .string "[IMPORT ERROR] Failed to create import context"
+.STR6:    .string "[IMPORT ERROR] No imports array found"
+.STR7:    .string "[IMPORT ERROR] Null import statement at index "
+.STR8:    .string "[IMPORT ERROR] Null filename in import statement"
+.STR9:    .string "[IMPORT ERROR] Failed to resolve import: "
+.STR10:    .string "[IMPORT ERROR] Import stack overflow"
+.STR11:    .string "[IMPORT ERROR] Failed to read import file: "
+.STR12:    .string "[IMPORT ERROR] Failed to create lexer for: "
+.STR13:    .string "[IMPORT ERROR] Failed to create parser for: "
+.STR14:    .string "[IMPORT ERROR] Failed to merge functions from: "
+.STR15:    .string "[IMPORT ERROR] Failed to merge types from: "
+.STR16:    .string "[IMPORT SUCCESS] Processed "
+.STR17:    .string " imports successfully"
 .text
+
+
+.globl set_import_base_dir
+set_import_base_dir:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    leaq IMPORT_BASE_DIR(%rip), %rbx  # Address of global variable    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl set_import_source_dir
+set_import_source_dir:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    leaq IMPORT_SOURCE_DIR(%rip), %rbx  # Address of global variable    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl extract_directory
+extract_directory:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L2
+.L1:
+.L2:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -16(%rbp)
+    movq -16(%rbp), %rax
+    movq %rax, -24(%rbp)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L11
+    movq -8(%rbp), %rax
+    addq -24(%rbp), %rax
+    subq $1, %rax
+    movq %rax, -32(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_byte@PLT
+    movq %rax, -40(%rbp)
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L21
+    movq -24(%rbp), %rax
+    subq $1, %rax
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L22
+.L21:
+.L22:
+    jmp .L12
+.L11:
+.L12:
+    movq $0, %rax
+    subq $1, %rax
+    movq %rax, -48(%rbp)
+    movq $0, %rax
+    movq %rax, -56(%rbp)
+.L31:    movq -56(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L32
+    movq -8(%rbp), %rax
+    addq -56(%rbp), %rax
+    movq %rax, -64(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_byte@PLT
+    movq %rax, -72(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L41
+    movq -56(%rbp), %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L42
+.L41:
+.L42:
+    movq -56(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -56(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L31
+.L32:
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L51
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L52
+.L51:
+.L52:
+    movq -48(%rbp), %rax
+    addq $1, %rax
+    movq %rax, -80(%rbp)
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call string_substring@PLT
+    movq %rbp, %rsp
+    popq %rbp
+    ret
 
 
 .globl import_context_create
@@ -150,14 +351,14 @@ import_context_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1
+    jz .L61
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2
-.L1:
-.L2:
+    jmp .L62
+.L61:
+.L62:
     movq $64, %rax
     movq %rax, -24(%rbp)
     movq -24(%rbp), %rax
@@ -192,14 +393,14 @@ import_context_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L11
+    jz .L71
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L12
-.L11:
-.L12:
+    jmp .L72
+.L71:
+.L72:
     movq -40(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -208,14 +409,14 @@ import_context_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L21
+    jz .L81
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L22
-.L21:
-.L22:
+    jmp .L82
+.L81:
+.L82:
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -297,7 +498,7 @@ import_context_is_visited:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L31:    movq -40(%rbp), %rax
+.L91:    movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -305,7 +506,7 @@ import_context_is_visited:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L32
+    jz .L92
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -335,22 +536,22 @@ import_context_is_visited:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L41
+    jz .L101
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L42
-.L41:
-.L42:
+    jmp .L102
+.L101:
+.L102:
     movq -40(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L31
-.L32:
+    jmp .L91
+.L92:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -397,7 +598,7 @@ import_context_mark_visited:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L51
+    jz .L111
     leaq .STR0(%rip), %rax
     pushq %rax
     popq %rdi
@@ -406,9 +607,9 @@ import_context_mark_visited:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L52
-.L51:
-.L52:
+    jmp .L112
+.L111:
+.L112:
     movq -16(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -425,14 +626,14 @@ import_context_mark_visited:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L61
+    jz .L121
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L62
-.L61:
-.L62:
+    jmp .L122
+.L121:
+.L122:
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -507,14 +708,14 @@ import_context_push_stack:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L71
+    jz .L131
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L72
-.L71:
-.L72:
+    jmp .L132
+.L131:
+.L132:
     movq -16(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -531,14 +732,14 @@ import_context_push_stack:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L81
+    jz .L141
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L82
-.L81:
-.L82:
+    jmp .L142
+.L141:
+.L142:
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -595,14 +796,14 @@ import_context_pop_stack:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L91
+    jz .L151
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L92
-.L91:
-.L92:
+    jmp .L152
+.L151:
+.L152:
     movq -16(%rbp), %rax
     subq $1, %rax
     pushq %rax
@@ -645,7 +846,7 @@ import_context_is_in_stack:
     movq %rax, -32(%rbp)
     movq $0, %rax
     movq %rax, -40(%rbp)
-.L101:    movq -40(%rbp), %rax
+.L161:    movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -653,7 +854,7 @@ import_context_is_in_stack:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L102
+    jz .L162
     movq -40(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -683,22 +884,22 @@ import_context_is_in_stack:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L111
+    jz .L171
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L112
-.L111:
-.L112:
+    jmp .L172
+.L171:
+.L172:
     movq -40(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L101
-.L102:
+    jmp .L161
+.L162:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -733,7 +934,7 @@ import_context_print_stack:
     call print_string
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L121:    movq -32(%rbp), %rax
+.L181:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -741,7 +942,7 @@ import_context_print_stack:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L122
+    jz .L182
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -771,8 +972,8 @@ import_context_print_stack:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L121
-.L122:
+    jmp .L181
+.L182:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -786,24 +987,35 @@ resolve_import_path:
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L191
+    movq -8(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L192
+.L191:
+.L192:
     leaq .STR3(%rip), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
     movq %rax, -24(%rbp)
-    leaq .STR4(%rip), %rax
-    movq %rax, -32(%rbp)
-    leaq .STR5(%rip), %rax
-    movq %rax, -40(%rbp)
-    leaq .STR6(%rip), %rax
-    movq %rax, -48(%rbp)
     movq -24(%rbp), %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    movq %rax, -56(%rbp)
-    movq -56(%rbp), %rax
-    pushq %rax
     popq %rdi
     call file_exists
     pushq %rax
@@ -813,86 +1025,146 @@ resolve_import_path:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L131
-    movq -56(%rbp), %rax
+    jz .L201
+    movq -24(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L132
-.L131:
-.L132:
+    jmp .L202
+.L201:
+.L202:
+    movq $0, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_byte@PLT
+    movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    pushq %rax
-    leaq -56(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -56(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call file_exists
-    pushq %rax
-    movq $1, %rax
+    movq $46, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L141
-    movq -56(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L142
-.L141:
-.L142:
+    jz .L211
+    movq $1, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_byte@PLT
+    movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    pushq %rax
-    leaq -56(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -56(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call file_exists
-    pushq %rax
-    movq $1, %rax
+    movq $46, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L151
-    movq -56(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L152
-.L151:
-.L152:
+    jz .L221
+    movq $2, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_byte@PLT
+    movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
     pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L231
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    pushq %rax
+    movq $3, %rax
+    pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call string_concat@PLT
+    popq %rdx
+    call string_substring@PLT
+    movq %rax, -56(%rbp)
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
     pushq %rax
-    leaq -56(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L241
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L251
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -72(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L261
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -80(%rbp)
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L271
     movq -56(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -88(%rbp)
+    movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     call file_exists
@@ -903,14 +1175,357 @@ resolve_import_path:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L161
-    movq -56(%rbp), %rax
+    jz .L281
+    movq -88(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L162
-.L161:
-.L162:
+    jmp .L282
+.L281:
+.L282:
+    jmp .L272
+.L271:
+.L272:
+    jmp .L262
+.L261:
+.L262:
+    jmp .L252
+.L251:
+.L252:
+    jmp .L242
+.L241:
+.L242:
+    jmp .L232
+.L231:
+.L232:
+    jmp .L222
+.L221:
+.L222:
+    jmp .L212
+.L211:
+.L212:
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L291
+    movq -8(%rbp), %rax
+    pushq %rax
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -96(%rbp)
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L301
+    movq -96(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L302
+.L301:
+.L302:
+    leaq .STR3(%rip), %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -104(%rbp)
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L311
+    movq -104(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L312
+.L311:
+.L312:
+    jmp .L292
+.L291:
+.L292:
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L321
+    movq -8(%rbp), %rax
+    pushq %rax
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -112(%rbp)
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L331
+    movq -112(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L332
+.L331:
+.L332:
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -120(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L341
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -128(%rbp)
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L351
+    movq -128(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L352
+.L351:
+.L352:
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -136(%rbp)
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L361
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -144(%rbp)
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L371
+    movq -144(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L372
+.L371:
+.L372:
+    jmp .L362
+.L361:
+.L362:
+    jmp .L342
+.L341:
+.L342:
+    jmp .L322
+.L321:
+.L322:
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L381
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L391
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -152(%rbp)
+    movq -152(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -160(%rbp)
+    movq -160(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L401
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -168(%rbp)
+    movq -168(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L411
+    movq -168(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L412
+.L411:
+.L412:
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call extract_directory
+    movq %rax, -176(%rbp)
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L421
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq -176(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -184(%rbp)
+    movq -184(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L431
+    movq -184(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L432
+.L431:
+.L432:
+    jmp .L422
+.L421:
+.L422:
+    jmp .L402
+.L401:
+.L402:
+    jmp .L392
+.L391:
+.L392:
+    jmp .L382
+.L381:
+.L382:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -923,7 +1538,7 @@ file_exists:
     movq %rsp, %rbp
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
-    leaq .STR7(%rip), %rax
+    leaq .STR4(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -939,14 +1554,14 @@ file_exists:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L171
+    jz .L441
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L172
-.L171:
-.L172:
+    jmp .L442
+.L441:
+.L442:
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -963,7 +1578,7 @@ read_file_internal:
     movq %rsp, %rbp
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
-    leaq .STR7(%rip), %rax
+    leaq .STR4(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -979,14 +1594,14 @@ read_file_internal:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L181
+    jz .L451
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L182
-.L181:
-.L182:
+    jmp .L452
+.L451:
+.L452:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1000,7 +1615,7 @@ read_file_internal:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L191
+    jz .L461
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1009,9 +1624,9 @@ read_file_internal:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L192
-.L191:
-.L192:
+    jmp .L462
+.L461:
+.L462:
     movq -24(%rbp), %rax
     addq $1, %rax
     pushq %rax
@@ -1026,7 +1641,7 @@ read_file_internal:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L201
+    jz .L471
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1035,9 +1650,9 @@ read_file_internal:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L202
-.L201:
-.L202:
+    jmp .L472
+.L471:
+.L472:
     movq -24(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -1061,7 +1676,7 @@ read_file_internal:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L211
+    jz .L481
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1070,9 +1685,9 @@ read_file_internal:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L212
-.L211:
-.L212:
+    jmp .L482
+.L481:
+.L482:
     movq $0, %rax
     pushq %rax
     movq $0, %rax
@@ -1096,7 +1711,7 @@ get_file_size:
     movq %rsp, %rbp
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
-    leaq .STR7(%rip), %rax
+    leaq .STR4(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -1112,14 +1727,14 @@ get_file_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L221
+    jz .L491
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L222
-.L221:
-.L222:
+    jmp .L492
+.L491:
+.L492:
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1139,14 +1754,13 @@ get_file_size:
 process_imports_recursive:
     pushq %rbp
     movq %rsp, %rbp
-    # Stack overflow protection
-    movq %rsp, %rax
-    subq $16384, %rax  # Check if we have 16KB stack space
-    cmpq $0x100000, %rax  # Compare against 1MB limit
-    jb .stack_overflow_panic
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
+    movq $0, %rax
+    pushq %rax
+    leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
+    movq %rax, (%rbx)
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1160,8 +1774,8 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L231
-    leaq .STR8(%rip), %rax
+    jz .L501
+    leaq .STR5(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1169,9 +1783,66 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L232
-.L231:
-.L232:
+    jmp .L502
+.L501:
+.L502:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call process_imports_with_context
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl process_imports_with_context
+process_imports_with_context:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+    movq %rdx, -24(%rbp)
+    leaq IMPORT_DEPTH(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_DEPTH
+    addq $1, %rax
+    pushq %rax
+    leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
+    movq %rax, (%rbx)
+    leaq IMPORT_DEPTH(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_DEPTH
+    pushq %rax
+    movq $2, %rax  # Load constant IMPORT_MAX_DEPTH
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L511
+    leaq IMPORT_DEPTH(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_DEPTH
+    subq $1, %rax
+    pushq %rax
+    leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L512
+.L511:
+.L512:
     movq $40, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1188,14 +1859,14 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L241
+    jz .L521
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L242
-.L241:
-.L242:
+    jmp .L522
+.L521:
+.L522:
     movq $32, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1212,8 +1883,8 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L251
-    leaq .STR9(%rip), %rax
+    jz .L531
+    leaq .STR6(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1221,12 +1892,12 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L252
-.L251:
-.L252:
+    jmp .L532
+.L531:
+.L532:
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L261:    movq -48(%rbp), %rax
+.L541:    movq -48(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -1234,7 +1905,7 @@ process_imports_recursive:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L262
+    jz .L542
     movq $8, %rax
     movq %rax, -56(%rbp)
     movq -48(%rbp), %rax
@@ -1262,8 +1933,8 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L271
-    leaq .STR10(%rip), %rax
+    jz .L551
+    leaq .STR7(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1275,9 +1946,9 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L272
-.L271:
-.L272:
+    jmp .L552
+.L551:
+.L552:
     movq $0, %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -1294,8 +1965,8 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L281
-    leaq .STR11(%rip), %rax
+    jz .L561
+    leaq .STR8(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1303,134 +1974,9 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L282
-.L281:
-.L282:
-    movq -88(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call import_context_is_in_stack
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L291
-    leaq .STR12(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    leaq .STR13(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -88(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call import_context_print_stack
-    leaq .STR14(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L292
-.L291:
-.L292:
-    movq -88(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call import_context_is_visited
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L301
-    movq -48(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -48(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L261
-    jmp .L302
-.L301:
-.L302:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -88(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call import_context_mark_visited
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L311
-    leaq .STR15(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L312
-.L311:
-.L312:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -88(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call import_context_push_stack
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L321
-    leaq .STR16(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L322
-.L321:
-.L322:
+    jmp .L562
+.L561:
+.L562:
     movq -16(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
@@ -1447,8 +1993,84 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L331
-    leaq .STR17(%rip), %rax
+    jz .L571
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L581
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L591
+    leaq IMPORT_SOURCE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_SOURCE_DIR
+    pushq %rax
+    leaq IMPORT_BASE_DIR(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_BASE_DIR
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -104(%rbp)
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -112(%rbp)
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call file_exists
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L601
+    movq -112(%rbp), %rax
+    pushq %rax
+    leaq -96(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L602
+.L601:
+.L602:
+    jmp .L592
+.L591:
+.L592:
+    jmp .L582
+.L581:
+.L582:
+    jmp .L572
+.L571:
+.L572:
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L611
+    leaq .STR9(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1456,97 +2078,144 @@ process_imports_recursive:
     pushq %rax
     popq %rdi
     call print_string
+    movq -48(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L541
+    jmp .L612
+.L611:
+.L612:
+    movq -96(%rbp), %rax
+    pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
-    call import_context_pop_stack
+    popq %rsi
+    call import_context_is_visited
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L621
+    movq -48(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L541
+    jmp .L622
+.L621:
+.L622:
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call import_context_is_visited
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L631
+    movq -48(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L541
+    jmp .L632
+.L631:
+.L632:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call import_context_mark_visited
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call import_context_mark_visited
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call import_context_is_in_stack
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L641
+    movq -48(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L541
+    jmp .L642
+.L641:
+.L642:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call import_context_push_stack
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L651
+    leaq .STR10(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L332
-.L331:
-.L332:
+    jmp .L652
+.L651:
+.L652:
     movq -96(%rbp), %rax
     pushq %rax
     popq %rdi
     call read_file_internal@PLT
-    movq %rax, -104(%rbp)
-    movq -104(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L341
-    leaq .STR18(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -96(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call import_context_pop_stack
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L342
-.L341:
-.L342:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -104(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call lexer_create
-    movq %rax, -112(%rbp)
-    movq -112(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L351
-    leaq .STR19(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -96(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -104(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call import_context_pop_stack
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L352
-.L351:
-.L352:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -112(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_create
     movq %rax, -120(%rbp)
     movq -120(%rbp), %rax
     pushq %rax
@@ -1556,8 +2225,8 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L361
-    leaq .STR20(%rip), %rax
+    jz .L661
+    leaq .STR11(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1565,14 +2234,6 @@ process_imports_recursive:
     pushq %rax
     popq %rdi
     call print_string
-    movq -112(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call lexer_destroy
-    movq -104(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -1581,13 +2242,16 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L362
-.L361:
-.L362:
+    jmp .L662
+.L661:
+.L662:
+    movq -16(%rbp), %rax
+    pushq %rax
     movq -120(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_program
+    popq %rsi
+    call lexer_create
     movq %rax, -128(%rbp)
     movq -128(%rbp), %rax
     pushq %rax
@@ -1597,8 +2261,8 @@ process_imports_recursive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L371
-    leaq .STR21(%rip), %rax
+    jz .L671
+    leaq .STR12(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1607,14 +2271,6 @@ process_imports_recursive:
     popq %rdi
     call print_string
     movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_destroy
-    movq -112(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call lexer_destroy
-    movq -104(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -1626,35 +2282,39 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L372
-.L371:
-.L372:
+    jmp .L672
+.L671:
+.L672:
     movq -16(%rbp), %rax
     pushq %rax
     movq -128(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call process_imports_recursive
+    call parser_create
     movq %rax, -136(%rbp)
     movq -136(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
-    setne %al
+    sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L381
-    movq -120(%rbp), %rax
+    jz .L681
+    leaq .STR13(%rip), %rax
     pushq %rax
     popq %rdi
-    call parser_destroy
-    movq -112(%rbp), %rax
+    call print_string
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -128(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_destroy
-    movq -104(%rbp), %rax
+    movq -120(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -1666,120 +2326,32 @@ process_imports_recursive:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L382
-.L381:
-.L382:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq -128(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
+    jmp .L682
+.L681:
+.L682:
+    movq -136(%rbp), %rax
     pushq %rax
     popq %rdi
-    popq %rsi
-    popq %rdx
-    call merge_imported_functions
+    call parser_parse_program
     movq %rax, -144(%rbp)
     movq -144(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
-    setne %al
+    sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L391
-    leaq .STR22(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -96(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -120(%rbp), %rax
+    jz .L691
+    movq -136(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_destroy
-    movq -112(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call lexer_destroy
-    movq -104(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call import_context_pop_stack
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L392
-.L391:
-.L392:
-    movq -16(%rbp), %rax
-    pushq %rax
     movq -128(%rbp), %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call merge_imported_types
-    movq %rax, -152(%rbp)
-    movq -152(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L401
-    leaq .STR23(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -96(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_destroy
-    movq -112(%rbp), %rax
-    pushq %rax
     popq %rdi
     call lexer_destroy
-    movq -104(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -24(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call import_context_pop_stack
-    movq $1, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L402
-.L401:
-.L402:
     movq -120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_destroy
-    movq -112(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call lexer_destroy
-    movq -104(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
@@ -1793,9 +2365,154 @@ process_imports_recursive:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L261
-.L262:
-    leaq .STR24(%rip), %rax
+    jmp .L541
+    jmp .L692
+.L691:
+.L692:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call process_imports_with_context
+    movq %rax, -152(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -144(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call merge_imported_functions
+    movq %rax, -160(%rbp)
+    movq -160(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L701
+    leaq .STR14(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_destroy
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call lexer_destroy
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call import_context_pop_stack
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L702
+.L701:
+.L702:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -144(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call merge_imported_types
+    movq %rax, -168(%rbp)
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L711
+    leaq .STR15(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_destroy
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call lexer_destroy
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call import_context_pop_stack
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L712
+.L711:
+.L712:
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_destroy
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call lexer_destroy
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call import_context_pop_stack
+    movq -48(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L541
+.L542:
+    leaq IMPORT_DEPTH(%rip), %rax
+    movq (%rax), %rax  # Load mutable global IMPORT_DEPTH
+    subq $1, %rax
+    pushq %rax
+    leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
+    movq %rax, (%rbx)
+    leaq .STR16(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1803,7 +2520,7 @@ process_imports_recursive:
     pushq %rax
     popq %rdi
     call print_integer
-    leaq .STR25(%rip), %rax
+    leaq .STR17(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -1837,14 +2554,14 @@ merge_imported_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L411
+    jz .L721
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L412
-.L411:
-.L412:
+    jmp .L722
+.L721:
+.L722:
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -1861,14 +2578,14 @@ merge_imported_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L421
+    jz .L731
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L422
-.L421:
-.L422:
+    jmp .L732
+.L731:
+.L732:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1908,17 +2625,17 @@ merge_imported_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L431
+    jz .L741
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L432
-.L431:
-.L432:
+    jmp .L742
+.L741:
+.L742:
     movq $0, %rax
     movq %rax, -80(%rbp)
-.L441:    movq -80(%rbp), %rax
+.L751:    movq -80(%rbp), %rax
     pushq %rax
     movq -48(%rbp), %rax
     popq %rbx
@@ -1926,7 +2643,7 @@ merge_imported_functions:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L442
+    jz .L752
     movq -80(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -1959,11 +2676,11 @@ merge_imported_functions:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L441
-.L442:
+    jmp .L751
+.L752:
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L451:    movq -96(%rbp), %rax
+.L761:    movq -96(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -1971,7 +2688,7 @@ merge_imported_functions:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L452
+    jz .L762
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -2012,8 +2729,8 @@ merge_imported_functions:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L451
-.L452:
+    jmp .L761
+.L762:
     movq -72(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -2074,14 +2791,14 @@ merge_imported_types:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L461
+    jz .L771
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L462
-.L461:
-.L462:
+    jmp .L772
+.L771:
+.L772:
     movq $16, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -2098,14 +2815,14 @@ merge_imported_types:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L471
+    jz .L781
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L472
-.L471:
-.L472:
+    jmp .L782
+.L781:
+.L782:
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2145,17 +2862,17 @@ merge_imported_types:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L481
+    jz .L791
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L482
-.L481:
-.L482:
+    jmp .L792
+.L791:
+.L792:
     movq $0, %rax
     movq %rax, -80(%rbp)
-.L491:    movq -80(%rbp), %rax
+.L801:    movq -80(%rbp), %rax
     pushq %rax
     movq -48(%rbp), %rax
     popq %rbx
@@ -2163,7 +2880,7 @@ merge_imported_types:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L492
+    jz .L802
     movq -80(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -2196,11 +2913,11 @@ merge_imported_types:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L491
-.L492:
+    jmp .L801
+.L802:
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L501:    movq -96(%rbp), %rax
+.L811:    movq -96(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -2208,7 +2925,7 @@ merge_imported_types:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L502
+    jz .L812
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -2249,8 +2966,8 @@ merge_imported_types:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L501
-.L502:
+    jmp .L811
+.L812:
     movq -72(%rbp), %rax
     pushq %rax
     movq $16, %rax

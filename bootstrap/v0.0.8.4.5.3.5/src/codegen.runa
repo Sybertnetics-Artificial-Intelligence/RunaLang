@@ -87,6 +87,198 @@ Process called "codegen_compare_strings" takes key1 as Integer, key2 as Integer 
     End If
 End Process
 
+Note: ============================================================================
+Note: Mutable globals tracking
+Note: A global is "mutable" if any function contains a Set statement targeting it.
+Note: Mutable globals must be loaded from memory at runtime, not inlined as constants.
+Note: ============================================================================
+
+Process called "codegen_mark_global_mutated" takes codegen as Integer, name as Integer returns Integer:
+    Note: Add a global name to the mutated set (if not already present)
+    Let mut_globals be memory_get_pointer(codegen, 96)
+    Let mut_count be memory_get_int32(codegen, 104)
+    Note: Check if already marked
+    Let k be 0
+    While k is less than mut_count:
+        Let k_offset be k multiplied by 8
+        Let existing be memory_get_pointer(mut_globals, k_offset)
+        If string_equals(existing, name) is equal to 1:
+            Return 0
+        End If
+        Set k to k plus 1
+    End While
+    Note: Add to the set
+    If mut_count is less than 256:
+        Let new_offset be mut_count multiplied by 8
+        memory_set_pointer(mut_globals, new_offset, name)
+        Set mut_count to mut_count plus 1
+        memory_set_int32(codegen, 104, mut_count)
+    End If
+    Return 0
+End Process
+
+Process called "codegen_is_global_mutated" takes codegen as Integer, name as Integer returns Integer:
+    Note: Returns 1 if the global has been marked as mutated by Set, 0 otherwise
+    Let mut_globals be memory_get_pointer(codegen, 96)
+    Let mut_count be memory_get_int32(codegen, 104)
+    Let k be 0
+    While k is less than mut_count:
+        Let k_offset be k multiplied by 8
+        Let existing be memory_get_pointer(mut_globals, k_offset)
+        If string_equals(existing, name) is equal to 1:
+            Return 1
+        End If
+        Set k to k plus 1
+    End While
+    Return 0
+End Process
+
+Note: Pre-pass: scan a statement for Set targets that are globals
+Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Integer, program as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+    Let stmt_type be memory_get_int32(stmt, 0)
+    Note: STMT_SET = 2 (Set X to Y) - target at offset 8
+    If stmt_type is equal to 2:
+        Let target_expr be memory_get_pointer(stmt, 8)
+        If target_expr is not equal to 0:
+            Let target_type be memory_get_int32(target_expr, 0)
+            If target_type is equal to 1:
+                Note: EXPR_VARIABLE - check if it's a global
+                Let var_name be memory_get_pointer(target_expr, 8)
+                If var_name is not equal to 0:
+                    Let global_count be memory_get_int32(program, 56)
+                    Let globals_arr be memory_get_pointer(program, 48)
+                    If globals_arr is not equal to 0:
+                        Let g be 0
+                        While g is less than global_count:
+                            Let g_offset be g multiplied by 8
+                            Let g_ptr be memory_get_pointer(globals_arr, g_offset)
+                            If g_ptr is not equal to 0:
+                                Let g_name be memory_get_pointer(g_ptr, 0)
+                                If g_name is not equal to 0:
+                                    If string_equals(g_name, var_name) is equal to 1:
+                                        codegen_mark_global_mutated(codegen, g_name)
+                                        Set g to global_count
+                                    End If
+                                End If
+                            End If
+                            Set g to g plus 1
+                        End While
+                    End If
+                End If
+            End If
+        End If
+    End If
+    Note: Recurse into nested statements
+    Note: STMT_IF = 5: condition(8), if_body(16), if_body_count(24), else_body(32), else_body_count(40)
+    If stmt_type is equal to 5:
+        Let if_body be memory_get_pointer(stmt, 16)
+        Let if_count be memory_get_integer(stmt, 24)
+        If if_body is not equal to 0:
+            If if_count is greater than 0:
+                Let si be 0
+                While si is less than if_count:
+                    Let si_offset be si multiplied by 8
+                    Let child_stmt be memory_get_pointer(if_body, si_offset)
+                    codegen_scan_set_targets(codegen, child_stmt, program)
+                    Set si to si plus 1
+                End While
+            End If
+        End If
+        Let else_body be memory_get_pointer(stmt, 32)
+        Let else_count be memory_get_integer(stmt, 40)
+        If else_body is not equal to 0:
+            If else_count is greater than 0:
+                Let sei be 0
+                While sei is less than else_count:
+                    Let sei_offset be sei multiplied by 8
+                    Let else_child be memory_get_pointer(else_body, sei_offset)
+                    codegen_scan_set_targets(codegen, else_child, program)
+                    Set sei to sei plus 1
+                End While
+            End If
+        End If
+    End If
+    Note: STMT_WHILE = 6: condition(8), body(16), body_count(24)
+    If stmt_type is equal to 6:
+        Let while_body be memory_get_pointer(stmt, 16)
+        Let while_count be memory_get_integer(stmt, 24)
+        If while_body is not equal to 0:
+            If while_count is greater than 0:
+                Let wi be 0
+                While wi is less than while_count:
+                    Let wi_offset be wi multiplied by 8
+                    Let while_child be memory_get_pointer(while_body, wi_offset)
+                    codegen_scan_set_targets(codegen, while_child, program)
+                    Set wi to wi plus 1
+                End While
+            End If
+        End If
+    End If
+    Note: STMT_FOR_EACH = 12: var_name(8), collection(16), body(24), body_count(32)
+    If stmt_type is equal to 12:
+        Let for_body be memory_get_pointer(stmt, 24)
+        Let for_count be memory_get_integer(stmt, 32)
+        If for_body is not equal to 0:
+            If for_count is greater than 0:
+                Let fi be 0
+                While fi is less than for_count:
+                    Let fi_offset be fi multiplied by 8
+                    Let for_child be memory_get_pointer(for_body, fi_offset)
+                    codegen_scan_set_targets(codegen, for_child, program)
+                    Set fi to fi plus 1
+                End While
+            End If
+        End If
+    End If
+    Note: STMT_FOR = 11: var(8), start(16), end(24), body(32), body_count(40)
+    If stmt_type is equal to 11:
+        Let for_r_body be memory_get_pointer(stmt, 32)
+        Let for_r_count be memory_get_integer(stmt, 40)
+        If for_r_body is not equal to 0:
+            If for_r_count is greater than 0:
+                Let fri be 0
+                While fri is less than for_r_count:
+                    Let fri_offset be fri multiplied by 8
+                    Let for_r_child be memory_get_pointer(for_r_body, fri_offset)
+                    codegen_scan_set_targets(codegen, for_r_child, program)
+                    Set fri to fri plus 1
+                End While
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+Note: Pre-pass entry: scan all functions for Set statements targeting globals
+Process called "codegen_build_mutated_globals" takes codegen as Integer, program as Integer returns Integer:
+    Let func_count be memory_get_int32(program, 8)
+    Let funcs be memory_get_pointer(program, 0)
+    If funcs is equal to 0:
+        Return 0
+    End If
+    Let fi be 0
+    While fi is less than func_count:
+        Let func be memory_get_pointer(funcs, fi multiplied by 8)
+        If func is not equal to 0:
+            Let stmts be memory_get_pointer(func, 32)
+            Let stmt_count be memory_get_int32(func, 40)
+            If stmts is not equal to 0:
+                Let si be 0
+                While si is less than stmt_count:
+                    Let stmt be memory_get_pointer(stmts, si multiplied by 8)
+                    codegen_scan_set_targets(codegen, stmt, program)
+                    Set si to si plus 1
+                End While
+            End If
+        End If
+        Set fi to fi plus 1
+    End While
+    Return 0
+End Process
+
 Note: Find variable in current scope - OPTIMIZED with first-char check
 Process called "codegen_find_variable" takes codegen as Integer, name as Integer returns Integer:
     Let variable_count be memory_get_int32(codegen, 16)  Note: codegen->variable_count (int)
@@ -397,6 +589,19 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
         Return 0
     End If
 
+    If expr_type is equal to 17:  Note: EXPR_LIST_LITERAL
+        Let ll_str_elems be memory_get_pointer(expr, 8)
+        Let ll_str_count be memory_get_integer(expr, 16)
+        Set i to 0
+        While i is less than ll_str_count:
+            Let ll_str_offset be i multiplied by 8
+            Let ll_str_elem be memory_get_pointer(ll_str_elems, ll_str_offset)
+            codegen_collect_strings_from_expression(codegen, ll_str_elem)
+            Set i to i plus 1
+        End While
+        Return 0
+    End If
+
     If expr_type is equal to 25:  Note: EXPR_QUALIFIED_CALL (module.function())
         Note: Qualified call: module_name at 8, function_name at 16, arguments at 24, arg_count at 32
         Let qual_args be memory_get_pointer(expr, 24)
@@ -610,6 +815,24 @@ Process called "codegen_collect_strings_from_statement" takes codegen as Integer
             codegen_collect_strings_from_statement(codegen, stmt_ptr)
             Set i to i plus 1
         End While
+        Return 0
+    End If
+
+    If stmt_type is equal to 12:  Note: STMT_FOR_EACH
+        Note: For Each has: var_name(8), collection_expr(16), body(24), body_count(32)
+        Let fe_collection be memory_get_pointer(stmt, 16)
+        Let fe_body be memory_get_pointer(stmt, 24)
+        Let fe_body_count be memory_get_int32(stmt, 32)
+        codegen_collect_strings_from_expression(codegen, fe_collection)
+        If fe_body is not equal to 0:
+            Set i to 0
+            While i is less than fe_body_count:
+                Set stmt_offset to i multiplied by 8
+                Set stmt_ptr to memory_get_pointer(fe_body, stmt_offset)
+                codegen_collect_strings_from_statement(codegen, stmt_ptr)
+                Set i to i plus 1
+            End While
+        End If
         Return 0
     End If
 
@@ -1078,7 +1301,19 @@ Process called "codegen_generate_variable_expr" takes codegen as Integer, expr a
         End If
 
         If is_global is equal to 1:
-            Note: Check if this global has an integer initial_value (compile-time constant)
+            Note: Check if this global is mutated by any Set statement
+            Let is_mutated be codegen_is_global_mutated(codegen, variable_name)
+            If is_mutated is equal to 1:
+                Note: Mutable global - must load from memory at runtime
+                file_write_buffered(output_file, "    leaq ", 0)
+                file_write_buffered(output_file, variable_name, 0)
+                file_write_buffered(output_file, "(%rip), %rax\n", 0)
+                file_write_buffered(output_file, "    movq (%rax), %rax  # Load mutable global ", 0)
+                file_write_buffered(output_file, variable_name, 0)
+                file_write_buffered(output_file, "\n", 0)
+                Return 0
+            End If
+            Note: Immutable global - safe to inline as compile-time constant
             Let initial_value be memory_get_pointer(found_global_ptr, 16)  Note: global->initial_value
             If initial_value is not equal to 0:
                 Let expr_type be memory_get_int32(initial_value, 0)  Note: initial_value->type
@@ -1086,56 +1321,27 @@ Process called "codegen_generate_variable_expr" takes codegen as Integer, expr a
                     Let integer_value be memory_get_pointer(initial_value, 8)  Note: initial_value->data.integer_value
                     file_write_buffered(output_file, "    movq $", 0)
                     file_write_buffered(output_file, integer_to_string(integer_value), 0)
-                    file_write_buffered(output_file, ", %rax  # Load compile-time constant ", 0)
+                    file_write_buffered(output_file, ", %rax  # Load constant ", 0)
                     file_write_buffered(output_file, variable_name, 0)
                     file_write_buffered(output_file, "\n", 0)
                     Return 0
                 End If
             End If
-            Note: Not a compile-time constant, generate runtime access
-            file_write_buffered(output_file, "    movq ", 0)
+            Note: Non-integer initial value, generate runtime access
+            file_write_buffered(output_file, "    leaq ", 0)
             file_write_buffered(output_file, variable_name, 0)
-            file_write_buffered(output_file, "(%rip), %rax  # Load global variable\n", 0)
+            file_write_buffered(output_file, "(%rip), %rax\n", 0)
+            file_write_buffered(output_file, "    movq (%rax), %rax  # Load global ", 0)
+            file_write_buffered(output_file, variable_name, 0)
+            file_write_buffered(output_file, "\n", 0)
             Return 0
         End If
 
-        Note: Check if function name
-        Let is_function be 0
-        If current_program is not equal to 0:
-            Let function_count be memory_get_int32(current_program, 8)  Note: PROGRAM_FUNCTION_COUNT
-            Let functions be memory_get_pointer(current_program, 0)  Note: PROGRAM_FUNCTIONS
-
-            Note: Optimization: get first character for fast filtering
-            Let name_first_char be memory_get_byte(variable_name, 0)
-
-            Set j to 0
-            While j is less than function_count:
-                Let func_offset be j multiplied by 8
-                Let function_ptr be memory_get_pointer(functions, func_offset)
-                Let function_name be memory_get_pointer(function_ptr, 0)
-
-                Note: Fast path: check first character before expensive string_equals
-                Let func_first_char be memory_get_byte(function_name, 0)
-                If func_first_char is equal to name_first_char:
-                    If string_equals(function_name, variable_name) is equal to 1:
-                        Set is_function to 1
-                        Set j to function_count
-                    End If
-                End If
-
-                Set j to j plus 1
-            End While
-        End If
-
-        If is_function is equal to 0:
-            print_string("[CODEGEN ERROR] Undefined variable: ")
-            print_string(variable_name)
-            exit_with_code(1)
-        End If
-
+        Note: Not a local, not a global - assume it's a function name or external symbol
+        Note: Emit as symbol reference - assembler/linker will resolve
         file_write_buffered(output_file, "    leaq ", 0)
         file_write_buffered(output_file, variable_name, 0)
-        file_write_buffered(output_file, "(%rip), %rax  # Load function address\n", 0)
+        file_write_buffered(output_file, "(%rip), %rax  # Symbol reference\n", 0)
         Return 0
     End If
 
@@ -3993,7 +4199,7 @@ Note:   offset 80: call_graph
 Note:   offset 88: arena (pointer) - for temporary allocations
 
 Process called "codegen_create" takes output_filename as Integer, arena as Integer returns Integer:
-    Let codegen be allocate(96)  Note: sizeof(CodeGenerator) - expanded for arena at offset 88
+    Let codegen be allocate(112)  Note: sizeof(CodeGenerator) - expanded for mutated_globals at offset 96
 
     Note: Note: allocate() uses calloc() which already zeros the memory,
     Note: so no explicit initialization loop is needed
@@ -4029,6 +4235,11 @@ Process called "codegen_create" takes output_filename as Integer, arena as Integ
 
     Note: Hash table will be created on first use (function pointers not available yet)
     memory_set_pointer(codegen, 72, 0)  Note: codegen->var_hashtable (initially NULL)
+
+    Note: Mutated globals tracking - array of name pointers for globals targeted by Set
+    Let mut_globals be allocate(256 multiplied by 8)  Note: Space for 256 mutable global names
+    memory_set_pointer(codegen, 96, mut_globals)  Note: codegen->mutated_globals (pointer array)
+    memory_set_int32(codegen, 104, 0)  Note: codegen->mutated_globals_count
 
     If output_file is equal to 0:
         deallocate(variables)
@@ -4352,6 +4563,10 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 
     Note: Store program reference for type lookups
     memory_set_pointer(codegen, 48, program)  Note: codegen->current_program = program (pointer with padding)
+
+    Note: Pre-pass: identify globals that are targets of Set statements
+    Note: These must be loaded from memory at runtime, not inlined as constants
+    codegen_build_mutated_globals(codegen, program)
 
     Let output_file be memory_get_integer(codegen, 0)  Note: codegen->output_file
 
