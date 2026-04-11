@@ -412,7 +412,7 @@ print_integer:
 .STR16:    .string "[PARSER ERROR] parser became NULL before expression parsing in Let"
 .STR17:    .string "Parser error: Expected operation after gets (got token "
 .STR18:    .string ")"
-.STR19:    .string "[PARSER ERROR] Expected token type "
+.STR19:    .string "[PARSER WARNING] Expected token "
 .STR20:    .string ", got "
 .STR21:    .string " at line "
 .STR22:    .string "[PARSER ERROR] Null parser in parse_primary"
@@ -5323,8 +5323,6 @@ parser_eat:
     jmp .L1372
 .L1371:
     leaq .STR19(%rip), %rax
-    movq %rax, -48(%rbp)
-    movq -48(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -5333,8 +5331,6 @@ parser_eat:
     popq %rdi
     call print_integer
     leaq .STR20(%rip), %rax
-    movq %rax, -56(%rbp)
-    movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -5343,8 +5339,6 @@ parser_eat:
     popq %rdi
     call print_integer
     leaq .STR21(%rip), %rax
-    movq %rax, -64(%rbp)
-    movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -5355,16 +5349,17 @@ parser_eat:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -72(%rbp)
-    movq -72(%rbp), %rax
+    movq %rax, -48(%rbp)
+    movq -48(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
     call print_newline
-    movq $1, %rax
+    movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call exit_with_code@PLT
+    call parser_advance
+    movq %rax, -56(%rbp)
 .L1372:
     movq $0, %rax
     movq %rbp, %rsp
