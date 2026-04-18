@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,708 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles WebAssembly System Interface (WASI) and system integration.
+WASI Interface - WebAssembly System Interface (preview1) Integration
+
+This file implements the WASI preview1 interface for Runa WebAssembly backend.
+WASI provides a standardized set of system calls that WASM modules can import
+to access host system resources (file I/O, stdout/stderr, exit codes, clocks).
+
+WASI preview1 is the current stable standard. Every WASI function imported by
+a WASM module must come from the "wasi_snapshot_preview1" module namespace.
 
 This file performs the following tasks:
-- Process WASI system calls and system interface integration
-- Handle WASI file system operations and file system interface
-- Manage WASI network operations and network interface
-- Process WASI process management and process interface
+- Define WASI preview1 function signatures as WASM type entries
+- Register WASI imports into a WASM module (adds to Import section)
+- Emit WASI call sequences for file I/O (fd_read, fd_write, fd_close)
+- Emit WASI call sequences for process control (proc_exit)
+- Emit WASI call sequences for clock access (clock_time_get)
+- Emit WASI call sequences for environment/args (args_get, environ_get)
+- Maintain registry of imported WASI functions with their assigned indices
 
 This file is essential because of the following reasons:
-- WASI interface enables WebAssembly system integration and system calls
-- Proper WASI handling ensures correct WebAssembly system functionality
-- WASI support enables Runa compilation for WebAssembly system integration
+- WASM modules cannot directly invoke system calls - they must go through WASI
+- Correct WASI import registration is required for WASM modules to run in any
+  WASI-compliant runtime (wasmtime, wasmer, Node.js with WASI, browser polyfills)
+- Function type signatures must exactly match the WASI preview1 specification
+- Import index tracking ensures generated code calls the correct function
 
 This file consists of the following functions/features/operation types:
-- WASI system calls and system interface integration
-- WASI file system operations and file system interface
-- WASI network operations and network interface
-- WASI process management and process interface
+- WASI function identifier constants (one per WASI call)
+- WasiRegistry structure tracking which WASI functions are imported
+- Type signature emission for each WASI function
+- Import entry emission for each registered WASI function
+- High-level helpers for common patterns (write to stdout, exit with code)
+
+Dependencies:
+- wasm_encoder for module-level state and section building
+- instruction_encoder for LEB128 and opcode byte emission
+- MachineCode for output buffer operations
+- Layout for memory allocation
+- List for collection operations
 :End Note
 
-Note: TODO - Implement WASI interface functionality
+Import "compiler/backend/machine_code/wasm/wasm_encoder.runa" as WasmEncoder
+Import "compiler/backend/machine_code/wasm/instruction_encoder.runa" as WasmInstr
+Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================================
+Note: WASI FUNCTION IDENTIFIER CONSTANTS
+Note: ============================================================================
+
+Note:
+WASI preview1 function IDs. These are assigned by this file and used as keys
+in the WasiRegistry to track which WASI functions the module imports.
+
+They do NOT correspond to fixed external numbers - WASI functions are identified
+by name (e.g. "wasi_snapshot_preview1.fd_write"). These IDs are purely internal
+to our compiler for bookkeeping.
+:End Note
+
+Constant WASI_FN_FD_WRITE as Integer is 1         Note: Write to file descriptor (stdout, stderr, files)
+Constant WASI_FN_FD_READ as Integer is 2          Note: Read from file descriptor (stdin, files)
+Constant WASI_FN_FD_CLOSE as Integer is 3         Note: Close file descriptor
+Constant WASI_FN_FD_SEEK as Integer is 4          Note: Seek within file
+Constant WASI_FN_PROC_EXIT as Integer is 5        Note: Exit process with status code
+Constant WASI_FN_CLOCK_TIME_GET as Integer is 6   Note: Get clock time (monotonic, realtime)
+Constant WASI_FN_ARGS_GET as Integer is 7         Note: Get command-line arguments
+Constant WASI_FN_ARGS_SIZES_GET as Integer is 8   Note: Get arg count and total buffer size
+Constant WASI_FN_ENVIRON_GET as Integer is 9      Note: Get environment variables
+Constant WASI_FN_ENVIRON_SIZES_GET as Integer is 10   Note: Get env count and buffer size
+Constant WASI_FN_PATH_OPEN as Integer is 11       Note: Open file at path
+Constant WASI_FN_RANDOM_GET as Integer is 12      Note: Fill buffer with random bytes
+Constant WASI_FN_FD_FDSTAT_GET as Integer is 13   Note: Get fd metadata
+Constant WASI_FN_FD_PRESTAT_GET as Integer is 14  Note: Get preopened directory info
+Constant WASI_FN_FD_PRESTAT_DIR_NAME as Integer is 15  Note: Get preopened dir path
+
+Note: Total number of WASI functions we support
+Constant WASI_FN_COUNT as Integer is 15
+
+Note: ============================================================================
+Note: WASI VALUE TYPE CONSTANTS
+Note: ============================================================================
+
+Note: WASM value types used in WASI function signatures
+Constant WASM_VAL_I32 as Integer is 127    Note: 0x7F in WASM binary
+Constant WASM_VAL_I64 as Integer is 126    Note: 0x7E in WASM binary
+Constant WASM_VAL_F32 as Integer is 125    Note: 0x7D in WASM binary
+Constant WASM_VAL_F64 as Integer is 124    Note: 0x7C in WASM binary
+
+Note: WASI errno values (returned as i32 from most WASI functions)
+Constant WASI_ERRNO_SUCCESS as Integer is 0
+Constant WASI_ERRNO_BADF as Integer is 8        Note: Bad file descriptor
+Constant WASI_ERRNO_INVAL as Integer is 28      Note: Invalid argument
+Constant WASI_ERRNO_IO as Integer is 29         Note: I/O error
+Constant WASI_ERRNO_NOENT as Integer is 44      Note: No such file or directory
+
+Note: Standard file descriptors
+Constant WASI_FD_STDIN as Integer is 0
+Constant WASI_FD_STDOUT as Integer is 1
+Constant WASI_FD_STDERR as Integer is 2
+
+Note: WASI clock IDs
+Constant WASI_CLOCK_REALTIME as Integer is 0
+Constant WASI_CLOCK_MONOTONIC as Integer is 1
+Constant WASI_CLOCK_PROCESS_CPUTIME as Integer is 2
+Constant WASI_CLOCK_THREAD_CPUTIME as Integer is 3
+
+Note: WASI seek whence values
+Constant WASI_WHENCE_SET as Integer is 0
+Constant WASI_WHENCE_CUR as Integer is 1
+Constant WASI_WHENCE_END as Integer is 2
+
+Note: ============================================================================
+Note: WASI REGISTRY STRUCTURE
+Note: ============================================================================
+
+@Reasoning
+WasiRegistry tracks which WASI functions have been imported by the current
+module. Each WASI function gets a stable import index assigned on first use.
+The registry also tracks the corresponding type signature index so we can
+emit the correct import entry later.
+
+When code generation needs to call a WASI function, it calls wasi_get_import_index
+which returns the function's assigned WASM function index (registering the
+function if not already imported). Generated code then uses this index in a
+WASM call instruction.
+
+Memory layout (120 bytes, Tier 3 OWNED HEAP):
+Offset 0:   module_state (pointer to WasmModuleState)
+Offset 8:   import_indices (array of 15 i32, one slot per WASI function)
+Offset 128: imported_count (number of WASI functions actually imported)
+@End Reasoning
+
+Type called "WasiRegistry":
+    module_state as Integer
+    import_indices as Integer
+    imported_count as Integer
+End Type
+
+Note: ============================================================================
+Note: REGISTRY CREATION AND DESTRUCTION
+Note: ============================================================================
+
+Process called "wasi_registry_create" that takes module_state as Integer returns Integer:
+    @Reasoning
+    Creates a new WASI registry bound to the given WasmModuleState.
+    The registry starts empty; WASI functions will be registered on demand
+    during code generation.
+    @End Reasoning
+
+    Let registry be proc allocate from Layout with 24
+    If registry is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate import_indices array: 16 slots (WASI_FN_COUNT + 1 buffer) of 8 bytes each
+    Let indices be proc allocate from Layout with 128
+    If indices is equal to 0:
+        proc deallocate from Layout with registry
+        Return 0
+    End If
+
+    Note: Initialize all indices to -1 (not imported)
+    Let i be 0
+    While i is less than 16:
+        proc memory_set_int64 from Layout with indices, i multiplied by 8, -1
+        Set i to i plus 1
+    End While
+
+    proc memory_set_int64 from Layout with registry, 0, module_state
+    proc memory_set_int64 from Layout with registry, 8, indices
+    proc memory_set_int64 from Layout with registry, 16, 0
+
+    Return registry
+End Process
+
+Process called "wasi_registry_destroy" that takes registry as Integer returns Integer:
+    @Reasoning
+    Releases memory held by the registry. Does NOT free the module_state
+    (owned elsewhere) or emitted import entries (owned by module_state).
+    @End Reasoning
+
+    If registry is equal to 0:
+        Return 1
+    End If
+
+    Let indices be proc memory_get_int64 from Layout with registry, 8
+    If indices is not equal to 0:
+        proc deallocate from Layout with indices
+    End If
+
+    proc deallocate from Layout with registry
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: WASI TYPE SIGNATURE EMISSION
+Note: ============================================================================
+
+@Reasoning
+Each WASI function has a fixed type signature defined by the WASI preview1 spec.
+This process emits the bytes representing the function type signature into the
+module's type section.
+
+Type signature bytes (per WASM binary spec):
+  0x60              Note: function type marker
+  param_count       Note: LEB128-encoded number of parameters
+  param_types...    Note: One byte per parameter (valtype)
+  return_count      Note: LEB128-encoded number of return values
+  return_types...   Note: One byte per return value (valtype)
+
+WASI functions always return exactly one i32 (the errno).
+Exception: proc_exit returns zero values (it doesn't return at all).
+@End Reasoning
+
+Process called "wasi_emit_type_signature" that takes module_state as Integer, wasi_fn as Integer returns Integer:
+    Note: Emits type signature into the module's type section and returns the type index
+
+    Note: Get parameter bytes for this WASI function
+    Let params be proc allocate from Layout with 16
+    If params is equal to 0:
+        Return -1
+    End If
+
+    Let param_count be 0
+    Let return_count be 1
+
+    If wasi_fn is equal to WASI_FN_FD_WRITE:
+        Note: fd_write(fd: i32, iovs: ptr, iovs_len: i32, nwritten: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 2, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 3, WASM_VAL_I32
+        Set param_count to 4
+    End If
+
+    If wasi_fn is equal to WASI_FN_FD_READ:
+        Note: fd_read(fd: i32, iovs: ptr, iovs_len: i32, nread: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 2, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 3, WASM_VAL_I32
+        Set param_count to 4
+    End If
+
+    If wasi_fn is equal to WASI_FN_FD_CLOSE:
+        Note: fd_close(fd: i32) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        Set param_count to 1
+    End If
+
+    If wasi_fn is equal to WASI_FN_FD_SEEK:
+        Note: fd_seek(fd: i32, offset: i64, whence: i32, newoffset: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I64
+        proc memory_set_byte from Layout with params, 2, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 3, WASM_VAL_I32
+        Set param_count to 4
+    End If
+
+    If wasi_fn is equal to WASI_FN_PROC_EXIT:
+        Note: proc_exit(code: i32) -> never
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        Set param_count to 1
+        Set return_count to 0
+    End If
+
+    If wasi_fn is equal to WASI_FN_CLOCK_TIME_GET:
+        Note: clock_time_get(id: i32, precision: i64, time: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I64
+        proc memory_set_byte from Layout with params, 2, WASM_VAL_I32
+        Set param_count to 3
+    End If
+
+    If wasi_fn is equal to WASI_FN_ARGS_GET:
+        Note: args_get(argv: ptr, argv_buf: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_ARGS_SIZES_GET:
+        Note: args_sizes_get(argc: ptr, argv_buf_size: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_ENVIRON_GET:
+        Note: environ_get(environ: ptr, environ_buf: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_ENVIRON_SIZES_GET:
+        Note: environ_sizes_get(count: ptr, buf_size: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_PATH_OPEN:
+        Note: path_open(fd, dirflags, path, path_len, oflags, fs_rights_base: i64,
+        Note:           fs_rights_inheriting: i64, fdflags, opened_fd: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 2, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 3, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 4, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 5, WASM_VAL_I64
+        proc memory_set_byte from Layout with params, 6, WASM_VAL_I64
+        proc memory_set_byte from Layout with params, 7, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 8, WASM_VAL_I32
+        Set param_count to 9
+    End If
+
+    If wasi_fn is equal to WASI_FN_RANDOM_GET:
+        Note: random_get(buf: ptr, buf_len: i32) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_FD_FDSTAT_GET:
+        Note: fd_fdstat_get(fd: i32, buf: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_FD_PRESTAT_GET:
+        Note: fd_prestat_get(fd: i32, buf: ptr) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        Set param_count to 2
+    End If
+
+    If wasi_fn is equal to WASI_FN_FD_PRESTAT_DIR_NAME:
+        Note: fd_prestat_dir_name(fd: i32, path: ptr, path_len: i32) -> errno: i32
+        proc memory_set_byte from Layout with params, 0, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 1, WASM_VAL_I32
+        proc memory_set_byte from Layout with params, 2, WASM_VAL_I32
+        Set param_count to 3
+    End If
+
+    If param_count is equal to 0:
+        Note: Unknown WASI function ID
+        proc deallocate from Layout with params
+        Return -1
+    End If
+
+    Note: Register the type signature in the module's type section
+    Let type_index be proc add_function_type from WasmEncoder with module_state, params, param_count, return_count
+    proc deallocate from Layout with params
+    Return type_index
+End Process
+
+Note: ============================================================================
+Note: WASI IMPORT REGISTRATION
+Note: ============================================================================
+
+@Reasoning
+Registers a WASI function as an import in the module's import section if not
+already registered. Returns the WASM function index to use in call instructions.
+
+Import entries have the format:
+  module_name     Note: always "wasi_snapshot_preview1"
+  field_name      Note: WASI function name (e.g. "fd_write")
+  import_kind     Note: 0x00 for function import
+  type_index      Note: LEB128 type index
+
+Because imports occur BEFORE function definitions in the WASM function index
+space, the first imported WASI function gets function index 0, second gets 1,
+etc. Actual user-defined functions get indices starting after all imports.
+@End Reasoning
+
+Process called "wasi_get_function_name" that takes wasi_fn as Integer returns Integer:
+    Note: Returns pointer to the null-terminated WASI function name string
+
+    If wasi_fn is equal to WASI_FN_FD_WRITE:
+        Return proc string_literal from WasmEncoder with "fd_write"
+    End If
+    If wasi_fn is equal to WASI_FN_FD_READ:
+        Return proc string_literal from WasmEncoder with "fd_read"
+    End If
+    If wasi_fn is equal to WASI_FN_FD_CLOSE:
+        Return proc string_literal from WasmEncoder with "fd_close"
+    End If
+    If wasi_fn is equal to WASI_FN_FD_SEEK:
+        Return proc string_literal from WasmEncoder with "fd_seek"
+    End If
+    If wasi_fn is equal to WASI_FN_PROC_EXIT:
+        Return proc string_literal from WasmEncoder with "proc_exit"
+    End If
+    If wasi_fn is equal to WASI_FN_CLOCK_TIME_GET:
+        Return proc string_literal from WasmEncoder with "clock_time_get"
+    End If
+    If wasi_fn is equal to WASI_FN_ARGS_GET:
+        Return proc string_literal from WasmEncoder with "args_get"
+    End If
+    If wasi_fn is equal to WASI_FN_ARGS_SIZES_GET:
+        Return proc string_literal from WasmEncoder with "args_sizes_get"
+    End If
+    If wasi_fn is equal to WASI_FN_ENVIRON_GET:
+        Return proc string_literal from WasmEncoder with "environ_get"
+    End If
+    If wasi_fn is equal to WASI_FN_ENVIRON_SIZES_GET:
+        Return proc string_literal from WasmEncoder with "environ_sizes_get"
+    End If
+    If wasi_fn is equal to WASI_FN_PATH_OPEN:
+        Return proc string_literal from WasmEncoder with "path_open"
+    End If
+    If wasi_fn is equal to WASI_FN_RANDOM_GET:
+        Return proc string_literal from WasmEncoder with "random_get"
+    End If
+    If wasi_fn is equal to WASI_FN_FD_FDSTAT_GET:
+        Return proc string_literal from WasmEncoder with "fd_fdstat_get"
+    End If
+    If wasi_fn is equal to WASI_FN_FD_PRESTAT_GET:
+        Return proc string_literal from WasmEncoder with "fd_prestat_get"
+    End If
+    If wasi_fn is equal to WASI_FN_FD_PRESTAT_DIR_NAME:
+        Return proc string_literal from WasmEncoder with "fd_prestat_dir_name"
+    End If
+
+    Return 0
+End Process
+
+Process called "wasi_get_import_index" that takes registry as Integer, wasi_fn as Integer returns Integer:
+    @Reasoning
+    Returns the WASM function index for the given WASI function, registering
+    the import if it has not been registered yet. This is the primary entry
+    point used by code generation when emitting a call to a WASI function.
+    @End Reasoning
+
+    If registry is equal to 0:
+        Return -1
+    End If
+
+    If wasi_fn is less than 1:
+        Return -1
+    End If
+    If wasi_fn is greater than WASI_FN_COUNT:
+        Return -1
+    End If
+
+    Let indices be proc memory_get_int64 from Layout with registry, 8
+    Let slot_offset be wasi_fn multiplied by 8
+    Let existing_index be proc memory_get_int64 from Layout with indices, slot_offset
+
+    If existing_index is not equal to -1:
+        Note: Already imported - return existing index
+        Return existing_index
+    End If
+
+    Note: Not yet imported - register it now
+    Let module_state be proc memory_get_int64 from Layout with registry, 0
+
+    Let type_index be proc wasi_emit_type_signature with module_state, wasi_fn
+    If type_index is equal to -1:
+        Return -1
+    End If
+
+    Let module_name be proc string_literal from WasmEncoder with "wasi_snapshot_preview1"
+    Let field_name be proc wasi_get_function_name with wasi_fn
+
+    Let import_index be proc add_function_import from WasmEncoder with module_state, module_name, field_name, type_index
+
+    proc memory_set_int64 from Layout with indices, slot_offset, import_index
+
+    Let imported_count be proc memory_get_int64 from Layout with registry, 16
+    proc memory_set_int64 from Layout with registry, 16, imported_count plus 1
+
+    Return import_index
+End Process
+
+Note: ============================================================================
+Note: HIGH-LEVEL WASI CALL EMITTERS
+Note: ============================================================================
+
+@Reasoning
+These helpers emit complete WASM instruction sequences for common WASI
+operations. They handle argument setup, the call instruction, and any
+required post-call error handling.
+
+Each helper assumes the generated function has a linear memory buffer
+available (standard WASM memory). Arguments and output buffers for WASI
+calls must be placed in linear memory by the caller.
+@End Reasoning
+
+Process called "wasi_emit_call_fd_write" that takes registry as Integer, code_buf as Integer, fd as Integer, iovs_ptr as Integer, iovs_len as Integer, nwritten_ptr as Integer returns Integer:
+    Note: Emit a call to fd_write with constant arguments
+    Note: Stack after: errno (i32)
+
+    Let import_index be proc wasi_get_import_index with registry, WASI_FN_FD_WRITE
+    If import_index is equal to -1:
+        Return 0
+    End If
+
+    Note: i32.const fd
+    proc emit_i32_const from WasmInstr with code_buf, fd
+    Note: i32.const iovs_ptr
+    proc emit_i32_const from WasmInstr with code_buf, iovs_ptr
+    Note: i32.const iovs_len
+    proc emit_i32_const from WasmInstr with code_buf, iovs_len
+    Note: i32.const nwritten_ptr
+    proc emit_i32_const from WasmInstr with code_buf, nwritten_ptr
+    Note: call import_index
+    proc emit_call from WasmInstr with code_buf, import_index
+
+    Return 1
+End Process
+
+Process called "wasi_emit_call_fd_read" that takes registry as Integer, code_buf as Integer, fd as Integer, iovs_ptr as Integer, iovs_len as Integer, nread_ptr as Integer returns Integer:
+    Note: Emit a call to fd_read. Stack after: errno (i32)
+
+    Let import_index be proc wasi_get_import_index with registry, WASI_FN_FD_READ
+    If import_index is equal to -1:
+        Return 0
+    End If
+
+    proc emit_i32_const from WasmInstr with code_buf, fd
+    proc emit_i32_const from WasmInstr with code_buf, iovs_ptr
+    proc emit_i32_const from WasmInstr with code_buf, iovs_len
+    proc emit_i32_const from WasmInstr with code_buf, nread_ptr
+    proc emit_call from WasmInstr with code_buf, import_index
+
+    Return 1
+End Process
+
+Process called "wasi_emit_call_proc_exit" that takes registry as Integer, code_buf as Integer, exit_code as Integer returns Integer:
+    Note: Emit a call to proc_exit. Does not return.
+
+    Let import_index be proc wasi_get_import_index with registry, WASI_FN_PROC_EXIT
+    If import_index is equal to -1:
+        Return 0
+    End If
+
+    proc emit_i32_const from WasmInstr with code_buf, exit_code
+    proc emit_call from WasmInstr with code_buf, import_index
+
+    Note: proc_exit does not return - emit unreachable to satisfy type checker
+    proc emit_unreachable from WasmInstr with code_buf
+
+    Return 1
+End Process
+
+Process called "wasi_emit_call_clock_time_get" that takes registry as Integer, code_buf as Integer, clock_id as Integer, precision as Integer, time_ptr as Integer returns Integer:
+    Note: Emit a call to clock_time_get. Stack after: errno (i32)
+    Note: The time is written to memory at time_ptr as i64
+
+    Let import_index be proc wasi_get_import_index with registry, WASI_FN_CLOCK_TIME_GET
+    If import_index is equal to -1:
+        Return 0
+    End If
+
+    proc emit_i32_const from WasmInstr with code_buf, clock_id
+    proc emit_i64_const from WasmInstr with code_buf, precision
+    proc emit_i32_const from WasmInstr with code_buf, time_ptr
+    proc emit_call from WasmInstr with code_buf, import_index
+
+    Return 1
+End Process
+
+Process called "wasi_emit_call_random_get" that takes registry as Integer, code_buf as Integer, buf_ptr as Integer, buf_len as Integer returns Integer:
+    Note: Emit a call to random_get. Fills buf_ptr with random bytes.
+
+    Let import_index be proc wasi_get_import_index with registry, WASI_FN_RANDOM_GET
+    If import_index is equal to -1:
+        Return 0
+    End If
+
+    proc emit_i32_const from WasmInstr with code_buf, buf_ptr
+    proc emit_i32_const from WasmInstr with code_buf, buf_len
+    proc emit_call from WasmInstr with code_buf, import_index
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: CONVENIENCE WRAPPERS FOR COMMON PATTERNS
+Note: ============================================================================
+
+Process called "wasi_emit_write_stdout" that takes registry as Integer, code_buf as Integer, data_ptr as Integer, data_len as Integer, iov_scratch_ptr as Integer, nwritten_scratch_ptr as Integer returns Integer:
+    @Reasoning
+    Emits code that writes a buffer to stdout via fd_write. WASI fd_write
+    takes an iovec (pointer + length pair) in linear memory, not a raw buffer.
+
+    Before emitting the call, we write the iovec into iov_scratch_ptr:
+      iov_scratch_ptr[0] = data_ptr    (8 bytes - pointer as i32 in low 32 bits, padded)
+      iov_scratch_ptr[8] = data_len
+
+    Then we call fd_write(STDOUT, iov_scratch_ptr, 1, nwritten_scratch_ptr).
+
+    The caller must have allocated iov_scratch_ptr (8 bytes) and
+    nwritten_scratch_ptr (4 bytes) in linear memory.
+    @End Reasoning
+
+    Note: Store data_ptr at iov_scratch_ptr + 0 using i32.store
+    proc emit_i32_const from WasmInstr with code_buf, iov_scratch_ptr
+    proc emit_i32_const from WasmInstr with code_buf, data_ptr
+    proc emit_i32_store from WasmInstr with code_buf, 2, 0
+
+    Note: Store data_len at iov_scratch_ptr + 4 (standard WASI iovec_t layout in 32-bit WASM)
+    proc emit_i32_const from WasmInstr with code_buf, iov_scratch_ptr
+    proc emit_i32_const from WasmInstr with code_buf, data_len
+    proc emit_i32_store from WasmInstr with code_buf, 2, 4
+
+    Note: Call fd_write(STDOUT, iov_scratch_ptr, 1, nwritten_scratch_ptr)
+    Return proc wasi_emit_call_fd_write with registry, code_buf, WASI_FD_STDOUT, iov_scratch_ptr, 1, nwritten_scratch_ptr
+End Process
+
+Process called "wasi_emit_write_stderr" that takes registry as Integer, code_buf as Integer, data_ptr as Integer, data_len as Integer, iov_scratch_ptr as Integer, nwritten_scratch_ptr as Integer returns Integer:
+    @Reasoning
+    Same as wasi_emit_write_stdout but writes to stderr (fd 2) instead of stdout.
+    Useful for emitting error diagnostics from generated code.
+    @End Reasoning
+
+    proc emit_i32_const from WasmInstr with code_buf, iov_scratch_ptr
+    proc emit_i32_const from WasmInstr with code_buf, data_ptr
+    proc emit_i32_store from WasmInstr with code_buf, 2, 0
+
+    proc emit_i32_const from WasmInstr with code_buf, iov_scratch_ptr
+    proc emit_i32_const from WasmInstr with code_buf, data_len
+    proc emit_i32_store from WasmInstr with code_buf, 2, 4
+
+    Return proc wasi_emit_call_fd_write with registry, code_buf, WASI_FD_STDERR, iov_scratch_ptr, 1, nwritten_scratch_ptr
+End Process
+
+Note: ============================================================================
+Note: REGISTRY QUERIES
+Note: ============================================================================
+
+Process called "wasi_is_registered" that takes registry as Integer, wasi_fn as Integer returns Integer:
+    Note: Returns 1 if the given WASI function has been imported, 0 otherwise
+
+    If registry is equal to 0:
+        Return 0
+    End If
+    If wasi_fn is less than 1:
+        Return 0
+    End If
+    If wasi_fn is greater than WASI_FN_COUNT:
+        Return 0
+    End If
+
+    Let indices be proc memory_get_int64 from Layout with registry, 8
+    Let slot_offset be wasi_fn multiplied by 8
+    Let existing_index be proc memory_get_int64 from Layout with indices, slot_offset
+
+    If existing_index is equal to -1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "wasi_imported_count" that takes registry as Integer returns Integer:
+    Note: Returns the number of WASI functions currently registered
+    If registry is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with registry, 16
+End Process
+
+Note: ============================================================================
+Note: ERROR HANDLING HELPERS
+Note: ============================================================================
+
+@Reasoning
+Most WASI functions return an i32 errno value. These helpers emit common
+error-checking patterns on the stack value left by a WASI call.
+@End Reasoning
+
+Process called "wasi_emit_check_errno_and_exit" that takes registry as Integer, code_buf as Integer returns Integer:
+    Note: After a WASI call has left errno on the stack, this emits:
+    Note:   if errno != 0: proc_exit(errno) ; unreachable
+    Note: otherwise continue execution
+
+    Note: Duplicate errno value so we can test and use it
+    Note: local.tee is used to keep the value on the stack after storing
+
+    Note: if errno != 0
+    proc emit_i32_const from WasmInstr with code_buf, 0
+    proc emit_i32_ne from WasmInstr with code_buf
+    proc emit_if from WasmInstr with code_buf, 64
+
+    Note: Emit proc_exit with errno as exit code
+    Let import_index be proc wasi_get_import_index with registry, WASI_FN_PROC_EXIT
+    If import_index is equal to -1:
+        proc emit_end from WasmInstr with code_buf
+        Return 0
+    End If
+
+    Note: Put errno back on stack (it was consumed by the comparison, so
+    Note: caller should have saved it in a local variable beforehand).
+    Note: This helper assumes the caller left errno duplicated on the stack
+    Note: so we just emit the call with a stack value of errno.
+    proc emit_call from WasmInstr with code_buf, import_index
+    proc emit_unreachable from WasmInstr with code_buf
+
+    proc emit_end from WasmInstr with code_buf
+
+    Return 1
+End Process
