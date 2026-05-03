@@ -973,6 +973,36 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
         Return type_name
     End If
 
+    If expr_type is equal to 4:  Note: EXPR_FUNCTION_CALL
+        Note: Look up the function's declared return type so callers like
+        Note: `Let r be proc make_struct` learn the actual struct type rather
+        Note: than defaulting to "Integer". Layout: name at offset 8.
+        Let fc_func_name be memory_get_pointer(expr, 8)  Note: function_call.name
+        Let fc_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program
+        If fc_program is equal to 0:
+            Return 0
+        End If
+        Let fc_function_count be memory_get_int32(fc_program, 8)  Note: PROGRAM_FUNCTION_COUNT
+        Let fc_functions be memory_get_pointer(fc_program, 0)     Note: PROGRAM_FUNCTIONS
+        If fc_functions is equal to 0:
+            Return 0
+        End If
+
+        Let fc_i be 0
+        While fc_i is less than fc_function_count:
+            Let fc_func be memory_get_pointer(fc_functions, fc_i multiplied by 8)
+            If fc_func is not equal to 0:
+                Let fc_name be memory_get_pointer(fc_func, 0)  Note: func->name
+                If string_equals(fc_name, fc_func_name) is equal to 1:
+                    Let fc_ret_type be memory_get_pointer(fc_func, 24)  Note: func->return_type
+                    Return fc_ret_type
+                End If
+            End If
+            Set fc_i to fc_i plus 1
+        End While
+        Return 0
+    End If
+
     If expr_type is equal to 6:  Note: EXPR_FIELD_ACCESS
         Let field_access_ptr be expr plus 8  Note: &expr->data.field_access
         Let object be memory_get_pointer(field_access_ptr, 0)       Note: field_access.object
@@ -1131,37 +1161,39 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
         Note: Now %rbx contains the struct pointer value
         Note: We need to add the field offset to get the field address
 
-        Note: Get the type of the object using our helper function
+        Note: Resolve the struct type via field-aware dispatch. Same helper as the
+        Note: rvalue codegen - tries declared type first, falls back to scanning
+        Note: user types for a unique struct that owns this field. Handles legacy
+        Note: `Integer` placeholder return/parameter declarations transparently.
         Let object_type be codegen_get_expression_type(codegen, object)
-        If object_type is equal to 0:
-            print_string("[CODEGEN ERROR] Cannot determine type of object in field access")
-            exit_with_code(1)
-        End If
+        Let type be codegen_find_struct_type_for_field(codegen, object_type, field_name)
 
-        Note: Find the type definition
-        Set current_program to memory_get_pointer(codegen, 48)  Note: codegen->current_program (pointer with padding)
-        Let type_count be memory_get_int32(current_program, 24)  Note: PROGRAM_TYPE_COUNT
-        Let types be memory_get_pointer(current_program, 16)       Note: PROGRAM_TYPES
-        Let type be 0
-
-        Let i be 0
-        While i is less than type_count:
-            Let type_offset be i multiplied by 8
-            Let type_ptr be memory_get_pointer(types, type_offset)
-            Let type_name_ptr be memory_get_pointer(type_ptr, 0)  Note: type->name
-            If string_equals(type_name_ptr, object_type) is equal to 1:
-                Set type to type_ptr
-                Set i to type_count  Note: break loop
+        Note: Structural fallback (Fix B+): when field-name dispatch is ambiguous,
+        Note: walk the current function for every field accessed on the same
+        Note: variable and find the unique type carrying ALL of them.
+        If type is equal to 0:
+            Let lv_obj_t be memory_get_int32(object, 0)
+            If lv_obj_t is equal to 1:  Note: EXPR_VARIABLE
+                Let lv_obj_name be memory_get_pointer(object, 8)
+                If lv_obj_name is not equal to 0:
+                    Set type to codegen_resolve_struct_via_structural(codegen, lv_obj_name)
+                End If
             End If
-            Set i to i plus 1
-        End While
+        End If
 
         If type is equal to 0:
-            print_string("[CODEGEN ERROR] Unknown type '")
-            print_string(object_type)
-            print_string("'")
+            print_string("[CODEGEN ERROR] Could not resolve struct type for field '")
+            print_string(field_name)
+            print_string("' in lvalue context")
+            If object_type is not equal to 0:
+                print_string(" (object declared as '")
+                print_string(object_type)
+                print_string("')")
+            End If
+            print_newline()
             exit_with_code(1)
         End If
+        Set object_type to memory_get_pointer(type, 0)
 
         Note: Find field offset
         Let field_offset be -1  Note: -1 for not found
@@ -1173,16 +1205,16 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
             Let field_count be memory_get_int32(type, 24)
             Let fields be memory_get_pointer(type, 16)
 
-            Set i to 0
-            While i is less than field_count:
-                Let field_idx_offset be i multiplied by 24
+            Let lvi be 0
+            While lvi is less than field_count:
+                Let field_idx_offset be lvi multiplied by 24
                 Let field_ptr be fields plus field_idx_offset  Note: sizeof(FieldDefinition)
                 Let field_name_ptr be memory_get_pointer(field_ptr, 0)  Note: field.name
                 If string_equals(field_name_ptr, field_name) is equal to 1:
                     Set field_offset to memory_get_int32(field_ptr, 16)  Note: field.offset
-                    Set i to field_count  Note: break loop
+                    Set lvi to field_count  Note: break loop
                 End If
-                Set i to i plus 1
+                Set lvi to lvi plus 1
             End While
         End If
 
@@ -1979,43 +2011,512 @@ Process called "codegen_generate_indirect_call" takes codegen as Integer, expr a
 End Process
 
 Note: Generate code for field access expressions
+Note: Walk an expression sub-tree, collecting field names accessed on the named
+Note: target variable (Fix B+ structural type inference). Adds each unique field
+Note: name into fields_buf (an array of pointers, count tracked in count_ptr).
+Note: Recurses into all expression types that can hold sub-expressions.
+Process called "codegen_collect_field_names_in_expr" takes expr as Integer, target_name as Integer, fields_buf as Integer, count_ptr as Integer, max_count as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+    Let cfn_etype be memory_get_int32(expr, 0)
+
+    If cfn_etype is equal to 6:  Note: EXPR_FIELD_ACCESS
+        Let cfn_obj be memory_get_pointer(expr, 8)
+        Let cfn_fn be memory_get_pointer(expr, 16)
+        If cfn_obj is not equal to 0:
+            Let cfn_obj_t be memory_get_int32(cfn_obj, 0)
+            If cfn_obj_t is equal to 1:  Note: EXPR_VARIABLE
+                Let cfn_obj_name be memory_get_pointer(cfn_obj, 8)
+                If cfn_obj_name is not equal to 0:
+                    If string_equals(cfn_obj_name, target_name) is equal to 1:
+                        If cfn_fn is not equal to 0:
+                            Let cfn_cur be memory_get_int32(count_ptr, 0)
+                            Let cfn_dup be 0
+                            Let cfn_di be 0
+                            While cfn_di is less than cfn_cur:
+                                Let cfn_di_off be cfn_di multiplied by 8
+                                Let cfn_existing be memory_get_pointer(fields_buf, cfn_di_off)
+                                If string_equals(cfn_existing, cfn_fn) is equal to 1:
+                                    Set cfn_dup to 1
+                                    Set cfn_di to cfn_cur
+                                End If
+                                Set cfn_di to cfn_di plus 1
+                            End While
+                            If cfn_dup is equal to 0:
+                                If cfn_cur is less than max_count:
+                                    Let cfn_put_off be cfn_cur multiplied by 8
+                                    memory_set_pointer(fields_buf, cfn_put_off, cfn_fn)
+                                    memory_set_int32(count_ptr, 0, cfn_cur plus 1)
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            Note: Recurse into the object so chained field accesses are seen too.
+            codegen_collect_field_names_in_expr(cfn_obj, target_name, fields_buf, count_ptr, max_count)
+        End If
+        Return 0
+    End If
+
+    If cfn_etype is equal to 2:  Note: EXPR_BINARY_OP
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 8), target_name, fields_buf, count_ptr, max_count)
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 16), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfn_etype is equal to 3:  Note: EXPR_COMPARISON
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 8), target_name, fields_buf, count_ptr, max_count)
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 16), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfn_etype is equal to 12:  Note: EXPR_UNARY
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 8), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfn_etype is equal to 7:  Note: EXPR_TYPE_CAST
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 16), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfn_etype is equal to 4:  Note: EXPR_FUNCTION_CALL - args at 16, count at 24
+        Let cfn_fc_args be memory_get_pointer(expr, 16)
+        Let cfn_fc_argc be memory_get_int32(expr, 24)
+        If cfn_fc_args is not equal to 0:
+            Let cfn_fc_i be 0
+            While cfn_fc_i is less than cfn_fc_argc:
+                Let cfn_fc_off be cfn_fc_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_fc_args, cfn_fc_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_fc_i to cfn_fc_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfn_etype is equal to 8:  Note: EXPR_BUILTIN_CALL - args at 16, count at 24
+        Let cfn_bc_args be memory_get_pointer(expr, 16)
+        Let cfn_bc_argc be memory_get_int32(expr, 24)
+        If cfn_bc_args is not equal to 0:
+            Let cfn_bc_i be 0
+            While cfn_bc_i is less than cfn_bc_argc:
+                Let cfn_bc_off be cfn_bc_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_bc_args, cfn_bc_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_bc_i to cfn_bc_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfn_etype is equal to 11:  Note: EXPR_INDIRECT_CALL - fn_expr at 8, args at 16, count at 24
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 8), target_name, fields_buf, count_ptr, max_count)
+        Let cfn_ic_args be memory_get_pointer(expr, 16)
+        Let cfn_ic_argc be memory_get_int32(expr, 24)
+        If cfn_ic_args is not equal to 0:
+            Let cfn_ic_i be 0
+            While cfn_ic_i is less than cfn_ic_argc:
+                Let cfn_ic_off be cfn_ic_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_ic_args, cfn_ic_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_ic_i to cfn_ic_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfn_etype is equal to 25:  Note: EXPR_QUALIFIED_CALL - args at 24, count at 32
+        Let cfn_qc_args be memory_get_pointer(expr, 24)
+        Let cfn_qc_argc be memory_get_int32(expr, 32)
+        If cfn_qc_args is not equal to 0:
+            Let cfn_qc_i be 0
+            While cfn_qc_i is less than cfn_qc_argc:
+                Let cfn_qc_off be cfn_qc_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_qc_args, cfn_qc_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_qc_i to cfn_qc_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfn_etype is equal to 16:  Note: EXPR_ARRAY_INDEX - array at 8, index at 16
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 8), target_name, fields_buf, count_ptr, max_count)
+        codegen_collect_field_names_in_expr(memory_get_pointer(expr, 16), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfn_etype is equal to 17:  Note: EXPR_LIST_LITERAL - elems at 8, count at 16
+        Let cfn_ll_elems be memory_get_pointer(expr, 8)
+        Let cfn_ll_count be memory_get_integer(expr, 16)
+        If cfn_ll_elems is not equal to 0:
+            Let cfn_ll_i be 0
+            While cfn_ll_i is less than cfn_ll_count:
+                Let cfn_ll_off be cfn_ll_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_ll_elems, cfn_ll_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_ll_i to cfn_ll_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfn_etype is equal to 20:  Note: EXPR_STRUCT_CONSTRUCTION - field_values at 24, count at 32
+        Let cfn_sc_vals be memory_get_pointer(expr, 24)
+        Let cfn_sc_count be memory_get_int32(expr, 32)
+        If cfn_sc_vals is not equal to 0:
+            Let cfn_sc_i be 0
+            While cfn_sc_i is less than cfn_sc_count:
+                Let cfn_sc_off be cfn_sc_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_sc_vals, cfn_sc_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_sc_i to cfn_sc_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfn_etype is equal to 9:  Note: EXPR_VARIANT_CONSTRUCTOR - field_values at 24, count at 32
+        Let cfn_vc_vals be memory_get_pointer(expr, 24)
+        Let cfn_vc_count be memory_get_int32(expr, 32)
+        If cfn_vc_vals is not equal to 0:
+            Let cfn_vc_i be 0
+            While cfn_vc_i is less than cfn_vc_count:
+                Let cfn_vc_off be cfn_vc_i multiplied by 8
+                codegen_collect_field_names_in_expr(memory_get_pointer(cfn_vc_vals, cfn_vc_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfn_vc_i to cfn_vc_i plus 1
+            End While
+        End If
+        Return 0
+    End If
+    Note: Other expression types are leaves (EXPR_INTEGER, EXPR_VARIABLE, EXPR_STRING_LITERAL, etc.)
+    Return 0
+End Process
+
+Note: Walk a statement sub-tree collecting field names accessed on the named
+Note: target variable. Recurses into nested bodies (if/while/for/foreach).
+Process called "codegen_collect_field_names_in_stmt" takes stmt as Integer, target_name as Integer, fields_buf as Integer, count_ptr as Integer, max_count as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+    Let cfs_stype be memory_get_int32(stmt, 0)
+
+    If cfs_stype is equal to 1:  Note: STMT_LET - expression at 16
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 16), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfs_stype is equal to 2:  Note: STMT_SET - target at 8, value at 16
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 16), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfs_stype is equal to 3:  Note: STMT_RETURN - value at 8
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfs_stype is equal to 4:  Note: STMT_PRINT - value at 8
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfs_stype is equal to 5:  Note: STMT_IF - cond(8), then_body(16), then_count(24), else_body(32), else_count(40)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        Let cfs_then_body be memory_get_pointer(stmt, 16)
+        Let cfs_then_count be memory_get_int32(stmt, 24)
+        If cfs_then_body is not equal to 0:
+            Let cfs_ti be 0
+            While cfs_ti is less than cfs_then_count:
+                Let cfs_t_off be cfs_ti multiplied by 8
+                codegen_collect_field_names_in_stmt(memory_get_pointer(cfs_then_body, cfs_t_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfs_ti to cfs_ti plus 1
+            End While
+        End If
+        Let cfs_else_body be memory_get_pointer(stmt, 32)
+        Let cfs_else_count be memory_get_int32(stmt, 40)
+        If cfs_else_body is not equal to 0:
+            Let cfs_ei be 0
+            While cfs_ei is less than cfs_else_count:
+                Let cfs_e_off be cfs_ei multiplied by 8
+                codegen_collect_field_names_in_stmt(memory_get_pointer(cfs_else_body, cfs_e_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfs_ei to cfs_ei plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfs_stype is equal to 6:  Note: STMT_WHILE - cond(8), body(16), body_count(24)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        Let cfs_wh_body be memory_get_pointer(stmt, 16)
+        Let cfs_wh_count be memory_get_int32(stmt, 24)
+        If cfs_wh_body is not equal to 0:
+            Let cfs_wi be 0
+            While cfs_wi is less than cfs_wh_count:
+                Let cfs_w_off be cfs_wi multiplied by 8
+                codegen_collect_field_names_in_stmt(memory_get_pointer(cfs_wh_body, cfs_w_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfs_wi to cfs_wi plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfs_stype is equal to 7:  Note: STMT_EXPRESSION - expr at 8
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    If cfs_stype is equal to 11:  Note: STMT_FOR - start(16), end(24), body(40), body_count(48)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 16), target_name, fields_buf, count_ptr, max_count)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 24), target_name, fields_buf, count_ptr, max_count)
+        Let cfs_for_body be memory_get_pointer(stmt, 40)
+        Let cfs_for_count be memory_get_int32(stmt, 48)
+        If cfs_for_body is not equal to 0:
+            Let cfs_fri be 0
+            While cfs_fri is less than cfs_for_count:
+                Let cfs_fr_off be cfs_fri multiplied by 8
+                codegen_collect_field_names_in_stmt(memory_get_pointer(cfs_for_body, cfs_fr_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfs_fri to cfs_fri plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfs_stype is equal to 12:  Note: STMT_FOR_EACH - var(8), collection(16), body(24), body_count(32)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 16), target_name, fields_buf, count_ptr, max_count)
+        Let cfs_fe_body be memory_get_pointer(stmt, 24)
+        Let cfs_fe_count be memory_get_int32(stmt, 32)
+        If cfs_fe_body is not equal to 0:
+            Let cfs_fei be 0
+            While cfs_fei is less than cfs_fe_count:
+                Let cfs_fe_off be cfs_fei multiplied by 8
+                codegen_collect_field_names_in_stmt(memory_get_pointer(cfs_fe_body, cfs_fe_off), target_name, fields_buf, count_ptr, max_count)
+                Set cfs_fei to cfs_fei plus 1
+            End While
+        End If
+        Return 0
+    End If
+    If cfs_stype is equal to 17:  Note: STMT_COMPOUND_ASSIGN - target(8), expr(24)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 8), target_name, fields_buf, count_ptr, max_count)
+        codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 24), target_name, fields_buf, count_ptr, max_count)
+        Return 0
+    End If
+    Note: STMT_BREAK, STMT_CONTINUE etc. are leaves
+    Return 0
+End Process
+
+Note: Resolve a struct type by walking the current function body, collecting all
+Note: field names accessed on the same target variable, and finding the unique
+Note: user-defined struct that has every collected field. Used as a fallback
+Note: when field-name dispatch (codegen_find_struct_type_for_field) is ambiguous.
+Note: Returns the TypeDefinition* pointer or 0 if no unique structural match.
+Process called "codegen_resolve_struct_via_structural" takes codegen as Integer, target_name as Integer returns Integer:
+    Let cs_func be memory_get_pointer(codegen, 112)  Note: codegen->current_function
+    If cs_func is equal to 0:
+        Return 0
+    End If
+    Let cs_stmts be memory_get_pointer(cs_func, 32)  Note: func->statements
+    Let cs_stmt_count be memory_get_int32(cs_func, 40)  Note: func->statement_count
+    If cs_stmts is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate scratch buffer for up to 64 distinct field names.
+    Let cs_buf be allocate(64 multiplied by 8)
+    If cs_buf is equal to 0:
+        Return 0
+    End If
+    Let cs_count_ptr be allocate(8)
+    If cs_count_ptr is equal to 0:
+        deallocate(cs_buf)
+        Return 0
+    End If
+    memory_set_int32(cs_count_ptr, 0, 0)
+
+    Note: Walk every top-level statement; recursion descends into nested bodies.
+    Let cs_si be 0
+    While cs_si is less than cs_stmt_count:
+        Let cs_s_off be cs_si multiplied by 8
+        codegen_collect_field_names_in_stmt(memory_get_pointer(cs_stmts, cs_s_off), target_name, cs_buf, cs_count_ptr, 64)
+        Set cs_si to cs_si plus 1
+    End While
+
+    Let cs_field_count be memory_get_int32(cs_count_ptr, 0)
+    If cs_field_count is equal to 0:
+        deallocate(cs_buf)
+        deallocate(cs_count_ptr)
+        Return 0
+    End If
+
+    Note: Find the unique struct type containing every collected field.
+    Let cs_program be memory_get_pointer(codegen, 48)
+    Let cs_match be 0
+    Let cs_match_count be 0
+    If cs_program is not equal to 0:
+        Let cs_tcount be memory_get_int32(cs_program, 24)
+        Let cs_types be memory_get_pointer(cs_program, 16)
+        If cs_types is not equal to 0:
+            Let cs_ti be 0
+            While cs_ti is less than cs_tcount:
+                Let cs_t_off be cs_ti multiplied by 8
+                Let cs_t be memory_get_pointer(cs_types, cs_t_off)
+                If cs_t is not equal to 0:
+                    Let cs_kind be memory_get_int32(cs_t, 8)
+                    If cs_kind is equal to 0:  Note: TYPE_KIND_STRUCT
+                        Let cs_t_fc be memory_get_int32(cs_t, 24)
+                        Let cs_t_fields be memory_get_pointer(cs_t, 16)
+                        Note: Verify this struct has every field in the collected set.
+                        Let cs_all_present be 1
+                        Let cs_fi be 0
+                        While cs_fi is less than cs_field_count:
+                            Let cs_f_off be cs_fi multiplied by 8
+                            Let cs_target_field be memory_get_pointer(cs_buf, cs_f_off)
+                            Let cs_field_found be 0
+                            Let cs_tf_i be 0
+                            While cs_tf_i is less than cs_t_fc:
+                                Let cs_tf_off be cs_tf_i multiplied by 24
+                                Let cs_tf_ptr be cs_t_fields plus cs_tf_off
+                                Let cs_tf_name be memory_get_pointer(cs_tf_ptr, 0)
+                                If string_equals(cs_tf_name, cs_target_field) is equal to 1:
+                                    Set cs_field_found to 1
+                                    Set cs_tf_i to cs_t_fc
+                                End If
+                                Set cs_tf_i to cs_tf_i plus 1
+                            End While
+                            If cs_field_found is equal to 0:
+                                Set cs_all_present to 0
+                                Set cs_fi to cs_field_count
+                            End If
+                            Set cs_fi to cs_fi plus 1
+                        End While
+                        If cs_all_present is equal to 1:
+                            Set cs_match to cs_t
+                            Set cs_match_count to cs_match_count plus 1
+                        End If
+                    End If
+                End If
+                Set cs_ti to cs_ti plus 1
+            End While
+        End If
+    End If
+
+    deallocate(cs_buf)
+    deallocate(cs_count_ptr)
+
+    If cs_match_count is equal to 1:
+        Return cs_match
+    End If
+    Return 0
+End Process
+
+Note: Find the struct type that owns a given field. Tries the caller's declared
+Note: type first; if that type doesn't carry the field (or the declared name was
+Note: 0/"Integer"/some other placeholder), falls back to field-name dispatch -
+Note: scan all user types for exactly one with that field. This unblocks the
+Note: legacy v0.0.8.5 idiom of declaring `returns Integer` / `param as Integer`
+Note: as a placeholder for an actual struct type without forcing a 50-file
+Note: source sweep. Returns the TypeDefinition* pointer, or 0 if no unique match.
+Process called "codegen_find_struct_type_for_field" takes codegen as Integer, declared_name as Integer, field_name as Integer returns Integer:
+    Let cf_program be memory_get_pointer(codegen, 48)
+    If cf_program is equal to 0:
+        Return 0
+    End If
+    Let cf_type_count be memory_get_int32(cf_program, 24)
+    Let cf_types be memory_get_pointer(cf_program, 16)
+    If cf_types is equal to 0:
+        Return 0
+    End If
+
+    Note: Pass 1 - if a declared type name was supplied AND it carries the field,
+    Note: prefer it (semantics-preserving for code that already declares correct
+    Note: types). Walk fails fast on miss.
+    If declared_name is not equal to 0:
+        Let cf_i be 0
+        While cf_i is less than cf_type_count:
+            Let cf_offset be cf_i multiplied by 8
+            Let cf_t be memory_get_pointer(cf_types, cf_offset)
+            If cf_t is not equal to 0:
+                Let cf_tname be memory_get_pointer(cf_t, 0)
+                If string_equals(cf_tname, declared_name) is equal to 1:
+                    Let cf_kind be memory_get_int32(cf_t, 8)
+                    If cf_kind is equal to 0:
+                        Let cf_fc be memory_get_int32(cf_t, 24)
+                        Let cf_fields be memory_get_pointer(cf_t, 16)
+                        Let cf_j be 0
+                        While cf_j is less than cf_fc:
+                            Let cf_foff be cf_j multiplied by 24
+                            Let cf_fp be cf_fields plus cf_foff
+                            Let cf_fname be memory_get_pointer(cf_fp, 0)
+                            If string_equals(cf_fname, field_name) is equal to 1:
+                                Return cf_t
+                            End If
+                            Set cf_j to cf_j plus 1
+                        End While
+                    End If
+                    Set cf_i to cf_type_count
+                End If
+            End If
+            Set cf_i to cf_i plus 1
+        End While
+    End If
+
+    Note: Pass 2 - field-name dispatch. Find every struct type that has the field;
+    Note: return it only if exactly one type owns it. Ambiguous matches return 0
+    Note: so the caller can emit a precise error rather than silently picking one.
+    Let cf_match be 0
+    Let cf_count be 0
+    Let cf_k be 0
+    While cf_k is less than cf_type_count:
+        Let cf_o2 be cf_k multiplied by 8
+        Let cf_t2 be memory_get_pointer(cf_types, cf_o2)
+        If cf_t2 is not equal to 0:
+            Let cf_kind2 be memory_get_int32(cf_t2, 8)
+            If cf_kind2 is equal to 0:
+                Let cf_fc2 be memory_get_int32(cf_t2, 24)
+                Let cf_fields2 be memory_get_pointer(cf_t2, 16)
+                Let cf_l be 0
+                While cf_l is less than cf_fc2:
+                    Let cf_foff2 be cf_l multiplied by 24
+                    Let cf_fp2 be cf_fields2 plus cf_foff2
+                    Let cf_fname2 be memory_get_pointer(cf_fp2, 0)
+                    If string_equals(cf_fname2, field_name) is equal to 1:
+                        Set cf_match to cf_t2
+                        Set cf_count to cf_count plus 1
+                        Set cf_l to cf_fc2
+                    End If
+                    Set cf_l to cf_l plus 1
+                End While
+            End If
+        End If
+        Set cf_k to cf_k plus 1
+    End While
+
+    If cf_count is equal to 1:
+        Return cf_match
+    End If
+    Return 0
+End Process
+
 Process called "codegen_generate_field_access" takes codegen as Integer, expr as Integer returns Integer:
     Let output_file be memory_get_integer(codegen, 0)
     Let field_access_ptr be expr plus 8  Note: Union at offset 8
     Let obj be memory_get_pointer(field_access_ptr, 0)
     Let field_name be memory_get_pointer(field_access_ptr, 8)
 
-    Note: Get the type of the object
+    Note: Resolve the struct type by trying the declared type first then falling
+    Note: back to field-name dispatch. The helper handles object_type=0 (no
+    Note: declared type) and object_type="Integer" (legacy placeholder) cases.
     Let object_type be codegen_get_expression_type(codegen, obj)
-    If object_type is equal to 0:
-        print_string("[CODEGEN ERROR] Cannot determine type of object in field access")
-        exit_with_code(1)
-    End If
+    Let type be codegen_find_struct_type_for_field(codegen, object_type, field_name)
 
-    Note: Find the type definition
-    Let current_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program
-    Let type_count be memory_get_int32(current_program, 24)  Note: PROGRAM_TYPE_COUNT
-    Let types be memory_get_pointer(current_program, 16)     Note: PROGRAM_TYPES
-    Let type be 0
-
-    Let i be 0
-    While i is less than type_count:
-        Let type_offset be i multiplied by 8
-        Let type_ptr be memory_get_pointer(types, type_offset)
-        Let type_name_ptr be memory_get_pointer(type_ptr, 0)  Note: type->name
-        If string_equals(type_name_ptr, object_type) is equal to 1:
-            Set type to type_ptr
-            Set i to type_count  Note: break loop
+    Note: Structural fallback (Fix B+): when field-name dispatch is ambiguous,
+    Note: walk the current function for every field accessed on the same
+    Note: variable and find the unique type carrying ALL of them.
+    If type is equal to 0:
+        Let rv_obj_t be memory_get_int32(obj, 0)
+        If rv_obj_t is equal to 1:  Note: EXPR_VARIABLE
+            Let rv_obj_name be memory_get_pointer(obj, 8)
+            If rv_obj_name is not equal to 0:
+                Set type to codegen_resolve_struct_via_structural(codegen, rv_obj_name)
+            End If
         End If
-        Set i to i plus 1
-    End While
+    End If
 
     If type is equal to 0:
-        print_string("[CODEGEN ERROR] Unknown type '")
-        print_string(object_type)
+        print_string("[CODEGEN ERROR] Could not resolve struct type for field '")
+        print_string(field_name)
         print_string("'")
+        If object_type is not equal to 0:
+            print_string(" (object declared as '")
+            print_string(object_type)
+            print_string("')")
+        End If
+        print_newline()
         exit_with_code(1)
     End If
+
+    Note: Refresh object_type to the resolved type's name so downstream error
+    Note: messages show the actual type rather than the placeholder.
+    Set object_type to memory_get_pointer(type, 0)
 
 
     Note: Find field offset
@@ -4199,7 +4700,7 @@ Note:   offset 80: call_graph
 Note:   offset 88: arena (pointer) - for temporary allocations
 
 Process called "codegen_create" takes output_filename as Integer, arena as Integer returns Integer:
-    Let codegen be allocate(112)  Note: sizeof(CodeGenerator) - expanded for mutated_globals at offset 96
+    Let codegen be allocate(120)  Note: sizeof(CodeGenerator) - 112 + 8 for current_function at offset 112 (used by structural type inference)
 
     Note: Note: allocate() uses calloc() which already zeros the memory,
     Note: so no explicit initialization loop is needed
@@ -4392,6 +4893,10 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     memory_set_int32(codegen, 16, 0)  Note: codegen->variable_count = 0
     memory_set_int32(codegen, 24, 0)  Note: codegen->stack_offset = 0
     memory_set_int32(codegen, 64, 0)  Note: codegen->loop_depth = 0 (int)
+
+    Note: Stash the function pointer so structural type inference can walk
+    Note: the function body when field-name dispatch is ambiguous (Fix B+).
+    memory_set_pointer(codegen, 112, func)  Note: codegen->current_function
 
     Let output_file be memory_get_integer(codegen, 0)  Note: codegen->output_file
     Let func_name be memory_get_pointer(func, 0)  Note: func->name
@@ -4617,10 +5122,14 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 
     Let functions be memory_get_pointer(program, 0)        Note: PROGRAM_FUNCTIONS - use pointer
 
-    Note: Safety check - if functions is NULL, return error
+    Note: Safety check - if functions is NULL, the program parsed but produced
+    Note: no functions. Treat as a hard error so callers don't see a "Successfully
+    Note: compiled" message paired with a 0-byte output (the [BF-0007] silent
+    Note: failure pattern).
     If functions is equal to 0:
-        print_string("[ERROR] codegen_generate: functions pointer is NULL")
-        Return 0
+        print_string("[CODEGEN ERROR] No functions to compile (program is empty after parsing)")
+        print_newline()
+        exit_with_code(1)
     End If
 
     Set i to 0

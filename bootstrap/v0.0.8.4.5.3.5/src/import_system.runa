@@ -613,6 +613,21 @@ Process called "process_imports_with_context" takes program as Integer, arena as
             Return 1
         End If
 
+        Note: Merge globals/constants from imported program. Required so
+        Note: `Module.CONSTANT` references (which the parser rewrites to bare
+        Note: variable references against the flattened namespace) resolve
+        Note: against actual emitted .data/.bss labels.
+        Let global_merge_result be merge_imported_globals(program, import_program, arena)
+        If global_merge_result is not equal to 0:
+            print_string("[IMPORT ERROR] Failed to merge globals from: ")
+            print_string(resolved_path)
+            parser_destroy(import_parser)
+            lexer_destroy(import_lexer)
+            deallocate(import_source)
+            import_context_pop_stack(context)
+            Return 1
+        End If
+
         Note: Cleanup import parsing resources
         parser_destroy(import_parser)
         lexer_destroy(import_lexer)
@@ -677,6 +692,84 @@ Process called "merge_imported_functions" takes main_program as Integer, import_
     memory_set_pointer(main_program, 0, new_functions)
     memory_set_int32(main_program, 8, new_func_count)
     memory_set_int32(main_program, 12, new_func_count)  Note: function_capacity = function_count
+
+    Return 0
+End Process
+
+Note: Merge global variables and constants from imported program into main program.
+Note: GlobalVariable layout (24 bytes): name(0), type_string(8), initial_value(16).
+Note: Skips entries whose name already exists in the destination so multiple imports
+Note: defining the same constant do not produce duplicate emitted symbols.
+Note: Returns 0 on success, 1 on error.
+Process called "merge_imported_globals" takes main_program as Integer, import_program as Integer, arena as Integer returns Integer:
+    Let import_global_count be memory_get_int32(import_program, 56)
+    If import_global_count is equal to 0:
+        Return 0
+    End If
+
+    Let import_globals be memory_get_pointer(import_program, 48)
+    If import_globals is equal to 0:
+        Return 1
+    End If
+
+    Let main_global_count be memory_get_int32(main_program, 56)
+    Let main_globals be memory_get_pointer(main_program, 48)
+
+    Note: Allocate the merged array on the heap rather than the arena. The
+    Note: arena grows by reallocating its underlying buffer, which invalidates
+    Note: pointers handed out by earlier arena_allocate calls. A subsequent
+    Note: arena grow during parsing or codegen would leave main_program's
+    Note: globals pointer dangling and trigger free() invalid pointer at
+    Note: shutdown. Heap allocation gives a stable address; the small leak
+    Note: is acceptable in the bootstrap (programs are short-lived).
+    Let new_capacity be main_global_count plus import_global_count
+    Let new_globals be allocate(new_capacity multiplied by 8)
+    If new_globals is equal to 0:
+        Return 1
+    End If
+
+    Note: Copy existing globals
+    Let i be 0
+    While i is less than main_global_count:
+        Let existing_ptr be memory_get_pointer(main_globals, i multiplied by 8)
+        memory_set_pointer(new_globals, i multiplied by 8, existing_ptr)
+        Set i to i plus 1
+    End While
+
+    Note: Append imported globals, skipping duplicates by name.
+    Let actual_count be main_global_count
+    Let j be 0
+    While j is less than import_global_count:
+        Let imp_ptr be memory_get_pointer(import_globals, j multiplied by 8)
+        If imp_ptr is not equal to 0:
+            Let imp_name be memory_get_pointer(imp_ptr, 0)
+            Let dup_found be 0
+            Let k be 0
+            While k is less than actual_count:
+                Let exist_ptr be memory_get_pointer(new_globals, k multiplied by 8)
+                If exist_ptr is not equal to 0:
+                    Let exist_name be memory_get_pointer(exist_ptr, 0)
+                    If string_equals(exist_name, imp_name) is equal to 1:
+                        Set dup_found to 1
+                        Set k to actual_count
+                    End If
+                End If
+                Set k to k plus 1
+            End While
+
+            If dup_found is equal to 0:
+                Let dest_offset be actual_count multiplied by 8
+                memory_set_pointer(new_globals, dest_offset, imp_ptr)
+                Set actual_count to actual_count plus 1
+            End If
+        End If
+        Set j to j plus 1
+    End While
+
+    Note: Update main program with merged (deduplicated) global table.
+    memory_set_pointer(main_program, 48, new_globals)
+    memory_set_int32(main_program, 56, actual_count)
+    memory_set_int32(main_program, 60, actual_count)
 
     Return 0
 End Process

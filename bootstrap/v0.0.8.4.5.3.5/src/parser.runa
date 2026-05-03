@@ -128,6 +128,8 @@ Process called "token_can_be_identifier" takes token_type as Integer returns Int
         Return 1
     Otherwise If token_type is equal to 161:  Note: TOKEN_LAMBDA
         Return 1
+    Otherwise If token_type is equal to 164:  Note: TOKEN_CONSTANT (used as variant/field name)
+        Return 1
     End If
 
     Return 0
@@ -570,12 +572,56 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 deallocate(left)  Note: Free the EXPR_VARIABLE
                 Set left to qualified_call
             Otherwise:
-                Note: Regular field access (not a function call)
-                Let field_access be memory_allocate(32)  Note: sizeof(Expression)
-                memory_set_integer(field_access, 0, 10)  Note: EXPR_FIELD_ACCESS
-                memory_set_pointer(field_access, 8, left)  Note: field_access.object
-                memory_set_pointer(field_access, 16, field_name)  Note: field_access.field_name
-                Set left to field_access
+                Note: `Module.IDENTIFIER` (no parentheses) is module-qualified
+                Note: constant access. The bootstrap import system flattens
+                Note: namespaces - constants and globals from imported modules
+                Note: are merged into the main program by name. So when `left`
+                Note: is a bare variable whose name matches a known import
+                Note: alias, rewrite the access to a plain reference to the
+                Note: identifier, matching how `Module.func()` is rewritten to
+                Note: a plain function call (see EXPR_QUALIFIED_CALL codegen,
+                Note: which strips the module prefix at emit time).
+                Let mqc_left_type be memory_get_int32(left, 0)
+                Let mqc_is_module be 0
+                If mqc_left_type is equal to 1:  Note: EXPR_VARIABLE
+                    Let mqc_left_name be memory_get_pointer(left, 8)
+                    Let mqc_program be memory_get_pointer(parser, 16)  Note: parser->current_program
+                    If mqc_program is not equal to 0:
+                        Let mqc_imp_count be memory_get_int32(mqc_program, 40)
+                        Let mqc_imports be memory_get_pointer(mqc_program, 32)
+                        If mqc_imports is not equal to 0:
+                            Let mqc_i be 0
+                            While mqc_i is less than mqc_imp_count:
+                                Let mqc_imp_off be mqc_i multiplied by 8
+                                Let mqc_imp_ptr be memory_get_pointer(mqc_imports, mqc_imp_off)
+                                If mqc_imp_ptr is not equal to 0:
+                                    Let mqc_mod_name be memory_get_pointer(mqc_imp_ptr, 8)
+                                    If string_equals(mqc_mod_name, mqc_left_name) is equal to 1:
+                                        Set mqc_is_module to 1
+                                        Set mqc_i to mqc_imp_count
+                                    End If
+                                End If
+                                Set mqc_i to mqc_i plus 1
+                            End While
+                        End If
+                    End If
+                End If
+
+                If mqc_is_module is equal to 1:
+                    Note: Translate `Module.IDENTIFIER` to a bare variable reference
+                    Note: against the merged global namespace. The original EXPR_VARIABLE
+                    Note: holding the module alias is left for the arena to reclaim - the
+                    Note: bootstrap parser leaks small nodes throughout this hot path and
+                    Note: an explicit deallocate here triggered a downstream double-free.
+                    Set left to expression_create_variable(field_name)
+                Otherwise:
+                    Note: Regular field access (not a function call, not a module constant)
+                    Let field_access be memory_allocate(32)  Note: sizeof(Expression)
+                    memory_set_int32(field_access, 0, 6)  Note: EXPR_FIELD_ACCESS
+                    memory_set_pointer(field_access, 8, left)  Note: field_access.object
+                    memory_set_pointer(field_access, 16, field_name)  Note: field_access.field_name
+                    Set left to field_access
+                End If
             End If
         End If
 
@@ -1971,6 +2017,85 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
 
     Let token_type be memory_get_integer(current_token, 0)
 
+    Note: Handle `size_of TypeName` - canonical Runa for compile-time type size.
+    Note: Used in v0.0.8.5 source for `proc memory_allocate from MemoryCore with size_of T`
+    Note: where T is a struct type. Lexer tokenizes `size_of` as a plain identifier;
+    Note: detect it here by name and resolve to an EXPR_INTEGER literal carrying the
+    Note: type's size. Primitive types use hard-coded sizes; user types are looked up
+    Note: in program->types (offset 40 in TypeDefinition holds the computed size).
+    If token_type is equal to 53:
+        Let so_token_value be memory_get_pointer(current_token, 8)
+        If so_token_value is not equal to 0:
+            Let so_is_size_of be string_equals(so_token_value, "size_of")
+            If so_is_size_of is equal to 1:
+                parser_eat(parser, 53)  Note: Eat `size_of`
+                Let so_type_token be memory_get_pointer(parser, 8)
+                Let so_type_tt be memory_get_integer(so_type_token, 0)
+                Let so_type_val be memory_get_pointer(so_type_token, 8)
+
+                Note: Capture the type name; accept identifier (53), TOKEN_INTEGER_TYPE (4),
+                Note: or any token whose value text names a type.
+                Let so_type_name be 0
+                If so_type_val is not equal to 0:
+                    Set so_type_name to string_duplicate_parser(so_type_val)
+                End If
+                parser_eat(parser, so_type_tt)
+
+                Note: Resolve the size. Primitive defaults match the bootstrap layout
+                Note: (Integer/Float/String pointers are 8 bytes; Boolean and Character
+                Note: are 1 byte stored in 8-byte slots; everything else looks up the
+                Note: user type definition).
+                Let so_size be 0
+                If so_type_name is not equal to 0:
+                    If string_equals(so_type_name, "Integer") is equal to 1:
+                        Set so_size to 8
+                    Otherwise If string_equals(so_type_name, "Float") is equal to 1:
+                        Set so_size to 8
+                    Otherwise If string_equals(so_type_name, "String") is equal to 1:
+                        Set so_size to 8
+                    Otherwise If string_equals(so_type_name, "Boolean") is equal to 1:
+                        Set so_size to 8
+                    Otherwise If string_equals(so_type_name, "Character") is equal to 1:
+                        Set so_size to 8
+                    Otherwise:
+                        Note: User-defined type - look it up in program->types.
+                        Let so_program be memory_get_pointer(parser, 16)
+                        If so_program is not equal to 0:
+                            Let so_type_count be memory_get_int32(so_program, 24)
+                            Let so_types be memory_get_pointer(so_program, 16)
+                            If so_types is not equal to 0:
+                                Let so_i be 0
+                                While so_i is less than so_type_count:
+                                    Let so_t_off be so_i multiplied by 8
+                                    Let so_t_ptr be memory_get_pointer(so_types, so_t_off)
+                                    If so_t_ptr is not equal to 0:
+                                        Let so_t_name be memory_get_pointer(so_t_ptr, 0)
+                                        If string_equals(so_t_name, so_type_name) is equal to 1:
+                                            Set so_size to memory_get_int32(so_t_ptr, 40)
+                                            Set so_i to so_type_count
+                                        End If
+                                    End If
+                                    Set so_i to so_i plus 1
+                                End While
+                            End If
+                        End If
+                        Note: If type was not found (forward reference or import-only),
+                        Note: fall back to a single pointer slot. Real type resolution
+                        Note: happens at codegen for everything else; size_of is a
+                        Note: compile-time constant so we resolve here.
+                        If so_size is equal to 0:
+                            Set so_size to 8
+                        End If
+                    End If
+                Otherwise:
+                    Set so_size to 8
+                End If
+
+                Return expression_create_integer(so_size)
+            End If
+        End If
+    End If
+
     Note: Handle "a value of type TypeName [with field as value, ...]"
     Note: TOKEN_A = 155. Only trigger if followed by "value" - otherwise treat as variable
     If token_type is equal to 155:
@@ -2112,15 +2237,18 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             Let avot_next be memory_get_pointer(parser, 8)
             Let avot_next_type be memory_get_integer(avot_next, 0)
             Let avot_field_count be 0
+            Let avot_names be 0
+            Let avot_values be 0
 
             If avot_next_type is equal to 114:
                 Note: TOKEN_WITH = 114 - parse field initializers
                 parser_eat(parser, 114)
 
-                Note: Count fields by parsing field as value pairs
-                Note: For bootstrap, we generate: allocate(field_count * 8) then store each field
-                Note: Build a list of value expressions
-                Let avot_values be memory_allocate(128)  Note: Space for up to 16 field values
+                Note: Capture field names AND values into parallel arrays so we can
+                Note: emit a proper EXPR_STRUCT_CONSTRUCTION node that preserves the
+                Note: object's type for later field access lowering.
+                Set avot_names to memory_allocate(128)  Note: Up to 16 field names
+                Set avot_values to memory_allocate(128)  Note: Up to 16 field values
                 Let avot_parsing_fields be 1
 
                 While avot_parsing_fields is equal to 1:
@@ -2133,14 +2261,17 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                     If avot_is_field is equal to 0:
                         Set avot_parsing_fields to 0
                     Otherwise:
-                        Note: Eat the field name
+                        Note: Capture the field name BEFORE eating the token.
+                        Let avot_field_name_raw be memory_get_pointer(avot_field_token, 8)
+                        Let avot_field_name be string_duplicate(avot_field_name_raw)
                         parser_eat(parser, avot_field_tt)
                         Note: Eat 'as'
                         parser_eat(parser, 34)
                         Note: Parse the value expression
                         Let avot_val_expr be parser_parse_expression(parser)
-                        Note: Store in values array
+                        Note: Store name and value in parallel arrays
                         Let avot_val_offset be avot_field_count multiplied by 8
+                        memory_set_pointer(avot_names, avot_val_offset, avot_field_name)
                         memory_set_pointer(avot_values, avot_val_offset, avot_val_expr)
                         Set avot_field_count to avot_field_count plus 1
 
@@ -2158,26 +2289,17 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                 End While
             End If
 
-            Note: Generate: allocate(field_count * 8) or allocate(8) if no fields
-            Let avot_alloc_size be avot_field_count multiplied by 8
-            If avot_alloc_size is equal to 0:
-                Set avot_alloc_size to 8
-            End If
-            Let avot_size_expr be expression_create_integer(avot_alloc_size)
-            Let avot_alloc_args be memory_allocate(8)
-            memory_set_pointer(avot_alloc_args, 0, avot_size_expr)
-            Let avot_alloc_call be expression_create_function_call(string_duplicate("allocate"), avot_alloc_args, 1)
-
-            Note: If no fields, just return the allocate call
-            If avot_field_count is equal to 0:
-                Return avot_alloc_call
-            End If
-
-            Note: With fields: we need to generate a sequence that allocates, stores fields, returns ptr
-            Note: For simplicity in the bootstrap, return just the allocate call
-            Note: The field stores will need to be generated as separate statements
-            Note: For now, return the allocation - field initialization will be handled later
-            Return avot_alloc_call
+            Note: Build EXPR_STRUCT_CONSTRUCTION node so the type name survives.
+            Note: Layout: type(int32 at 0), type_name(ptr at 8), field_names(ptr at 16),
+            Note:         field_values(ptr at 24), field_count(int32 at 32) - matches
+            Note:         the codegen handler for EXPR_STRUCT_CONSTRUCTION.
+            Let avot_struct_expr be memory_allocate(40)
+            memory_set_int32(avot_struct_expr, 0, 20)  Note: EXPR_STRUCT_CONSTRUCTION
+            memory_set_pointer(avot_struct_expr, 8, avot_type_name)
+            memory_set_pointer(avot_struct_expr, 16, avot_names)
+            memory_set_pointer(avot_struct_expr, 24, avot_values)
+            memory_set_int32(avot_struct_expr, 32, avot_field_count)
+            Return avot_struct_expr
         Otherwise:
             Note: 'a' is NOT followed by 'value' - treat as a variable named 'a'
             Return expression_create_variable(string_duplicate_parser("a"))
@@ -5443,12 +5565,20 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                 Note: CRITICAL: Read token_value BEFORE any memory operations that could invalidate the token!
                 Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
 
-                If token_type is not equal to 53:
-                    print_string("[PARSER ERROR] Expected variant name at line ")
-                    Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
-                    print_integer(line)
-                    print_newline()
-                    exit(1)
+                Note: Accept any identifier-like token as a variant name. Variant names
+                Note: are program-defined and can collide with keywords (e.g., `| Constant`,
+                Note: `| Type`) - the lexer tokenizes those as keywords but in this position
+                Note: they are user identifiers. token_can_be_identifier() handles the same
+                Note: distinction in struct constructor field-name parsing.
+                Let vn_can_id be token_can_be_identifier(token_type)
+                If vn_can_id is not equal to 1:
+                    If token_type is not equal to 53:
+                        print_string("[PARSER ERROR] Expected variant name at line ")
+                        Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
+                        print_integer(line)
+                        print_newline()
+                        exit(1)
+                    End If
                 End If
 
                 Note: Add variant
@@ -5471,9 +5601,114 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                 memory_set_int32(variant, VARIANT_FIELD_COUNT_OFFSET, 0)
                 memory_set_int32(variant, VARIANT_TAG_OFFSET, tag)
 
-                parser_eat(parser, 53)
+                Note: Eat whatever identifier-like token carried the variant name
+                Note: (TOKEN_IDENTIFIER, or a keyword like Constant/Type/Set used as a name).
+                parser_eat(parser, token_type)
 
-                Note: Parse optional variant fields
+                Note: Parse optional variant fields. Two canonical forms:
+                Note:   `| Variant with field as Type and field as Type` (token 114, "and"-separated)
+                Note:   `| Variant as field as Type, field as Type`       (token 34, comma-separated)
+                Note: Both produce identical AST - a list of named fields on the variant.
+                Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+
+                Note: `| Variant as field as Type, field as Type, ...` form. Structural
+                Note: clone of the `with`-introduced form below. Differs only in the
+                Note: introducer token (34=`as` instead of 114=`with`) and the field
+                Note: separator (52=`,` instead of 30=`and`). All field-append variables
+                Note: must use `Set` (not `Let`) - they're declared as `Let` in the `with`
+                Note: form and the bootstrap rejects re-declarations within the function.
+                If token_type is equal to 34:
+                    parser_eat(parser, 34)
+
+                    Set field_offset to 8  Note: Start after tag (8 bytes for tag)
+
+                    Note: Parse fields: field1 as Type1, field2 as Type2...
+                    Set continue_parsing to 1
+                    While continue_parsing is equal to 1:
+                        Note: Parse field name
+                        Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                        Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+                        If token_type is not equal to 53:
+                            print_string("[PARSER ERROR] Expected field name in variant at line ")
+                            Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
+                            print_integer(line)
+                            print_newline()
+                            exit(1)
+                        End If
+
+                        Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+                        Set field_name to string_duplicate(token_value)
+                        parser_eat(parser, 53)
+                        parser_eat(parser, 34)
+
+                        Note: Parse field type
+                        Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                        Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+                        If token_type is not equal to 4:
+                            If token_type is not equal to 5:
+                                If token_type is not equal to 6:
+                                    If token_type is not equal to 53:
+                                        print_string("[PARSER ERROR] Expected field type at line ")
+                                        Set line to memory_get_int32(current_token, TOKEN_LINE_OFFSET)
+                                        print_integer(line)
+                                        print_newline()
+                                        exit(1)
+                                    End If
+                                End If
+                            End If
+                        End If
+
+                        Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
+                        Set field_type to string_duplicate(token_value)
+                        If token_type is equal to 4:
+                            parser_eat(parser, 4)
+                        End If
+                        If token_type is equal to 5:
+                            parser_eat(parser, 5)
+                        End If
+                        If token_type is equal to 6:
+                            parser_eat(parser, 6)
+                        End If
+                        If token_type is equal to 53:
+                            parser_eat(parser, 53)
+                        End If
+
+                        Note: Add field to variant. We Let-declare these here (first
+                        Note: occurrence in source) so the `with` form below re-uses them
+                        Note: via `Set`. Both forms share the field-append machinery.
+                        Let variant_field_count be memory_get_int32(variant, VARIANT_FIELD_COUNT_OFFSET)
+                        Let new_variant_field_count be variant_field_count plus 1
+                        memory_set_int32(variant, VARIANT_FIELD_COUNT_OFFSET, new_variant_field_count)
+
+                        Let variant_fields be memory_get_pointer(variant, VARIANT_FIELDS_OFFSET)
+                        Let new_variant_fields_size be new_variant_field_count multiplied by TYPEFIELD_SIZE
+                        Let new_variant_fields be memory_reallocate(variant_fields, new_variant_fields_size)
+                        memory_set_pointer(variant, VARIANT_FIELDS_OFFSET, new_variant_fields)
+
+                        Let variant_field_index be new_variant_field_count minus 1
+                        Let variant_field_offset be variant_field_index multiplied by TYPEFIELD_SIZE
+                        Set field to new_variant_fields plus variant_field_offset
+                        memory_set_pointer(field, TYPEFIELD_NAME_OFFSET, field_name)
+                        memory_set_pointer(field, TYPEFIELD_TYPE_OFFSET, field_type)
+                        memory_set_int32(field, TYPEFIELD_OFFSET_OFFSET, field_offset)
+
+                        Set current_program to memory_get_pointer(parser, PARSER_CURRENT_PROGRAM_OFFSET)
+                        Set field_size to calculate_type_size(field_type, current_program)
+                        memory_set_int32(field, TYPEFIELD_SIZE_OFFSET, field_size)
+                        Set field_offset to field_offset plus field_size
+
+                        Note: Check for `,` to continue with more fields
+                        Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                        Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+                        If token_type is equal to 52:
+                            parser_eat(parser, 52)
+                        Otherwise:
+                            Set continue_parsing to 0
+                        End If
+                    End While
+                End If
+
                 Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
                 Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
                 If token_type is equal to 114:
@@ -5532,18 +5767,19 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                             parser_eat(parser, 53)
                         End If
 
-                        Note: Add field to variant
-                        Let variant_field_count be memory_get_int32(variant, VARIANT_FIELD_COUNT_OFFSET)
-                        Let new_variant_field_count be variant_field_count plus 1
+                        Note: Add field to variant. Variables Let-declared in the as-form
+                        Note: above; re-assign here.
+                        Set variant_field_count to memory_get_int32(variant, VARIANT_FIELD_COUNT_OFFSET)
+                        Set new_variant_field_count to variant_field_count plus 1
                         memory_set_int32(variant, VARIANT_FIELD_COUNT_OFFSET, new_variant_field_count)
 
-                        Let variant_fields be memory_get_pointer(variant, VARIANT_FIELDS_OFFSET)
-                        Let new_variant_fields_size be new_variant_field_count multiplied by TYPEFIELD_SIZE
-                        Let new_variant_fields be memory_reallocate(variant_fields, new_variant_fields_size)
+                        Set variant_fields to memory_get_pointer(variant, VARIANT_FIELDS_OFFSET)
+                        Set new_variant_fields_size to new_variant_field_count multiplied by TYPEFIELD_SIZE
+                        Set new_variant_fields to memory_reallocate(variant_fields, new_variant_fields_size)
                         memory_set_pointer(variant, VARIANT_FIELDS_OFFSET, new_variant_fields)
 
-                        Let variant_field_index be new_variant_field_count minus 1
-                        Let variant_field_offset be variant_field_index multiplied by TYPEFIELD_SIZE
+                        Set variant_field_index to new_variant_field_count minus 1
+                        Set variant_field_offset to variant_field_index multiplied by TYPEFIELD_SIZE
                         Set field to new_variant_fields plus variant_field_offset
                         memory_set_pointer(field, TYPEFIELD_NAME_OFFSET, field_name)
                         memory_set_pointer(field, TYPEFIELD_TYPE_OFFSET, field_type)
@@ -5925,14 +6161,19 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
         End If
 
         If stmt is equal to 0:
-            Note: Unknown token - warn and skip to continue parsing
-            print_string("[PARSER WARNING] Skipping unexpected token ")
-            print_integer(body_token_type)
-            print_string(" in function body at line ")
+            Note: Statement parsing failed. Previously the parser warned and skipped
+            Note: the token, then silently added a NULL stmt to the function body -
+            Note: which downstream codegen would either crash on or silently emit
+            Note: 0-byte output for. Per [DEC-0003] the compiler must never bypass
+            Note: errors to inflate compilation numbers; surface this as a hard error.
+            print_string("[PARSER ERROR] Unrecognized statement at line ")
             Let stmt_error_line be memory_get_int32(body_current_token, TOKEN_LINE_OFFSET)
             print_integer(stmt_error_line)
+            print_string(" (token type ")
+            print_integer(body_token_type)
+            print_string(")")
             print_newline()
-            parser_eat(parser, body_token_type)
+            exit_with_code(1)
         End If
 
         function_add_statement(func, stmt)
@@ -6066,7 +6307,9 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
     Let test_token be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
     Let test_type be memory_get_int32(test_token, TOKEN_TYPE_OFFSET)
     If test_type is equal to 0:
-        print_string("[ERROR] First token is already EOF!")
+        print_string("[PARSER ERROR] First token is already EOF (input file is empty or unreadable)")
+        print_newline()
+        exit_with_code(1)
     End If
     Note: Initialize pointers to NULL (0) - they will be allocated when needed
     memory_set_pointer(program, PROGRAM_IMPORTS, 0)
@@ -6578,7 +6821,10 @@ Process called "program_destroy" takes program as Integer returns Integer:
             End If
             Set k to k plus 1
         End While
-        deallocate(globals)
+        Note: DO NOT deallocate globals array - may be arena-allocated after import
+        Note: processing (merge_imported_globals reallocates into the shared arena
+        Note: just like merge_imported_functions and merge_imported_types do).
+        Note: Arena memory will be freed when arena_destroy() is called.
     End If
 
     deallocate(program)
