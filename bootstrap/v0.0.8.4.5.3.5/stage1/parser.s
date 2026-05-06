@@ -415,21 +415,21 @@ print_integer:
 .STR19:    .string "[PARSER ERROR] Expected token type "
 .STR20:    .string ", got "
 .STR21:    .string " at line "
-.STR22:    .string "Integer"
-.STR23:    .string "Float"
-.STR24:    .string "String"
-.STR25:    .string "Boolean"
-.STR26:    .string "Character"
-.STR27:    .string "[PARSER ERROR] Null parser in parse_primary"
-.STR28:    .string "[PARSER ERROR] Null current_token in parse_primary"
-.STR29:    .string "size_of"
-.STR30:    .string "list"
-.STR31:    .string "nothing"
-.STR32:    .string "dictionary"
-.STR33:    .string "[PARSER ERROR] Expected 'as' in dictionary literal at line "
-.STR34:    .string "value"
-.STR35:    .string "a"
-.STR36:    .string "_"
+.STR22:    .string "_"
+.STR23:    .string "nothing"
+.STR24:    .string "[PARSER ERROR] Expected 'as' in dictionary literal at line "
+.STR25:    .string "Integer"
+.STR26:    .string "Float"
+.STR27:    .string "String"
+.STR28:    .string "Boolean"
+.STR29:    .string "Character"
+.STR30:    .string "[PARSER ERROR] Null parser in parse_primary"
+.STR31:    .string "[PARSER ERROR] Null current_token in parse_primary"
+.STR32:    .string "size_of"
+.STR33:    .string "list"
+.STR34:    .string "dictionary"
+.STR35:    .string "value"
+.STR36:    .string "a"
 .STR37:    .string "memory_get_pointer"
 .STR38:    .string "memory_get_byte"
 .STR39:    .string "[PARSER ERROR] Expected function name after $ at line "
@@ -1218,6 +1218,54 @@ token_can_be_identifier:
     ret
     jmp .L462
 .L461:
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $4, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L471
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L472
+.L471:
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $5, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L481
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L482
+.L481:
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $6, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L491
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L492
+.L491:
+.L492:
+.L482:
+.L472:
 .L462:
 .L452:
 .L442:
@@ -1304,7 +1352,7 @@ parser_parse_logical_or:
     movq %rax, -16(%rbp)
     movq $1, %rax
     movq %rax, -24(%rbp)
-.L471:    movq -24(%rbp), %rax
+.L501:    movq -24(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -1312,7 +1360,7 @@ parser_parse_logical_or:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L472
+    jz .L502
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1337,7 +1385,7 @@ parser_parse_logical_or:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L481
+    jz .L511
     movq $31, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1364,16 +1412,16 @@ parser_parse_logical_or:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L482
-.L481:
+    jmp .L512
+.L511:
     movq $0, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L482:
-    jmp .L471
-.L472:
+.L512:
+    jmp .L501
+.L502:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1393,7 +1441,7 @@ parser_parse_logical_and:
     movq %rax, -16(%rbp)
     movq $1, %rax
     movq %rax, -24(%rbp)
-.L491:    movq -24(%rbp), %rax
+.L521:    movq -24(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -1401,7 +1449,7 @@ parser_parse_logical_and:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L492
+    jz .L522
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1426,7 +1474,7 @@ parser_parse_logical_and:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L501
+    jz .L531
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1453,16 +1501,16 @@ parser_parse_logical_and:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L502
-.L501:
+    jmp .L532
+.L531:
     movq $0, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L502:
-    jmp .L491
-.L492:
+.L532:
+    jmp .L521
+.L522:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1507,7 +1555,7 @@ parser_parse_additive:
     movq %rax, -16(%rbp)
     movq $1, %rax
     movq %rax, -24(%rbp)
-.L511:    movq -24(%rbp), %rax
+.L541:    movq -24(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -1515,7 +1563,7 @@ parser_parse_additive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L512
+    jz .L542
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1540,7 +1588,7 @@ parser_parse_additive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L521
+    jz .L551
     movq -40(%rbp), %rax
     movq %rax, -48(%rbp)
     movq $16, %rax
@@ -1569,8 +1617,8 @@ parser_parse_additive:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L522
-.L521:
+    jmp .L552
+.L551:
     movq -40(%rbp), %rax
     pushq %rax
     movq $17, %rax
@@ -1579,7 +1627,7 @@ parser_parse_additive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L531
+    jz .L561
     movq $17, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1609,8 +1657,8 @@ parser_parse_additive:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L532
-.L531:
+    jmp .L562
+.L561:
     movq -40(%rbp), %rax
     pushq %rax
     movq $182, %rax
@@ -1619,7 +1667,7 @@ parser_parse_additive:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L541
+    jz .L571
     movq $182, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1684,18 +1732,18 @@ parser_parse_additive:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L542
-.L541:
+    jmp .L572
+.L571:
     movq $0, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L572:
+.L562:
+.L552:
+    jmp .L541
 .L542:
-.L532:
-.L522:
-    jmp .L511
-.L512:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1715,7 +1763,7 @@ parser_parse_multiplicative:
     movq %rax, -16(%rbp)
     movq $1, %rax
     movq %rax, -24(%rbp)
-.L551:    movq -24(%rbp), %rax
+.L581:    movq -24(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -1723,7 +1771,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L552
+    jz .L582
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -1748,7 +1796,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L561
+    jz .L591
     movq -40(%rbp), %rax
     movq %rax, -48(%rbp)
     movq $35, %rax
@@ -1784,160 +1832,11 @@ parser_parse_multiplicative:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L562
-.L561:
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq $36, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L571
-    movq -40(%rbp), %rax
-    pushq %rax
-    leaq -48(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $36, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $38, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_primary_with_postfix
-    pushq %rax
-    leaq -56(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq -48(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call expression_create_binary_op
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L572
-.L571:
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq $37, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L581
-    movq -40(%rbp), %rax
-    pushq %rax
-    leaq -48(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $37, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $38, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_primary_with_postfix
-    pushq %rax
-    leaq -56(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq -48(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call expression_create_binary_op
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L582
-.L581:
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq $42, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L591
-    movq -40(%rbp), %rax
-    pushq %rax
-    leaq -48(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $42, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_primary_with_postfix
-    pushq %rax
-    leaq -56(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq -48(%rbp), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call expression_create_binary_op
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
     jmp .L592
 .L591:
     movq -40(%rbp), %rax
     pushq %rax
-    movq $43, %rax
+    movq $36, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -1949,7 +1848,14 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $43, %rax
+    movq $36, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $38, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -1982,7 +1888,7 @@ parser_parse_multiplicative:
 .L601:
     movq -40(%rbp), %rax
     pushq %rax
-    movq $39, %rax
+    movq $37, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -1994,7 +1900,14 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $39, %rax
+    movq $37, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $38, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -2027,7 +1940,7 @@ parser_parse_multiplicative:
 .L611:
     movq -40(%rbp), %rax
     pushq %rax
-    movq $40, %rax
+    movq $42, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -2039,7 +1952,7 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $40, %rax
+    movq $42, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -2072,13 +1985,148 @@ parser_parse_multiplicative:
 .L621:
     movq -40(%rbp), %rax
     pushq %rax
-    movq $41, %rax
+    movq $43, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L631
+    movq -40(%rbp), %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $43, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_primary_with_postfix
+    pushq %rax
+    leaq -56(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call expression_create_binary_op
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L632
+.L631:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $39, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L641
+    movq -40(%rbp), %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $39, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_primary_with_postfix
+    pushq %rax
+    leaq -56(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call expression_create_binary_op
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L642
+.L641:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $40, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L651
+    movq -40(%rbp), %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $40, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_primary_with_postfix
+    pushq %rax
+    leaq -56(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call expression_create_binary_op
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L652
+.L651:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $41, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L661
     movq -40(%rbp), %rax
     pushq %rax
     leaq -48(%rbp), %rbx
@@ -2113,8 +2161,8 @@ parser_parse_multiplicative:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L632
-.L631:
+    jmp .L662
+.L661:
     movq -40(%rbp), %rax
     pushq %rax
     movq $175, %rax
@@ -2123,7 +2171,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L641
+    jz .L671
     movq $175, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2160,7 +2208,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L651
+    jz .L681
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2173,8 +2221,8 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L652
-.L651:
+    jmp .L682
+.L681:
     movq -72(%rbp), %rax
     pushq %rax
     movq $31, %rax
@@ -2183,7 +2231,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L661
+    jz .L691
     movq $31, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2196,8 +2244,8 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L662
-.L661:
+    jmp .L692
+.L691:
     movq $8, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -2216,7 +2264,7 @@ parser_parse_multiplicative:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L671
+    jz .L701
     leaq .STR1(%rip), %rax
     pushq %rax
     movq -80(%rbp), %rax
@@ -2228,9 +2276,9 @@ parser_parse_multiplicative:
     leaq -88(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L672
-.L671:
-.L672:
+    jmp .L702
+.L701:
+.L702:
     movq -88(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -2239,7 +2287,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L681
+    jz .L711
     movq -72(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2252,8 +2300,8 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L682
-.L681:
+    jmp .L712
+.L711:
     movq -72(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2261,9 +2309,9 @@ parser_parse_multiplicative:
     popq %rdi
     popq %rsi
     call parser_eat
+.L712:
+.L692:
 .L682:
-.L662:
-.L652:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -2286,8 +2334,8 @@ parser_parse_multiplicative:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L642
-.L641:
+    jmp .L672
+.L671:
     movq -40(%rbp), %rax
     pushq %rax
     movq $176, %rax
@@ -2296,7 +2344,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L691
+    jz .L721
     movq $176, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2328,7 +2376,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L701
+    jz .L731
     movq $177, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2348,9 +2396,9 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L702
-.L701:
-.L702:
+    jmp .L732
+.L731:
+.L732:
     movq -104(%rbp), %rax
     pushq %rax
     movq $178, %rax
@@ -2359,7 +2407,7 @@ parser_parse_multiplicative:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L711
+    jz .L741
     movq $178, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2379,9 +2427,9 @@ parser_parse_multiplicative:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L712
-.L711:
-.L712:
+    jmp .L742
+.L741:
+.L742:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -2404,25 +2452,25 @@ parser_parse_multiplicative:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L692
-.L691:
+    jmp .L722
+.L721:
     movq $0, %rax
     pushq %rax
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L692:
+.L722:
+.L672:
+.L662:
+.L652:
 .L642:
 .L632:
 .L622:
 .L612:
 .L602:
 .L592:
+    jmp .L581
 .L582:
-.L572:
-.L562:
-    jmp .L551
-.L552:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -2469,7 +2517,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L721
+    jz .L751
     movq $148, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2501,7 +2549,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L731
+    jz .L761
     movq $149, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2509,9 +2557,9 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L732
-.L731:
-.L732:
+    jmp .L762
+.L761:
+.L762:
     movq -48(%rbp), %rax
     pushq %rax
     movq $150, %rax
@@ -2520,7 +2568,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L741
+    jz .L771
     movq $150, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2528,9 +2576,9 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L742
-.L741:
-.L742:
+    jmp .L772
+.L771:
+.L772:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -2578,9 +2626,9 @@ parser_parse_primary_with_postfix:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L722
-.L721:
-.L722:
+    jmp .L752
+.L751:
+.L752:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2605,7 +2653,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L751
+    jz .L781
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -2622,7 +2670,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L761
+    jz .L791
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -2662,7 +2710,7 @@ parser_parse_primary_with_postfix:
     movq %rax, (%rbx)
     movq $1, %rax
     movq %rax, -144(%rbp)
-.L771:    movq -144(%rbp), %rax
+.L801:    movq -144(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -2670,7 +2718,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L772
+    jz .L802
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2695,14 +2743,14 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L781
+    jz .L811
     movq $0, %rax
     pushq %rax
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L782
-.L781:
+    jmp .L812
+.L811:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -2716,7 +2764,7 @@ parser_parse_primary_with_postfix:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L791
+    jz .L821
     movq -120(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -2743,9 +2791,9 @@ parser_parse_primary_with_postfix:
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L792
-.L791:
-.L792:
+    jmp .L822
+.L821:
+.L822:
     movq -112(%rbp), %rax
     pushq %rax
     movq -128(%rbp), %rax
@@ -2795,7 +2843,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L801
+    jz .L831
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2803,12 +2851,12 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L802
-.L801:
+    jmp .L832
+.L831:
+.L832:
+.L812:
+    jmp .L801
 .L802:
-.L782:
-    jmp .L771
-.L772:
     movq $49, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2836,12 +2884,12 @@ parser_parse_primary_with_postfix:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L762
-.L761:
-.L762:
-    jmp .L752
-.L751:
-.L752:
+    jmp .L792
+.L791:
+.L792:
+    jmp .L782
+.L781:
+.L782:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2872,7 +2920,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L811
+    jz .L841
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2937,7 +2985,7 @@ parser_parse_primary_with_postfix:
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L821:    movq -144(%rbp), %rax
+.L851:    movq -144(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -2945,7 +2993,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L822
+    jz .L852
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -2970,7 +3018,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L831
+    jz .L861
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3009,72 +3057,36 @@ parser_parse_primary_with_postfix:
     leaq -112(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L832
-.L831:
+    jmp .L862
+.L861:
     movq $0, %rax
     pushq %rax
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L832:
-    jmp .L821
-.L822:
-    movq $32, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -256(%rbp)
-    movq $24, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -256(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -256(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -104(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -256(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
+.L862:
+    jmp .L851
+.L852:
     movq -112(%rbp), %rax
     pushq %rax
-    movq $24, %rax
+    movq -104(%rbp), %rax
     pushq %rax
-    movq -256(%rbp), %rax
+    movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
-    call memory_set_int32@PLT
-    movq -256(%rbp), %rax
+    call with_promote_to_call_or_lambda
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L812
-.L811:
-.L812:
+    jmp .L842
+.L841:
+.L842:
     movq $1, %rax
-    movq %rax, -264(%rbp)
-.L841:    movq -264(%rbp), %rax
+    movq %rax, -256(%rbp)
+.L871:    movq -256(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3082,7 +3094,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L842
+    jz .L872
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3090,16 +3102,16 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -272(%rbp)
+    movq %rax, -264(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -272(%rbp), %rax
+    movq -264(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -280(%rbp)
-    movq -280(%rbp), %rax
+    movq %rax, -272(%rbp)
+    movq -272(%rbp), %rax
     pushq %rax
     movq $51, %rax
     popq %rbx
@@ -3107,7 +3119,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L851
+    jz .L881
     movq $51, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3122,21 +3134,21 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -288(%rbp)
+    movq %rax, -280(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -288(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -296(%rbp)
-    movq -296(%rbp), %rax
+    movq %rax, -288(%rbp)
+    movq -288(%rbp), %rax
     pushq %rax
     popq %rdi
     call token_can_be_identifier
-    movq %rax, -304(%rbp)
-    movq -304(%rbp), %rax
+    movq %rax, -296(%rbp)
+    movq -296(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3144,8 +3156,8 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L861
-    movq -296(%rbp), %rax
+    jz .L891
+    movq -288(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -3153,43 +3165,61 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L871
+    jz .L901
     leaq .STR3(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
     movq $16, %rax
     pushq %rax
-    movq -288(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -312(%rbp)
-    movq -312(%rbp), %rax
+    movq %rax, -304(%rbp)
+    movq -304(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
     call print_newline
-    jmp .L872
-.L871:
-.L872:
-    jmp .L862
-.L861:
-.L862:
+    jmp .L902
+.L901:
+.L902:
+    jmp .L892
+.L891:
+.L892:
     movq $8, %rax
     pushq %rax
-    movq -288(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -320(%rbp)
-    movq -320(%rbp), %rax
+    movq %rax, -312(%rbp)
+    movq -312(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -328(%rbp)
+    movq %rax, -320(%rbp)
+    movq -296(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L911
+    movq -288(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L912
+.L911:
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3197,6 +3227,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
+.L912:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3204,16 +3235,16 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -336(%rbp)
+    movq %rax, -328(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -336(%rbp), %rax
+    movq -328(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -344(%rbp)
-    movq -344(%rbp), %rax
+    movq %rax, -336(%rbp)
+    movq -336(%rbp), %rax
     pushq %rax
     movq $48, %rax
     popq %rbx
@@ -3221,7 +3252,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L881
+    jz .L921
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -3229,8 +3260,8 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -352(%rbp)
-    movq -352(%rbp), %rax
+    movq %rax, -344(%rbp)
+    movq -344(%rbp), %rax
     pushq %rax
     movq $1, %rax  # Load compile-time constant EXPR_VARIABLE
     popq %rbx
@@ -3238,7 +3269,7 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L891
+    jz .L931
     leaq .STR4(%rip), %rax
     pushq %rax
     popq %rdi
@@ -3248,9 +3279,9 @@ parser_parse_primary_with_postfix:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L892
-.L891:
-.L892:
+    jmp .L932
+.L931:
+.L932:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -3258,7 +3289,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -360(%rbp)
+    movq %rax, -352(%rbp)
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3267,30 +3298,30 @@ parser_parse_primary_with_postfix:
     popq %rsi
     call parser_eat
     movq $0, %rax
-    movq %rax, -368(%rbp)
+    movq %rax, -360(%rbp)
     movq $0, %rax
-    movq %rax, -376(%rbp)
+    movq %rax, -368(%rbp)
     movq $4, %rax
-    movq %rax, -384(%rbp)
+    movq %rax, -376(%rbp)
     movq $8, %rax
-    movq %rax, -392(%rbp)
-    movq -384(%rbp), %rax
+    movq %rax, -384(%rbp)
+    movq -376(%rbp), %rax
     pushq %rax
-    movq -392(%rbp), %rax
+    movq -384(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -400(%rbp)
-    movq -400(%rbp), %rax
+    movq %rax, -392(%rbp)
+    movq -392(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -368(%rbp), %rbx
+    leaq -360(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
-    movq %rax, -408(%rbp)
-.L901:    movq -408(%rbp), %rax
+    movq %rax, -400(%rbp)
+.L941:    movq -400(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3298,7 +3329,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L902
+    jz .L942
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3306,16 +3337,16 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -416(%rbp)
+    movq %rax, -408(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -416(%rbp), %rax
+    movq -408(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -424(%rbp)
-    movq -424(%rbp), %rax
+    movq %rax, -416(%rbp)
+    movq -416(%rbp), %rax
     pushq %rax
     movq $49, %rax
     popq %rbx
@@ -3323,42 +3354,42 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L911
+    jz .L951
     movq $0, %rax
     pushq %rax
-    leaq -408(%rbp), %rbx
+    leaq -400(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L912
-.L911:
+    jmp .L952
+.L951:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -432(%rbp)
-    movq -376(%rbp), %rax
+    movq %rax, -424(%rbp)
+    movq -368(%rbp), %rax
     pushq %rax
-    movq -392(%rbp), %rax
+    movq -384(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
+    movq %rax, -432(%rbp)
+    movq -360(%rbp), %rax
+    addq -432(%rbp), %rax
     movq %rax, -440(%rbp)
-    movq -368(%rbp), %rax
-    addq -440(%rbp), %rax
-    movq %rax, -448(%rbp)
-    movq -432(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -448(%rbp), %rax
+    movq -440(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -376(%rbp), %rax
+    movq -368(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -376(%rbp), %rbx
+    leaq -368(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
@@ -3368,16 +3399,16 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -456(%rbp)
+    movq %rax, -448(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -456(%rbp), %rax
+    movq -448(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -464(%rbp)
-    movq -464(%rbp), %rax
+    movq %rax, -456(%rbp)
+    movq -456(%rbp), %rax
     pushq %rax
     movq $52, %rax
     popq %rbx
@@ -3385,7 +3416,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L921
+    jz .L961
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3393,12 +3424,12 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L922
-.L921:
-.L922:
-.L912:
-    jmp .L901
-.L902:
+    jmp .L962
+.L961:
+.L962:
+.L952:
+    jmp .L941
+.L942:
     movq $49, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3410,32 +3441,42 @@ parser_parse_primary_with_postfix:
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -472(%rbp)
+    movq %rax, -464(%rbp)
     movq $25, %rax  # Load compile-time constant EXPR_QUALIFIED_CALL
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -472(%rbp), %rax
+    movq -464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -360(%rbp), %rax
+    movq -352(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -472(%rbp), %rax
+    movq -464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -328(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -472(%rbp), %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -360(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3443,19 +3484,9 @@ parser_parse_primary_with_postfix:
     call memory_set_pointer@PLT
     movq -368(%rbp), %rax
     pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -472(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -376(%rbp), %rax
-    pushq %rax
     movq $32, %rax
     pushq %rax
-    movq -472(%rbp), %rax
+    movq -464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3465,13 +3496,13 @@ parser_parse_primary_with_postfix:
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -472(%rbp), %rax
+    movq -464(%rbp), %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L882
-.L881:
+    jmp .L922
+.L921:
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -3479,10 +3510,10 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -480(%rbp)
+    movq %rax, -472(%rbp)
     movq $0, %rax
-    movq %rax, -488(%rbp)
-    movq -480(%rbp), %rax
+    movq %rax, -480(%rbp)
+    movq -472(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3490,7 +3521,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L931
+    jz .L971
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -3498,7 +3529,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -496(%rbp)
+    movq %rax, -488(%rbp)
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3506,8 +3537,8 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -504(%rbp)
-    movq -504(%rbp), %rax
+    movq %rax, -496(%rbp)
+    movq -496(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -3515,24 +3546,24 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L941
+    jz .L981
     movq $40, %rax
     pushq %rax
-    movq -504(%rbp), %rax
+    movq -496(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -512(%rbp)
+    movq %rax, -504(%rbp)
     movq $32, %rax
     pushq %rax
-    movq -504(%rbp), %rax
+    movq -496(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -520(%rbp)
-    movq -520(%rbp), %rax
+    movq %rax, -512(%rbp)
+    movq -512(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -3540,33 +3571,33 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L951
+    jz .L991
     movq $0, %rax
-    movq %rax, -528(%rbp)
-.L961:    movq -528(%rbp), %rax
+    movq %rax, -520(%rbp)
+.L1001:    movq -520(%rbp), %rax
     pushq %rax
-    movq -512(%rbp), %rax
+    movq -504(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L962
-    movq -528(%rbp), %rax
+    jz .L1002
+    movq -520(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -536(%rbp)
-    movq -536(%rbp), %rax
+    movq %rax, -528(%rbp)
+    movq -528(%rbp), %rax
     pushq %rax
-    movq -520(%rbp), %rax
+    movq -512(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -544(%rbp)
-    movq -544(%rbp), %rax
+    movq %rax, -536(%rbp)
+    movq -536(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -3574,18 +3605,18 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L971
+    jz .L1011
     movq $8, %rax
     pushq %rax
-    movq -544(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -552(%rbp)
-    movq -496(%rbp), %rax
+    movq %rax, -544(%rbp)
+    movq -488(%rbp), %rax
     pushq %rax
-    movq -552(%rbp), %rax
+    movq -544(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3597,41 +3628,41 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L981
+    jz .L1021
     movq $1, %rax
     pushq %rax
-    leaq -488(%rbp), %rbx
+    leaq -480(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -512(%rbp), %rax
+    movq -504(%rbp), %rax
     pushq %rax
-    leaq -528(%rbp), %rbx
+    leaq -520(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    jmp .L1022
+.L1021:
+.L1022:
+    jmp .L1012
+.L1011:
+.L1012:
+    movq -520(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -520(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1001
+.L1002:
+    jmp .L992
+.L991:
+.L992:
     jmp .L982
 .L981:
 .L982:
     jmp .L972
 .L971:
 .L972:
-    movq -528(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -528(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L961
-.L962:
-    jmp .L952
-.L951:
-.L952:
-    jmp .L942
-.L941:
-.L942:
-    jmp .L932
-.L931:
-.L932:
-    movq -488(%rbp), %rax
+    movq -480(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3639,8 +3670,8 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L991
-    movq -328(%rbp), %rax
+    jz .L1031
+    movq -320(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_variable
@@ -3648,18 +3679,18 @@ parser_parse_primary_with_postfix:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L992
-.L991:
+    jmp .L1032
+.L1031:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -560(%rbp)
+    movq %rax, -552(%rbp)
     movq $6, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -560(%rbp), %rax
+    movq -552(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3669,33 +3700,33 @@ parser_parse_primary_with_postfix:
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -560(%rbp), %rax
+    movq -552(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -328(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -560(%rbp), %rax
+    movq -552(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -560(%rbp), %rax
+    movq -552(%rbp), %rax
     pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L992:
+.L1032:
+.L922:
+    jmp .L882
+.L881:
 .L882:
-    jmp .L852
-.L851:
-.L852:
-    movq -280(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     movq $148, %rax
     popq %rbx
@@ -3703,7 +3734,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1001
+    jz .L1041
     movq $148, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3719,21 +3750,21 @@ parser_parse_primary_with_postfix:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -272(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
     pushq %rax
-    movq -272(%rbp), %rax
+    movq -264(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -280(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -280(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     movq $149, %rax
     popq %rbx
@@ -3741,7 +3772,7 @@ parser_parse_primary_with_postfix:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1011
+    jz .L1051
     movq $149, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3753,17 +3784,17 @@ parser_parse_primary_with_postfix:
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -568(%rbp)
+    movq %rax, -560(%rbp)
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -576(%rbp)
+    movq %rax, -568(%rbp)
     movq $16, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -576(%rbp), %rax
+    movq -568(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3773,7 +3804,17 @@ parser_parse_primary_with_postfix:
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -576(%rbp), %rax
+    movq -568(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -560(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -568(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3781,34 +3822,24 @@ parser_parse_primary_with_postfix:
     call memory_set_pointer@PLT
     movq -568(%rbp), %rax
     pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -576(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -576(%rbp), %rax
-    pushq %rax
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1012
-.L1011:
+    jmp .L1052
+.L1051:
     leaq .STR5(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
     movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
     pushq %rax
-    movq -272(%rbp), %rax
+    movq -264(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -584(%rbp)
-    movq -584(%rbp), %rax
+    movq %rax, -576(%rbp)
+    movq -576(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -3817,11 +3848,11 @@ parser_parse_primary_with_postfix:
     pushq %rax
     popq %rdi
     call exit
-.L1012:
-    jmp .L1002
-.L1001:
-.L1002:
-    movq -280(%rbp), %rax
+.L1052:
+    jmp .L1042
+.L1041:
+.L1042:
+    movq -272(%rbp), %rax
     pushq %rax
     movq $51, %rax
     popq %rbx
@@ -3829,8 +3860,8 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1021
-    movq -280(%rbp), %rax
+    jz .L1061
+    movq -272(%rbp), %rax
     pushq %rax
     movq $148, %rax
     popq %rbx
@@ -3838,20 +3869,20 @@ parser_parse_primary_with_postfix:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1031
+    jz .L1071
     movq $0, %rax
     pushq %rax
-    leaq -264(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1032
-.L1031:
-.L1032:
-    jmp .L1022
-.L1021:
-.L1022:
-    jmp .L841
-.L842:
+    jmp .L1072
+.L1071:
+.L1072:
+    jmp .L1062
+.L1061:
+.L1062:
+    jmp .L871
+.L872:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3893,7 +3924,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1041
+    jz .L1081
     movq $21, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3927,7 +3958,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1051
+    jz .L1091
     movq $29, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3962,9 +3993,9 @@ parser_parse_comparison:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1052
-.L1051:
-.L1052:
+    jmp .L1092
+.L1091:
+.L1092:
     movq $0, %rax
     movq %rax, -64(%rbp)
     movq -48(%rbp), %rax
@@ -3975,7 +4006,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1061
+    jz .L1101
     movq $22, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -3998,23 +4029,23 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1071
+    jz .L1111
     movq $23, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1072
-.L1071:
+    jmp .L1112
+.L1111:
     movq $22, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L1072:
-    jmp .L1062
-.L1061:
-.L1062:
+.L1112:
+    jmp .L1102
+.L1101:
+.L1102:
     movq -48(%rbp), %rax
     pushq %rax
     movq $24, %rax
@@ -4023,7 +4054,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1081
+    jz .L1121
     movq $24, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4055,7 +4086,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1091
+    jz .L1131
     movq $28, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4087,7 +4118,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1101
+    jz .L1141
     movq $31, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4117,23 +4148,23 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1111
+    jz .L1151
     movq $25, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1112
-.L1111:
+    jmp .L1152
+.L1151:
     movq $27, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L1112:
-    jmp .L1102
-.L1101:
-.L1102:
+.L1152:
+    jmp .L1142
+.L1141:
+.L1142:
     movq -96(%rbp), %rax
     pushq %rax
     movq $31, %rax
@@ -4142,7 +4173,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1121
+    jz .L1161
     movq -56(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -4151,26 +4182,26 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1131
+    jz .L1171
     movq $26, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1132
-.L1131:
+    jmp .L1172
+.L1171:
     movq $24, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L1172:
+    jmp .L1162
+.L1161:
+.L1162:
+    jmp .L1132
+.L1131:
 .L1132:
-    jmp .L1122
-.L1121:
-.L1122:
-    jmp .L1092
-.L1091:
-.L1092:
     movq -80(%rbp), %rax
     pushq %rax
     movq $28, %rax
@@ -4179,7 +4210,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1141
+    jz .L1181
     leaq .STR6(%rip), %rax
     movq %rax, -104(%rbp)
     movq -104(%rbp), %rax
@@ -4203,12 +4234,12 @@ parser_parse_comparison:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L1142
-.L1141:
-.L1142:
-    jmp .L1082
-.L1081:
-.L1082:
+    jmp .L1182
+.L1181:
+.L1182:
+    jmp .L1122
+.L1121:
+.L1122:
     movq -48(%rbp), %rax
     pushq %rax
     movq $25, %rax
@@ -4217,7 +4248,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1151
+    jz .L1191
     movq $25, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4255,7 +4286,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1161
+    jz .L1201
     movq $28, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4293,7 +4324,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1171
+    jz .L1211
     movq $31, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4323,23 +4354,23 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1181
+    jz .L1221
     movq $24, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1182
-.L1181:
+    jmp .L1222
+.L1221:
     movq $26, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L1182:
-    jmp .L1172
-.L1171:
-.L1172:
+.L1222:
+    jmp .L1212
+.L1211:
+.L1212:
     movq -96(%rbp), %rax
     pushq %rax
     movq $31, %rax
@@ -4348,7 +4379,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1191
+    jz .L1231
     movq -56(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -4357,26 +4388,26 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1201
+    jz .L1241
     movq $27, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1202
-.L1201:
+    jmp .L1242
+.L1241:
     movq $25, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L1242:
+    jmp .L1232
+.L1231:
+.L1232:
+    jmp .L1202
+.L1201:
 .L1202:
-    jmp .L1192
-.L1191:
-.L1192:
-    jmp .L1162
-.L1161:
-.L1162:
     movq -80(%rbp), %rax
     pushq %rax
     movq $28, %rax
@@ -4385,7 +4416,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1211
+    jz .L1251
     leaq .STR7(%rip), %rax
     pushq %rax
     leaq -104(%rbp), %rbx
@@ -4415,12 +4446,12 @@ parser_parse_comparison:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L1212
-.L1211:
-.L1212:
-    jmp .L1152
-.L1151:
-.L1152:
+    jmp .L1252
+.L1251:
+.L1252:
+    jmp .L1192
+.L1191:
+.L1192:
     movq -64(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -4429,7 +4460,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1221
+    jz .L1261
     movq -56(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -4438,23 +4469,23 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1231
+    jz .L1271
     movq $23, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1232
-.L1231:
+    jmp .L1272
+.L1271:
     movq $22, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L1232:
-    jmp .L1222
-.L1221:
-.L1222:
+.L1272:
+    jmp .L1262
+.L1261:
+.L1262:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -4489,7 +4520,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1241
+    jz .L1281
     leaq .STR8(%rip), %rax
     pushq %rax
     movq -136(%rbp), %rax
@@ -4504,15 +4535,15 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1251
+    jz .L1291
     movq $1, %rax
     pushq %rax
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1252
-.L1251:
-.L1252:
+    jmp .L1292
+.L1291:
+.L1292:
     leaq .STR9(%rip), %rax
     pushq %rax
     movq -136(%rbp), %rax
@@ -4527,18 +4558,18 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1261
+    jz .L1301
     movq $1, %rax
     pushq %rax
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1262
-.L1261:
-.L1262:
-    jmp .L1242
-.L1241:
-.L1242:
+    jmp .L1302
+.L1301:
+.L1302:
+    jmp .L1282
+.L1281:
+.L1282:
     movq -144(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -4547,7 +4578,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1271
+    jz .L1311
     movq -128(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4573,9 +4604,9 @@ parser_parse_comparison:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1272
-.L1271:
-.L1272:
+    jmp .L1312
+.L1311:
+.L1312:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4594,9 +4625,9 @@ parser_parse_comparison:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1042
-.L1041:
-.L1042:
+    jmp .L1082
+.L1081:
+.L1082:
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -4605,7 +4636,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1281
+    jz .L1321
     movq $8, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -4622,7 +4653,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1291
+    jz .L1331
     leaq .STR10(%rip), %rax
     pushq %rax
     movq -168(%rbp), %rax
@@ -4637,7 +4668,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1301
+    jz .L1341
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4663,9 +4694,9 @@ parser_parse_comparison:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1302
-.L1301:
-.L1302:
+    jmp .L1342
+.L1341:
+.L1342:
     leaq .STR11(%rip), %rax
     pushq %rax
     movq -168(%rbp), %rax
@@ -4680,7 +4711,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1311
+    jz .L1351
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4720,7 +4751,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1321
+    jz .L1361
     movq $29, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4769,9 +4800,9 @@ parser_parse_comparison:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1322
-.L1321:
-.L1322:
+    jmp .L1362
+.L1361:
+.L1362:
     movq -200(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -4780,7 +4811,7 @@ parser_parse_comparison:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1331
+    jz .L1371
     leaq .STR12(%rip), %rax
     pushq %rax
     movq -200(%rbp), %rax
@@ -4795,7 +4826,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1341
+    jz .L1381
     movq -192(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4821,21 +4852,21 @@ parser_parse_comparison:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1342
-.L1341:
-.L1342:
+    jmp .L1382
+.L1381:
+.L1382:
+    jmp .L1372
+.L1371:
+.L1372:
+    jmp .L1352
+.L1351:
+.L1352:
     jmp .L1332
 .L1331:
 .L1332:
-    jmp .L1312
-.L1311:
-.L1312:
-    jmp .L1292
-.L1291:
-.L1292:
-    jmp .L1282
-.L1281:
-.L1282:
+    jmp .L1322
+.L1321:
+.L1322:
     movq -32(%rbp), %rax
     pushq %rax
     movq $179, %rax
@@ -4844,7 +4875,7 @@ parser_parse_comparison:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1351
+    jz .L1391
     movq $179, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4898,9 +4929,9 @@ parser_parse_comparison:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1352
-.L1351:
-.L1352:
+    jmp .L1392
+.L1391:
+.L1392:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -4921,7 +4952,7 @@ parser_parse_let_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1361
+    jz .L1401
     leaq .STR14(%rip), %rax
     pushq %rax
     popq %rdi
@@ -4931,9 +4962,9 @@ parser_parse_let_statement:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L1362
-.L1361:
-.L1362:
+    jmp .L1402
+.L1401:
+.L1402:
     movq $12, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4970,7 +5001,7 @@ parser_parse_let_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1371
+    jz .L1411
     leaq .STR15(%rip), %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
@@ -4994,9 +5025,9 @@ parser_parse_let_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L1372
-.L1371:
-.L1372:
+    jmp .L1412
+.L1411:
+.L1412:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -5032,7 +5063,7 @@ parser_parse_let_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1381
+    jz .L1421
     leaq .STR16(%rip), %rax
     pushq %rax
     popq %rdi
@@ -5042,9 +5073,9 @@ parser_parse_let_statement:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L1382
-.L1381:
-.L1382:
+    jmp .L1422
+.L1421:
+.L1422:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -5168,7 +5199,7 @@ parser_parse_set_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1391
+    jz .L1431
     movq $136, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5208,7 +5239,7 @@ parser_parse_set_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1401
+    jz .L1441
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
@@ -5221,9 +5252,9 @@ parser_parse_set_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L1402
-.L1401:
-.L1402:
+    jmp .L1442
+.L1441:
+.L1442:
     movq -32(%rbp), %rax
     pushq %rax
     movq $138, %rax
@@ -5232,7 +5263,7 @@ parser_parse_set_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1411
+    jz .L1451
     movq $1, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
@@ -5245,105 +5276,105 @@ parser_parse_set_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L1412
-.L1411:
-.L1412:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $35, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1421
-    movq $2, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $35, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L1422
-.L1421:
-.L1422:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $141, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1431
-    movq $2, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $141, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L1432
-.L1431:
-.L1432:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $36, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1441
-    movq $3, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $36, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L1442
-.L1441:
-.L1442:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $142, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1451
-    movq $3, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $142, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
     jmp .L1452
 .L1451:
 .L1452:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $35, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1461
+    movq $2, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $35, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1462
+.L1461:
+.L1462:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $141, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1471
+    movq $2, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $141, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1472
+.L1471:
+.L1472:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $36, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1481
+    movq $3, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $36, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1482
+.L1481:
+.L1482:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $142, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1491
+    movq $3, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $142, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1492
+.L1491:
+.L1492:
     movq -40(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -5352,7 +5383,7 @@ parser_parse_set_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1461
+    jz .L1501
     movq -32(%rbp), %rax
     pushq %rax
     movq $137, %rax
@@ -5361,7 +5392,7 @@ parser_parse_set_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1471
+    jz .L1511
     leaq .STR17(%rip), %rax
     pushq %rax
     popq %rdi
@@ -5379,12 +5410,12 @@ parser_parse_set_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L1472
-.L1471:
-.L1472:
-    jmp .L1462
-.L1461:
-.L1462:
+    jmp .L1512
+.L1511:
+.L1512:
+    jmp .L1502
+.L1501:
+.L1502:
     movq $38, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5412,9 +5443,9 @@ parser_parse_set_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1392
-.L1391:
-.L1392:
+    jmp .L1432
+.L1431:
+.L1432:
     movq $15, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5461,14 +5492,14 @@ string_duplicate_parser:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1481
+    jz .L1521
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1482
-.L1481:
-.L1482:
+    jmp .L1522
+.L1521:
+.L1522:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -5575,14 +5606,14 @@ parser_eat:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1491
+    jz .L1531
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_advance
     movq %rax, -40(%rbp)
-    jmp .L1492
-.L1491:
+    jmp .L1532
+.L1531:
     leaq .STR19(%rip), %rax
     pushq %rax
     popq %rdi
@@ -5620,7 +5651,7 @@ parser_eat:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-.L1492:
+.L1532:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -5680,7 +5711,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1501
+    jz .L1541
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5688,8 +5719,8 @@ parser_parse_call_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L1502
-.L1501:
+    jmp .L1542
+.L1541:
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5697,7 +5728,7 @@ parser_parse_call_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-.L1502:
+.L1542:
     movq $0, %rax
     movq %rax, -48(%rbp)
     movq $8, %rax
@@ -5724,7 +5755,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1511
+    jz .L1551
     movq $144, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5775,7 +5806,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1521
+    jz .L1561
     movq -80(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5783,8 +5814,8 @@ parser_parse_call_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L1522
-.L1521:
+    jmp .L1562
+.L1561:
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5792,10 +5823,10 @@ parser_parse_call_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-.L1522:
-    jmp .L1512
-.L1511:
-.L1512:
+.L1562:
+    jmp .L1552
+.L1551:
+.L1552:
     movq $0, %rax
     movq %rax, -96(%rbp)
     movq $0, %rax
@@ -5830,7 +5861,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1531
+    jz .L1571
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5856,7 +5887,7 @@ parser_parse_call_statement:
     movq %rax, (%rbx)
     movq $1, %rax
     movq %rax, -128(%rbp)
-.L1541:    movq -128(%rbp), %rax
+.L1581:    movq -128(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -5864,7 +5895,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1542
+    jz .L1582
     movq -104(%rbp), %rax
     pushq %rax
     movq -112(%rbp), %rax
@@ -5873,7 +5904,7 @@ parser_parse_call_statement:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1551
+    jz .L1591
     movq -112(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -5903,9 +5934,9 @@ parser_parse_call_statement:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1552
-.L1551:
-.L1552:
+    jmp .L1592
+.L1591:
+.L1592:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -5957,7 +5988,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1561
+    jz .L1601
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5989,7 +6020,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1571
+    jz .L1611
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5997,11 +6028,11 @@ parser_parse_call_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L1572
-.L1571:
-.L1572:
-    jmp .L1562
-.L1561:
+    jmp .L1612
+.L1611:
+.L1612:
+    jmp .L1602
+.L1601:
     movq -160(%rbp), %rax
     pushq %rax
     movq $30, %rax
@@ -6010,7 +6041,7 @@ parser_parse_call_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1581
+    jz .L1621
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6018,20 +6049,20 @@ parser_parse_call_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L1582
-.L1581:
+    jmp .L1622
+.L1621:
     movq $0, %rax
     pushq %rax
     leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L1622:
+.L1602:
+    jmp .L1581
 .L1582:
-.L1562:
-    jmp .L1541
-.L1542:
-    jmp .L1532
-.L1531:
-.L1532:
+    jmp .L1572
+.L1571:
+.L1572:
     movq $0, %rax
     movq %rax, -184(%rbp)
     movq -48(%rbp), %rax
@@ -6042,7 +6073,7 @@ parser_parse_call_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1591
+    jz .L1631
     movq $40, %rax
     pushq %rax
     popq %rdi
@@ -6101,8 +6132,8 @@ parser_parse_call_statement:
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    jmp .L1592
-.L1591:
+    jmp .L1632
+.L1631:
     movq -104(%rbp), %rax
     pushq %rax
     movq -96(%rbp), %rax
@@ -6117,7 +6148,7 @@ parser_parse_call_statement:
     leaq -184(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L1592:
+.L1632:
     movq -184(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -6188,7 +6219,7 @@ parser_peek_struct_field_after_comma:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1601
+    jz .L1641
     movq $0, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -6210,7 +6241,7 @@ parser_peek_struct_field_after_comma:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1611
+    jz .L1651
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -6224,7 +6255,7 @@ parser_peek_struct_field_after_comma:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1621
+    jz .L1661
     movq $0, %rax
     pushq %rax
     movq -88(%rbp), %rax
@@ -6241,32 +6272,32 @@ parser_peek_struct_field_after_comma:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1631
+    jz .L1671
     movq $1, %rax
     pushq %rax
     leaq -56(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L1632
-.L1631:
-.L1632:
+    jmp .L1672
+.L1671:
+.L1672:
     movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
     call token_destroy
-    jmp .L1622
-.L1621:
-.L1622:
-    jmp .L1612
-.L1611:
-.L1612:
+    jmp .L1662
+.L1661:
+.L1662:
+    jmp .L1652
+.L1651:
+.L1652:
     movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call token_destroy
-    jmp .L1602
-.L1601:
-.L1602:
+    jmp .L1642
+.L1641:
+.L1642:
     movq -24(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -6313,6 +6344,2410 @@ parser_peek_struct_field_after_comma:
     ret
 
 
+.globl parser_parse_a_value_of_type
+parser_parse_a_value_of_type:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $125, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -24(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -32(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $50, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1681
+    movq $50, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1682
+.L1681:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L1682:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -40(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -48(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    popq %rdi
+    call string_duplicate@PLT
+    movq %rax, -56(%rbp)
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call token_can_be_identifier
+    movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1691
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1692
+.L1691:
+    movq $53, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L1692:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -72(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -80(%rbp)
+    movq $0, %rax
+    movq %rax, -88(%rbp)
+    movq $0, %rax
+    movq %rax, -96(%rbp)
+    movq $0, %rax
+    movq %rax, -104(%rbp)
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq $114, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1701
+    movq $114, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $128, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -96(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $128, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $1, %rax
+    movq %rax, -112(%rbp)
+.L1711:    movq -112(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1712
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -120(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -128(%rbp)
+    movq -128(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call token_can_be_identifier
+    movq %rax, -136(%rbp)
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1721
+    movq $0, %rax
+    pushq %rax
+    leaq -112(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1722
+.L1721:
+    movq $8, %rax
+    pushq %rax
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -144(%rbp)
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate@PLT
+    movq %rax, -152(%rbp)
+    movq -128(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $34, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_expression
+    movq %rax, -160(%rbp)
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -168(%rbp)
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -160(%rbp), %rax
+    pushq %rax
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq -104(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -88(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -88(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -176(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -176(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -184(%rbp)
+    movq -184(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1731
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1732
+.L1731:
+    movq $0, %rax
+    pushq %rax
+    leaq -112(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L1732:
+.L1722:
+    jmp .L1711
+.L1712:
+    jmp .L1702
+.L1701:
+.L1702:
+    movq $40, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -192(%rbp)
+    movq $20, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -192(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -192(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -192(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -104(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -192(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $32, %rax
+    pushq %rax
+    movq -192(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -192(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl parser_parse_proc_expression
+parser_parse_proc_expression:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq $171, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -16(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -24(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    popq %rdi
+    call string_duplicate@PLT
+    movq %rax, -32(%rbp)
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call token_can_be_identifier
+    movq %rax, -40(%rbp)
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1741
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1742
+.L1741:
+    movq $53, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L1742:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -48(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -48(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -56(%rbp)
+    movq $0, %rax
+    movq %rax, -64(%rbp)
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $51, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1751
+    movq $51, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -32(%rbp), %rax
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -72(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -80(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    popq %rdi
+    call string_duplicate@PLT
+    pushq %rax
+    leaq -32(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -80(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call token_can_be_identifier
+    movq %rax, -88(%rbp)
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1761
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1762
+.L1761:
+    movq $53, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L1762:
+    jmp .L1752
+.L1751:
+.L1752:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -96(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -104(%rbp)
+    movq -104(%rbp), %rax
+    pushq %rax
+    movq $144, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1771
+    movq $144, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -112(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -120(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    popq %rdi
+    call string_duplicate@PLT
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -120(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call token_can_be_identifier
+    movq %rax, -128(%rbp)
+    movq -128(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1781
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1782
+.L1781:
+    movq $53, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L1782:
+    jmp .L1772
+.L1771:
+.L1772:
+    movq -32(%rbp), %rax
+    movq %rax, -136(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1791
+    leaq .STR22(%rip), %rax
+    movq %rax, -144(%rbp)
+    movq -144(%rbp), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    movq %rax, -152(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -152(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_concat@PLT
+    pushq %rax
+    leaq -136(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1792
+.L1791:
+.L1792:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -96(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rax, -160(%rbp)
+    movq $0, %rax
+    movq %rax, -168(%rbp)
+    movq -104(%rbp), %rax
+    pushq %rax
+    movq $114, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1801
+    movq $114, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    movq %rax, -176(%rbp)
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -184(%rbp)
+    movq -184(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -160(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $1, %rax
+    movq %rax, -192(%rbp)
+.L1811:    movq -192(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1812
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq -176(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1821
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq $2, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -176(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -184(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -184(%rbp), %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -160(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1822
+.L1821:
+.L1822:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_expression
+    movq %rax, -200(%rbp)
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -208(%rbp)
+    movq -200(%rbp), %rax
+    pushq %rax
+    movq -208(%rbp), %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -168(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -168(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -216(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -216(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -224(%rbp)
+    movq -224(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1831
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_peek_struct_field_after_comma
+    movq %rax, -232(%rbp)
+    movq -232(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1841
+    movq $0, %rax
+    pushq %rax
+    leaq -192(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1842
+.L1841:
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L1842:
+    jmp .L1832
+.L1831:
+    movq $0, %rax
+    pushq %rax
+    leaq -192(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L1832:
+    jmp .L1811
+.L1812:
+    jmp .L1802
+.L1801:
+.L1802:
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1851
+    movq $40, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -240(%rbp)
+    movq $25, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -240(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -240(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -240(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -160(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -240(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq $32, %rax
+    pushq %rax
+    movq -240(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq -240(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1852
+.L1851:
+.L1852:
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    movq -136(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call expression_create_function_call
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl with_promote_to_call_or_lambda
+with_promote_to_call_or_lambda:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+    movq %rdx, -24(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -32(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1861
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -40(%rbp)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call expression_create_function_call
+    movq %rax, -48(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -48(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1862
+.L1861:
+.L1862:
+    movq $32, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -56(%rbp)
+    movq $24, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -56(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl parser_parse_a_list_literal
+parser_parse_a_list_literal:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $156, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -24(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -32(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -40(%rbp)
+    movq $0, %rax
+    movq %rax, -48(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $174, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1871
+    movq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1872
+.L1871:
+.L1872:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1881
+    leaq .STR23(%rip), %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1891
+    movq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1892
+.L1891:
+.L1892:
+    jmp .L1882
+.L1881:
+.L1882:
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1901
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $24, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -56(%rbp)
+    movq $17, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq -56(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1902
+.L1901:
+.L1902:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -64(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -72(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq $9, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1911
+    movq $9, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L1912
+.L1911:
+.L1912:
+    movq $128, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -80(%rbp)
+    movq $0, %rax
+    movq %rax, -88(%rbp)
+    movq $16, %rax
+    movq %rax, -96(%rbp)
+    movq $1, %rax
+    movq %rax, -104(%rbp)
+.L1921:    movq -104(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1922
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -112(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -120(%rbp)
+    movq $0, %rax
+    movq %rax, -128(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1931
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1932
+.L1931:
+.L1932:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1941
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1942
+.L1941:
+.L1942:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $19, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1951
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1952
+.L1951:
+.L1952:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $7, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1961
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1962
+.L1961:
+.L1962:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $12, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1971
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1972
+.L1971:
+.L1972:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $14, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1981
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1982
+.L1981:
+.L1982:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $18, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1991
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L1992
+.L1991:
+.L1992:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2001
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2002
+.L2001:
+.L2002:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $172, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2011
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2012
+.L2011:
+.L2012:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $143, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2021
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2022
+.L2021:
+.L2022:
+    movq -128(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2031
+    movq $0, %rax
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2032
+.L2031:
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq -96(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2041
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $2, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -96(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -136(%rbp)
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2042
+.L2041:
+.L2042:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_expression
+    movq %rax, -144(%rbp)
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -152(%rbp)
+    movq -144(%rbp), %rax
+    pushq %rax
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -88(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -88(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -160(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -168(%rbp)
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2051
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_peek_struct_field_after_comma
+    movq %rax, -176(%rbp)
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2061
+    movq $0, %rax
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2062
+.L2061:
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L2062:
+    jmp .L2052
+.L2051:
+.L2052:
+.L2032:
+    jmp .L1921
+.L1922:
+    movq $24, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -184(%rbp)
+    movq $17, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -184(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -184(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -184(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq -184(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl parser_parse_a_dictionary_literal
+parser_parse_a_dictionary_literal:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Stack overflow protection
+    movq %rsp, %rax
+    subq $16384, %rax  # Check if we have 16KB stack space
+    cmpq $0x100000, %rax  # Compare against 1MB limit
+    jb .stack_overflow_panic
+    subq $2048, %rsp  # Pre-allocate generous stack space
+    movq %rdi, -8(%rbp)
+    movq %rsi, -16(%rbp)
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $156, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -24(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -32(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -40(%rbp)
+    movq $0, %rax
+    movq %rax, -48(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $174, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2071
+    movq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2072
+.L2071:
+.L2072:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2081
+    leaq .STR23(%rip), %rax
+    pushq %rax
+    movq -40(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2091
+    movq $1, %rax
+    pushq %rax
+    leaq -48(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2092
+.L2091:
+.L2092:
+    jmp .L2082
+.L2081:
+.L2082:
+    movq -48(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2101
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $32, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -56(%rbp)
+    movq $22, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -56(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -56(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L2102
+.L2101:
+.L2102:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $9, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2111
+    movq $9, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L2112
+.L2111:
+.L2112:
+    movq $8, %rax
+    movq %rax, -64(%rbp)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -72(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -80(%rbp)
+    movq -72(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -88(%rbp)
+    movq $0, %rax
+    movq %rax, -96(%rbp)
+    movq $1, %rax
+    movq %rax, -104(%rbp)
+.L2121:    movq -104(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2122
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -112(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -120(%rbp)
+    movq $0, %rax
+    movq %rax, -128(%rbp)
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2131
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2132
+.L2131:
+.L2132:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2141
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2142
+.L2141:
+.L2142:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $19, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2151
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2152
+.L2151:
+.L2152:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $7, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2161
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2162
+.L2161:
+.L2162:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $12, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2171
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2172
+.L2171:
+.L2172:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $14, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2181
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2182
+.L2181:
+.L2182:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $18, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2191
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2192
+.L2191:
+.L2192:
+    movq -120(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2201
+    movq $1, %rax
+    pushq %rax
+    leaq -128(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2202
+.L2201:
+.L2202:
+    movq -128(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2211
+    movq $0, %rax
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2212
+.L2211:
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq -64(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2221
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $2, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -72(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -72(%rbp), %rax
+    pushq %rax
+    movq -88(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -88(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2222
+.L2221:
+.L2222:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_additive
+    movq %rax, -136(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -144(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -152(%rbp)
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq $34, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2231
+    leaq .STR24(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    movq $16, %rax
+    pushq %rax
+    movq -144(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -160(%rbp)
+    movq -160(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_integer
+    call print_newline
+    movq $1, %rax
+    pushq %rax
+    popq %rdi
+    call exit_with_code@PLT
+    jmp .L2232
+.L2231:
+.L2232:
+    movq $34, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_additive
+    movq %rax, -168(%rbp)
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -176(%rbp)
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq -80(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq -176(%rbp), %rax
+    pushq %rax
+    movq -88(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -96(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -96(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -184(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -184(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -192(%rbp)
+    movq -192(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2241
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_peek_struct_field_after_comma
+    movq %rax, -200(%rbp)
+    movq -200(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2251
+    movq $0, %rax
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2252
+.L2251:
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -208(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -208(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -216(%rbp)
+    movq -216(%rbp), %rax
+    pushq %rax
+    movq $30, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2261
+    movq $30, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L2262
+.L2261:
+.L2262:
+.L2252:
+    jmp .L2242
+.L2241:
+    movq -192(%rbp), %rax
+    pushq %rax
+    movq $30, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2271
+    movq $30, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L2272
+.L2271:
+    movq $0, %rax
+    pushq %rax
+    leaq -104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L2272:
+.L2242:
+.L2212:
+    jmp .L2121
+.L2122:
+    movq $32, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -224(%rbp)
+    movq $22, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -224(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -80(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -224(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -88(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -224(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -224(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -224(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
 .globl parser_is_builtin_function_token
 parser_is_builtin_function_token:
     pushq %rbp
@@ -6327,13 +8762,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1641
+    jz .L2281
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1642
-.L1641:
+    jmp .L2282
+.L2281:
     movq -8(%rbp), %rax
     pushq %rax
     movq $55, %rax
@@ -6342,13 +8777,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1651
+    jz .L2291
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1652
-.L1651:
+    jmp .L2292
+.L2291:
     movq -8(%rbp), %rax
     pushq %rax
     movq $57, %rax
@@ -6357,13 +8792,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1661
+    jz .L2301
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1662
-.L1661:
+    jmp .L2302
+.L2301:
     movq -8(%rbp), %rax
     pushq %rax
     movq $58, %rax
@@ -6372,13 +8807,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1671
+    jz .L2311
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1672
-.L1671:
+    jmp .L2312
+.L2311:
     movq -8(%rbp), %rax
     pushq %rax
     movq $59, %rax
@@ -6387,13 +8822,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1681
+    jz .L2321
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1682
-.L1681:
+    jmp .L2322
+.L2321:
     movq -8(%rbp), %rax
     pushq %rax
     movq $60, %rax
@@ -6402,13 +8837,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1691
+    jz .L2331
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1692
-.L1691:
+    jmp .L2332
+.L2331:
     movq -8(%rbp), %rax
     pushq %rax
     movq $61, %rax
@@ -6417,13 +8852,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1701
+    jz .L2341
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1702
-.L1701:
+    jmp .L2342
+.L2341:
     movq -8(%rbp), %rax
     pushq %rax
     movq $62, %rax
@@ -6432,13 +8867,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1711
+    jz .L2351
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1712
-.L1711:
+    jmp .L2352
+.L2351:
     movq -8(%rbp), %rax
     pushq %rax
     movq $63, %rax
@@ -6447,13 +8882,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1721
+    jz .L2361
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1722
-.L1721:
+    jmp .L2362
+.L2361:
     movq -8(%rbp), %rax
     pushq %rax
     movq $64, %rax
@@ -6462,13 +8897,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1731
+    jz .L2371
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1732
-.L1731:
+    jmp .L2372
+.L2371:
     movq -8(%rbp), %rax
     pushq %rax
     movq $65, %rax
@@ -6477,13 +8912,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1741
+    jz .L2381
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1742
-.L1741:
+    jmp .L2382
+.L2381:
     movq -8(%rbp), %rax
     pushq %rax
     movq $66, %rax
@@ -6492,13 +8927,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1751
+    jz .L2391
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1752
-.L1751:
+    jmp .L2392
+.L2391:
     movq -8(%rbp), %rax
     pushq %rax
     movq $67, %rax
@@ -6507,13 +8942,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1761
+    jz .L2401
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1762
-.L1761:
+    jmp .L2402
+.L2401:
     movq -8(%rbp), %rax
     pushq %rax
     movq $68, %rax
@@ -6522,13 +8957,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1771
+    jz .L2411
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1772
-.L1771:
+    jmp .L2412
+.L2411:
     movq -8(%rbp), %rax
     pushq %rax
     movq $69, %rax
@@ -6537,13 +8972,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1781
+    jz .L2421
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1782
-.L1781:
+    jmp .L2422
+.L2421:
     movq -8(%rbp), %rax
     pushq %rax
     movq $70, %rax
@@ -6552,13 +8987,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1791
+    jz .L2431
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1792
-.L1791:
+    jmp .L2432
+.L2431:
     movq -8(%rbp), %rax
     pushq %rax
     movq $71, %rax
@@ -6567,13 +9002,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1801
+    jz .L2441
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1802
-.L1801:
+    jmp .L2442
+.L2441:
     movq -8(%rbp), %rax
     pushq %rax
     movq $72, %rax
@@ -6582,13 +9017,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1811
+    jz .L2451
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1812
-.L1811:
+    jmp .L2452
+.L2451:
     movq -8(%rbp), %rax
     pushq %rax
     movq $73, %rax
@@ -6597,13 +9032,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1821
+    jz .L2461
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1822
-.L1821:
+    jmp .L2462
+.L2461:
     movq -8(%rbp), %rax
     pushq %rax
     movq $74, %rax
@@ -6612,13 +9047,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1831
+    jz .L2471
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1832
-.L1831:
+    jmp .L2472
+.L2471:
     movq -8(%rbp), %rax
     pushq %rax
     movq $75, %rax
@@ -6627,13 +9062,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1841
+    jz .L2481
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1842
-.L1841:
+    jmp .L2482
+.L2481:
     movq -8(%rbp), %rax
     pushq %rax
     movq $76, %rax
@@ -6642,13 +9077,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1851
+    jz .L2491
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1852
-.L1851:
+    jmp .L2492
+.L2491:
     movq -8(%rbp), %rax
     pushq %rax
     movq $77, %rax
@@ -6657,13 +9092,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1861
+    jz .L2501
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1862
-.L1861:
+    jmp .L2502
+.L2501:
     movq -8(%rbp), %rax
     pushq %rax
     movq $78, %rax
@@ -6672,13 +9107,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1871
+    jz .L2511
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1872
-.L1871:
+    jmp .L2512
+.L2511:
     movq -8(%rbp), %rax
     pushq %rax
     movq $79, %rax
@@ -6687,13 +9122,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1881
+    jz .L2521
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1882
-.L1881:
+    jmp .L2522
+.L2521:
     movq -8(%rbp), %rax
     pushq %rax
     movq $80, %rax
@@ -6702,13 +9137,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1891
+    jz .L2531
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1892
-.L1891:
+    jmp .L2532
+.L2531:
     movq -8(%rbp), %rax
     pushq %rax
     movq $81, %rax
@@ -6717,13 +9152,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1901
+    jz .L2541
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1902
-.L1901:
+    jmp .L2542
+.L2541:
     movq -8(%rbp), %rax
     pushq %rax
     movq $82, %rax
@@ -6732,13 +9167,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1911
+    jz .L2551
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1912
-.L1911:
+    jmp .L2552
+.L2551:
     movq -8(%rbp), %rax
     pushq %rax
     movq $83, %rax
@@ -6747,13 +9182,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1921
+    jz .L2561
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1922
-.L1921:
+    jmp .L2562
+.L2561:
     movq -8(%rbp), %rax
     pushq %rax
     movq $84, %rax
@@ -6762,13 +9197,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1931
+    jz .L2571
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1932
-.L1931:
+    jmp .L2572
+.L2571:
     movq -8(%rbp), %rax
     pushq %rax
     movq $85, %rax
@@ -6777,13 +9212,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1941
+    jz .L2581
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1942
-.L1941:
+    jmp .L2582
+.L2581:
     movq -8(%rbp), %rax
     pushq %rax
     movq $86, %rax
@@ -6792,13 +9227,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1951
+    jz .L2591
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1952
-.L1951:
+    jmp .L2592
+.L2591:
     movq -8(%rbp), %rax
     pushq %rax
     movq $87, %rax
@@ -6807,13 +9242,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1961
+    jz .L2601
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1962
-.L1961:
+    jmp .L2602
+.L2601:
     movq -8(%rbp), %rax
     pushq %rax
     movq $88, %rax
@@ -6822,13 +9257,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1971
+    jz .L2611
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1972
-.L1971:
+    jmp .L2612
+.L2611:
     movq -8(%rbp), %rax
     pushq %rax
     movq $89, %rax
@@ -6837,13 +9272,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1981
+    jz .L2621
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1982
-.L1981:
+    jmp .L2622
+.L2621:
     movq -8(%rbp), %rax
     pushq %rax
     movq $90, %rax
@@ -6852,13 +9287,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1991
+    jz .L2631
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1992
-.L1991:
+    jmp .L2632
+.L2631:
     movq -8(%rbp), %rax
     pushq %rax
     movq $91, %rax
@@ -6867,13 +9302,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2001
+    jz .L2641
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2002
-.L2001:
+    jmp .L2642
+.L2641:
     movq -8(%rbp), %rax
     pushq %rax
     movq $92, %rax
@@ -6882,13 +9317,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2011
+    jz .L2651
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2012
-.L2011:
+    jmp .L2652
+.L2651:
     movq -8(%rbp), %rax
     pushq %rax
     movq $93, %rax
@@ -6897,13 +9332,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2021
+    jz .L2661
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2022
-.L2021:
+    jmp .L2662
+.L2661:
     movq -8(%rbp), %rax
     pushq %rax
     movq $94, %rax
@@ -6912,13 +9347,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2031
+    jz .L2671
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2032
-.L2031:
+    jmp .L2672
+.L2671:
     movq -8(%rbp), %rax
     pushq %rax
     movq $95, %rax
@@ -6927,13 +9362,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2041
+    jz .L2681
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2042
-.L2041:
+    jmp .L2682
+.L2681:
     movq -8(%rbp), %rax
     pushq %rax
     movq $96, %rax
@@ -6942,13 +9377,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2051
+    jz .L2691
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2052
-.L2051:
+    jmp .L2692
+.L2691:
     movq -8(%rbp), %rax
     pushq %rax
     movq $97, %rax
@@ -6957,13 +9392,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2061
+    jz .L2701
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2062
-.L2061:
+    jmp .L2702
+.L2701:
     movq -8(%rbp), %rax
     pushq %rax
     movq $98, %rax
@@ -6972,13 +9407,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2071
+    jz .L2711
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2072
-.L2071:
+    jmp .L2712
+.L2711:
     movq -8(%rbp), %rax
     pushq %rax
     movq $99, %rax
@@ -6987,13 +9422,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2081
+    jz .L2721
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2082
-.L2081:
+    jmp .L2722
+.L2721:
     movq -8(%rbp), %rax
     pushq %rax
     movq $100, %rax
@@ -7002,13 +9437,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2091
+    jz .L2731
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2092
-.L2091:
+    jmp .L2732
+.L2731:
     movq -8(%rbp), %rax
     pushq %rax
     movq $101, %rax
@@ -7017,13 +9452,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2101
+    jz .L2741
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2102
-.L2101:
+    jmp .L2742
+.L2741:
     movq -8(%rbp), %rax
     pushq %rax
     movq $102, %rax
@@ -7032,13 +9467,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2111
+    jz .L2751
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2112
-.L2111:
+    jmp .L2752
+.L2751:
     movq -8(%rbp), %rax
     pushq %rax
     movq $103, %rax
@@ -7047,13 +9482,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2121
+    jz .L2761
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2122
-.L2121:
+    jmp .L2762
+.L2761:
     movq -8(%rbp), %rax
     pushq %rax
     movq $104, %rax
@@ -7062,13 +9497,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2131
+    jz .L2771
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2132
-.L2131:
+    jmp .L2772
+.L2771:
     movq -8(%rbp), %rax
     pushq %rax
     movq $105, %rax
@@ -7077,13 +9512,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2141
+    jz .L2781
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2142
-.L2141:
+    jmp .L2782
+.L2781:
     movq -8(%rbp), %rax
     pushq %rax
     movq $106, %rax
@@ -7092,13 +9527,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2151
+    jz .L2791
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2152
-.L2151:
+    jmp .L2792
+.L2791:
     movq -8(%rbp), %rax
     pushq %rax
     movq $107, %rax
@@ -7107,13 +9542,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2161
+    jz .L2801
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2162
-.L2161:
+    jmp .L2802
+.L2801:
     movq -8(%rbp), %rax
     pushq %rax
     movq $108, %rax
@@ -7122,13 +9557,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2171
+    jz .L2811
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2172
-.L2171:
+    jmp .L2812
+.L2811:
     movq -8(%rbp), %rax
     pushq %rax
     movq $109, %rax
@@ -7137,13 +9572,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2181
+    jz .L2821
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2182
-.L2181:
+    jmp .L2822
+.L2821:
     movq -8(%rbp), %rax
     pushq %rax
     movq $110, %rax
@@ -7152,13 +9587,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2191
+    jz .L2831
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2192
-.L2191:
+    jmp .L2832
+.L2831:
     movq -8(%rbp), %rax
     pushq %rax
     movq $115, %rax
@@ -7167,13 +9602,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2201
+    jz .L2841
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2202
-.L2201:
+    jmp .L2842
+.L2841:
     movq -8(%rbp), %rax
     pushq %rax
     movq $116, %rax
@@ -7182,13 +9617,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2211
+    jz .L2851
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2212
-.L2211:
+    jmp .L2852
+.L2851:
     movq -8(%rbp), %rax
     pushq %rax
     movq $117, %rax
@@ -7197,13 +9632,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2221
+    jz .L2861
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2222
-.L2221:
+    jmp .L2862
+.L2861:
     movq -8(%rbp), %rax
     pushq %rax
     movq $118, %rax
@@ -7212,13 +9647,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2231
+    jz .L2871
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2232
-.L2231:
+    jmp .L2872
+.L2871:
     movq -8(%rbp), %rax
     pushq %rax
     movq $119, %rax
@@ -7227,13 +9662,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2241
+    jz .L2881
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2242
-.L2241:
+    jmp .L2882
+.L2881:
     movq -8(%rbp), %rax
     pushq %rax
     movq $120, %rax
@@ -7242,13 +9677,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2251
+    jz .L2891
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2252
-.L2251:
+    jmp .L2892
+.L2891:
     movq -8(%rbp), %rax
     pushq %rax
     movq $130, %rax
@@ -7257,13 +9692,13 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2261
+    jz .L2901
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2262
-.L2261:
+    jmp .L2902
+.L2901:
     movq -8(%rbp), %rax
     pushq %rax
     movq $131, %rax
@@ -7272,77 +9707,77 @@ parser_is_builtin_function_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2271
+    jz .L2911
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2272
-.L2271:
-.L2272:
-.L2262:
-.L2252:
-.L2242:
-.L2232:
-.L2222:
-.L2212:
-.L2202:
-.L2192:
-.L2182:
-.L2172:
-.L2162:
-.L2152:
-.L2142:
-.L2132:
-.L2122:
-.L2112:
-.L2102:
-.L2092:
-.L2082:
-.L2072:
-.L2062:
-.L2052:
-.L2042:
-.L2032:
-.L2022:
-.L2012:
-.L2002:
-.L1992:
-.L1982:
-.L1972:
-.L1962:
-.L1952:
-.L1942:
-.L1932:
-.L1922:
-.L1912:
-.L1902:
-.L1892:
-.L1882:
-.L1872:
-.L1862:
-.L1852:
-.L1842:
-.L1832:
-.L1822:
-.L1812:
-.L1802:
-.L1792:
-.L1782:
-.L1772:
-.L1762:
-.L1752:
-.L1742:
-.L1732:
-.L1722:
-.L1712:
-.L1702:
-.L1692:
-.L1682:
-.L1672:
-.L1662:
-.L1652:
-.L1642:
+    jmp .L2912
+.L2911:
+.L2912:
+.L2902:
+.L2892:
+.L2882:
+.L2872:
+.L2862:
+.L2852:
+.L2842:
+.L2832:
+.L2822:
+.L2812:
+.L2802:
+.L2792:
+.L2782:
+.L2772:
+.L2762:
+.L2752:
+.L2742:
+.L2732:
+.L2722:
+.L2712:
+.L2702:
+.L2692:
+.L2682:
+.L2672:
+.L2662:
+.L2652:
+.L2642:
+.L2632:
+.L2622:
+.L2612:
+.L2602:
+.L2592:
+.L2582:
+.L2572:
+.L2562:
+.L2552:
+.L2542:
+.L2532:
+.L2522:
+.L2512:
+.L2502:
+.L2492:
+.L2482:
+.L2472:
+.L2462:
+.L2452:
+.L2442:
+.L2432:
+.L2422:
+.L2412:
+.L2402:
+.L2392:
+.L2382:
+.L2372:
+.L2362:
+.L2352:
+.L2342:
+.L2332:
+.L2322:
+.L2312:
+.L2302:
+.L2292:
+.L2282:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -7719,7 +10154,7 @@ lambda_is_var_in_list:
     movq %rdx, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L2281:    movq -32(%rbp), %rax
+.L2921:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -7727,7 +10162,7 @@ lambda_is_var_in_list:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2282
+    jz .L2922
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -7756,22 +10191,22 @@ lambda_is_var_in_list:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2291
+    jz .L2931
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2292
-.L2291:
-.L2292:
+    jmp .L2932
+.L2931:
+.L2932:
     movq -32(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2281
-.L2282:
+    jmp .L2921
+.L2922:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -7811,7 +10246,7 @@ lambda_add_free_var:
     movq %rax, -40(%rbp)
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L2301:    movq -48(%rbp), %rax
+.L2941:    movq -48(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -7819,7 +10254,7 @@ lambda_add_free_var:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2302
+    jz .L2942
     movq -48(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -7848,22 +10283,22 @@ lambda_add_free_var:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2311
+    jz .L2951
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2312
-.L2311:
-.L2312:
+    jmp .L2952
+.L2951:
+.L2952:
     movq -48(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2301
-.L2302:
+    jmp .L2941
+.L2942:
     movq -32(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -7872,7 +10307,7 @@ lambda_add_free_var:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2321
+    jz .L2961
     movq $8, %rax
     movq %rax, -72(%rbp)
     movq -40(%rbp), %rax
@@ -7883,7 +10318,7 @@ lambda_add_free_var:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2331
+    jz .L2971
     movq -40(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -7893,9 +10328,9 @@ lambda_add_free_var:
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2332
-.L2331:
-.L2332:
+    jmp .L2972
+.L2971:
+.L2972:
     movq -72(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -7907,7 +10342,7 @@ lambda_add_free_var:
     movq %rax, -80(%rbp)
     movq $0, %rax
     movq %rax, -88(%rbp)
-.L2341:    movq -88(%rbp), %rax
+.L2981:    movq -88(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -7915,7 +10350,7 @@ lambda_add_free_var:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2342
+    jz .L2982
     movq -88(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -7946,8 +10381,8 @@ lambda_add_free_var:
     leaq -88(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2341
-.L2342:
+    jmp .L2981
+.L2982:
     movq -24(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -7956,14 +10391,14 @@ lambda_add_free_var:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2351
+    jz .L2991
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L2352
-.L2351:
-.L2352:
+    jmp .L2992
+.L2991:
+.L2992:
     movq -80(%rbp), %rax
     pushq %rax
     leaq -24(%rbp), %rbx
@@ -7989,9 +10424,9 @@ lambda_add_free_var:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L2322
-.L2321:
-.L2322:
+    jmp .L2962
+.L2961:
+.L2962:
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -8055,14 +10490,14 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2361
+    jz .L3001
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2362
-.L2361:
-.L2362:
+    jmp .L3002
+.L3001:
+.L3002:
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8079,7 +10514,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2371
+    jz .L3011
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8107,7 +10542,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2381
+    jz .L3021
     movq -48(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -8115,16 +10550,16 @@ lambda_collect_free_vars:
     popq %rdi
     popq %rsi
     call lambda_add_free_var
-    jmp .L2382
-.L2381:
-.L2382:
+    jmp .L3022
+.L3021:
+.L3022:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2372
-.L2371:
-.L2372:
+    jmp .L3012
+.L3011:
+.L3012:
     movq -40(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -8133,7 +10568,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2391
+    jz .L3031
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8180,9 +10615,9 @@ lambda_collect_free_vars:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2392
-.L2391:
-.L2392:
+    jmp .L3032
+.L3031:
+.L3032:
     movq -40(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -8191,7 +10626,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2401
+    jz .L3041
     movq $16, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8210,7 +10645,7 @@ lambda_collect_free_vars:
     movq %rax, -88(%rbp)
     movq $0, %rax
     movq %rax, -96(%rbp)
-.L2411:    movq -96(%rbp), %rax
+.L3051:    movq -96(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     popq %rbx
@@ -8218,7 +10653,7 @@ lambda_collect_free_vars:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2412
+    jz .L3052
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -8252,15 +10687,15 @@ lambda_collect_free_vars:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2411
-.L2412:
+    jmp .L3051
+.L3052:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2402
-.L2401:
-.L2402:
+    jmp .L3042
+.L3041:
+.L3042:
     movq -40(%rbp), %rax
     pushq %rax
     movq $12, %rax
@@ -8269,7 +10704,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2421
+    jz .L3061
     movq $16, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8295,9 +10730,9 @@ lambda_collect_free_vars:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2422
-.L2421:
-.L2422:
+    jmp .L3062
+.L3061:
+.L3062:
     movq -40(%rbp), %rax
     pushq %rax
     movq $16, %rax
@@ -8306,7 +10741,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2431
+    jz .L3071
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8353,9 +10788,9 @@ lambda_collect_free_vars:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2432
-.L2431:
-.L2432:
+    jmp .L3072
+.L3071:
+.L3072:
     movq -40(%rbp), %rax
     pushq %rax
     movq $24, %rax
@@ -8364,7 +10799,7 @@ lambda_collect_free_vars:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2441
+    jz .L3081
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -8413,7 +10848,7 @@ lambda_collect_free_vars:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L2451:    movq -96(%rbp), %rax
+.L3091:    movq -96(%rbp), %rax
     pushq %rax
     movq -88(%rbp), %rax
     popq %rbx
@@ -8421,7 +10856,7 @@ lambda_collect_free_vars:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2452
+    jz .L3092
     movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -8461,15 +10896,15 @@ lambda_collect_free_vars:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2451
-.L2452:
+    jmp .L3091
+.L3092:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2442
-.L2441:
-.L2442:
+    jmp .L3082
+.L3081:
+.L3082:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -9738,7 +12173,7 @@ program_add_function:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2461
+    jz .L3101
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -9747,14 +12182,14 @@ program_add_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2471
+    jz .L3111
     movq $128, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2472
-.L2471:
+    jmp .L3112
+.L3111:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -9764,7 +12199,7 @@ program_add_function:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L2472:
+.L3112:
     movq $8, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rax
@@ -9809,9 +12244,9 @@ program_add_function:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L2462
-.L2461:
-.L2462:
+    jmp .L3102
+.L3101:
+.L3102:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -9892,7 +12327,7 @@ program_add_global:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2481
+    jz .L3121
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -9901,14 +12336,14 @@ program_add_global:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2491
+    jz .L3131
     movq $4, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2492
-.L2491:
+    jmp .L3132
+.L3131:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -9918,7 +12353,7 @@ program_add_global:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L2492:
+.L3132:
     movq $8, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rax
@@ -9963,9 +12398,9 @@ program_add_global:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L2482
-.L2481:
-.L2482:
+    jmp .L3122
+.L3121:
+.L3122:
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10046,7 +12481,7 @@ program_add_type:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2501
+    jz .L3141
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -10055,14 +12490,14 @@ program_add_type:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2511
+    jz .L3151
     movq $4, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2512
-.L2511:
+    jmp .L3152
+.L3151:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -10072,7 +12507,7 @@ program_add_type:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L2512:
+.L3152:
     movq $8, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rax
@@ -10117,9 +12552,9 @@ program_add_type:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L2502
-.L2501:
-.L2502:
+    jmp .L3142
+.L3141:
+.L3142:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10200,7 +12635,7 @@ program_add_import:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2521
+    jz .L3161
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -10209,14 +12644,14 @@ program_add_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2531
+    jz .L3171
     movq $4, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2532
-.L2531:
+    jmp .L3172
+.L3171:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -10226,7 +12661,7 @@ program_add_import:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L2532:
+.L3172:
     movq $8, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rax
@@ -10271,9 +12706,9 @@ program_add_import:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L2522
-.L2521:
-.L2522:
+    jmp .L3162
+.L3161:
+.L3162:
     movq $32, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10338,80 +12773,14 @@ codegen_lookup_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2541
+    jz .L3181
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2542
-.L2541:
-.L2542:
-    leaq .STR22(%rip), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2551
-    movq $8, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L2552
-.L2551:
-.L2552:
-    leaq .STR23(%rip), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2561
-    movq $8, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L2562
-.L2561:
-.L2562:
-    leaq .STR24(%rip), %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2571
-    movq $8, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L2572
-.L2571:
-.L2572:
+    jmp .L3182
+.L3181:
+.L3182:
     leaq .STR25(%rip), %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -10426,14 +12795,14 @@ codegen_lookup_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2581
+    jz .L3191
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2582
-.L2581:
-.L2582:
+    jmp .L3192
+.L3191:
+.L3192:
     leaq .STR26(%rip), %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -10448,14 +12817,80 @@ codegen_lookup_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2591
+    jz .L3201
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2592
-.L2591:
-.L2592:
+    jmp .L3202
+.L3201:
+.L3202:
+    leaq .STR27(%rip), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3211
+    movq $8, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L3212
+.L3211:
+.L3212:
+    leaq .STR28(%rip), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3221
+    movq $8, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L3222
+.L3221:
+.L3222:
+    leaq .STR29(%rip), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3231
+    movq $8, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L3232
+.L3231:
+.L3232:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10472,14 +12907,14 @@ codegen_lookup_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2601
+    jz .L3241
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2602
-.L2601:
-.L2602:
+    jmp .L3242
+.L3241:
+.L3242:
     movq $24, %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -10504,17 +12939,17 @@ codegen_lookup_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2611
+    jz .L3251
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2612
-.L2611:
-.L2612:
+    jmp .L3252
+.L3251:
+.L3252:
     movq $0, %rax
     movq %rax, -48(%rbp)
-.L2621:    movq -48(%rbp), %rax
+.L3261:    movq -48(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     popq %rbx
@@ -10522,7 +12957,7 @@ codegen_lookup_type_size:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2622
+    jz .L3262
     movq -48(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -10545,7 +12980,7 @@ codegen_lookup_type_size:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2631
+    jz .L3271
     movq $0, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -10568,7 +13003,7 @@ codegen_lookup_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2641
+    jz .L3281
     movq $40, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -10579,20 +13014,20 @@ codegen_lookup_type_size:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2642
-.L2641:
-.L2642:
-    jmp .L2632
-.L2631:
-.L2632:
+    jmp .L3282
+.L3281:
+.L3282:
+    jmp .L3272
+.L3271:
+.L3272:
     movq -48(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2621
-.L2622:
+    jmp .L3261
+.L3262:
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -10618,8 +13053,8 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2651
-    leaq .STR27(%rip), %rax
+    jz .L3291
+    leaq .STR30(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -10627,9 +13062,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L2652
-.L2651:
-.L2652:
+    jmp .L3292
+.L3291:
+.L3292:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10646,8 +13081,8 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2661
-    leaq .STR28(%rip), %rax
+    jz .L3301
+    leaq .STR31(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -10655,9 +13090,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L2662
-.L2661:
-.L2662:
+    jmp .L3302
+.L3301:
+.L3302:
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -10674,7 +13109,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2671
+    jz .L3311
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -10691,8 +13126,8 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2681
-    leaq .STR29(%rip), %rax
+    jz .L3321
+    leaq .STR32(%rip), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
@@ -10708,7 +13143,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2691
+    jz .L3331
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10750,7 +13185,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2701
+    jz .L3341
     movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -10759,9 +13194,9 @@ parser_parse_primary:
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2702
-.L2701:
-.L2702:
+    jmp .L3342
+.L3341:
+.L3342:
     movq -56(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10784,15 +13219,15 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2692
-.L2691:
-.L2692:
-    jmp .L2682
-.L2681:
-.L2682:
-    jmp .L2672
-.L2671:
-.L2672:
+    jmp .L3332
+.L3331:
+.L3332:
+    jmp .L3322
+.L3321:
+.L3322:
+    jmp .L3312
+.L3311:
+.L3312:
     movq -24(%rbp), %rax
     pushq %rax
     movq $155, %rax
@@ -10801,7 +13236,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2711
+    jz .L3351
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -10851,15 +13286,15 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2721
+    jz .L3361
     movq $1, %rax
     pushq %rax
     leaq -120(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2722
-.L2721:
-.L2722:
+    jmp .L3362
+.L3361:
+.L3362:
     movq -112(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -10868,8 +13303,8 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2731
-    leaq .STR30(%rip), %rax
+    jz .L3371
+    leaq .STR33(%rip), %rax
     pushq %rax
     movq -112(%rbp), %rax
     pushq %rax
@@ -10883,18 +13318,18 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2741
+    jz .L3381
     movq $1, %rax
     pushq %rax
     leaq -120(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2742
-.L2741:
-.L2742:
-    jmp .L2732
-.L2731:
-.L2732:
+    jmp .L3382
+.L3381:
+.L3382:
+    jmp .L3372
+.L3371:
+.L3372:
     movq -120(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -10903,585 +13338,22 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2751
+    jz .L3391
     movq -104(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call parser_eat
-    movq $156, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
+    call parser_parse_a_list_literal
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L3392
+.L3391:
+.L3392:
+    movq $0, %rax
     movq %rax, -128(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -128(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -136(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -128(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -144(%rbp)
-    movq $0, %rax
-    movq %rax, -152(%rbp)
-    movq -136(%rbp), %rax
-    pushq %rax
-    movq $174, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2761
-    movq $1, %rax
-    pushq %rax
-    leaq -152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2762
-.L2761:
-.L2762:
-    movq -144(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2771
-    leaq .STR31(%rip), %rax
-    pushq %rax
-    movq -144(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2781
-    movq $1, %rax
-    pushq %rax
-    leaq -152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2782
-.L2781:
-.L2782:
-    jmp .L2772
-.L2771:
-.L2772:
-    movq -152(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2791
-    movq -136(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $24, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -160(%rbp)
-    movq $17, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq -160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L2792
-.L2791:
-.L2792:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -168(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -168(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -176(%rbp)
-    movq -176(%rbp), %rax
-    pushq %rax
-    movq $9, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2801
-    movq $9, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L2802
-.L2801:
-.L2802:
-    movq $128, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -184(%rbp)
-    movq $0, %rax
-    movq %rax, -192(%rbp)
-    movq $16, %rax
-    movq %rax, -200(%rbp)
-    movq $1, %rax
-    movq %rax, -208(%rbp)
-.L2811:    movq -208(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2812
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -216(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -216(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -224(%rbp)
-    movq $0, %rax
-    movq %rax, -232(%rbp)
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2821
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2822
-.L2821:
-.L2822:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2831
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2832
-.L2831:
-.L2832:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $19, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2841
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2842
-.L2841:
-.L2842:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $7, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2851
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2852
-.L2851:
-.L2852:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $12, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2861
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2862
-.L2861:
-.L2862:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $14, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2871
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2872
-.L2871:
-.L2872:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $18, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2881
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2882
-.L2881:
-.L2882:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $47, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2891
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2892
-.L2891:
-.L2892:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $172, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2901
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2902
-.L2901:
-.L2902:
-    movq -224(%rbp), %rax
-    pushq %rax
-    movq $143, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2911
-    movq $1, %rax
-    pushq %rax
-    leaq -232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2912
-.L2911:
-.L2912:
-    movq -232(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2921
-    movq $0, %rax
-    pushq %rax
-    leaq -208(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2922
-.L2921:
-    movq -192(%rbp), %rax
-    pushq %rax
-    movq -200(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2931
-    movq -200(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -200(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -200(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -240(%rbp)
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq -184(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -184(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2932
-.L2931:
-.L2932:
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_expression
-    movq %rax, -248(%rbp)
-    movq -192(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -256(%rbp)
-    movq -248(%rbp), %rax
-    pushq %rax
-    movq -256(%rbp), %rax
-    pushq %rax
-    movq -184(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -192(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -192(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -264(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -264(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -272(%rbp)
-    movq -272(%rbp), %rax
-    pushq %rax
-    movq $52, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2941
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_peek_struct_field_after_comma
-    movq %rax, -280(%rbp)
-    movq -280(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2951
-    movq $0, %rax
-    pushq %rax
-    leaq -208(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2952
-.L2951:
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L2952:
-    jmp .L2942
-.L2941:
-.L2942:
-.L2922:
-    jmp .L2811
-.L2812:
-    movq $24, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -288(%rbp)
-    movq $17, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -288(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -184(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -288(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -192(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -288(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq -288(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L2752
-.L2751:
-.L2752:
-    movq $0, %rax
-    movq %rax, -296(%rbp)
     movq -112(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -11490,742 +13362,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2961
-    leaq .STR32(%rip), %rax
-    pushq %rax
-    movq -112(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    leaq -296(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2962
-.L2961:
-.L2962:
-    movq -296(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2971
-    movq -104(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $156, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -304(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -304(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -312(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -304(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -320(%rbp)
-    movq $0, %rax
-    movq %rax, -328(%rbp)
-    movq -312(%rbp), %rax
-    pushq %rax
-    movq $174, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2981
-    movq $1, %rax
-    pushq %rax
-    leaq -328(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2982
-.L2981:
-.L2982:
-    movq -320(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2991
-    leaq .STR31(%rip), %rax
-    pushq %rax
-    movq -320(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3001
-    movq $1, %rax
-    pushq %rax
-    leaq -328(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3002
-.L3001:
-.L3002:
-    jmp .L2992
-.L2991:
-.L2992:
-    movq -328(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3011
-    movq -312(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $32, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -336(%rbp)
-    movq $22, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -336(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -336(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -336(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -336(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -336(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L3012
-.L3011:
-.L3012:
-    movq -312(%rbp), %rax
-    pushq %rax
-    movq $9, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3021
-    movq $9, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3022
-.L3021:
-.L3022:
-    movq $8, %rax
-    movq %rax, -344(%rbp)
-    movq -344(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -352(%rbp)
-    movq -352(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -360(%rbp)
-    movq -352(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -368(%rbp)
-    movq $0, %rax
-    movq %rax, -376(%rbp)
-    movq $1, %rax
-    movq %rax, -384(%rbp)
-.L3031:    movq -384(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3032
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -392(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -392(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -400(%rbp)
-    movq $0, %rax
-    movq %rax, -408(%rbp)
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3041
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3042
-.L3041:
-.L3042:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3051
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3052
-.L3051:
-.L3052:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $19, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3061
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3062
-.L3061:
-.L3062:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $7, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3071
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3072
-.L3071:
-.L3072:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $12, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3081
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3082
-.L3081:
-.L3082:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $14, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3091
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3092
-.L3091:
-.L3092:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $18, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3101
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3102
-.L3101:
-.L3102:
-    movq -400(%rbp), %rax
-    pushq %rax
-    movq $47, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3111
-    movq $1, %rax
-    pushq %rax
-    leaq -408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3112
-.L3111:
-.L3112:
-    movq -408(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3121
-    movq $0, %rax
-    pushq %rax
-    leaq -384(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3122
-.L3121:
-    movq -376(%rbp), %rax
-    pushq %rax
-    movq -344(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3131
-    movq -344(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -344(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -344(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -352(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -352(%rbp), %rax
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -360(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -352(%rbp), %rax
-    pushq %rax
-    movq -368(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -368(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3132
-.L3131:
-.L3132:
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_additive
-    movq %rax, -416(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -424(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -424(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -432(%rbp)
-    movq -432(%rbp), %rax
-    pushq %rax
-    movq $34, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3141
-    leaq .STR33(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq $16, %rax
-    pushq %rax
-    movq -424(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -440(%rbp)
-    movq -440(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_integer
-    call print_newline
-    movq $1, %rax
-    pushq %rax
-    popq %rdi
-    call exit_with_code@PLT
-    jmp .L3142
-.L3141:
-.L3142:
-    movq $34, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_additive
-    movq %rax, -448(%rbp)
-    movq -376(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -456(%rbp)
-    movq -416(%rbp), %rax
-    pushq %rax
-    movq -456(%rbp), %rax
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -448(%rbp), %rax
-    pushq %rax
-    movq -456(%rbp), %rax
-    pushq %rax
-    movq -368(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -376(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -376(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -464(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -464(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -472(%rbp)
-    movq -472(%rbp), %rax
-    pushq %rax
-    movq $52, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3151
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_peek_struct_field_after_comma
-    movq %rax, -480(%rbp)
-    movq -480(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3161
-    movq $0, %rax
-    pushq %rax
-    leaq -384(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3162
-.L3161:
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -488(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -488(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -496(%rbp)
-    movq -496(%rbp), %rax
-    pushq %rax
-    movq $30, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3171
-    movq $30, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3172
-.L3171:
-.L3172:
-.L3162:
-    jmp .L3152
-.L3151:
-    movq -472(%rbp), %rax
-    pushq %rax
-    movq $30, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3181
-    movq $30, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3182
-.L3181:
-    movq $0, %rax
-    pushq %rax
-    leaq -384(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L3182:
-.L3152:
-.L3122:
-    jmp .L3031
-.L3032:
-    movq $32, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -504(%rbp)
-    movq $22, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -360(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -368(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -376(%rbp), %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -504(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L2972
-.L2971:
-.L2972:
-    movq $0, %rax
-    movq %rax, -512(%rbp)
-    movq -112(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3191
+    jz .L3401
     leaq .STR34(%rip), %rax
     pushq %rax
     movq -112(%rbp), %rax
@@ -12234,13 +13371,13 @@ parser_parse_primary:
     popq %rsi
     call string_equals@PLT
     pushq %rax
-    leaq -512(%rbp), %rbx
+    leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3192
-.L3191:
-.L3192:
-    movq -512(%rbp), %rax
+    jmp .L3402
+.L3401:
+.L3402:
+    movq -128(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -12248,395 +13385,68 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3201
+    jz .L3411
     movq -104(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call parser_eat
-    movq $125, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -520(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -520(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -528(%rbp)
-    movq -528(%rbp), %rax
-    pushq %rax
-    movq $50, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3211
-    movq $50, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3212
-.L3211:
-    movq -528(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L3212:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -536(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -536(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -544(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -536(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    popq %rdi
-    call string_duplicate@PLT
-    movq %rax, -552(%rbp)
-    movq -544(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call token_can_be_identifier
-    movq %rax, -560(%rbp)
-    movq -560(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3221
-    movq -544(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3222
-.L3221:
-    movq $53, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L3222:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -568(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -568(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -576(%rbp)
-    movq $0, %rax
-    movq %rax, -584(%rbp)
-    movq $0, %rax
-    movq %rax, -592(%rbp)
-    movq $0, %rax
-    movq %rax, -600(%rbp)
-    movq -576(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3231
-    movq $114, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $128, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -592(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $128, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -600(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $1, %rax
-    movq %rax, -608(%rbp)
-.L3241:    movq -608(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3242
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -616(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -616(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -624(%rbp)
-    movq -624(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call token_can_be_identifier
-    movq %rax, -632(%rbp)
-    movq -632(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3251
-    movq $0, %rax
-    pushq %rax
-    leaq -608(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3252
-.L3251:
-    movq $8, %rax
-    pushq %rax
-    movq -616(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -640(%rbp)
-    movq -640(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate@PLT
-    movq %rax, -648(%rbp)
-    movq -624(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $34, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_expression
-    movq %rax, -656(%rbp)
-    movq -584(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -664(%rbp)
-    movq -648(%rbp), %rax
-    pushq %rax
-    movq -664(%rbp), %rax
-    pushq %rax
-    movq -592(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -656(%rbp), %rax
-    pushq %rax
-    movq -664(%rbp), %rax
-    pushq %rax
-    movq -600(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -584(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -584(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -672(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -672(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -680(%rbp)
-    movq -680(%rbp), %rax
-    pushq %rax
-    movq $52, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3261
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3262
-.L3261:
-    movq $0, %rax
-    pushq %rax
-    leaq -608(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L3262:
-.L3252:
-    jmp .L3241
-.L3242:
-    jmp .L3232
-.L3231:
-.L3232:
-    movq $40, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -688(%rbp)
-    movq $20, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -688(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -552(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -688(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -592(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -688(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -600(%rbp), %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -688(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -584(%rbp), %rax
-    pushq %rax
-    movq $32, %rax
-    pushq %rax
-    movq -688(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -688(%rbp), %rax
+    call parser_parse_a_dictionary_literal
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3202
-.L3201:
+    jmp .L3412
+.L3411:
+.L3412:
+    movq $0, %rax
+    movq %rax, -136(%rbp)
+    movq -112(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3421
     leaq .STR35(%rip), %rax
+    pushq %rax
+    movq -112(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    leaq -136(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L3422
+.L3421:
+.L3422:
+    movq -136(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L3431
+    movq -104(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_parse_a_value_of_type
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L3432
+.L3431:
+.L3432:
+    leaq .STR36(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
@@ -12646,10 +13456,9 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-.L3202:
-    jmp .L2712
-.L2711:
-.L2712:
+    jmp .L3352
+.L3351:
+.L3352:
     movq -24(%rbp), %rax
     pushq %rax
     movq $171, %rax
@@ -12658,597 +13467,17 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3271
-    movq $171, %rax
-    pushq %rax
+    jz .L3441
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -696(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -696(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -704(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -696(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    popq %rdi
-    call string_duplicate@PLT
-    movq %rax, -712(%rbp)
-    movq -704(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call token_can_be_identifier
-    movq %rax, -720(%rbp)
-    movq -720(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3281
-    movq -704(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3282
-.L3281:
-    movq $53, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L3282:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -728(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -728(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -736(%rbp)
-    movq $0, %rax
-    movq %rax, -744(%rbp)
-    movq -736(%rbp), %rax
-    pushq %rax
-    movq $51, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3291
-    movq $51, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -712(%rbp), %rax
-    pushq %rax
-    leaq -744(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -752(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -752(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -760(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -752(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    popq %rdi
-    call string_duplicate@PLT
-    pushq %rax
-    leaq -712(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -760(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call token_can_be_identifier
-    movq %rax, -768(%rbp)
-    movq -768(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3301
-    movq -760(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3302
-.L3301:
-    movq $53, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L3302:
-    jmp .L3292
-.L3291:
-.L3292:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -776(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -776(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -784(%rbp)
-    movq -784(%rbp), %rax
-    pushq %rax
-    movq $144, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3311
-    movq $144, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -792(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -792(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -800(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -792(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    popq %rdi
-    call string_duplicate@PLT
-    pushq %rax
-    leaq -744(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -800(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call token_can_be_identifier
-    movq %rax, -808(%rbp)
-    movq -808(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3321
-    movq -800(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L3322
-.L3321:
-    movq $53, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L3322:
-    jmp .L3312
-.L3311:
-.L3312:
-    movq -712(%rbp), %rax
-    movq %rax, -816(%rbp)
-    movq -744(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3331
-    leaq .STR36(%rip), %rax
-    movq %rax, -824(%rbp)
-    movq -824(%rbp), %rax
-    pushq %rax
-    movq -744(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    movq %rax, -832(%rbp)
-    movq -712(%rbp), %rax
-    pushq %rax
-    movq -832(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_concat@PLT
-    pushq %rax
-    leaq -816(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3332
-.L3331:
-.L3332:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -776(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -776(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -784(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    movq %rax, -840(%rbp)
-    movq $0, %rax
-    movq %rax, -848(%rbp)
-    movq -784(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3341
-    movq $114, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    movq %rax, -856(%rbp)
-    movq -856(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -864(%rbp)
-    movq -864(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -840(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $1, %rax
-    movq %rax, -872(%rbp)
-.L3351:    movq -872(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3352
-    movq -848(%rbp), %rax
-    pushq %rax
-    movq -856(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3361
-    movq -856(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -856(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -856(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -864(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -864(%rbp), %rax
-    pushq %rax
-    movq -840(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -840(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3362
-.L3361:
-.L3362:
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_expression
-    movq %rax, -880(%rbp)
-    movq -848(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -888(%rbp)
-    movq -880(%rbp), %rax
-    pushq %rax
-    movq -888(%rbp), %rax
-    pushq %rax
-    movq -840(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -848(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -848(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -896(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -896(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -904(%rbp)
-    movq -904(%rbp), %rax
-    pushq %rax
-    movq $52, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3371
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_peek_struct_field_after_comma
-    movq %rax, -912(%rbp)
-    movq -912(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3381
-    movq $0, %rax
-    pushq %rax
-    leaq -872(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L3382
-.L3381:
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-.L3382:
-    jmp .L3372
-.L3371:
-    movq $0, %rax
-    pushq %rax
-    leaq -872(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L3372:
-    jmp .L3351
-.L3352:
-    jmp .L3342
-.L3341:
-.L3342:
-    movq -744(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L3391
-    movq $40, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -920(%rbp)
-    movq $25, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -920(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq -744(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -920(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -712(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -920(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -840(%rbp), %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -920(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -848(%rbp), %rax
-    pushq %rax
-    movq $32, %rax
-    pushq %rax
-    movq -920(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq -920(%rbp), %rax
+    call parser_parse_proc_expression
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3392
-.L3391:
-    movq -848(%rbp), %rax
-    pushq %rax
-    movq -840(%rbp), %rax
-    pushq %rax
-    movq -816(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call expression_create_function_call
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L3392:
-    jmp .L3272
-.L3271:
-.L3272:
+    jmp .L3442
+.L3441:
+.L3442:
     movq -24(%rbp), %rax
     pushq %rax
     movq $168, %rax
@@ -13257,7 +13486,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3401
+    jz .L3451
     movq $168, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13276,7 +13505,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -928(%rbp)
+    movq %rax, -144(%rbp)
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13288,7 +13517,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -936(%rbp)
+    movq %rax, -152(%rbp)
     movq $49, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13300,22 +13529,22 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -944(%rbp)
-    movq -928(%rbp), %rax
+    movq %rax, -160(%rbp)
+    movq -144(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -944(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -936(%rbp), %rax
+    movq -152(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -944(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -13323,7 +13552,7 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $2, %rax
     pushq %rax
-    movq -944(%rbp), %rax
+    movq -160(%rbp), %rax
     pushq %rax
     leaq .STR37(%rip), %rax
     pushq %rax
@@ -13337,9 +13566,9 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3402
-.L3401:
-.L3402:
+    jmp .L3452
+.L3451:
+.L3452:
     movq -24(%rbp), %rax
     pushq %rax
     movq $170, %rax
@@ -13348,7 +13577,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3411
+    jz .L3461
     movq $170, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13367,7 +13596,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -952(%rbp)
+    movq %rax, -168(%rbp)
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13379,7 +13608,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -960(%rbp)
+    movq %rax, -176(%rbp)
     movq $49, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13391,22 +13620,22 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -968(%rbp)
-    movq -952(%rbp), %rax
+    movq %rax, -184(%rbp)
+    movq -168(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -968(%rbp), %rax
+    movq -184(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -960(%rbp), %rax
+    movq -176(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -968(%rbp), %rax
+    movq -184(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -13414,7 +13643,7 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $2, %rax
     pushq %rax
-    movq -968(%rbp), %rax
+    movq -184(%rbp), %rax
     pushq %rax
     leaq .STR38(%rip), %rax
     pushq %rax
@@ -13428,15 +13657,15 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3412
-.L3411:
-.L3412:
+    jmp .L3462
+.L3461:
+.L3462:
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_is_builtin_function_token
-    movq %rax, -976(%rbp)
-    movq -976(%rbp), %rax
+    movq %rax, -192(%rbp)
+    movq -192(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -13444,17 +13673,17 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3421
+    jz .L3471
     movq -24(%rbp), %rax
-    movq %rax, -984(%rbp)
-    movq -984(%rbp), %rax
+    movq %rax, -200(%rbp)
+    movq -200(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -992(%rbp)
+    movq %rax, -208(%rbp)
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13462,11 +13691,11 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1000(%rbp)
+    movq %rax, -216(%rbp)
     movq $0, %rax
-    movq %rax, -1008(%rbp)
+    movq %rax, -224(%rbp)
     movq $0, %rax
-    movq %rax, -1016(%rbp)
+    movq %rax, -232(%rbp)
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13474,16 +13703,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1024(%rbp)
+    movq %rax, -240(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1024(%rbp), %rax
+    movq -240(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -1032(%rbp)
-    movq -1032(%rbp), %rax
+    movq %rax, -248(%rbp)
+    movq -248(%rbp), %rax
     pushq %rax
     movq $49, %rax
     popq %rbx
@@ -13491,28 +13720,28 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3431
+    jz .L3481
     movq $2, %rax
-    movq %rax, -1040(%rbp)
+    movq %rax, -256(%rbp)
     movq $8, %rax
-    movq %rax, -1048(%rbp)
-    movq -1040(%rbp), %rax
+    movq %rax, -264(%rbp)
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1056(%rbp)
-    movq -1056(%rbp), %rax
+    movq %rax, -272(%rbp)
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1008(%rbp), %rbx
+    leaq -224(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
-    movq %rax, -1064(%rbp)
-.L3441:    movq -1064(%rbp), %rax
+    movq %rax, -280(%rbp)
+.L3491:    movq -280(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -13520,7 +13749,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3442
+    jz .L3492
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13528,16 +13757,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1072(%rbp)
+    movq %rax, -288(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1072(%rbp), %rax
+    movq -288(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -1080(%rbp)
-    movq -1080(%rbp), %rax
+    movq %rax, -296(%rbp)
+    movq -296(%rbp), %rax
     pushq %rax
     movq $52, %rax
     popq %rbx
@@ -13545,7 +13774,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3451
+    jz .L3501
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13553,76 +13782,76 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1088(%rbp)
-    jmp .L3452
-.L3451:
-.L3452:
+    movq %rax, -304(%rbp)
+    jmp .L3502
+.L3501:
+.L3502:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -1096(%rbp)
-    movq -1016(%rbp), %rax
+    movq %rax, -312(%rbp)
+    movq -232(%rbp), %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3461
-    movq -1040(%rbp), %rax
+    jz .L3511
+    movq -256(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1104(%rbp)
-    movq -1104(%rbp), %rax
+    movq %rax, -320(%rbp)
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1008(%rbp), %rax
+    movq -224(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1008(%rbp), %rbx
+    leaq -224(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3462
-.L3461:
-.L3462:
-    movq -1016(%rbp), %rax
+    jmp .L3512
+.L3511:
+.L3512:
+    movq -232(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1112(%rbp)
-    movq -1008(%rbp), %rax
-    addq -1112(%rbp), %rax
-    movq %rax, -1120(%rbp)
-    movq -1096(%rbp), %rax
+    movq %rax, -328(%rbp)
+    movq -224(%rbp), %rax
+    addq -328(%rbp), %rax
+    movq %rax, -336(%rbp)
+    movq -312(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1120(%rbp), %rax
+    movq -336(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1016(%rbp), %rax
+    movq -232(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1016(%rbp), %rbx
+    leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
@@ -13632,16 +13861,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1128(%rbp)
+    movq %rax, -344(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1128(%rbp), %rax
+    movq -344(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -1136(%rbp)
-    movq -1136(%rbp), %rax
+    movq %rax, -352(%rbp)
+    movq -352(%rbp), %rax
     pushq %rax
     movq $52, %rax
     popq %rbx
@@ -13649,20 +13878,20 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3471
+    jz .L3521
     movq $0, %rax
     pushq %rax
-    leaq -1064(%rbp), %rbx
+    leaq -280(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3472
-.L3471:
-.L3472:
-    jmp .L3441
-.L3442:
-    jmp .L3432
-.L3431:
-.L3432:
+    jmp .L3522
+.L3521:
+.L3522:
+    jmp .L3491
+.L3492:
+    jmp .L3482
+.L3481:
+.L3482:
     movq $49, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13670,61 +13899,61 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1144(%rbp)
+    movq %rax, -360(%rbp)
     movq $32, %rax
-    movq %rax, -1152(%rbp)
-    movq -1152(%rbp), %rax
+    movq %rax, -368(%rbp)
+    movq -368(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1160(%rbp)
+    movq %rax, -376(%rbp)
     movq $8, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -984(%rbp), %rax
+    movq -200(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -1008(%rbp), %rax
+    movq -224(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1016(%rbp), %rax
+    movq -232(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3422
-.L3421:
-.L3422:
+    jmp .L3472
+.L3471:
+.L3472:
     movq -24(%rbp), %rax
     pushq %rax
     movq $11, %rax
@@ -13733,7 +13962,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3481
+    jz .L3531
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -13741,12 +13970,12 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1168(%rbp)
-    movq -1168(%rbp), %rax
+    movq %rax, -384(%rbp)
+    movq -384(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_to_integer
-    movq %rax, -1176(%rbp)
+    movq %rax, -392(%rbp)
     movq $11, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13754,22 +13983,22 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1184(%rbp)
-    movq -1176(%rbp), %rax
+    movq %rax, -400(%rbp)
+    movq -392(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_integer
     pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3482
-.L3481:
-.L3482:
+    jmp .L3532
+.L3531:
+.L3532:
     movq -24(%rbp), %rax
     pushq %rax
     movq $10, %rax
@@ -13778,7 +14007,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3491
+    jz .L3541
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -13787,16 +14016,16 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1168(%rbp), %rbx
+    leaq -384(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1168(%rbp), %rax
+    movq -384(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -1192(%rbp)
+    movq %rax, -408(%rbp)
     movq $0, %rax
-    movq %rax, -1200(%rbp)
+    movq %rax, -416(%rbp)
     movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -13804,8 +14033,8 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1208(%rbp)
-    movq -1208(%rbp), %rax
+    movq %rax, -424(%rbp)
+    movq -424(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -13813,76 +14042,76 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3501
+    jz .L3551
     movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
     pushq %rax
-    movq -1208(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1216(%rbp)
+    movq %rax, -432(%rbp)
     movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
     pushq %rax
-    movq -1208(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1224(%rbp)
+    movq %rax, -440(%rbp)
     movq $0, %rax
-    movq %rax, -1232(%rbp)
-.L3511:    movq -1232(%rbp), %rax
+    movq %rax, -448(%rbp)
+.L3561:    movq -448(%rbp), %rax
     pushq %rax
-    movq -1216(%rbp), %rax
+    movq -432(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3512
+    jz .L3562
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1232(%rbp), %rax
+    movq -448(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1112(%rbp), %rbx
+    leaq -328(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1224(%rbp), %rax
-    addq -1112(%rbp), %rax
-    movq %rax, -1240(%rbp)
+    movq -440(%rbp), %rax
+    addq -328(%rbp), %rax
+    movq %rax, -456(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1240(%rbp), %rax
+    movq -456(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1248(%rbp)
+    movq %rax, -464(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1248(%rbp), %rax
+    movq -464(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1256(%rbp)
-    movq -1192(%rbp), %rax
+    movq %rax, -472(%rbp)
+    movq -408(%rbp), %rax
     pushq %rax
-    movq -1256(%rbp), %rax
+    movq -472(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1264(%rbp)
-    movq -1264(%rbp), %rax
+    movq %rax, -480(%rbp)
+    movq -480(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -13890,31 +14119,31 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3521
+    jz .L3571
     movq $1, %rax
     pushq %rax
-    leaq -1200(%rbp), %rbx
+    leaq -416(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1216(%rbp), %rax
+    movq -432(%rbp), %rax
     pushq %rax
-    leaq -1232(%rbp), %rbx
+    leaq -448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3522
-.L3521:
-    movq -1232(%rbp), %rax
+    jmp .L3572
+.L3571:
+    movq -448(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1232(%rbp), %rbx
+    leaq -448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3522:
-    jmp .L3511
-.L3512:
-    jmp .L3502
-.L3501:
-.L3502:
+.L3572:
+    jmp .L3561
+.L3562:
+    jmp .L3552
+.L3551:
+.L3552:
     movq $10, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -13922,8 +14151,8 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1272(%rbp)
-    movq -1200(%rbp), %rax
+    movq %rax, -488(%rbp)
+    movq -416(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -13931,62 +14160,62 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3531
+    jz .L3581
     movq $32, %rax
     pushq %rax
-    leaq -1152(%rbp), %rbx
+    leaq -368(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1152(%rbp), %rax
+    movq -368(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $7, %rax  # Load compile-time constant EXPR_TYPE_NAME
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1192(%rbp), %rax
+    movq -408(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3532
-.L3531:
-    movq -1192(%rbp), %rax
+    jmp .L3582
+.L3581:
+    movq -408(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_string_literal_owned
     pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L3532:
-    jmp .L3492
-.L3491:
-.L3492:
+.L3582:
+    jmp .L3542
+.L3541:
+.L3542:
     movq -24(%rbp), %rax
     pushq %rax
     movq $157, %rax
@@ -13995,7 +14224,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3541
+    jz .L3591
     movq $157, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14003,7 +14232,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1280(%rbp)
+    movq %rax, -496(%rbp)
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14011,16 +14240,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1288(%rbp)
+    movq %rax, -504(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -504(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -1296(%rbp)
-    movq -1296(%rbp), %rax
+    movq %rax, -512(%rbp)
+    movq -512(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -14028,20 +14257,20 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3551
+    jz .L3601
     leaq .STR39(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
     movq $16, %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -504(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1304(%rbp)
-    movq -1304(%rbp), %rax
+    movq %rax, -520(%rbp)
+    movq -520(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -14050,22 +14279,22 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L3552
-.L3551:
-.L3552:
+    jmp .L3602
+.L3601:
+.L3602:
     movq $8, %rax
     pushq %rax
-    movq -1288(%rbp), %rax
+    movq -504(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1312(%rbp)
-    movq -1312(%rbp), %rax
+    movq %rax, -528(%rbp)
+    movq -528(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -1320(%rbp)
+    movq %rax, -536(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14073,47 +14302,47 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -1328(%rbp)
+    movq %rax, -544(%rbp)
     movq $32, %rax
     pushq %rax
-    leaq -1152(%rbp), %rbx
+    leaq -368(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1152(%rbp), %rax
+    movq -368(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $10, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1320(%rbp), %rax
+    movq -536(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3542
-.L3541:
-.L3542:
+    jmp .L3592
+.L3591:
+.L3592:
     movq -24(%rbp), %rax
     pushq %rax
     movq $48, %rax
@@ -14122,7 +14351,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3561
+    jz .L3611
     movq $48, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14134,7 +14363,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -1336(%rbp)
+    movq %rax, -552(%rbp)
     movq $49, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14142,13 +14371,13 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq -1336(%rbp), %rax
+    movq -552(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3562
-.L3561:
-.L3562:
+    jmp .L3612
+.L3611:
+.L3612:
     movq -24(%rbp), %rax
     pushq %rax
     movq $17, %rax
@@ -14157,7 +14386,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3571
+    jz .L3621
     movq $17, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14169,30 +14398,30 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_primary
-    movq %rax, -1344(%rbp)
+    movq %rax, -560(%rbp)
     movq $0, %rax
     pushq %rax
     popq %rdi
     call expression_create_integer
-    movq %rax, -1352(%rbp)
-    movq -1344(%rbp), %rax
+    movq %rax, -568(%rbp)
+    movq -560(%rbp), %rax
     pushq %rax
     movq $17, %rax
     pushq %rax
-    movq -1352(%rbp), %rax
+    movq -568(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call expression_create_binary_op
-    movq %rax, -1360(%rbp)
-    movq -1360(%rbp), %rax
+    movq %rax, -576(%rbp)
+    movq -576(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3572
-.L3571:
-.L3572:
+    jmp .L3622
+.L3621:
+.L3622:
     movq -24(%rbp), %rax
     pushq %rax
     movq $151, %rax
@@ -14201,7 +14430,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3581
+    jz .L3631
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -14209,7 +14438,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1368(%rbp)
+    movq %rax, -584(%rbp)
     movq $151, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14224,16 +14453,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1376(%rbp)
+    movq %rax, -592(%rbp)
     movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
     pushq %rax
-    movq -1376(%rbp), %rax
+    movq -592(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1384(%rbp)
-    movq -1384(%rbp), %rax
+    movq %rax, -600(%rbp)
+    movq -600(%rbp), %rax
     pushq %rax
     movq $125, %rax
     popq %rbx
@@ -14241,7 +14470,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3591
+    jz .L3641
     movq $125, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14253,17 +14482,17 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_primary
-    movq %rax, -1392(%rbp)
+    movq %rax, -608(%rbp)
     movq $8, %rax
     pushq %rax
     popq %rdi
     call allocate@PLT
-    movq %rax, -1400(%rbp)
-    movq -1392(%rbp), %rax
+    movq %rax, -616(%rbp)
+    movq -608(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1400(%rbp), %rax
+    movq -616(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -14271,7 +14500,7 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $1, %rax
     pushq %rax
-    movq -1400(%rbp), %rax
+    movq -616(%rbp), %rax
     pushq %rax
     leaq .STR40(%rip), %rax
     pushq %rax
@@ -14285,8 +14514,8 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3592
-.L3591:
+    jmp .L3642
+.L3641:
     leaq .STR41(%rip), %rax
     pushq %rax
     popq %rdi
@@ -14297,10 +14526,10 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-.L3592:
-    jmp .L3582
-.L3581:
-.L3582:
+.L3642:
+    jmp .L3632
+.L3631:
+.L3632:
     movq -24(%rbp), %rax
     pushq %rax
     movq $175, %rax
@@ -14309,7 +14538,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3601
+    jz .L3651
     movq $175, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14324,16 +14553,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1408(%rbp)
+    movq %rax, -624(%rbp)
     movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
     pushq %rax
-    movq -1408(%rbp), %rax
+    movq -624(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1416(%rbp)
-    movq -1416(%rbp), %rax
+    movq %rax, -632(%rbp)
+    movq -632(%rbp), %rax
     pushq %rax
     movq $29, %rax
     popq %rbx
@@ -14341,7 +14570,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3611
+    jz .L3661
     movq $29, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14353,34 +14582,34 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_primary
-    movq %rax, -1424(%rbp)
+    movq %rax, -640(%rbp)
     movq $0, %rax
     subq $1, %rax
     pushq %rax
     popq %rdi
     call expression_create_integer
-    movq %rax, -1432(%rbp)
-    movq -1432(%rbp), %rax
+    movq %rax, -648(%rbp)
+    movq -648(%rbp), %rax
     pushq %rax
     movq $41, %rax
     pushq %rax
-    movq -1424(%rbp), %rax
+    movq -640(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call expression_create_binary_op
-    movq %rax, -1440(%rbp)
-    movq -1440(%rbp), %rax
+    movq %rax, -656(%rbp)
+    movq -656(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3612
-.L3611:
-.L3612:
-    jmp .L3602
-.L3601:
-.L3602:
+    jmp .L3662
+.L3661:
+.L3662:
+    jmp .L3652
+.L3651:
+.L3652:
     movq -24(%rbp), %rax
     pushq %rax
     movq $158, %rax
@@ -14389,7 +14618,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3621
+    jz .L3671
     movq $158, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14427,7 +14656,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3631
+    jz .L3681
     leaq .STR42(%rip), %rax
     pushq %rax
     popq %rdi
@@ -14439,8 +14668,8 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -1448(%rbp)
-    movq -1448(%rbp), %rax
+    movq %rax, -664(%rbp)
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -14449,9 +14678,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L3632
-.L3631:
-.L3632:
+    jmp .L3682
+.L3681:
+.L3682:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -14459,12 +14688,12 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1456(%rbp)
-    movq -1456(%rbp), %rax
+    movq %rax, -672(%rbp)
+    movq -672(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -1464(%rbp)
+    movq %rax, -680(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14502,7 +14731,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3641
+    jz .L3691
     leaq .STR43(%rip), %rax
     pushq %rax
     popq %rdi
@@ -14515,10 +14744,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -14527,9 +14756,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L3642
-.L3641:
-.L3642:
+    jmp .L3692
+.L3691:
+.L3692:
     movq $125, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14541,49 +14770,49 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_primary
-    movq %rax, -1472(%rbp)
+    movq %rax, -688(%rbp)
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1480(%rbp)
+    movq %rax, -696(%rbp)
     movq $6, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1480(%rbp), %rax
+    movq -696(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1472(%rbp), %rax
+    movq -688(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1480(%rbp), %rax
+    movq -696(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1464(%rbp), %rax
+    movq -680(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1480(%rbp), %rax
+    movq -696(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1480(%rbp), %rax
+    movq -696(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3622
-.L3621:
-.L3622:
+    jmp .L3672
+.L3671:
+.L3672:
     movq -24(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -14592,7 +14821,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3651
+    jz .L3701
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -14601,26 +14830,26 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1456(%rbp), %rbx
+    leaq -672(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    leaq .STR35(%rip), %rax
+    leaq .STR36(%rip), %rax
     pushq %rax
-    movq -1456(%rbp), %rax
+    movq -672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1488(%rbp)
+    movq %rax, -704(%rbp)
     leaq .STR44(%rip), %rax
     pushq %rax
-    movq -1456(%rbp), %rax
+    movq -672(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1496(%rbp)
-    movq -1488(%rbp), %rax
+    movq %rax, -712(%rbp)
+    movq -704(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -14628,7 +14857,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3661
+    jz .L3711
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14636,15 +14865,15 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1504(%rbp)
+    movq %rax, -720(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -1504(%rbp), %rax
+    movq -720(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -1512(%rbp)
+    movq %rax, -728(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14682,7 +14911,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3671
+    jz .L3721
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -14690,16 +14919,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1520(%rbp)
-    leaq .STR30(%rip), %rax
+    movq %rax, -736(%rbp)
+    leaq .STR33(%rip), %rax
     pushq %rax
-    movq -1520(%rbp), %rax
+    movq -736(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1528(%rbp)
-    movq -1528(%rbp), %rax
+    movq %rax, -744(%rbp)
+    movq -744(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -14707,7 +14936,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3681
+    jz .L3731
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14745,7 +14974,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3691
+    jz .L3741
     leaq .STR45(%rip), %rax
     pushq %rax
     popq %rdi
@@ -14758,10 +14987,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -14770,9 +14999,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L3692
-.L3691:
-.L3692:
+    jmp .L3742
+.L3741:
+.L3742:
     movq $156, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14781,46 +15010,46 @@ parser_parse_primary:
     popq %rsi
     call parser_eat
     movq $0, %rax
-    movq %rax, -1536(%rbp)
+    movq %rax, -752(%rbp)
     movq $0, %rax
-    movq %rax, -1544(%rbp)
+    movq %rax, -760(%rbp)
     movq $4, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1056(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -1552(%rbp)
-    movq -1552(%rbp), %rax
+    movq %rax, -768(%rbp)
+    movq -768(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -14828,12 +15057,12 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
-    movq %rax, -1560(%rbp)
-.L3701:    movq -1560(%rbp), %rax
+    movq %rax, -776(%rbp)
+.L3751:    movq -776(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -14841,7 +15070,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3702
+    jz .L3752
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14872,7 +15101,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3711
+    jz .L3761
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14910,7 +15139,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3721
+    jz .L3771
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -14918,143 +15147,143 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L3722
-.L3721:
-.L3722:
+    jmp .L3772
+.L3771:
+.L3772:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -1568(%rbp)
-    movq -1544(%rbp), %rax
+    movq %rax, -784(%rbp)
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3731
-    movq -1040(%rbp), %rax
+    jz .L3781
+    movq -256(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1104(%rbp), %rbx
+    leaq -320(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3732
-.L3731:
-.L3732:
-    movq -1544(%rbp), %rax
+    jmp .L3782
+.L3781:
+.L3782:
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1112(%rbp), %rbx
+    leaq -328(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1536(%rbp), %rax
-    addq -1112(%rbp), %rax
-    movq %rax, -1576(%rbp)
-    movq -1568(%rbp), %rax
+    movq -752(%rbp), %rax
+    addq -328(%rbp), %rax
+    movq %rax, -792(%rbp)
+    movq -784(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1576(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3712
-.L3711:
+    jmp .L3762
+.L3761:
     movq $0, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3712:
-    jmp .L3701
-.L3702:
+.L3762:
+    jmp .L3751
+.L3752:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1584(%rbp)
+    movq %rax, -800(%rbp)
     movq $17, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1584(%rbp), %rax
+    movq -800(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1584(%rbp), %rax
+    movq -800(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1584(%rbp), %rax
+    movq -800(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1584(%rbp), %rax
+    movq -800(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3682
-.L3681:
+    jmp .L3732
+.L3731:
     leaq .STR46(%rip), %rax
     pushq %rax
-    movq -1520(%rbp), %rax
+    movq -736(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1592(%rbp)
-    movq -1592(%rbp), %rax
+    movq %rax, -808(%rbp)
+    movq -808(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -15062,7 +15291,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3741
+    jz .L3791
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15100,7 +15329,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3751
+    jz .L3801
     leaq .STR47(%rip), %rax
     pushq %rax
     popq %rdi
@@ -15113,10 +15342,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -15125,9 +15354,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L3752
-.L3751:
-.L3752:
+    jmp .L3802
+.L3801:
+.L3802:
     movq $156, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15137,39 +15366,39 @@ parser_parse_primary:
     call parser_eat
     movq $0, %rax
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $4, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1056(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -8(%rbp), %rax
@@ -15177,14 +15406,14 @@ parser_parse_primary:
     popq %rdi
     call parser_parse_expression
     pushq %rax
-    leaq -1552(%rbp), %rbx
+    leaq -768(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1552(%rbp), %rax
+    movq -768(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -15192,15 +15421,15 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3761:    movq -1560(%rbp), %rax
+.L3811:    movq -776(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -15208,7 +15437,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3762
+    jz .L3812
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15239,7 +15468,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3771
+    jz .L3821
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15277,7 +15506,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3781
+    jz .L3831
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15285,140 +15514,140 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L3782
-.L3781:
-.L3782:
+    jmp .L3832
+.L3831:
+.L3832:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_expression
     pushq %rax
-    leaq -1568(%rbp), %rbx
+    leaq -784(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3791
-    movq -1040(%rbp), %rax
+    jz .L3841
+    movq -256(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1104(%rbp), %rbx
+    leaq -320(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3792
-.L3791:
-.L3792:
-    movq -1544(%rbp), %rax
+    jmp .L3842
+.L3841:
+.L3842:
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1112(%rbp), %rbx
+    leaq -328(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1536(%rbp), %rax
-    addq -1112(%rbp), %rax
+    movq -752(%rbp), %rax
+    addq -328(%rbp), %rax
     pushq %rax
-    leaq -1576(%rbp), %rbx
+    leaq -792(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1568(%rbp), %rax
+    movq -784(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1576(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3772
-.L3771:
+    jmp .L3822
+.L3821:
     movq $0, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3772:
-    jmp .L3761
-.L3762:
+.L3822:
+    jmp .L3811
+.L3812:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1600(%rbp)
+    movq %rax, -816(%rbp)
     movq $21, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3742
-.L3741:
+    jmp .L3792
+.L3791:
     movq $16, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15427,12 +15656,12 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1208(%rbp), %rbx
+    leaq -424(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
-    movq %rax, -1608(%rbp)
-    movq -1208(%rbp), %rax
+    movq %rax, -824(%rbp)
+    movq -424(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -15440,71 +15669,71 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3801
+    jz .L3851
     movq $24, %rax
     pushq %rax
-    movq -1208(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1216(%rbp), %rbx
+    leaq -432(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $16, %rax
     pushq %rax
-    movq -1208(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1224(%rbp), %rbx
+    leaq -440(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
-    movq %rax, -1616(%rbp)
-.L3811:    movq -1616(%rbp), %rax
+    movq %rax, -832(%rbp)
+.L3861:    movq -832(%rbp), %rax
     pushq %rax
-    movq -1216(%rbp), %rax
+    movq -432(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3812
-    movq -1616(%rbp), %rax
+    jz .L3862
+    movq -832(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1624(%rbp)
-    movq -1624(%rbp), %rax
+    movq %rax, -840(%rbp)
+    movq -840(%rbp), %rax
     pushq %rax
-    movq -1224(%rbp), %rax
+    movq -440(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1240(%rbp), %rbx
+    leaq -456(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -1240(%rbp), %rax
+    movq -456(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1256(%rbp), %rbx
+    leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1520(%rbp), %rax
+    movq -736(%rbp), %rax
     pushq %rax
-    movq -1256(%rbp), %rax
+    movq -472(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -15516,32 +15745,32 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3821
+    jz .L3871
     movq $1, %rax
     pushq %rax
-    leaq -1608(%rbp), %rbx
+    leaq -824(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1216(%rbp), %rax
+    movq -432(%rbp), %rax
     pushq %rax
-    leaq -1616(%rbp), %rbx
+    leaq -832(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3822
-.L3821:
-.L3822:
-    movq -1616(%rbp), %rax
+    jmp .L3872
+.L3871:
+.L3872:
+    movq -832(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1616(%rbp), %rbx
+    leaq -832(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3811
-.L3812:
-    jmp .L3802
-.L3801:
-.L3802:
-    movq -1608(%rbp), %rax
+    jmp .L3861
+.L3862:
+    jmp .L3852
+.L3851:
+.L3852:
+    movq -824(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -15549,12 +15778,12 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3831
-    movq -1520(%rbp), %rax
+    jz .L3881
+    movq -736(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -1632(%rbp)
+    movq %rax, -848(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15592,7 +15821,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3841
+    jz .L3891
     leaq .STR48(%rip), %rax
     pushq %rax
     popq %rdi
@@ -15605,10 +15834,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -15617,9 +15846,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L3842
-.L3841:
-.L3842:
+    jmp .L3892
+.L3891:
+.L3892:
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15628,43 +15857,43 @@ parser_parse_primary:
     popq %rsi
     call parser_eat
     movq $0, %rax
-    movq %rax, -1640(%rbp)
+    movq %rax, -856(%rbp)
     movq $0, %rax
-    movq %rax, -1648(%rbp)
+    movq %rax, -864(%rbp)
     movq $0, %rax
-    movq %rax, -1656(%rbp)
+    movq %rax, -872(%rbp)
     movq $4, %rax
-    movq %rax, -1664(%rbp)
+    movq %rax, -880(%rbp)
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1672(%rbp)
-    movq -1672(%rbp), %rax
+    movq %rax, -888(%rbp)
+    movq -888(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1640(%rbp), %rbx
+    leaq -856(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1672(%rbp), %rax
+    movq -888(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
-    movq %rax, -1680(%rbp)
-.L3851:    movq -1680(%rbp), %rax
+    movq %rax, -896(%rbp)
+.L3901:    movq -896(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -15672,7 +15901,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3852
+    jz .L3902
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15703,7 +15932,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3861
+    jz .L3911
     leaq .STR49(%rip), %rax
     pushq %rax
     popq %rdi
@@ -15716,10 +15945,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -15728,9 +15957,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L3862
-.L3861:
-.L3862:
+    jmp .L3912
+.L3911:
+.L3912:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -15738,13 +15967,13 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1688(%rbp)
-    movq -1688(%rbp), %rax
+    movq %rax, -904(%rbp)
+    movq -904(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
     pushq %rax
-    leaq -1464(%rbp), %rbx
+    leaq -680(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $53, %rax
@@ -15758,92 +15987,92 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -1696(%rbp)
-    movq -1656(%rbp), %rax
+    movq %rax, -912(%rbp)
+    movq -872(%rbp), %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3871
-    movq -1664(%rbp), %rax
+    jz .L3921
+    movq -880(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1664(%rbp), %rbx
+    leaq -880(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1704(%rbp)
-    movq -1704(%rbp), %rax
+    movq %rax, -920(%rbp)
+    movq -920(%rbp), %rax
     pushq %rax
-    movq -1640(%rbp), %rax
+    movq -856(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1640(%rbp), %rbx
+    leaq -856(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1704(%rbp), %rax
+    movq -920(%rbp), %rax
     pushq %rax
-    movq -1648(%rbp), %rax
+    movq -864(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3872
-.L3871:
-.L3872:
-    movq -1656(%rbp), %rax
+    jmp .L3922
+.L3921:
+.L3922:
+    movq -872(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -1712(%rbp)
-    movq -1640(%rbp), %rax
-    addq -1712(%rbp), %rax
-    movq %rax, -1720(%rbp)
-    movq -1648(%rbp), %rax
-    addq -1712(%rbp), %rax
-    movq %rax, -1728(%rbp)
-    movq -1464(%rbp), %rax
+    movq %rax, -928(%rbp)
+    movq -856(%rbp), %rax
+    addq -928(%rbp), %rax
+    movq %rax, -936(%rbp)
+    movq -864(%rbp), %rax
+    addq -928(%rbp), %rax
+    movq %rax, -944(%rbp)
+    movq -680(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1720(%rbp), %rax
+    movq -936(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1696(%rbp), %rax
+    movq -912(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1728(%rbp), %rax
+    movq -944(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1656(%rbp), %rbx
+    leaq -872(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
@@ -15876,7 +16105,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3881
+    jz .L3931
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -15884,87 +16113,87 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L3882
-.L3881:
+    jmp .L3932
+.L3931:
     movq $0, %rax
     pushq %rax
-    leaq -1680(%rbp), %rbx
+    leaq -896(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3882:
-    jmp .L3851
-.L3852:
+.L3932:
+    jmp .L3901
+.L3902:
     movq $40, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1736(%rbp)
+    movq %rax, -952(%rbp)
     movq $20, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1736(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1632(%rbp), %rax
+    movq -848(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1736(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1640(%rbp), %rax
+    movq -856(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1736(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1648(%rbp), %rax
+    movq -864(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1736(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     pushq %rax
     movq $32, %rax
     pushq %rax
-    movq -1736(%rbp), %rax
+    movq -952(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1736(%rbp), %rax
+    movq -952(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3832
-.L3831:
+    jmp .L3882
+.L3881:
     movq $2, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1744(%rbp)
+    movq %rax, -960(%rbp)
     movq $97, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1744(%rbp), %rax
+    movq -960(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -15974,36 +16203,36 @@ parser_parse_primary:
     pushq %rax
     movq $1, %rax
     pushq %rax
-    movq -1744(%rbp), %rax
+    movq -960(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_byte@PLT
-    movq -1744(%rbp), %rax
+    movq -960(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_variable
-    movq %rax, -1752(%rbp)
-    movq -1752(%rbp), %rax
+    movq %rax, -968(%rbp)
+    movq -968(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L3832:
-.L3742:
-.L3682:
-    jmp .L3672
-.L3671:
+.L3882:
+.L3792:
+.L3732:
+    jmp .L3722
+.L3721:
     movq $2, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1760(%rbp)
+    movq %rax, -976(%rbp)
     movq $97, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1760(%rbp), %rax
+    movq -976(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -16013,26 +16242,26 @@ parser_parse_primary:
     pushq %rax
     movq $1, %rax
     pushq %rax
-    movq -1760(%rbp), %rax
+    movq -976(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_byte@PLT
-    movq -1760(%rbp), %rax
+    movq -976(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_variable
-    movq %rax, -1768(%rbp)
-    movq -1768(%rbp), %rax
+    movq %rax, -984(%rbp)
+    movq -984(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L3672:
-    jmp .L3662
-.L3661:
-.L3662:
-    movq -1496(%rbp), %rax
+.L3722:
+    jmp .L3712
+.L3711:
+.L3712:
+    movq -712(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -16040,7 +16269,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3891
+    jz .L3941
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16078,7 +16307,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3901
+    jz .L3951
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16087,18 +16316,18 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1520(%rbp), %rbx
+    leaq -736(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     leaq .STR50(%rip), %rax
     pushq %rax
-    movq -1520(%rbp), %rax
+    movq -736(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1776(%rbp)
-    movq -1776(%rbp), %rax
+    movq %rax, -992(%rbp)
+    movq -992(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -16106,7 +16335,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3911
+    jz .L3961
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16144,7 +16373,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3921
+    jz .L3971
     leaq .STR51(%rip), %rax
     pushq %rax
     popq %rdi
@@ -16157,10 +16386,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -16169,9 +16398,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L3922
-.L3921:
-.L3922:
+    jmp .L3972
+.L3971:
+.L3972:
     movq $125, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16209,7 +16438,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3931
+    jz .L3981
     leaq .STR52(%rip), %rax
     pushq %rax
     popq %rdi
@@ -16222,10 +16451,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -16234,9 +16463,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L3932
-.L3931:
-.L3932:
+    jmp .L3982
+.L3981:
+.L3982:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16244,12 +16473,12 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1784(%rbp)
-    movq -1784(%rbp), %rax
+    movq %rax, -1000(%rbp)
+    movq -1000(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_to_integer
-    movq %rax, -1792(%rbp)
+    movq %rax, -1008(%rbp)
     movq $11, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16287,7 +16516,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3941
+    jz .L3991
     leaq .STR53(%rip), %rax
     pushq %rax
     popq %rdi
@@ -16300,10 +16529,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -16312,9 +16541,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L3942
-.L3941:
-.L3942:
+    jmp .L3992
+.L3991:
+.L3992:
     movq $8, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -16322,12 +16551,12 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -1800(%rbp)
-    movq -1800(%rbp), %rax
+    movq %rax, -1016(%rbp)
+    movq -1016(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -1808(%rbp)
+    movq %rax, -1024(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16365,7 +16594,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3951
+    jz .L4001
     movq $156, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16375,39 +16604,39 @@ parser_parse_primary:
     call parser_eat
     movq $0, %rax
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $4, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1056(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -8(%rbp), %rax
@@ -16415,14 +16644,14 @@ parser_parse_primary:
     popq %rdi
     call parser_parse_expression
     pushq %rax
-    leaq -1552(%rbp), %rbx
+    leaq -768(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1552(%rbp), %rax
+    movq -768(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -16430,15 +16659,15 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3961:    movq -1560(%rbp), %rax
+.L4011:    movq -776(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -16446,7 +16675,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3962
+    jz .L4012
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16477,7 +16706,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3971
+    jz .L4021
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16515,7 +16744,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3981
+    jz .L4031
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -16523,113 +16752,113 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L3982
-.L3981:
-.L3982:
+    jmp .L4032
+.L4031:
+.L4032:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_expression
     pushq %rax
-    leaq -1568(%rbp), %rbx
+    leaq -784(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L3991
-    movq -1040(%rbp), %rax
+    jz .L4041
+    movq -256(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1104(%rbp), %rbx
+    leaq -320(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3992
-.L3991:
-.L3992:
-    movq -1544(%rbp), %rax
+    jmp .L4042
+.L4041:
+.L4042:
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1112(%rbp), %rbx
+    leaq -328(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1536(%rbp), %rax
-    addq -1112(%rbp), %rax
+    movq -752(%rbp), %rax
+    addq -328(%rbp), %rax
     pushq %rax
-    leaq -1576(%rbp), %rbx
+    leaq -792(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1568(%rbp), %rax
+    movq -784(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1576(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L3972
-.L3971:
+    jmp .L4022
+.L4021:
     movq $0, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L3972:
-    jmp .L3961
-.L3962:
-    movq -1544(%rbp), %rax
+.L4022:
+    jmp .L4011
+.L4012:
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1792(%rbp), %rax
+    movq -1008(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4001
+    jz .L4051
     leaq .STR54(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -1792(%rbp), %rax
+    movq -1008(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -16637,7 +16866,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call print_string
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -16650,591 +16879,222 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L4002
-.L4001:
-.L4002:
+    jmp .L4052
+.L4051:
+.L4052:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1816(%rbp)
+    movq %rax, -1032(%rbp)
     movq $18, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1032(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1032(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1792(%rbp), %rax
+    movq -1008(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1032(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -1808(%rbp), %rax
+    movq -1024(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1816(%rbp), %rax
+    movq -1032(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1816(%rbp), %rax
+    movq -1032(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L3952
-.L3951:
+    jmp .L4002
+.L4001:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1824(%rbp)
+    movq %rax, -1040(%rbp)
     movq $19, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1824(%rbp), %rax
+    movq -1040(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -1792(%rbp), %rax
+    movq -1008(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1824(%rbp), %rax
+    movq -1040(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    movq -1808(%rbp), %rax
+    movq -1024(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1824(%rbp), %rax
+    movq -1040(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1824(%rbp), %rax
+    movq -1040(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L4002:
+    jmp .L3962
+.L3961:
+    movq -672(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    movq %rax, -1048(%rbp)
+    movq -1048(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call expression_create_variable
+    movq %rax, -1056(%rbp)
+    movq -1056(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L3962:
+    jmp .L3952
+.L3951:
+    movq -672(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    movq %rax, -1064(%rbp)
+    movq -1064(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call expression_create_variable
+    movq %rax, -1072(%rbp)
+    movq -1072(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
 .L3952:
-    jmp .L3912
-.L3911:
-    movq -1456(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    movq %rax, -1832(%rbp)
-    movq -1832(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call expression_create_variable
-    movq %rax, -1840(%rbp)
-    movq -1840(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L3912:
-    jmp .L3902
-.L3901:
-    movq -1456(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    movq %rax, -1848(%rbp)
-    movq -1848(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call expression_create_variable
-    movq %rax, -1856(%rbp)
-    movq -1856(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L3902:
-    jmp .L3892
-.L3891:
-.L3892:
-    jmp .L3652
-.L3651:
-.L3652:
+    jmp .L3942
+.L3941:
+.L3942:
+    jmp .L3702
+.L3701:
+.L3702:
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
     call token_can_be_identifier
-    movq %rax, -1864(%rbp)
-    movq -1864(%rbp), %rax
+    movq %rax, -1080(%rbp)
+    movq -1080(%rbp), %rax
     pushq %rax
     movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4011
-    movq $8, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1168(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1168(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    movq %rax, -1872(%rbp)
-    leaq .STR30(%rip), %rax
-    pushq %rax
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    movq %rax, -1880(%rbp)
-    movq -1880(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4021
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -1888(%rbp)
-    movq -1888(%rbp), %rax
-    pushq %rax
-    movq $156, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4031
-    movq $156, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $0, %rax
-    pushq %rax
-    leaq -1536(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    leaq -1544(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $4, %rax
-    pushq %rax
-    leaq -1040(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    leaq -1048(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1056(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1536(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_expression
-    pushq %rax
-    leaq -1552(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1552(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1536(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $1, %rax
-    pushq %rax
-    leaq -1544(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $1, %rax
-    pushq %rax
-    leaq -1560(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L4041:    movq -1560(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4042
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -24(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $52, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4051
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -24(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $30, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4061
-    movq $30, %rax
+    movq $8, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -384(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -384(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    movq %rax, -1088(%rbp)
+    leaq .STR33(%rip), %rax
+    pushq %rax
+    movq -1088(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    movq %rax, -1096(%rbp)
+    movq -1096(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4071
+    movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L4062
-.L4061:
-.L4062:
+    movq $8, %rax
+    pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_expression
+    popq %rsi
+    call memory_get_pointer@PLT
     pushq %rax
-    leaq -1568(%rbp), %rbx
+    leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1544(%rbp), %rax
+    movq $0, %rax
     pushq %rax
-    movq -1040(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4071
-    movq -1040(%rbp), %rax
+    movq -16(%rbp), %rax
     pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1040(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1104(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1104(%rbp)
     movq -1104(%rbp), %rax
     pushq %rax
-    movq -1536(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -1536(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4072
-.L4071:
-.L4072:
-    movq -1544(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1112(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1536(%rbp), %rax
-    addq -1112(%rbp), %rax
-    pushq %rax
-    leaq -1576(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1568(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1576(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -1544(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4052
-.L4051:
-    movq $0, %rax
-    pushq %rax
-    leaq -1560(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L4052:
-    jmp .L4041
-.L4042:
-    movq $32, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1584(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $17, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1584(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -1536(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -1584(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -1584(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -1584(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4032
-.L4031:
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call expression_create_variable
-    pushq %rax
-    leaq -1752(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1752(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L4032:
-    jmp .L4022
-.L4021:
-.L4022:
-    leaq .STR46(%rip), %rax
-    pushq %rax
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    movq %rax, -1896(%rbp)
-    movq -1896(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
+    movq $156, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4081
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -16(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -16(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    pushq %rax
-    leaq -1888(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1888(%rbp), %rax
-    pushq %rax
-    movq $156, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4091
     movq $156, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17244,39 +17104,39 @@ parser_parse_primary:
     call parser_eat
     movq $0, %rax
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $4, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1056(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -8(%rbp), %rax
@@ -17284,14 +17144,14 @@ parser_parse_primary:
     popq %rdi
     call parser_parse_expression
     pushq %rax
-    leaq -1552(%rbp), %rbx
+    leaq -768(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1552(%rbp), %rax
+    movq -768(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -17299,15 +17159,15 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4101:    movq -1560(%rbp), %rax
+.L4091:    movq -776(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -17315,7 +17175,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4102
+    jz .L4092
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17341,12 +17201,381 @@ parser_parse_primary:
     movq -24(%rbp), %rax
     pushq %rax
     movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4101
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $30, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4111
+    movq $30, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L4112
+.L4111:
+.L4112:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_expression
+    pushq %rax
+    leaq -784(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -760(%rbp), %rax
+    pushq %rax
+    movq -256(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4121
+    movq -256(%rbp), %rax
+    pushq %rax
+    movq $2, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -256(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -256(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -320(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -320(%rbp), %rax
+    pushq %rax
+    movq -752(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -752(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4122
+.L4121:
+.L4122:
+    movq -760(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -328(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -752(%rbp), %rax
+    addq -328(%rbp), %rax
+    pushq %rax
+    leaq -792(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -784(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -792(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -760(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -760(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4102
+.L4101:
+    movq $0, %rax
+    pushq %rax
+    leaq -776(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L4102:
+    jmp .L4091
+.L4092:
+    movq $32, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -800(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $17, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -800(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -752(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -800(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -760(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -800(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -1088(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -800(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4082
+.L4081:
+    movq -1088(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call expression_create_variable
+    pushq %rax
+    leaq -968(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -968(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L4082:
+    jmp .L4072
+.L4071:
+.L4072:
+    leaq .STR46(%rip), %rax
+    pushq %rax
+    movq -1088(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    movq %rax, -1112(%rbp)
+    movq -1112(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4131
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    pushq %rax
+    leaq -1104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1104(%rbp), %rax
+    pushq %rax
+    movq $156, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4141
+    movq $156, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $0, %rax
+    pushq %rax
+    leaq -752(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    leaq -760(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $4, %rax
+    pushq %rax
+    leaq -256(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    leaq -264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -256(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -272(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -272(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -752(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_expression
+    pushq %rax
+    leaq -768(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -768(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -752(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $1, %rax
+    pushq %rax
+    leaq -760(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $1, %rax
+    pushq %rax
+    leaq -776(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L4151:    movq -776(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4152
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4161
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17384,7 +17613,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4121
+    jz .L4171
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17392,172 +17621,172 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L4122
-.L4121:
-.L4122:
+    jmp .L4172
+.L4171:
+.L4172:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_expression
     pushq %rax
-    leaq -1568(%rbp), %rbx
+    leaq -784(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4131
-    movq -1040(%rbp), %rax
+    jz .L4181
+    movq -256(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1104(%rbp), %rbx
+    leaq -320(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1536(%rbp), %rbx
+    leaq -752(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4132
-.L4131:
-.L4132:
-    movq -1544(%rbp), %rax
+    jmp .L4182
+.L4181:
+.L4182:
+    movq -760(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1112(%rbp), %rbx
+    leaq -328(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1536(%rbp), %rax
-    addq -1112(%rbp), %rax
+    movq -752(%rbp), %rax
+    addq -328(%rbp), %rax
     pushq %rax
-    leaq -1576(%rbp), %rbx
+    leaq -792(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1568(%rbp), %rax
+    movq -784(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1576(%rbp), %rax
+    movq -792(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1544(%rbp), %rbx
+    leaq -760(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4112
-.L4111:
+    jmp .L4162
+.L4161:
     movq $0, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4112:
-    jmp .L4101
-.L4102:
+.L4162:
+    jmp .L4151
+.L4152:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1600(%rbp), %rbx
+    leaq -816(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $21, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1536(%rbp), %rax
+    movq -752(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1544(%rbp), %rax
+    movq -760(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1872(%rbp), %rax
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -1600(%rbp), %rax
+    movq -816(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4092
-.L4091:
-    movq -1872(%rbp), %rax
+    jmp .L4142
+.L4141:
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_variable
     pushq %rax
-    leaq -1752(%rbp), %rbx
+    leaq -968(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1752(%rbp), %rax
+    movq -968(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L4092:
-    jmp .L4082
-.L4081:
-.L4082:
-    leaq .STR32(%rip), %rax
+.L4142:
+    jmp .L4132
+.L4131:
+.L4132:
+    leaq .STR34(%rip), %rax
     pushq %rax
-    movq -1872(%rbp), %rax
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -1904(%rbp)
-    movq -1904(%rbp), %rax
+    movq %rax, -1120(%rbp)
+    movq -1120(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -17565,7 +17794,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4141
+    jz .L4191
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17592,10 +17821,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1888(%rbp), %rbx
+    leaq -1104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1888(%rbp), %rax
+    movq -1104(%rbp), %rax
     pushq %rax
     movq $114, %rax
     popq %rbx
@@ -17603,7 +17832,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4151
+    jz .L4201
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17641,7 +17870,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4161
+    jz .L4211
     leaq .STR57(%rip), %rax
     pushq %rax
     popq %rdi
@@ -17654,10 +17883,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -17666,9 +17895,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L4162
-.L4161:
-.L4162:
+    jmp .L4212
+.L4211:
+.L4212:
     movq $9, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17677,51 +17906,51 @@ parser_parse_primary:
     popq %rsi
     call parser_eat
     movq $0, %rax
-    movq %rax, -1912(%rbp)
+    movq %rax, -1128(%rbp)
     movq $0, %rax
-    movq %rax, -1920(%rbp)
+    movq %rax, -1136(%rbp)
     movq $0, %rax
-    movq %rax, -1928(%rbp)
+    movq %rax, -1144(%rbp)
     movq $4, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
     pushq %rax
-    leaq -1048(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1056(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1912(%rbp), %rbx
+    leaq -1128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1056(%rbp), %rax
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1920(%rbp), %rbx
+    leaq -1136(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -1936(%rbp)
+    movq %rax, -1152(%rbp)
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17752,8 +17981,8 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4171
-    leaq .STR33(%rip), %rax
+    jz .L4221
+    leaq .STR24(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -17765,10 +17994,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -17777,9 +18006,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L4172
-.L4171:
-.L4172:
+    jmp .L4222
+.L4221:
+.L4222:
     movq $34, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17791,22 +18020,22 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -1944(%rbp)
-    movq -1936(%rbp), %rax
+    movq %rax, -1160(%rbp)
+    movq -1152(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1912(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1944(%rbp), %rax
+    movq -1160(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1920(%rbp), %rax
+    movq -1136(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -17814,15 +18043,15 @@ parser_parse_primary:
     call memory_set_pointer@PLT
     movq $1, %rax
     pushq %rax
-    leaq -1928(%rbp), %rbx
+    leaq -1144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4181:    movq -1560(%rbp), %rax
+.L4231:    movq -776(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -17830,7 +18059,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4182
+    jz .L4232
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17861,7 +18090,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4191
+    jz .L4241
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17873,7 +18102,7 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -1952(%rbp)
+    movq %rax, -1168(%rbp)
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17904,8 +18133,8 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4201
-    leaq .STR33(%rip), %rax
+    jz .L4251
+    leaq .STR24(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -17917,10 +18146,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -17929,9 +18158,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L4202
-.L4201:
-.L4202:
+    jmp .L4252
+.L4251:
+.L4252:
     movq $34, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -17943,187 +18172,187 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_additive
-    movq %rax, -1960(%rbp)
-    movq -1928(%rbp), %rax
+    movq %rax, -1176(%rbp)
+    movq -1144(%rbp), %rax
     pushq %rax
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4211
-    movq -1040(%rbp), %rax
+    jz .L4261
+    movq -256(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1040(%rbp), %rbx
+    leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1040(%rbp), %rax
+    movq -256(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1104(%rbp), %rbx
+    leaq -320(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1912(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1912(%rbp), %rbx
+    leaq -1128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
+    movq -320(%rbp), %rax
     pushq %rax
-    movq -1920(%rbp), %rax
+    movq -1136(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1920(%rbp), %rbx
+    leaq -1136(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4212
-.L4211:
-.L4212:
-    movq -1928(%rbp), %rax
+    jmp .L4262
+.L4261:
+.L4262:
+    movq -1144(%rbp), %rax
     pushq %rax
-    movq -1048(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1112(%rbp), %rbx
+    leaq -328(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1912(%rbp), %rax
-    addq -1112(%rbp), %rax
-    movq %rax, -1968(%rbp)
-    movq -1920(%rbp), %rax
-    addq -1112(%rbp), %rax
+    movq -1128(%rbp), %rax
+    addq -328(%rbp), %rax
+    movq %rax, -1184(%rbp)
+    movq -1136(%rbp), %rax
+    addq -328(%rbp), %rax
     pushq %rax
-    leaq -1728(%rbp), %rbx
+    leaq -944(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1952(%rbp), %rax
+    movq -1168(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1968(%rbp), %rax
+    movq -1184(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1960(%rbp), %rax
+    movq -1176(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1728(%rbp), %rax
+    movq -944(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1928(%rbp), %rax
+    movq -1144(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1928(%rbp), %rbx
+    leaq -1144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4192
-.L4191:
+    jmp .L4242
+.L4241:
     movq $0, %rax
     pushq %rax
-    leaq -1560(%rbp), %rbx
+    leaq -776(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4192:
-    jmp .L4181
-.L4182:
+.L4242:
+    jmp .L4231
+.L4232:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -1976(%rbp)
+    movq %rax, -1192(%rbp)
     movq $22, %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1976(%rbp), %rax
+    movq -1192(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1912(%rbp), %rax
+    movq -1128(%rbp), %rax
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1976(%rbp), %rax
+    movq -1192(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1920(%rbp), %rax
+    movq -1136(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1976(%rbp), %rax
+    movq -1192(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1928(%rbp), %rax
+    movq -1144(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1976(%rbp), %rax
+    movq -1192(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1872(%rbp), %rax
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    movq -1976(%rbp), %rax
+    movq -1192(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4152
-.L4151:
-    movq -1872(%rbp), %rax
+    jmp .L4202
+.L4201:
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
     call expression_create_variable
     pushq %rax
-    leaq -1752(%rbp), %rbx
+    leaq -968(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1752(%rbp), %rax
+    movq -968(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L4152:
-    jmp .L4142
-.L4141:
-.L4142:
+.L4202:
+    jmp .L4192
+.L4191:
+.L4192:
     movq $0, %rax
     pushq %rax
-    leaq -1200(%rbp), %rbx
+    leaq -416(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
@@ -18134,10 +18363,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1208(%rbp), %rbx
+    leaq -424(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1208(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -18145,11 +18374,11 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4221
-    jmp .L4222
-.L4221:
-.L4222:
-    movq -1208(%rbp), %rax
+    jz .L4271
+    jmp .L4272
+.L4271:
+.L4272:
+    movq -424(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -18157,106 +18386,19 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4231
+    jz .L4281
     movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
     pushq %rax
-    movq -1208(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1216(%rbp), %rbx
+    leaq -432(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1216(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4241
-    jmp .L4242
-.L4241:
-.L4242:
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
-    pushq %rax
-    movq -1208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1224(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1224(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4251
-    jmp .L4252
-.L4251:
-.L4252:
-    movq $0, %rax
-    pushq %rax
-    leaq -1232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $1, %rax
-    movq %rax, -1984(%rbp)
-.L4261:    movq -1984(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4262
-    movq $0, %rax
-    movq %rax, -1992(%rbp)
-    movq -1232(%rbp), %rax
-    pushq %rax
-    movq -1216(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4271
-    movq $1, %rax
-    pushq %rax
-    leaq -1992(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4272
-.L4271:
-.L4272:
-    movq -1992(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4281
-    movq $0, %rax
-    pushq %rax
-    leaq -1984(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4282
-.L4281:
-.L4282:
-    movq -1992(%rbp), %rax
+    movq -432(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -18265,244 +18407,147 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4291
-    movq $8, %rax
+    jmp .L4292
+.L4291:
+.L4292:
+    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
     pushq %rax
-    leaq -1048(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1232(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1112(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1224(%rbp), %rax
-    addq -1112(%rbp), %rax
-    pushq %rax
-    leaq -1240(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -1240(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -1248(%rbp), %rbx
+    leaq -440(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    movq -440(%rbp), %rax
+    pushq %rax
     movq $0, %rax
-    pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1256(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1872(%rbp), %rax
-    pushq %rax
-    movq -1256(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    leaq -1264(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1264(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4301
-    movq $1, %rax
-    pushq %rax
-    leaq -1200(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    leaq -1984(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
     jmp .L4302
 .L4301:
 .L4302:
-    movq -1232(%rbp), %rax
-    addq $1, %rax
+    movq $0, %rax
     pushq %rax
-    leaq -1232(%rbp), %rbx
+    leaq -448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4292
-.L4291:
-.L4292:
-    jmp .L4261
-.L4262:
-    jmp .L4232
-.L4231:
-.L4232:
-    movq $0, %rax
-    movq %rax, -2000(%rbp)
-    movq $0, %rax
-    movq %rax, -2008(%rbp)
-    movq -1200(%rbp), %rax
+    movq $1, %rax
+    movq %rax, -1200(%rbp)
+.L4311:    movq -1200(%rbp), %rax
     pushq %rax
-    movq $0, %rax
+    movq $1, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4311
-    movq -1208(%rbp), %rax
-    pushq %rax
+    jz .L4312
     movq $0, %rax
+    movq %rax, -1208(%rbp)
+    movq -448(%rbp), %rax
+    pushq %rax
+    movq -432(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
-    setne %al
+    setge %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4321
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq $1, %rax
     pushq %rax
-    movq -1208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    pushq %rax
-    leaq -1216(%rbp), %rbx
+    leaq -1208(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
-    pushq %rax
+    jmp .L4322
+.L4321:
+.L4322:
     movq -1208(%rbp), %rax
     pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1224(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    movq %rax, -2016(%rbp)
-.L4331:    movq -2016(%rbp), %rax
-    pushq %rax
-    movq -1216(%rbp), %rax
+    movq $1, %rax
     popq %rbx
     cmpq %rax, %rbx
-    setl %al
+    sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4332
-    movq -2016(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1624(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1224(%rbp), %rax
-    addq -1624(%rbp), %rax
-    pushq %rax
-    leaq -1240(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
+    jz .L4331
     movq $0, %rax
     pushq %rax
-    movq -1240(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1248(%rbp), %rbx
+    leaq -1200(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    jmp .L4332
+.L4331:
+.L4332:
+    movq -1208(%rbp), %rax
     pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2024(%rbp)
-    movq -2024(%rbp), %rax
-    pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4341
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq $8, %rax
     pushq %rax
-    movq -1248(%rbp), %rax
+    leaq -264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -448(%rbp), %rax
     pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2032(%rbp)
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
-    pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2040(%rbp)
-    movq $0, %rax
-    movq %rax, -2048(%rbp)
-.L4351:    movq -2048(%rbp), %rax
-    pushq %rax
-    movq -2032(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4352
-    movq -2048(%rbp), %rax
-    pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq -264(%rbp), %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -2056(%rbp)
-    movq -2040(%rbp), %rax
-    addq -2056(%rbp), %rax
-    movq %rax, -2064(%rbp)
+    pushq %rax
+    leaq -328(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -440(%rbp), %rax
+    addq -328(%rbp), %rax
+    pushq %rax
+    leaq -456(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -2064(%rbp), %rax
+    movq -456(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2072(%rbp)
-    movq -1872(%rbp), %rax
     pushq %rax
-    movq -2072(%rbp), %rax
+    leaq -464(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -472(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1088(%rbp), %rax
+    pushq %rax
+    movq -472(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
+    pushq %rax
+    leaq -480(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -480(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -18510,83 +18555,48 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4361
+    jz .L4351
     movq $1, %rax
     pushq %rax
-    leaq -2000(%rbp), %rbx
+    leaq -416(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2080(%rbp)
-    movq -2080(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    pushq %rax
-    leaq -2008(%rbp), %rbx
+    leaq -1200(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1216(%rbp), %rax
-    pushq %rax
-    leaq -2016(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2032(%rbp), %rax
-    pushq %rax
-    leaq -2048(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4362
-.L4361:
-.L4362:
-    movq -2048(%rbp), %rax
+    jmp .L4352
+.L4351:
+.L4352:
+    movq -448(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -2048(%rbp), %rbx
+    leaq -448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4351
-.L4352:
     jmp .L4342
 .L4341:
 .L4342:
-    movq -2016(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -2016(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4331
-.L4332:
-    jmp .L4322
-.L4321:
-.L4322:
-    jmp .L4312
-.L4311:
+    jmp .L4311
 .L4312:
-    movq -24(%rbp), %rax
+    jmp .L4282
+.L4281:
+.L4282:
+    movq $0, %rax
+    movq %rax, -1216(%rbp)
+    movq $0, %rax
+    movq %rax, -1224(%rbp)
+    movq -416(%rbp), %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq %rax, -2088(%rbp)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2096(%rbp)
-    movq -2096(%rbp), %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4361
+    movq -424(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -18595,44 +18605,234 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4371
-    movq $0, %rax
+    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
     pushq %rax
-    movq -2096(%rbp), %rax
+    movq -424(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -2104(%rbp)
-    movq -2104(%rbp), %rax
     pushq %rax
-    movq $34, %rax
+    leaq -432(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    pushq %rax
+    movq -424(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -440(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rax, -1232(%rbp)
+.L4381:    movq -1232(%rbp), %rax
+    pushq %rax
+    movq -432(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
-    sete %al
+    setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4381
-    movq -1200(%rbp), %rax
+    jz .L4382
+    movq -1232(%rbp), %rax
     pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -840(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -440(%rbp), %rax
+    addq -840(%rbp), %rax
+    pushq %rax
+    leaq -456(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     movq $0, %rax
+    pushq %rax
+    movq -456(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -464(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1240(%rbp)
+    movq -1240(%rbp), %rax
+    pushq %rax
+    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4391
+    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1248(%rbp)
+    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1256(%rbp)
+    movq $0, %rax
+    movq %rax, -1264(%rbp)
+.L4401:    movq -1264(%rbp), %rax
+    pushq %rax
+    movq -1248(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4402
+    movq -1264(%rbp), %rax
+    pushq %rax
+    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -1272(%rbp)
+    movq -1256(%rbp), %rax
+    addq -1272(%rbp), %rax
+    movq %rax, -1280(%rbp)
     movq $0, %rax
     pushq %rax
-    leaq -2104(%rbp), %rbx
+    movq -1280(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1288(%rbp)
+    movq -1088(%rbp), %rax
+    pushq %rax
+    movq -1288(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4411
+    movq $1, %rax
+    pushq %rax
+    leaq -1216(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1296(%rbp)
+    movq -1296(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    pushq %rax
+    leaq -1224(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -432(%rbp), %rax
+    pushq %rax
+    leaq -1232(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1248(%rbp), %rax
+    pushq %rax
+    leaq -1264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4412
+.L4411:
+.L4412:
+    movq -1264(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -1264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4401
+.L4402:
     jmp .L4392
 .L4391:
 .L4392:
-    jmp .L4382
-.L4381:
+    movq -1232(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -1232(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4381
 .L4382:
-    movq -2104(%rbp), %rax
+    jmp .L4372
+.L4371:
+.L4372:
+    jmp .L4362
+.L4361:
+.L4362:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq %rax, -1304(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1312(%rbp)
+    movq -1312(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4421
+    movq $0, %rax
+    pushq %rax
+    movq -1312(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1320(%rbp)
+    movq -1320(%rbp), %rax
     pushq %rax
     movq $34, %rax
     popq %rbx
@@ -18640,7 +18840,36 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4401
+    jz .L4431
+    movq -416(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4441
+    movq $0, %rax
+    pushq %rax
+    leaq -1320(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4442
+.L4441:
+.L4442:
+    jmp .L4432
+.L4431:
+.L4432:
+    movq -1320(%rbp), %rax
+    pushq %rax
+    movq $34, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4451
     movq $34, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -18655,8 +18884,8 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2112(%rbp)
-    movq -2112(%rbp), %rax
+    movq %rax, -1328(%rbp)
+    movq -1328(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -18664,7 +18893,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4411
+    jz .L4461
     leaq .STR58(%rip), %rax
     pushq %rax
     popq %rdi
@@ -18673,23 +18902,23 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4412
-.L4411:
-.L4412:
+    jmp .L4462
+.L4461:
+.L4462:
     movq $0, %rax
     pushq %rax
-    movq -2112(%rbp), %rax
+    movq -1328(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -2120(%rbp)
-    movq -2120(%rbp), %rax
+    movq %rax, -1336(%rbp)
+    movq -1336(%rbp), %rax
     pushq %rax
     popq %rdi
     call token_can_be_identifier
-    movq %rax, -2128(%rbp)
-    movq -2128(%rbp), %rax
+    movq %rax, -1344(%rbp)
+    movq -1344(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -18697,8 +18926,8 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4421
-    movq -2120(%rbp), %rax
+    jz .L4471
+    movq -1336(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -18706,7 +18935,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4431
+    jz .L4481
     leaq .STR58(%rip), %rax
     pushq %rax
     popq %rdi
@@ -18715,15 +18944,15 @@ parser_parse_primary:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4432
-.L4431:
-.L4432:
-    jmp .L4422
-.L4421:
-.L4422:
+    jmp .L4482
+.L4481:
+.L4482:
+    jmp .L4472
+.L4471:
+.L4472:
     movq $8, %rax
     pushq %rax
-    movq -2112(%rbp), %rax
+    movq -1328(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18731,8 +18960,8 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -2136(%rbp)
-    movq -2120(%rbp), %rax
+    movq %rax, -1352(%rbp)
+    movq -1336(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -18741,45 +18970,45 @@ parser_parse_primary:
     call parser_eat
     movq $40, %rax
     pushq %rax
-    leaq -1152(%rbp), %rbx
+    leaq -368(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1152(%rbp), %rax
+    movq -368(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -1872(%rbp), %rax
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
     pushq %rax
     movq $8, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -2136(%rbp), %rax
+    movq -1352(%rbp), %rax
     pushq %rax
     movq $16, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18789,7 +19018,7 @@ parser_parse_primary:
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18799,7 +19028,7 @@ parser_parse_primary:
     pushq %rax
     movq $32, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -18812,386 +19041,33 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2144(%rbp)
-    movq -2144(%rbp), %rax
+    movq %rax, -1360(%rbp)
+    movq -1360(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
     setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4441
-    movq $0, %rax
-    pushq %rax
-    movq -2144(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2152(%rbp)
-    movq -2152(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4451
-    movq $114, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $0, %rax
-    pushq %rax
-    leaq -1648(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    leaq -1656(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $4, %rax
-    pushq %rax
-    leaq -1664(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1648(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $1, %rax
-    pushq %rax
-    leaq -1680(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L4461:    movq -1680(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4462
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2160(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2168(%rbp)
-    movq -2168(%rbp), %rax
-    pushq %rax
-    movq $53, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4471
-    leaq .STR59(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    call print_newline
-    movq $1, %rax
-    pushq %rax
-    popq %rdi
-    call exit_with_code@PLT
-    jmp .L4472
-.L4471:
-.L4472:
-    movq $53, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $34, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_comparison_level
-    movq %rax, -2176(%rbp)
-    movq -1656(%rbp), %rax
-    pushq %rax
-    movq -1664(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4481
-    movq -1664(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1664(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    movq -1648(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -1648(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4482
-.L4481:
-.L4482:
-    movq -1656(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1712(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2176(%rbp), %rax
-    pushq %rax
-    movq -1712(%rbp), %rax
-    pushq %rax
-    movq -1648(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -1656(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2184(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2184(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2192(%rbp)
-    movq -2192(%rbp), %rax
-    pushq %rax
-    movq $30, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4491
-    movq $30, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    jmp .L4492
-.L4491:
     movq $0, %rax
     pushq %rax
-    leaq -1680(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L4492:
-    jmp .L4461
-.L4462:
-    movq -1648(%rbp), %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
+    movq -1360(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    call memory_get_int32@PLT
+    movq %rax, -1368(%rbp)
+    movq -1368(%rbp), %rax
     pushq %rax
-    movq $32, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    jmp .L4452
-.L4451:
-.L4452:
-    jmp .L4442
-.L4441:
-.L4442:
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4402
-.L4401:
-.L4402:
-    jmp .L4372
-.L4371:
-.L4372:
-    movq -2000(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
+    movq $114, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4501
-    movq $40, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -2008(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $32, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -2144(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2144(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4511
-    movq $0, %rax
-    pushq %rax
-    movq -2144(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    pushq %rax
-    leaq -2152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2152(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4521
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -19201,20 +19077,20 @@ parser_parse_primary:
     call parser_eat
     movq $0, %rax
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    leaq -1656(%rbp), %rbx
+    leaq -872(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $4, %rax
     pushq %rax
-    leaq -1664(%rbp), %rbx
+    leaq -880(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -19223,15 +19099,15 @@ parser_parse_primary:
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1680(%rbp), %rbx
+    leaq -896(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4531:    movq -1680(%rbp), %rax
+.L4511:    movq -896(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -19239,7 +19115,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4532
+    jz .L4512
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -19247,22 +19123,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    pushq %rax
-    leaq -2160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
+    movq %rax, -1376(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -2160(%rbp), %rax
+    movq -1376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    pushq %rax
-    leaq -2168(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2168(%rbp), %rax
+    movq %rax, -1384(%rbp)
+    movq -1384(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -19270,7 +19140,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4541
+    jz .L4521
     leaq .STR59(%rip), %rax
     pushq %rax
     popq %rdi
@@ -19280,9 +19150,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L4542
-.L4541:
-.L4542:
+    jmp .L4522
+.L4521:
+.L4522:
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -19301,69 +19171,66 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_comparison_level
+    movq %rax, -1392(%rbp)
+    movq -872(%rbp), %rax
     pushq %rax
-    leaq -2176(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1656(%rbp), %rax
-    pushq %rax
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4551
-    movq -1664(%rbp), %rax
+    jz .L4531
+    movq -880(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1664(%rbp), %rbx
+    leaq -880(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -1648(%rbp), %rax
+    movq -864(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4552
-.L4551:
-.L4552:
-    movq -1656(%rbp), %rax
+    jmp .L4532
+.L4531:
+.L4532:
+    movq -872(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1712(%rbp), %rbx
+    leaq -928(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -2176(%rbp), %rax
+    movq -1392(%rbp), %rax
     pushq %rax
-    movq -1712(%rbp), %rax
+    movq -928(%rbp), %rax
     pushq %rax
-    movq -1648(%rbp), %rax
+    movq -864(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1656(%rbp), %rbx
+    leaq -872(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
@@ -19373,22 +19240,16 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    pushq %rax
-    leaq -2184(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
+    movq %rax, -1400(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -2184(%rbp), %rax
+    movq -1400(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    pushq %rax
-    leaq -2192(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2192(%rbp), %rax
+    movq %rax, -1408(%rbp)
+    movq -1408(%rbp), %rax
     pushq %rax
     movq $30, %rax
     popq %rbx
@@ -19396,7 +19257,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4561
+    jz .L4541
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -19404,49 +19265,122 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L4562
-.L4561:
+    jmp .L4542
+.L4541:
     movq $0, %rax
     pushq %rax
-    leaq -1680(%rbp), %rbx
+    leaq -896(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4562:
-    jmp .L4531
-.L4532:
-    movq -1648(%rbp), %rax
+.L4542:
+    jmp .L4511
+.L4512:
+    movq -864(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     pushq %rax
     movq $32, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L4522
-.L4521:
-.L4522:
-    jmp .L4512
-.L4511:
-.L4512:
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
     jmp .L4502
 .L4501:
 .L4502:
+    jmp .L4492
+.L4491:
+.L4492:
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4452
+.L4451:
+.L4452:
+    jmp .L4422
+.L4421:
+.L4422:
+    movq -1216(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4551
+    movq $40, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -1224(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -1088(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $32, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -19454,22 +19388,31 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2200(%rbp)
+    pushq %rax
+    leaq -1360(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1360(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4561
     movq $0, %rax
     pushq %rax
-    movq -2200(%rbp), %rax
+    movq -1360(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -2208(%rbp)
-    movq -1872(%rbp), %rax
-    movq %rax, -2216(%rbp)
-    movq $0, %rax
-    movq %rax, -2224(%rbp)
-    movq $1, %rax
-    movq %rax, -2232(%rbp)
-    movq -2208(%rbp), %rax
+    pushq %rax
+    leaq -1368(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1368(%rbp), %rax
     pushq %rax
     movq $114, %rax
     popq %rbx
@@ -19478,755 +19421,6 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4571
-    movq $0, %rax
-    pushq %rax
-    leaq -2232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4572
-.L4571:
-.L4572:
-    movq -2232(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4581
-    movq -1208(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4591
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
-    pushq %rax
-    movq -1208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2240(%rbp)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
-    pushq %rax
-    movq -1208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2248(%rbp)
-    movq $0, %rax
-    movq %rax, -2256(%rbp)
-.L4601:    movq -2256(%rbp), %rax
-    pushq %rax
-    movq -2240(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4602
-    movq -2248(%rbp), %rax
-    pushq %rax
-    movq -2256(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    popq %rbx
-    addq %rbx, %rax
-    movq %rax, -2264(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2264(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2272(%rbp)
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
-    pushq %rax
-    movq -2272(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2280(%rbp)
-    movq -2280(%rbp), %rax
-    pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4611
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
-    pushq %rax
-    movq -2272(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2288(%rbp)
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
-    pushq %rax
-    movq -2272(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2296(%rbp)
-    movq $0, %rax
-    movq %rax, -2304(%rbp)
-.L4621:    movq -2304(%rbp), %rax
-    pushq %rax
-    movq -2288(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4622
-    movq -2296(%rbp), %rax
-    pushq %rax
-    movq -2304(%rbp), %rax
-    pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
-    popq %rbx
-    imulq %rbx, %rax
-    popq %rbx
-    addq %rbx, %rax
-    movq %rax, -2312(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2312(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2320(%rbp)
-    movq -2216(%rbp), %rax
-    pushq %rax
-    movq -2320(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4631
-    movq -2272(%rbp), %rax
-    pushq %rax
-    leaq -2224(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2288(%rbp), %rax
-    pushq %rax
-    leaq -2304(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2240(%rbp), %rax
-    pushq %rax
-    leaq -2256(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4632
-.L4631:
-.L4632:
-    movq -2304(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -2304(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4621
-.L4622:
-    jmp .L4612
-.L4611:
-.L4612:
-    movq -2256(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -2256(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4601
-.L4602:
-    jmp .L4592
-.L4591:
-.L4592:
-    jmp .L4582
-.L4581:
-.L4582:
-    movq -2224(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4641
-    movq $40, %rax
-    pushq %rax
-    leaq -1152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1152(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq $0, %rax
-    pushq %rax
-    movq -2224(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2328(%rbp)
-    movq -2328(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -2216(%rbp), %rax
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $32, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4642
-.L4641:
-.L4642:
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2336(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2336(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2344(%rbp)
-    movq -2344(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4651
-    movq -1872(%rbp), %rax
-    movq %rax, -2352(%rbp)
-    movq $0, %rax
-    movq %rax, -2360(%rbp)
-    movq -1208(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4661
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
-    pushq %rax
-    movq -1208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -1216(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
-    pushq %rax
-    movq -1208(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1224(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    leaq -1232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $1, %rax
-    movq %rax, -2368(%rbp)
-.L4671:    movq -2368(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4672
-    movq $0, %rax
-    movq %rax, -2376(%rbp)
-    movq -1232(%rbp), %rax
-    pushq %rax
-    movq -1216(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4681
-    movq $1, %rax
-    pushq %rax
-    leaq -2376(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4682
-.L4681:
-.L4682:
-    movq -2376(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4691
-    movq $0, %rax
-    pushq %rax
-    leaq -2368(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4692
-.L4691:
-.L4692:
-    movq -2376(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4701
-    movq $8, %rax
-    pushq %rax
-    leaq -1048(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1232(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1112(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1224(%rbp), %rax
-    addq -1112(%rbp), %rax
-    pushq %rax
-    leaq -1240(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -1240(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -2024(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    movq %rax, -2384(%rbp)
-    movq -2024(%rbp), %rax
-    pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4711
-    movq $1, %rax
-    pushq %rax
-    leaq -2384(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4712
-.L4711:
-.L4712:
-    movq -2384(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4721
-    movq $24, %rax
-    pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -2032(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $16, %rax
-    pushq %rax
-    movq -1248(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -2040(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    movq %rax, -2392(%rbp)
-    movq $1, %rax
-    movq %rax, -2400(%rbp)
-.L4731:    movq -2400(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4732
-    movq $0, %rax
-    movq %rax, -2408(%rbp)
-    movq -2392(%rbp), %rax
-    pushq %rax
-    movq -2032(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4741
-    movq $1, %rax
-    pushq %rax
-    leaq -2408(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4742
-.L4741:
-.L4742:
-    movq -2408(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4751
-    movq $0, %rax
-    pushq %rax
-    leaq -2400(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4752
-.L4751:
-.L4752:
-    movq -2408(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4761
-    movq -2392(%rbp), %rax
-    pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -2056(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2040(%rbp), %rax
-    addq -2056(%rbp), %rax
-    pushq %rax
-    leaq -2064(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    movq -2064(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2416(%rbp)
-    movq -2352(%rbp), %rax
-    pushq %rax
-    movq -2416(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call string_equals@PLT
-    movq %rax, -2424(%rbp)
-    movq -2424(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4771
-    movq -1248(%rbp), %rax
-    pushq %rax
-    leaq -2360(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    leaq -2400(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    pushq %rax
-    leaq -2368(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4772
-.L4771:
-.L4772:
-    movq -2392(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -2392(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4762
-.L4761:
-.L4762:
-    jmp .L4731
-.L4732:
-    jmp .L4722
-.L4721:
-.L4722:
-    movq -1232(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -1232(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4702
-.L4701:
-.L4702:
-    jmp .L4671
-.L4672:
-    jmp .L4662
-.L4661:
-.L4662:
-    movq -2360(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4781
-    movq $40, %rax
-    pushq %rax
-    leaq -1152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1152(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq $0, %rax
-    pushq %rax
-    movq -2360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    pushq %rax
-    leaq -2328(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2328(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -2352(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    pushq %rax
-    movq $16, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $24, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq $0, %rax
-    pushq %rax
-    movq $32, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2432(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2432(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2440(%rbp)
-    movq -2440(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4791
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20236,20 +19430,20 @@ parser_parse_primary:
     call parser_eat
     movq $0, %rax
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    leaq -1656(%rbp), %rbx
+    leaq -872(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $4, %rax
     pushq %rax
-    leaq -1664(%rbp), %rbx
+    leaq -880(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -20258,15 +19452,15 @@ parser_parse_primary:
     popq %rdi
     call memory_allocate@PLT
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
     pushq %rax
-    leaq -1680(%rbp), %rbx
+    leaq -896(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4801:    movq -1680(%rbp), %rax
+.L4581:    movq -896(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -20274,7 +19468,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4802
+    jz .L4582
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20283,21 +19477,21 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -2160(%rbp), %rbx
+    leaq -1376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -2160(%rbp), %rax
+    movq -1376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -2168(%rbp), %rbx
+    leaq -1384(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -2168(%rbp), %rax
+    movq -1384(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -20305,7 +19499,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4811
+    jz .L4591
     leaq .STR59(%rip), %rax
     pushq %rax
     popq %rdi
@@ -20315,9 +19509,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L4812
-.L4811:
-.L4812:
+    jmp .L4592
+.L4591:
+.L4592:
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20337,68 +19531,68 @@ parser_parse_primary:
     popq %rdi
     call parser_parse_comparison_level
     pushq %rax
-    leaq -2176(%rbp), %rbx
+    leaq -1392(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     pushq %rax
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4821
-    movq -1664(%rbp), %rax
+    jz .L4601
+    movq -880(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1664(%rbp), %rbx
+    leaq -880(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1664(%rbp), %rax
+    movq -880(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -1648(%rbp), %rax
+    movq -864(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -1648(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4822
-.L4821:
-.L4822:
-    movq -1656(%rbp), %rax
+    jmp .L4602
+.L4601:
+.L4602:
+    movq -872(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -1712(%rbp), %rbx
+    leaq -928(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -2176(%rbp), %rax
+    movq -1392(%rbp), %rax
     pushq %rax
-    movq -1712(%rbp), %rax
+    movq -928(%rbp), %rax
     pushq %rax
-    movq -1648(%rbp), %rax
+    movq -864(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -1656(%rbp), %rbx
+    leaq -872(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
@@ -20409,21 +19603,21 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -2184(%rbp), %rbx
+    leaq -1400(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -2184(%rbp), %rax
+    movq -1400(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -2192(%rbp), %rbx
+    leaq -1408(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -2192(%rbp), %rax
+    movq -1408(%rbp), %rax
     pushq %rax
     movq $30, %rax
     popq %rbx
@@ -20431,7 +19625,7 @@ parser_parse_primary:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L4831
+    jz .L4611
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -20439,83 +19633,869 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L4832
-.L4831:
+    jmp .L4612
+.L4611:
     movq $0, %rax
     pushq %rax
-    leaq -1680(%rbp), %rbx
+    leaq -896(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L4832:
-    jmp .L4801
-.L4802:
-    movq -1648(%rbp), %rax
+.L4612:
+    jmp .L4581
+.L4582:
+    movq -864(%rbp), %rax
     pushq %rax
     movq $24, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -1656(%rbp), %rax
+    movq -872(%rbp), %rax
     pushq %rax
     movq $32, %rax
     pushq %rax
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L4792
-.L4791:
-.L4792:
-    movq -1160(%rbp), %rax
+    jmp .L4572
+.L4571:
+.L4572:
+    jmp .L4562
+.L4561:
+.L4562:
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4782
-.L4781:
-.L4782:
-    jmp .L4652
-.L4651:
-.L4652:
+    jmp .L4552
+.L4551:
+.L4552:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1416(%rbp)
     movq $0, %rax
-    movq %rax, -2448(%rbp)
-    movq -2448(%rbp), %rax
+    pushq %rax
+    movq -1416(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1424(%rbp)
+    movq -1088(%rbp), %rax
+    movq %rax, -1432(%rbp)
+    movq $0, %rax
+    movq %rax, -1440(%rbp)
+    movq $1, %rax
+    movq %rax, -1448(%rbp)
+    movq -1424(%rbp), %rax
+    pushq %rax
+    movq $114, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4621
+    movq $0, %rax
+    pushq %rax
+    leaq -1448(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4622
+.L4621:
+.L4622:
+    movq -1448(%rbp), %rax
     pushq %rax
     movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4631
+    movq -424(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4641
+    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    pushq %rax
+    movq -424(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1456(%rbp)
+    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    pushq %rax
+    movq -424(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1464(%rbp)
+    movq $0, %rax
+    movq %rax, -1472(%rbp)
+.L4651:    movq -1472(%rbp), %rax
+    pushq %rax
+    movq -1456(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4652
+    movq -1464(%rbp), %rax
+    pushq %rax
+    movq -1472(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    popq %rbx
+    addq %rbx, %rax
+    movq %rax, -1480(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1480(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1488(%rbp)
+    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    pushq %rax
+    movq -1488(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1496(%rbp)
+    movq -1496(%rbp), %rax
+    pushq %rax
+    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4661
+    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    pushq %rax
+    movq -1488(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1504(%rbp)
+    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    pushq %rax
+    movq -1488(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1512(%rbp)
+    movq $0, %rax
+    movq %rax, -1520(%rbp)
+.L4671:    movq -1520(%rbp), %rax
+    pushq %rax
+    movq -1504(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4672
+    movq -1512(%rbp), %rax
+    pushq %rax
+    movq -1520(%rbp), %rax
+    pushq %rax
+    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    popq %rbx
+    imulq %rbx, %rax
+    popq %rbx
+    addq %rbx, %rax
+    movq %rax, -1528(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1528(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1536(%rbp)
+    movq -1432(%rbp), %rax
+    pushq %rax
+    movq -1536(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4681
+    movq -1488(%rbp), %rax
+    pushq %rax
+    leaq -1440(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1504(%rbp), %rax
+    pushq %rax
+    leaq -1520(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1456(%rbp), %rax
+    pushq %rax
+    leaq -1472(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4682
+.L4681:
+.L4682:
+    movq -1520(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -1520(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4671
+.L4672:
+    jmp .L4662
+.L4661:
+.L4662:
+    movq -1472(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -1472(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4651
+.L4652:
+    jmp .L4642
+.L4641:
+.L4642:
+    jmp .L4632
+.L4631:
+.L4632:
+    movq -1440(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4691
+    movq $40, %rax
+    pushq %rax
+    leaq -368(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -368(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $0, %rax
+    pushq %rax
+    movq -1440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1544(%rbp)
+    movq -1544(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -1432(%rbp), %rax
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $32, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4692
+.L4691:
+.L4692:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1552(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1552(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1560(%rbp)
+    movq -1560(%rbp), %rax
+    pushq %rax
+    movq $114, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4701
+    movq -1088(%rbp), %rax
+    movq %rax, -1568(%rbp)
+    movq $0, %rax
+    movq %rax, -1576(%rbp)
+    movq -424(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4711
+    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    pushq %rax
+    movq -424(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -432(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    pushq %rax
+    movq -424(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -440(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    leaq -448(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $1, %rax
+    movq %rax, -1584(%rbp)
+.L4721:    movq -1584(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4722
+    movq $0, %rax
+    movq %rax, -1592(%rbp)
+    movq -448(%rbp), %rax
+    pushq %rax
+    movq -432(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4731
+    movq $1, %rax
+    pushq %rax
+    leaq -1592(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4732
+.L4731:
+.L4732:
+    movq -1592(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4741
+    movq $0, %rax
+    pushq %rax
+    leaq -1584(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4742
+.L4741:
+.L4742:
+    movq -1592(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4751
+    movq $8, %rax
+    pushq %rax
+    leaq -264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -448(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -328(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -440(%rbp), %rax
+    addq -328(%rbp), %rax
+    pushq %rax
+    leaq -456(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -456(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -464(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -1240(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rax, -1600(%rbp)
+    movq -1240(%rbp), %rax
+    pushq %rax
+    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4761
+    movq $1, %rax
+    pushq %rax
+    leaq -1600(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4762
+.L4761:
+.L4762:
+    movq -1600(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4771
+    movq $24, %rax
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -1248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $16, %rax
+    pushq %rax
+    movq -464(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -1256(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rax, -1608(%rbp)
+    movq $1, %rax
+    movq %rax, -1616(%rbp)
+.L4781:    movq -1616(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4782
+    movq $0, %rax
+    movq %rax, -1624(%rbp)
+    movq -1608(%rbp), %rax
+    pushq %rax
+    movq -1248(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4791
+    movq $1, %rax
+    pushq %rax
+    leaq -1624(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4792
+.L4791:
+.L4792:
+    movq -1624(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4801
+    movq $0, %rax
+    pushq %rax
+    leaq -1616(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4802
+.L4801:
+.L4802:
+    movq -1624(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4811
+    movq -1608(%rbp), %rax
+    pushq %rax
+    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -1272(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1256(%rbp), %rax
+    addq -1272(%rbp), %rax
+    pushq %rax
+    leaq -1280(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -1280(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1632(%rbp)
+    movq -1568(%rbp), %rax
+    pushq %rax
+    movq -1632(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call string_equals@PLT
+    movq %rax, -1640(%rbp)
+    movq -1640(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4821
+    movq -464(%rbp), %rax
+    pushq %rax
+    leaq -1576(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    leaq -1616(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    leaq -1584(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4822
+.L4821:
+.L4822:
+    movq -1608(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -1608(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4812
+.L4811:
+.L4812:
+    jmp .L4781
+.L4782:
+    jmp .L4772
+.L4771:
+.L4772:
+    movq -448(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -448(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4752
+.L4751:
+.L4752:
+    jmp .L4721
+.L4722:
+    jmp .L4712
+.L4711:
+.L4712:
+    movq -1576(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4831
+    movq $40, %rax
+    pushq %rax
+    leaq -368(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -368(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $0, %rax
+    pushq %rax
+    movq -1576(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    pushq %rax
+    leaq -1544(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1544(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -1568(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    pushq %rax
+    movq $16, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $32, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1648(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1648(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1656(%rbp)
+    movq -1656(%rbp), %rax
+    pushq %rax
+    movq $114, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4841
-    movq $51, %rax
+    movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -2456(%rbp)
     movq $0, %rax
     pushq %rax
-    leaq -1008(%rbp), %rbx
+    leaq -864(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    leaq -1016(%rbp), %rbx
+    leaq -872(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax
-    movq %rax, -2464(%rbp)
+    movq $4, %rax
+    pushq %rax
+    leaq -880(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -880(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -864(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     movq $1, %rax
-    movq %rax, -2472(%rbp)
-.L4851:    movq -2472(%rbp), %rax
+    pushq %rax
+    leaq -896(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L4851:    movq -896(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -20531,99 +20511,282 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2480(%rbp)
+    pushq %rax
+    leaq -1376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -2480(%rbp), %rax
+    movq -1376(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -2488(%rbp)
-    movq -2488(%rbp), %rax
+    call memory_get_int32@PLT
     pushq %rax
-    movq $49, %rax
+    leaq -1384(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1384(%rbp), %rax
+    pushq %rax
+    movq $53, %rax
     popq %rbx
     cmpq %rax, %rbx
-    sete %al
+    setne %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4861
-    movq $0, %rax
+    leaq .STR59(%rip), %rax
     pushq %rax
-    leaq -2472(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
+    popq %rdi
+    call print_string
+    call print_newline
+    movq $1, %rax
+    pushq %rax
+    popq %rdi
+    call exit_with_code@PLT
     jmp .L4862
 .L4861:
 .L4862:
-    movq -2488(%rbp), %rax
+    movq $53, %rax
     pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4871
-    movq $0, %rax
+    movq -8(%rbp), %rax
     pushq %rax
-    leaq -2472(%rbp), %rbx
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $34, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_comparison_level
+    pushq %rax
+    leaq -1392(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L4872
-.L4871:
-.L4872:
-    movq $0, %rax
-    movq %rax, -2496(%rbp)
-    movq -2488(%rbp), %rax
+    movq -872(%rbp), %rax
     pushq %rax
-    movq $49, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4881
-    movq -2488(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4891
-    movq $1, %rax
-    pushq %rax
-    leaq -2496(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4892
-.L4891:
-.L4892:
-    jmp .L4882
-.L4881:
-.L4882:
-    movq -2496(%rbp), %rax
-    pushq %rax
-    movq $1, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4901
-    movq -1016(%rbp), %rax
-    pushq %rax
-    movq -2464(%rbp), %rax
+    movq -880(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
+    jz .L4871
+    movq -880(%rbp), %rax
+    pushq %rax
+    movq $2, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -880(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -880(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    movq -864(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -864(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4872
+.L4871:
+.L4872:
+    movq -872(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -928(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1392(%rbp), %rax
+    pushq %rax
+    movq -928(%rbp), %rax
+    pushq %rax
+    movq -864(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -872(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -872(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    pushq %rax
+    leaq -1400(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    movq -1400(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    pushq %rax
+    leaq -1408(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1408(%rbp), %rax
+    pushq %rax
+    movq $30, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4881
+    movq $30, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L4882
+.L4881:
+    movq $0, %rax
+    pushq %rax
+    leaq -896(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L4882:
+    jmp .L4851
+.L4852:
+    movq -864(%rbp), %rax
+    pushq %rax
+    movq $24, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -872(%rbp), %rax
+    pushq %rax
+    movq $32, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    jmp .L4842
+.L4841:
+.L4842:
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4832
+.L4831:
+.L4832:
+    jmp .L4702
+.L4701:
+.L4702:
+    movq $0, %rax
+    movq %rax, -1664(%rbp)
+    movq -1664(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4891
+    movq $51, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq %rax, -1672(%rbp)
+    movq $0, %rax
+    pushq %rax
+    leaq -224(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    pushq %rax
+    leaq -232(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    movq %rax, -1680(%rbp)
+    movq $1, %rax
+    movq %rax, -1688(%rbp)
+.L4901:    movq -1688(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4902
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1696(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1696(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -1704(%rbp)
+    movq -1704(%rbp), %rax
+    pushq %rax
+    movq $49, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
     jz .L4911
-    movq -2464(%rbp), %rax
+    movq $0, %rax
+    pushq %rax
+    leaq -1688(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4912
+.L4911:
+.L4912:
+    movq -1704(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -20632,209 +20795,46 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4921
-    movq $4, %rax
+    movq $0, %rax
     pushq %rax
-    leaq -2464(%rbp), %rbx
+    leaq -1688(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     jmp .L4922
 .L4921:
-    movq -2464(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -2464(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
 .L4922:
-    movq $8, %rax
-    pushq %rax
-    leaq -1048(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -2464(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1104(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1104(%rbp), %rax
-    pushq %rax
-    movq -1008(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -1008(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4912
-.L4911:
-.L4912:
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_additive
-    pushq %rax
-    leaq -1096(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    leaq -1048(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1016(%rbp), %rax
-    pushq %rax
-    movq -1048(%rbp), %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -1112(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1008(%rbp), %rax
-    addq -1112(%rbp), %rax
-    pushq %rax
-    leaq -1120(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1096(%rbp), %rax
-    pushq %rax
     movq $0, %rax
-    pushq %rax
-    movq -1120(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1016(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -1016(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2504(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -2504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -2512(%rbp)
-    movq -2512(%rbp), %rax
+    movq %rax, -1712(%rbp)
+    movq -1704(%rbp), %rax
     pushq %rax
     movq $49, %rax
     popq %rbx
     cmpq %rax, %rbx
-    sete %al
+    setne %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4931
+    movq -1704(%rbp), %rax
+    pushq %rax
     movq $0, %rax
-    pushq %rax
-    leaq -2472(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L4932
-.L4931:
-    movq -2512(%rbp), %rax
-    pushq %rax
-    movq $52, %rax
     popq %rbx
     cmpq %rax, %rbx
-    sete %al
+    setne %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4941
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq %rax, -2520(%rbp)
-    jmp .L4942
-.L4941:
-    leaq .STR60(%rip), %rax
-    movq %rax, -2528(%rbp)
-    movq -2528(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    movq $16, %rax
-    pushq %rax
-    movq -2504(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    pushq %rax
-    leaq -1448(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call print_integer
-    call print_newline
     movq $1, %rax
     pushq %rax
-    popq %rdi
-    call exit_with_code@PLT
-.L4942:
-.L4932:
-    jmp .L4902
-.L4901:
-.L4902:
-    jmp .L4851
-.L4852:
-    movq $52, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq %rax, -2536(%rbp)
-    movq -1016(%rbp), %rax
-    pushq %rax
-    movq -1008(%rbp), %rax
-    pushq %rax
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call expression_create_function_call
-    pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -1712(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4842
-.L4841:
-.L4842:
-    movq -1200(%rbp), %rax
+    jmp .L4942
+.L4941:
+.L4942:
+    jmp .L4932
+.L4931:
+.L4932:
+    movq -1712(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -20843,224 +20843,111 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4951
-    movq $32, %rax
+    movq -232(%rbp), %rax
     pushq %rax
-    leaq -1152(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1152(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $7, %rax  # Load compile-time constant EXPR_TYPE_NAME
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -1872(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    pushq %rax
-    movq -1160(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4952
-.L4951:
-.L4952:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2544(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
-    pushq %rax
-    movq -2544(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2552(%rbp)
-    movq -2552(%rbp), %rax
-    pushq %rax
-    movq $144, %rax
+    movq -1680(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
-    sete %al
+    setge %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4961
-    movq $144, %rax
+    movq -1680(%rbp), %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2560(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
-    pushq %rax
-    movq -2560(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2568(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
-    pushq %rax
-    movq -2560(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2576(%rbp)
-    movq -2568(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call expression_create_variable
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4962
-.L4961:
-.L4962:
-    movq -1872(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call expression_create_variable
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4012
-.L4011:
-.L4012:
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $134, %rax
+    movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4971
-    movq $134, %rax
+    movq $4, %rax
     pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq %rax, -2584(%rbp)
-    movq $1, %rax
-    pushq %rax
-    popq %rdi
-    call expression_create_integer
-    pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -1680(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
     jmp .L4972
 .L4971:
-.L4972:
-    movq -24(%rbp), %rax
+    movq -1680(%rbp), %rax
     pushq %rax
-    movq $135, %rax
+    movq $2, %rax
     popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4981
-    movq $135, %rax
+    imulq %rbx, %rax
     pushq %rax
-    movq -8(%rbp), %rax
+    leaq -1680(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L4972:
+    movq $8, %rax
+    pushq %rax
+    leaq -264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1680(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -320(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -320(%rbp), %rax
+    pushq %rax
+    movq -224(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call parser_eat
+    call memory_reallocate@PLT
     pushq %rax
-    leaq -2456(%rbp), %rbx
+    leaq -224(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    jmp .L4962
+.L4961:
+.L4962:
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_additive
+    pushq %rax
+    leaq -312(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    leaq -264(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -232(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -328(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -224(%rbp), %rax
+    addq -328(%rbp), %rax
+    pushq %rax
+    leaq -336(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -312(%rbp), %rax
+    pushq %rax
     movq $0, %rax
     pushq %rax
-    popq %rdi
-    call expression_create_integer
-    pushq %rax
-    leaq -1160(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L4982
-.L4981:
-.L4982:
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $133, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L4991
-    movq $133, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
+    movq -336(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call parser_eat
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -232(%rbp), %rax
+    addq $1, %rax
     pushq %rax
-    leaq -2520(%rbp), %rbx
+    leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $8, %rax
@@ -21070,40 +20957,68 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2592(%rbp)
+    movq %rax, -1720(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -2592(%rbp), %rax
+    movq -1720(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_integer@PLT
-    movq %rax, -2600(%rbp)
-    movq -2600(%rbp), %rax
+    movq %rax, -1728(%rbp)
+    movq -1728(%rbp), %rax
     pushq %rax
-    movq $11, %rax
+    movq $49, %rax
     popq %rbx
     cmpq %rax, %rbx
-    setne %al
+    sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5001
-    leaq .STR61(%rip), %rax
+    jz .L4981
+    movq $0, %rax
+    pushq %rax
+    leaq -1688(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L4982
+.L4981:
+    movq -1728(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L4991
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq %rax, -1736(%rbp)
+    jmp .L4992
+.L4991:
+    leaq .STR60(%rip), %rax
+    movq %rax, -1744(%rbp)
+    movq -1744(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
     movq $16, %rax
     pushq %rax
-    movq -2592(%rbp), %rax
+    movq -1720(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1304(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1304(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -21112,208 +21027,271 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5002
-.L5001:
-.L5002:
-    movq $8, %rax
-    pushq %rax
-    movq -2592(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    pushq %rax
-    leaq -1168(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -1168(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_to_integer
-    pushq %rax
-    leaq -1176(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $0, %rax
-    subq -1176(%rbp), %rax
-    movq %rax, -2608(%rbp)
-    movq $11, %rax
+.L4992:
+.L4982:
+    jmp .L4952
+.L4951:
+.L4952:
+    jmp .L4901
+.L4902:
+    movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
-    movq %rax, -2616(%rbp)
-    movq -2608(%rbp), %rax
+    movq %rax, -1752(%rbp)
+    movq -232(%rbp), %rax
+    pushq %rax
+    movq -224(%rbp), %rax
+    pushq %rax
+    movq -1088(%rbp), %rax
     pushq %rax
     popq %rdi
-    call expression_create_integer
+    popq %rsi
+    popq %rdx
+    call expression_create_function_call
     pushq %rax
-    leaq -1160(%rbp), %rbx
+    leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1160(%rbp), %rax
+    movq -376(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L4992
-.L4991:
-.L4992:
-    movq -24(%rbp), %rax
+    jmp .L4892
+.L4891:
+.L4892:
+    movq -416(%rbp), %rax
     pushq %rax
-    movq $162, %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5001
+    movq $32, %rax
+    pushq %rax
+    leaq -368(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -368(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $7, %rax  # Load compile-time constant EXPR_TYPE_NAME
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -1088(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    pushq %rax
+    movq -376(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5002
+.L5001:
+.L5002:
+    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1760(%rbp)
+    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    pushq %rax
+    movq -1760(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1768(%rbp)
+    movq -1768(%rbp), %rax
+    pushq %rax
+    movq $144, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5011
-    movq $162, %rax
+    movq $144, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $0, %rax
-    movq %rax, -2624(%rbp)
-    movq $0, %rax
-    movq %rax, -2632(%rbp)
-    movq $4, %rax
-    movq %rax, -2640(%rbp)
-    movq -2640(%rbp), %rax
-    pushq %rax
-    movq $8, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -2648(%rbp)
-    movq -2648(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    pushq %rax
-    leaq -2624(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $8, %rax
+    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2656(%rbp)
-    movq $0, %rax
+    movq %rax, -1776(%rbp)
+    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
     pushq %rax
-    movq -2656(%rbp), %rax
+    movq -1776(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -2664(%rbp)
-    movq -2664(%rbp), %rax
+    movq %rax, -1784(%rbp)
+    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
-    movq $53, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5021
-    leaq .STR62(%rip), %rax
-    pushq %rax
-    popq %rdi
-    call print_string
-    call print_newline
-    movq $1, %rax
-    pushq %rax
-    popq %rdi
-    call exit_with_code@PLT
-    jmp .L5022
-.L5021:
-.L5022:
-    movq $8, %rax
-    pushq %rax
-    movq -2656(%rbp), %rax
+    movq -1776(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2672(%rbp)
-    movq -2672(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call string_duplicate_parser
-    movq %rax, -2680(%rbp)
-    movq -2680(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq -2624(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq $1, %rax
-    pushq %rax
-    leaq -2632(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq $53, %rax
+    movq %rax, -1792(%rbp)
+    movq -1784(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $1, %rax
-    movq %rax, -2688(%rbp)
-.L5031:    movq -2688(%rbp), %rax
+    movq -1088(%rbp), %rax
     pushq %rax
-    movq $1, %rax
+    popq %rdi
+    call expression_create_variable
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5012
+.L5011:
+.L5012:
+    movq -1088(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call expression_create_variable
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L4062
+.L4061:
+.L4062:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $134, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5032
-    movq $8, %rax
+    jz .L5021
+    movq $134, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -2696(%rbp)
-    movq $0, %rax
+    call parser_eat
+    movq %rax, -1800(%rbp)
+    movq $1, %rax
     pushq %rax
-    movq -2696(%rbp), %rax
+    popq %rdi
+    call expression_create_integer
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5022
+.L5021:
+.L5022:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $135, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5031
+    movq $135, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_int32@PLT
+    call parser_eat
     pushq %rax
-    leaq -1888(%rbp), %rbx
+    leaq -1672(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1888(%rbp), %rax
+    movq $0, %rax
     pushq %rax
-    movq $52, %rax
+    popq %rdi
+    call expression_create_integer
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5032
+.L5031:
+.L5032:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $133, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5041
-    movq $52, %rax
+    movq $133, %rax
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call parser_eat
+    pushq %rax
+    leaq -1736(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21321,28 +21299,43 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2704(%rbp)
+    movq %rax, -1808(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -2704(%rbp), %rax
+    movq -1808(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
-    call memory_get_int32@PLT
-    movq %rax, -2712(%rbp)
-    movq -2712(%rbp), %rax
+    call memory_get_integer@PLT
+    movq %rax, -1816(%rbp)
+    movq -1816(%rbp), %rax
     pushq %rax
-    movq $53, %rax
+    movq $11, %rax
     popq %rbx
     cmpq %rax, %rbx
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5051
-    leaq .STR63(%rip), %rax
+    leaq .STR61(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
+    movq $16, %rax
+    pushq %rax
+    movq -1808(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    pushq %rax
+    leaq -520(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -520(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call print_integer
     call print_newline
     movq $1, %rax
     pushq %rax
@@ -21353,38 +21346,148 @@ parser_parse_primary:
 .L5052:
     movq $8, %rax
     pushq %rax
-    movq -2704(%rbp), %rax
+    movq -1808(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2720(%rbp)
-    movq -2720(%rbp), %rax
+    pushq %rax
+    leaq -384(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -384(%rbp), %rax
     pushq %rax
     popq %rdi
-    call string_duplicate_parser
-    movq %rax, -2728(%rbp)
-    movq -2632(%rbp), %rax
+    call string_to_integer
+    pushq %rax
+    leaq -392(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $0, %rax
+    subq -392(%rbp), %rax
+    movq %rax, -1824(%rbp)
+    movq $11, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq %rax, -1832(%rbp)
+    movq -1824(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call expression_create_integer
+    pushq %rax
+    leaq -376(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -376(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L5042
+.L5041:
+.L5042:
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $162, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5061
+    movq $162, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $0, %rax
+    movq %rax, -1840(%rbp)
+    movq $0, %rax
+    movq %rax, -1848(%rbp)
+    movq $4, %rax
+    movq %rax, -1856(%rbp)
+    movq -1856(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -2736(%rbp)
-    movq -2728(%rbp), %rax
+    movq %rax, -1864(%rbp)
+    movq -1864(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    pushq %rax
+    leaq -1840(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1872(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1872(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1880(%rbp)
+    movq -1880(%rbp), %rax
+    pushq %rax
+    movq $53, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5071
+    leaq .STR62(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    call print_newline
+    movq $1, %rax
+    pushq %rax
+    popq %rdi
+    call exit_with_code@PLT
+    jmp .L5072
+.L5071:
+.L5072:
+    movq $8, %rax
+    pushq %rax
+    movq -1872(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1888(%rbp)
+    movq -1888(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    movq %rax, -1896(%rbp)
+    movq -1896(%rbp), %rax
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -2624(%rbp), %rax
-    addq -2736(%rbp), %rax
+    movq -1840(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -2632(%rbp), %rax
-    addq $1, %rax
+    movq $1, %rax
     pushq %rax
-    leaq -2632(%rbp), %rbx
+    leaq -1848(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $53, %rax
@@ -21394,16 +21497,17 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L5042
-.L5041:
-    movq $0, %rax
+    movq $1, %rax
+    movq %rax, -1904(%rbp)
+.L5081:    movq -1904(%rbp), %rax
     pushq %rax
-    leaq -2688(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L5042:
-    jmp .L5031
-.L5032:
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5082
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21411,16 +21515,141 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -2744(%rbp)
+    movq %rax, -1912(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -2744(%rbp), %rax
+    movq -1912(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -2752(%rbp)
-    movq -2752(%rbp), %rax
+    pushq %rax
+    leaq -1104(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -1104(%rbp), %rax
+    pushq %rax
+    movq $52, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5091
+    movq $52, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1920(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1920(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1928(%rbp)
+    movq -1928(%rbp), %rax
+    pushq %rax
+    movq $53, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5101
+    leaq .STR63(%rip), %rax
+    pushq %rax
+    popq %rdi
+    call print_string
+    call print_newline
+    movq $1, %rax
+    pushq %rax
+    popq %rdi
+    call exit_with_code@PLT
+    jmp .L5102
+.L5101:
+.L5102:
+    movq $8, %rax
+    pushq %rax
+    movq -1920(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1936(%rbp)
+    movq -1936(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_duplicate_parser
+    movq %rax, -1944(%rbp)
+    movq -1848(%rbp), %rax
+    pushq %rax
+    movq $8, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -1952(%rbp)
+    movq -1944(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq -1840(%rbp), %rax
+    addq -1952(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -1848(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -1848(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq $53, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L5092
+.L5091:
+    movq $0, %rax
+    pushq %rax
+    leaq -1904(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+.L5092:
+    jmp .L5081
+.L5082:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -1960(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -1960(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -1968(%rbp)
+    movq -1968(%rbp), %rax
     pushq %rax
     movq $9, %rax
     popq %rbx
@@ -21428,7 +21657,7 @@ parser_parse_primary:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5061
+    jz .L5111
     leaq .STR64(%rip), %rax
     pushq %rax
     popq %rdi
@@ -21438,9 +21667,9 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5062
-.L5061:
-.L5062:
+    jmp .L5112
+.L5111:
+.L5112:
     movq $9, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21452,44 +21681,44 @@ parser_parse_primary:
     pushq %rax
     popq %rdi
     call parser_parse_expression
-    movq %rax, -2760(%rbp)
-    movq -2760(%rbp), %rax
+    movq %rax, -1976(%rbp)
+    movq -1976(%rbp), %rax
     pushq %rax
-    movq -2632(%rbp), %rax
+    movq -1848(%rbp), %rax
     pushq %rax
-    movq -2624(%rbp), %rax
+    movq -1840(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call expression_create_lambda_multi
-    movq %rax, -2768(%rbp)
-    movq -2632(%rbp), %rax
+    movq %rax, -1984(%rbp)
+    movq -1848(%rbp), %rax
     pushq %rax
-    movq -2624(%rbp), %rax
+    movq -1840(%rbp), %rax
     pushq %rax
-    movq -2760(%rbp), %rax
+    movq -1976(%rbp), %rax
     pushq %rax
-    movq -2768(%rbp), %rax
+    movq -1984(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     popq %rcx
     call lambda_collect_free_vars
-    movq -2768(%rbp), %rax
+    movq -1984(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5012
-.L5011:
-.L5012:
+    jmp .L5062
+.L5061:
+.L5062:
     leaq .STR65(%rip), %rax
     pushq %rax
-    leaq -2528(%rbp), %rbx
+    leaq -1744(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -2528(%rbp), %rax
+    movq -1744(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -21501,10 +21730,10 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -1448(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -1448(%rbp), %rax
+    movq -664(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_integer
@@ -21559,91 +21788,6 @@ parser_parse_return_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5071
-    movq $1, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5072
-.L5071:
-.L5072:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $19, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5081
-    movq $1, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5082
-.L5081:
-.L5082:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $0, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5091
-    movq $1, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5092
-.L5091:
-.L5092:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $12, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5101
-    movq $1, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5102
-.L5101:
-.L5102:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $14, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5111
-    movq $1, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5112
-.L5111:
-.L5112:
-    movq -32(%rbp), %rax
-    pushq %rax
-    movq $18, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L5121
     movq $1, %rax
     pushq %rax
@@ -21655,7 +21799,7 @@ parser_parse_return_statement:
 .L5122:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $20, %rax
+    movq $19, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -21672,7 +21816,7 @@ parser_parse_return_statement:
 .L5132:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $47, %rax
+    movq $0, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -21689,7 +21833,7 @@ parser_parse_return_statement:
 .L5142:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $172, %rax
+    movq $12, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -21706,7 +21850,7 @@ parser_parse_return_statement:
 .L5152:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $7, %rax
+    movq $14, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -21723,7 +21867,7 @@ parser_parse_return_statement:
 .L5162:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $113, %rax
+    movq $18, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -21738,6 +21882,91 @@ parser_parse_return_statement:
     jmp .L5172
 .L5171:
 .L5172:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $20, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5181
+    movq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5182
+.L5181:
+.L5182:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5191
+    movq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5192
+.L5191:
+.L5192:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $172, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5201
+    movq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5202
+.L5201:
+.L5202:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $7, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5211
+    movq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5212
+.L5211:
+.L5212:
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $113, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5221
+    movq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5222
+.L5221:
+.L5222:
     movq $0, %rax
     movq %rax, -48(%rbp)
     movq -40(%rbp), %rax
@@ -21748,7 +21977,7 @@ parser_parse_return_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5181
+    jz .L5231
     movq $0, %rax
     pushq %rax
     popq %rdi
@@ -21757,8 +21986,8 @@ parser_parse_return_statement:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5182
-.L5181:
+    jmp .L5232
+.L5231:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -21767,7 +21996,7 @@ parser_parse_return_statement:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5182:
+.L5232:
     movq -48(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -21857,7 +22086,7 @@ parser_parse_print_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5191
+    jz .L5241
     movq $172, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21869,8 +22098,8 @@ parser_parse_print_statement:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5192
-.L5191:
+    jmp .L5242
+.L5241:
     movq $47, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21882,7 +22111,7 @@ parser_parse_print_statement:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5192:
+.L5242:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -21907,7 +22136,7 @@ parser_parse_print_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5201
+    jz .L5251
     leaq .STR66(%rip), %rax
     pushq %rax
     popq %rdi
@@ -21929,9 +22158,9 @@ parser_parse_print_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5202
-.L5201:
-.L5202:
+    jmp .L5252
+.L5251:
+.L5252:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -21961,10 +22190,10 @@ parser_parse_print_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5211
+    jz .L5261
     movq -64(%rbp), %rax
     movq %rax, -88(%rbp)
-.L5221:    movq -80(%rbp), %rax
+.L5271:    movq -80(%rbp), %rax
     pushq %rax
     movq $52, %rax
     popq %rbx
@@ -21972,7 +22201,7 @@ parser_parse_print_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5222
+    jz .L5272
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22049,8 +22278,8 @@ parser_parse_print_statement:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5221
-.L5222:
+    jmp .L5271
+.L5272:
     movq -88(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22058,8 +22287,8 @@ parser_parse_print_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5212
-.L5211:
+    jmp .L5262
+.L5261:
     movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22067,7 +22296,7 @@ parser_parse_print_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-.L5212:
+.L5262:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -22101,7 +22330,7 @@ parser_parse_statement_block:
     call memory_set_integer@PLT
     movq $1, %rax
     movq %rax, -40(%rbp)
-.L5231:    movq -40(%rbp), %rax
+.L5281:    movq -40(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -22109,7 +22338,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5232
+    jz .L5282
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22134,15 +22363,15 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5241
+    jz .L5291
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5242
-.L5241:
-.L5242:
+    jmp .L5292
+.L5291:
+.L5292:
     movq -56(%rbp), %rax
     pushq %rax
     movq $19, %rax
@@ -22151,15 +22380,15 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5251
+    jz .L5301
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5252
-.L5251:
-.L5252:
+    jmp .L5302
+.L5301:
+.L5302:
     movq -56(%rbp), %rax
     pushq %rax
     movq $113, %rax
@@ -22168,15 +22397,15 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5261
+    jz .L5311
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5262
-.L5261:
-.L5262:
+    jmp .L5312
+.L5311:
+.L5312:
     movq -56(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -22185,15 +22414,15 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5271
+    jz .L5321
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5272
-.L5271:
-.L5272:
+    jmp .L5322
+.L5321:
+.L5322:
     movq -40(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -22202,7 +22431,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5281
+    jz .L5331
     movq $0, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rax
@@ -22213,111 +22442,11 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5291
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_let_statement
-    pushq %rax
-    leaq -64(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5292
-.L5291:
-.L5292:
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq $14, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5301
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_set_statement
-    pushq %rax
-    leaq -64(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5302
-.L5301:
-.L5302:
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq $7, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5311
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_return_statement
-    pushq %rax
-    leaq -64(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5312
-.L5311:
-.L5312:
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq $44, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5321
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_break_statement
-    pushq %rax
-    leaq -64(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5322
-.L5321:
-.L5322:
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq $45, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5331
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_continue_statement
-    pushq %rax
-    leaq -64(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5332
-.L5331:
-.L5332:
-    movq -56(%rbp), %rax
-    pushq %rax
-    movq $47, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L5341
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_print_statement
+    call parser_parse_let_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22327,7 +22456,7 @@ parser_parse_statement_block:
 .L5342:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $18, %rax
+    movq $14, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22337,7 +22466,7 @@ parser_parse_statement_block:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_if_statement
+    call parser_parse_set_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22347,7 +22476,7 @@ parser_parse_statement_block:
 .L5352:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $20, %rax
+    movq $7, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22357,7 +22486,7 @@ parser_parse_statement_block:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_while_statement
+    call parser_parse_return_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22367,7 +22496,7 @@ parser_parse_statement_block:
 .L5362:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $180, %rax
+    movq $44, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22377,7 +22506,7 @@ parser_parse_statement_block:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_loop_forever
+    call parser_parse_break_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22387,7 +22516,7 @@ parser_parse_statement_block:
 .L5372:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $121, %rax
+    movq $45, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22397,7 +22526,7 @@ parser_parse_statement_block:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_inline_assembly_statement
+    call parser_parse_continue_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22407,7 +22536,7 @@ parser_parse_statement_block:
 .L5382:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $112, %rax
+    movq $47, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22417,7 +22546,7 @@ parser_parse_statement_block:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_match_statement
+    call parser_parse_print_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22427,7 +22556,7 @@ parser_parse_statement_block:
 .L5392:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $143, %rax
+    movq $18, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22437,7 +22566,7 @@ parser_parse_statement_block:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_for_range_statement
+    call parser_parse_if_statement
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
@@ -22447,13 +22576,113 @@ parser_parse_statement_block:
 .L5402:
     movq -56(%rbp), %rax
     pushq %rax
-    movq $139, %rax
+    movq $20, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5411
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_while_statement
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5412
+.L5411:
+.L5412:
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $180, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5421
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_loop_forever
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5422
+.L5421:
+.L5422:
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $121, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5431
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_inline_assembly_statement
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5432
+.L5431:
+.L5432:
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $112, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5441
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_match_statement
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5442
+.L5441:
+.L5442:
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $143, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5451
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_for_range_statement
+    pushq %rax
+    leaq -64(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5452
+.L5451:
+.L5452:
+    movq -56(%rbp), %rax
+    pushq %rax
+    movq $139, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5461
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22465,9 +22694,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5412
-.L5411:
-.L5412:
+    jmp .L5462
+.L5461:
+.L5462:
     movq -56(%rbp), %rax
     pushq %rax
     movq $140, %rax
@@ -22476,7 +22705,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5421
+    jz .L5471
     movq $1, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22488,9 +22717,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5422
-.L5421:
-.L5422:
+    jmp .L5472
+.L5471:
+.L5472:
     movq -56(%rbp), %rax
     pushq %rax
     movq $141, %rax
@@ -22499,7 +22728,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5431
+    jz .L5481
     movq $2, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22511,9 +22740,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5432
-.L5431:
-.L5432:
+    jmp .L5482
+.L5481:
+.L5482:
     movq -56(%rbp), %rax
     pushq %rax
     movq $142, %rax
@@ -22522,7 +22751,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5441
+    jz .L5491
     movq $3, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22534,9 +22763,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5442
-.L5441:
-.L5442:
+    jmp .L5492
+.L5491:
+.L5492:
     movq -56(%rbp), %rax
     pushq %rax
     movq $167, %rax
@@ -22545,7 +22774,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5451
+    jz .L5501
     movq $167, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22653,9 +22882,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5452
-.L5451:
-.L5452:
+    jmp .L5502
+.L5501:
+.L5502:
     movq -56(%rbp), %rax
     pushq %rax
     movq $169, %rax
@@ -22664,7 +22893,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5461
+    jz .L5511
     movq $169, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -22772,9 +23001,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5462
-.L5461:
-.L5462:
+    jmp .L5512
+.L5511:
+.L5512:
     movq -56(%rbp), %rax
     pushq %rax
     movq $171, %rax
@@ -22783,7 +23012,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5471
+    jz .L5521
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22797,9 +23026,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5472
-.L5471:
-.L5472:
+    jmp .L5522
+.L5521:
+.L5522:
     movq -56(%rbp), %rax
     pushq %rax
     movq $172, %rax
@@ -22808,7 +23037,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5481
+    jz .L5531
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22817,9 +23046,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5482
-.L5481:
-.L5482:
+    jmp .L5532
+.L5531:
+.L5532:
     movq -56(%rbp), %rax
     pushq %rax
     movq $183, %rax
@@ -22828,7 +23057,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5491
+    jz .L5541
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22837,9 +23066,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5492
-.L5491:
-.L5492:
+    jmp .L5542
+.L5541:
+.L5542:
     movq -56(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -22848,7 +23077,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5501
+    jz .L5551
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22870,7 +23099,7 @@ parser_parse_statement_block:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5511
+    jz .L5561
     movq -168(%rbp), %rax
     pushq %rax
     movq $25, %rax
@@ -22879,7 +23108,7 @@ parser_parse_statement_block:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5521
+    jz .L5571
     leaq .STR69(%rip), %rax
     pushq %rax
     popq %rdi
@@ -22893,12 +23122,12 @@ parser_parse_statement_block:
     popq %rdi
     call print_string
     call print_newline
-    jmp .L5522
-.L5521:
-.L5522:
-    jmp .L5512
-.L5511:
-.L5512:
+    jmp .L5572
+.L5571:
+.L5572:
+    jmp .L5562
+.L5561:
+.L5562:
     movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22907,9 +23136,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5502
-.L5501:
-.L5502:
+    jmp .L5552
+.L5551:
+.L5552:
     movq -56(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22923,7 +23152,7 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5531
+    jz .L5581
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -22937,9 +23166,9 @@ parser_parse_statement_block:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5532
-.L5531:
-.L5532:
+    jmp .L5582
+.L5581:
+.L5582:
     movq -64(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -22948,15 +23177,15 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5541
+    jz .L5591
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5542
-.L5541:
-.L5542:
+    jmp .L5592
+.L5591:
+.L5592:
     movq -64(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -22965,7 +23194,7 @@ parser_parse_statement_block:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5551
+    jz .L5601
     movq $0, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -22982,7 +23211,7 @@ parser_parse_statement_block:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5561
+    jz .L5611
     movq -32(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -22991,14 +23220,14 @@ parser_parse_statement_block:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5571
+    jz .L5621
     movq $256, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5572
-.L5571:
+    jmp .L5622
+.L5621:
     movq -32(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -23008,7 +23237,7 @@ parser_parse_statement_block:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5572:
+.L5622:
     movq $8, %rax
     movq %rax, -200(%rbp)
     movq -32(%rbp), %rax
@@ -23028,9 +23257,9 @@ parser_parse_statement_block:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5562
-.L5561:
-.L5562:
+    jmp .L5612
+.L5611:
+.L5612:
     movq $8, %rax
     pushq %rax
     leaq -200(%rbp), %rbx
@@ -23068,14 +23297,14 @@ parser_parse_statement_block:
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    jmp .L5552
-.L5551:
-.L5552:
-    jmp .L5282
-.L5281:
+    jmp .L5602
+.L5601:
+.L5602:
+    jmp .L5332
+.L5331:
+.L5332:
+    jmp .L5281
 .L5282:
-    jmp .L5231
-.L5232:
     movq -24(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -23104,7 +23333,7 @@ parser_parse_while_statement:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_comparison
+    call parser_parse_expression
     movq %rax, -24(%rbp)
     movq $9, %rax
     pushq %rax
@@ -23355,7 +23584,7 @@ parser_parse_for_range_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5581
+    jz .L5631
     movq $145, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23475,9 +23704,9 @@ parser_parse_for_range_statement:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L5582
-.L5581:
-.L5582:
+    jmp .L5632
+.L5631:
+.L5632:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23576,7 +23805,7 @@ parser_parse_for_range_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5591
+    jz .L5641
     movq $38, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23592,9 +23821,9 @@ parser_parse_for_range_statement:
     leaq -136(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5592
-.L5591:
-.L5592:
+    jmp .L5642
+.L5641:
+.L5642:
     movq $9, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23739,7 +23968,7 @@ parser_parse_if_statement:
     movq %rax, -72(%rbp)
     movq $1, %rax
     movq %rax, -80(%rbp)
-.L5601:    movq -80(%rbp), %rax
+.L5651:    movq -80(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -23747,7 +23976,7 @@ parser_parse_if_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5602
+    jz .L5652
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23772,7 +24001,7 @@ parser_parse_if_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5611
+    jz .L5661
     movq $19, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23805,7 +24034,7 @@ parser_parse_if_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5621
+    jz .L5671
     movq $18, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -23879,7 +24108,7 @@ parser_parse_if_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5631
+    jz .L5681
     movq $8, %rax
     pushq %rax
     popq %rdi
@@ -23903,9 +24132,9 @@ parser_parse_if_statement:
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5632
-.L5631:
-.L5632:
+    jmp .L5682
+.L5681:
+.L5682:
     movq -184(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -23914,7 +24143,7 @@ parser_parse_if_statement:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5641
+    jz .L5691
     movq $0, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -23931,7 +24160,7 @@ parser_parse_if_statement:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -200(%rbp)
-.L5651:    movq -200(%rbp), %rax
+.L5701:    movq -200(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -23939,7 +24168,7 @@ parser_parse_if_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5652
+    jz .L5702
     movq $0, %rax
     pushq %rax
     movq -200(%rbp), %rax
@@ -23962,8 +24191,8 @@ parser_parse_if_statement:
     leaq -200(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5651
-.L5652:
+    jmp .L5701
+.L5702:
     movq $8, %rax
     pushq %rax
     popq %rdi
@@ -23999,12 +24228,12 @@ parser_parse_if_statement:
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    jmp .L5642
-.L5641:
-.L5642:
-    jmp .L5622
-.L5621:
-.L5622:
+    jmp .L5692
+.L5691:
+.L5692:
+    jmp .L5672
+.L5671:
+.L5672:
     movq -120(%rbp), %rax
     pushq %rax
     movq $18, %rax
@@ -24013,7 +24242,7 @@ parser_parse_if_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5661
+    jz .L5711
     movq $9, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24055,7 +24284,7 @@ parser_parse_if_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5671
+    jz .L5721
     movq -232(%rbp), %rax
     pushq %rax
     leaq -64(%rbp), %rbx
@@ -24066,9 +24295,9 @@ parser_parse_if_statement:
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5672
-.L5671:
-.L5672:
+    jmp .L5722
+.L5721:
+.L5722:
     movq -64(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -24077,7 +24306,7 @@ parser_parse_if_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5681
+    jz .L5731
     movq -64(%rbp), %rax
     pushq %rax
     movq -232(%rbp), %rax
@@ -24086,7 +24315,7 @@ parser_parse_if_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5691
+    jz .L5741
     movq $0, %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -24109,7 +24338,7 @@ parser_parse_if_statement:
     leaq -200(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5701:    movq -200(%rbp), %rax
+.L5751:    movq -200(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -24117,7 +24346,7 @@ parser_parse_if_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5702
+    jz .L5752
     movq $0, %rax
     pushq %rax
     movq -200(%rbp), %rax
@@ -24140,8 +24369,8 @@ parser_parse_if_statement:
     leaq -200(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5701
-.L5702:
+    jmp .L5751
+.L5752:
     movq -232(%rbp), %rax
     pushq %rax
     movq $32, %rax
@@ -24162,32 +24391,12 @@ parser_parse_if_statement:
     popq %rsi
     popq %rdx
     call memory_set_integer@PLT
-    jmp .L5692
-.L5691:
-.L5692:
-    jmp .L5682
-.L5681:
-.L5682:
-    movq $0, %rax
-    pushq %rax
-    leaq -80(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5662
-.L5661:
-.L5662:
-    jmp .L5612
-.L5611:
-.L5612:
-    movq -96(%rbp), %rax
-    pushq %rax
-    movq $19, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setne %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5711
+    jmp .L5742
+.L5741:
+.L5742:
+    jmp .L5732
+.L5731:
+.L5732:
     movq $0, %rax
     pushq %rax
     leaq -80(%rbp), %rbx
@@ -24196,8 +24405,28 @@ parser_parse_if_statement:
     jmp .L5712
 .L5711:
 .L5712:
-    jmp .L5601
-.L5602:
+    jmp .L5662
+.L5661:
+.L5662:
+    movq -96(%rbp), %rax
+    pushq %rax
+    movq $19, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setne %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5761
+    movq $0, %rax
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5762
+.L5761:
+.L5762:
+    jmp .L5651
+.L5652:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24280,7 +24509,7 @@ parser_parse_match_statement:
     movq %rax, -40(%rbp)
     movq $1, %rax
     movq %rax, -48(%rbp)
-.L5721:    movq -48(%rbp), %rax
+.L5771:    movq -48(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -24288,7 +24517,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5722
+    jz .L5772
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24305,15 +24534,15 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5731
+    jz .L5781
     movq $0, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5732
-.L5731:
-.L5732:
+    jmp .L5782
+.L5781:
+.L5782:
     movq -56(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -24322,7 +24551,7 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5741
+    jz .L5791
     movq $0, %rax
     pushq %rax
     movq -56(%rbp), %rax
@@ -24339,7 +24568,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5751
+    jz .L5801
     movq $113, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24379,7 +24608,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5761
+    jz .L5811
     movq $2, %rax  # Load compile-time constant PATTERN_WILDCARD
     pushq %rax
     leaq -88(%rbp), %rbx
@@ -24392,8 +24621,8 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L5762
-.L5761:
+    jmp .L5812
+.L5811:
     movq -80(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -24402,7 +24631,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5771
+    jz .L5821
     movq $8, %rax
     pushq %rax
     movq -72(%rbp), %rax
@@ -24447,7 +24676,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5781
+    jz .L5831
     movq $125, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24479,7 +24708,7 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5791
+    jz .L5841
     leaq .STR71(%rip), %rax
     pushq %rax
     popq %rdi
@@ -24489,9 +24718,9 @@ parser_parse_match_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5792
-.L5791:
-.L5792:
+    jmp .L5842
+.L5841:
+.L5842:
     movq $50, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24523,7 +24752,7 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5801
+    jz .L5851
     movq -176(%rbp), %rax
     pushq %rax
     movq $4, %rax
@@ -24532,7 +24761,7 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5811
+    jz .L5861
     leaq .STR72(%rip), %rax
     pushq %rax
     popq %rdi
@@ -24542,12 +24771,12 @@ parser_parse_match_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5812
-.L5811:
-.L5812:
-    jmp .L5802
-.L5801:
-.L5802:
+    jmp .L5862
+.L5861:
+.L5862:
+    jmp .L5852
+.L5851:
+.L5852:
     movq $8, %rax
     pushq %rax
     movq -168(%rbp), %rax
@@ -24578,8 +24807,8 @@ parser_parse_match_statement:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5782
-.L5781:
+    jmp .L5832
+.L5831:
     movq -128(%rbp), %rax
     movq %rax, -200(%rbp)
     movq $8, %rax
@@ -24600,13 +24829,95 @@ parser_parse_match_statement:
     movq %rax, -216(%rbp)
     movq -216(%rbp), %rax
     pushq %rax
+    movq $144, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5871
+    movq $144, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -224(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -224(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -232(%rbp)
+    movq -232(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call token_can_be_identifier
+    movq %rax, -240(%rbp)
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5881
+    movq -232(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    jmp .L5882
+.L5881:
+    movq $53, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+.L5882:
+    jmp .L5872
+.L5871:
+.L5872:
+    movq $8, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -248(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -248(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_int32@PLT
+    movq %rax, -256(%rbp)
+    movq -256(%rbp), %rax
+    pushq %rax
     movq $9, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5821
+    jz .L5891
     movq $1, %rax  # Load compile-time constant PATTERN_VARIANT
     pushq %rax
     leaq -88(%rbp), %rbx
@@ -24617,9 +24928,9 @@ parser_parse_match_statement:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5822
-.L5821:
-    movq -216(%rbp), %rax
+    jmp .L5892
+.L5891:
+    movq -256(%rbp), %rax
     pushq %rax
     movq $114, %rax
     popq %rbx
@@ -24627,7 +24938,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5831
+    jz .L5901
     movq $1, %rax  # Load compile-time constant PATTERN_VARIANT
     pushq %rax
     leaq -88(%rbp), %rbx
@@ -24646,8 +24957,8 @@ parser_parse_match_statement:
     popq %rsi
     call parser_eat
     movq $4, %rax
-    movq %rax, -224(%rbp)
-    movq -224(%rbp), %rax
+    movq %rax, -264(%rbp)
+    movq -264(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -24660,8 +24971,8 @@ parser_parse_match_statement:
     popq %rax
     movq %rax, (%rbx)
     movq $1, %rax
-    movq %rax, -232(%rbp)
-.L5841:    movq -232(%rbp), %rax
+    movq %rax, -272(%rbp)
+.L5911:    movq -272(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -24669,7 +24980,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5842
+    jz .L5912
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24677,16 +24988,16 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -240(%rbp)
+    movq %rax, -280(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -240(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -248(%rbp)
-    movq -248(%rbp), %rax
+    movq %rax, -288(%rbp)
+    movq -288(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -24694,7 +25005,7 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5851
+    jz .L5921
     leaq .STR73(%rip), %rax
     pushq %rax
     popq %rdi
@@ -24704,22 +25015,22 @@ parser_parse_match_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5852
-.L5851:
-.L5852:
+    jmp .L5922
+.L5921:
+.L5922:
     movq $8, %rax
     pushq %rax
-    movq -240(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -256(%rbp)
-    movq -256(%rbp), %rax
+    movq %rax, -296(%rbp)
+    movq -296(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -264(%rbp)
+    movq %rax, -304(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24741,16 +25052,16 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -272(%rbp)
+    movq %rax, -312(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -272(%rbp), %rax
+    movq -312(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -280(%rbp)
-    movq -280(%rbp), %rax
+    movq %rax, -320(%rbp)
+    movq -320(%rbp), %rax
     pushq %rax
     movq $53, %rax
     popq %rbx
@@ -24758,7 +25069,7 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5861
+    jz .L5931
     leaq .STR74(%rip), %rax
     pushq %rax
     popq %rdi
@@ -24768,22 +25079,22 @@ parser_parse_match_statement:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L5862
-.L5861:
-.L5862:
+    jmp .L5932
+.L5931:
+.L5932:
     movq $8, %rax
     pushq %rax
-    movq -272(%rbp), %rax
+    movq -312(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -288(%rbp)
-    movq -288(%rbp), %rax
+    movq %rax, -328(%rbp)
+    movq -328(%rbp), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
-    movq %rax, -296(%rbp)
+    movq %rax, -336(%rbp)
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24793,23 +25104,23 @@ parser_parse_match_statement:
     call parser_eat
     movq -112(%rbp), %rax
     pushq %rax
-    movq -224(%rbp), %rax
+    movq -264(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5871
-    movq -224(%rbp), %rax
+    jz .L5941
+    movq -264(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -224(%rbp), %rbx
+    leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -224(%rbp), %rax
+    movq -264(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -24824,18 +25135,18 @@ parser_parse_match_statement:
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5872
-.L5871:
-.L5872:
+    jmp .L5942
+.L5941:
+.L5942:
     movq -112(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -304(%rbp)
-    movq -296(%rbp), %rax
+    movq %rax, -344(%rbp)
+    movq -336(%rbp), %rax
     pushq %rax
-    movq -304(%rbp), %rax
+    movq -344(%rbp), %rax
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
@@ -24856,16 +25167,16 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -312(%rbp)
+    movq %rax, -352(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -312(%rbp), %rax
+    movq -352(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -320(%rbp)
-    movq -320(%rbp), %rax
+    movq %rax, -360(%rbp)
+    movq -360(%rbp), %rax
     pushq %rax
     movq $52, %rax
     popq %rbx
@@ -24873,7 +25184,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5881
+    jz .L5951
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -24881,18 +25192,18 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L5882
-.L5881:
+    jmp .L5952
+.L5951:
     movq $0, %rax
     pushq %rax
-    leaq -232(%rbp), %rbx
+    leaq -272(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5882:
-    jmp .L5841
-.L5842:
-    jmp .L5832
-.L5831:
+.L5952:
+    jmp .L5911
+.L5912:
+    jmp .L5902
+.L5901:
     movq -200(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -24901,11 +25212,11 @@ parser_parse_match_statement:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L5902:
+.L5892:
 .L5832:
-.L5822:
-.L5782:
-    jmp .L5772
-.L5771:
+    jmp .L5822
+.L5821:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -24914,169 +25225,8 @@ parser_parse_match_statement:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5772:
-.L5762:
-    movq $9, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
-    movq $8, %rax
-    pushq %rax
-    popq %rdi
-    call memory_allocate@PLT
-    movq %rax, -328(%rbp)
-    movq -328(%rbp), %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_parse_statement_block
-    movq %rax, -336(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -328(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_integer@PLT
-    movq %rax, -344(%rbp)
-    movq -328(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call deallocate@PLT
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setge %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5891
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $2, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    leaq -24(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -24(%rbp), %rax
-    pushq %rax
-    movq $48, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    pushq %rax
-    movq -32(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_reallocate@PLT
-    pushq %rax
-    leaq -32(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5892
-.L5891:
-.L5892:
-    movq -40(%rbp), %rax
-    pushq %rax
-    movq $48, %rax
-    popq %rbx
-    imulq %rbx, %rax
-    movq %rax, -352(%rbp)
-    movq -32(%rbp), %rax
-    addq -352(%rbp), %rax
-    movq %rax, -360(%rbp)
-    movq -88(%rbp), %rax
-    pushq %rax
-    movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -96(%rbp), %rax
-    pushq %rax
-    movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -104(%rbp), %rax
-    pushq %rax
-    movq $16, %rax  # Load compile-time constant WHEN_FIELD_BINDINGS
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -112(%rbp), %rax
-    pushq %rax
-    movq $24, %rax  # Load compile-time constant WHEN_FIELD_COUNT
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_int32@PLT
-    movq -336(%rbp), %rax
-    pushq %rax
-    movq $32, %rax  # Load compile-time constant WHEN_BODY_STMTS
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_pointer@PLT
-    movq -344(%rbp), %rax
-    pushq %rax
-    movq $40, %rax  # Load compile-time constant WHEN_BODY_COUNT
-    pushq %rax
-    movq -360(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    call memory_set_integer@PLT
-    movq -40(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -40(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L5752
-.L5751:
-    movq -64(%rbp), %rax
-    pushq %rax
-    movq $19, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L5901
-    movq $19, %rax
-    pushq %rax
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call parser_eat
+.L5822:
+.L5812:
     movq $9, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -25117,7 +25267,7 @@ parser_parse_match_statement:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5911
+    jz .L5961
     movq -24(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -25142,9 +25292,9 @@ parser_parse_match_statement:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5912
-.L5911:
-.L5912:
+    jmp .L5962
+.L5961:
+.L5962:
     movq -40(%rbp), %rax
     pushq %rax
     movq $48, %rax
@@ -25154,7 +25304,7 @@ parser_parse_match_statement:
     movq -32(%rbp), %rax
     addq -392(%rbp), %rax
     movq %rax, -400(%rbp)
-    movq $2, %rax  # Load compile-time constant PATTERN_WILDCARD
+    movq -88(%rbp), %rax
     pushq %rax
     movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
     pushq %rax
@@ -25164,7 +25314,7 @@ parser_parse_match_statement:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $0, %rax
+    movq -96(%rbp), %rax
     pushq %rax
     movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
     pushq %rax
@@ -25174,7 +25324,7 @@ parser_parse_match_statement:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq $0, %rax
+    movq -104(%rbp), %rax
     pushq %rax
     movq $16, %rax  # Load compile-time constant WHEN_FIELD_BINDINGS
     pushq %rax
@@ -25184,7 +25334,7 @@ parser_parse_match_statement:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq $0, %rax
+    movq -112(%rbp), %rax
     pushq %rax
     movq $24, %rax  # Load compile-time constant WHEN_FIELD_COUNT
     pushq %rax
@@ -25220,8 +25370,169 @@ parser_parse_match_statement:
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5902
-.L5901:
+    jmp .L5802
+.L5801:
+    movq -64(%rbp), %rax
+    pushq %rax
+    movq $19, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5971
+    movq $19, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $9, %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_eat
+    movq $8, %rax
+    pushq %rax
+    popq %rdi
+    call memory_allocate@PLT
+    movq %rax, -408(%rbp)
+    movq -408(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call parser_parse_statement_block
+    movq %rax, -416(%rbp)
+    movq $0, %rax
+    pushq %rax
+    movq -408(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_integer@PLT
+    movq %rax, -424(%rbp)
+    movq -408(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call deallocate@PLT
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setge %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L5981
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $2, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    leaq -24(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    movq -24(%rbp), %rax
+    pushq %rax
+    movq $48, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_reallocate@PLT
+    pushq %rax
+    leaq -32(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5982
+.L5981:
+.L5982:
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq $48, %rax
+    popq %rbx
+    imulq %rbx, %rax
+    movq %rax, -432(%rbp)
+    movq -32(%rbp), %rax
+    addq -432(%rbp), %rax
+    movq %rax, -440(%rbp)
+    movq $2, %rax  # Load compile-time constant PATTERN_WILDCARD
+    pushq %rax
+    movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
+    pushq %rax
+    movq -440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
+    pushq %rax
+    movq -440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $16, %rax  # Load compile-time constant WHEN_FIELD_BINDINGS
+    pushq %rax
+    movq -440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq $0, %rax
+    pushq %rax
+    movq $24, %rax  # Load compile-time constant WHEN_FIELD_COUNT
+    pushq %rax
+    movq -440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_int32@PLT
+    movq -416(%rbp), %rax
+    pushq %rax
+    movq $32, %rax  # Load compile-time constant WHEN_BODY_STMTS
+    pushq %rax
+    movq -440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_pointer@PLT
+    movq -424(%rbp), %rax
+    pushq %rax
+    movq $40, %rax  # Load compile-time constant WHEN_BODY_COUNT
+    pushq %rax
+    movq -440(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call memory_set_integer@PLT
+    movq -40(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -40(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L5972
+.L5971:
     movq -64(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -25230,7 +25541,7 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5921
+    jz .L5991
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -25250,26 +25561,26 @@ parser_parse_match_statement:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5922
-.L5921:
+    jmp .L5992
+.L5991:
     movq $0, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L5922:
-.L5902:
-.L5752:
-    jmp .L5742
-.L5741:
-.L5742:
-    jmp .L5721
-.L5722:
+.L5992:
+.L5972:
+.L5802:
+    jmp .L5792
+.L5791:
+.L5792:
+    jmp .L5771
+.L5772:
     movq $0, %rax
-    movq %rax, -408(%rbp)
+    movq %rax, -448(%rbp)
     movq $0, %rax
-    movq %rax, -416(%rbp)
-.L5931:    movq -416(%rbp), %rax
+    movq %rax, -456(%rbp)
+.L6001:    movq -456(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
     popq %rbx
@@ -25277,31 +25588,31 @@ parser_parse_match_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5932
-    movq -416(%rbp), %rax
+    jz .L6002
+    movq -456(%rbp), %rax
     pushq %rax
     movq $48, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -352(%rbp), %rbx
+    leaq -392(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -32(%rbp), %rax
-    addq -352(%rbp), %rax
+    addq -392(%rbp), %rax
     pushq %rax
-    leaq -360(%rbp), %rbx
+    leaq -400(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
     pushq %rax
-    movq -360(%rbp), %rax
+    movq -400(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -424(%rbp)
-    movq -424(%rbp), %rax
+    movq %rax, -464(%rbp)
+    movq -464(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
@@ -25309,24 +25620,24 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5941
+    jz .L6011
     movq $1, %rax
     pushq %rax
-    leaq -408(%rbp), %rbx
+    leaq -448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5942
-.L5941:
-.L5942:
-    movq -416(%rbp), %rax
+    jmp .L6012
+.L6011:
+.L6012:
+    movq -456(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -416(%rbp), %rbx
+    leaq -456(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5931
-.L5932:
-    movq -408(%rbp), %rax
+    jmp .L6001
+.L6002:
+    movq -448(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25334,10 +25645,10 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5951
+    jz .L6021
     movq $8, %rax
-    movq %rax, -432(%rbp)
-    movq -432(%rbp), %rax
+    movq %rax, -472(%rbp)
+    movq -472(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -25345,12 +25656,12 @@ parser_parse_match_statement:
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -440(%rbp)
+    movq %rax, -480(%rbp)
     movq $0, %rax
-    movq %rax, -448(%rbp)
+    movq %rax, -488(%rbp)
     movq $0, %rax
-    movq %rax, -456(%rbp)
-.L5961:    movq -456(%rbp), %rax
+    movq %rax, -496(%rbp)
+.L6031:    movq -496(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
     popq %rbx
@@ -25358,34 +25669,34 @@ parser_parse_match_statement:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5962
-    movq -456(%rbp), %rax
+    jz .L6032
+    movq -496(%rbp), %rax
     pushq %rax
     movq $48, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -352(%rbp), %rbx
+    leaq -392(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq -32(%rbp), %rax
-    addq -352(%rbp), %rax
+    addq -392(%rbp), %rax
     pushq %rax
-    leaq -360(%rbp), %rbx
+    leaq -400(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
     pushq %rax
-    movq -360(%rbp), %rax
+    movq -400(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
     pushq %rax
-    leaq -424(%rbp), %rbx
+    leaq -464(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -424(%rbp), %rax
+    movq -464(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -25393,83 +25704,83 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5971
+    jz .L6041
     movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
     pushq %rax
-    movq -360(%rbp), %rax
+    movq -400(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -464(%rbp)
-    movq -448(%rbp), %rax
+    movq %rax, -504(%rbp)
+    movq -488(%rbp), %rax
     pushq %rax
-    movq -432(%rbp), %rax
+    movq -472(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5981
-    movq -432(%rbp), %rax
+    jz .L6051
+    movq -472(%rbp), %rax
     pushq %rax
     movq $2, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -432(%rbp), %rbx
+    leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -432(%rbp), %rax
+    movq -472(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -440(%rbp), %rax
+    movq -480(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_reallocate@PLT
     pushq %rax
-    leaq -440(%rbp), %rbx
+    leaq -480(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5982
-.L5981:
-.L5982:
-    movq -464(%rbp), %rax
+    jmp .L6052
+.L6051:
+.L6052:
+    movq -504(%rbp), %rax
     pushq %rax
-    movq -448(%rbp), %rax
+    movq -488(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -440(%rbp), %rax
+    movq -480(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq -448(%rbp), %rax
+    movq -488(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -448(%rbp), %rbx
+    leaq -488(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5972
-.L5971:
-.L5972:
-    movq -456(%rbp), %rax
+    jmp .L6042
+.L6041:
+.L6042:
+    movq -496(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -456(%rbp), %rbx
+    leaq -496(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L5961
-.L5962:
-    movq -448(%rbp), %rax
+    jmp .L6031
+.L6032:
+    movq -488(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25477,7 +25788,7 @@ parser_parse_match_statement:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L5991
+    jz .L6061
     movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -25485,8 +25796,8 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -472(%rbp)
-    movq -472(%rbp), %rax
+    movq %rax, -512(%rbp)
+    movq -512(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25494,16 +25805,16 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6001
+    jz .L6071
     movq $0, %rax
     pushq %rax
-    leaq -448(%rbp), %rbx
+    leaq -488(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6002
-.L6001:
-.L6002:
-    movq -472(%rbp), %rax
+    jmp .L6072
+.L6071:
+.L6072:
+    movq -512(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25511,63 +25822,63 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6011
+    jz .L6081
     movq $24, %rax
     pushq %rax
-    movq -472(%rbp), %rax
+    movq -512(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -480(%rbp)
+    movq %rax, -520(%rbp)
     movq $16, %rax
     pushq %rax
-    movq -472(%rbp), %rax
+    movq -512(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -488(%rbp)
+    movq %rax, -528(%rbp)
     movq $0, %rax
-    pushq %rax
-    movq -440(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer@PLT
-    movq %rax, -496(%rbp)
-    movq $0, %rax
-    movq %rax, -504(%rbp)
-    movq $0, %rax
-    movq %rax, -512(%rbp)
-    movq $0, %rax
-    movq %rax, -520(%rbp)
-.L6021:    movq -520(%rbp), %rax
     pushq %rax
     movq -480(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_pointer@PLT
+    movq %rax, -536(%rbp)
+    movq $0, %rax
+    movq %rax, -544(%rbp)
+    movq $0, %rax
+    movq %rax, -552(%rbp)
+    movq $0, %rax
+    movq %rax, -560(%rbp)
+.L6091:    movq -560(%rbp), %rax
+    pushq %rax
+    movq -520(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6022
-    movq -520(%rbp), %rax
-    pushq %rax
-    movq -488(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_pointer_at_index
-    movq %rax, -528(%rbp)
-    movq $8, %rax
+    jz .L6092
+    movq -560(%rbp), %rax
     pushq %rax
     movq -528(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
+    call memory_get_pointer_at_index
+    movq %rax, -568(%rbp)
+    movq $8, %rax
+    pushq %rax
+    movq -568(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -536(%rbp)
-    movq -536(%rbp), %rax
+    movq %rax, -576(%rbp)
+    movq -576(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -25575,54 +25886,54 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6031
+    jz .L6101
     movq $24, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -568(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_int32@PLT
-    movq %rax, -544(%rbp)
+    movq %rax, -584(%rbp)
     movq $16, %rax
     pushq %rax
-    movq -528(%rbp), %rax
+    movq -568(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -552(%rbp)
+    movq %rax, -592(%rbp)
     movq $0, %rax
-    movq %rax, -560(%rbp)
-.L6041:    movq -560(%rbp), %rax
+    movq %rax, -600(%rbp)
+.L6111:    movq -600(%rbp), %rax
     pushq %rax
-    movq -544(%rbp), %rax
+    movq -584(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6042
-    movq -560(%rbp), %rax
+    jz .L6112
+    movq -600(%rbp), %rax
     pushq %rax
     movq $32, %rax
     popq %rbx
     imulq %rbx, %rax
-    movq %rax, -568(%rbp)
-    movq -552(%rbp), %rax
-    addq -568(%rbp), %rax
-    movq %rax, -576(%rbp)
+    movq %rax, -608(%rbp)
+    movq -592(%rbp), %rax
+    addq -608(%rbp), %rax
+    movq %rax, -616(%rbp)
     movq $0, %rax
     pushq %rax
-    movq -576(%rbp), %rax
+    movq -616(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -584(%rbp)
-    movq -496(%rbp), %rax
+    movq %rax, -624(%rbp)
+    movq -536(%rbp), %rax
     pushq %rax
-    movq -584(%rbp), %rax
+    movq -624(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -25634,50 +25945,50 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6051
-    movq -528(%rbp), %rax
+    jz .L6121
+    movq -568(%rbp), %rax
     pushq %rax
-    leaq -504(%rbp), %rbx
+    leaq -544(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -544(%rbp), %rax
+    movq -584(%rbp), %rax
     pushq %rax
-    leaq -512(%rbp), %rbx
+    leaq -552(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -480(%rbp), %rax
-    pushq %rax
-    leaq -520(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -544(%rbp), %rax
+    movq -520(%rbp), %rax
     pushq %rax
     leaq -560(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6052
-.L6051:
-.L6052:
+    movq -584(%rbp), %rax
+    pushq %rax
+    leaq -600(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L6122
+.L6121:
+.L6122:
+    movq -600(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -600(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L6111
+.L6112:
+    jmp .L6102
+.L6101:
+.L6102:
     movq -560(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -560(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6041
-.L6042:
-    jmp .L6032
-.L6031:
-.L6032:
-    movq -520(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -520(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L6021
-.L6022:
-    movq -504(%rbp), %rax
+    jmp .L6091
+.L6092:
+    movq -544(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25685,57 +25996,57 @@ parser_parse_match_statement:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6061
+    jz .L6131
     movq $16, %rax
     pushq %rax
-    movq -504(%rbp), %rax
+    movq -544(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
     pushq %rax
-    leaq -552(%rbp), %rbx
+    leaq -592(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -504(%rbp), %rax
+    movq -544(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -592(%rbp)
+    movq %rax, -632(%rbp)
     movq $0, %rax
-    movq %rax, -600(%rbp)
+    movq %rax, -640(%rbp)
     movq $0, %rax
-    movq %rax, -608(%rbp)
-.L6071:    movq -608(%rbp), %rax
+    movq %rax, -648(%rbp)
+.L6141:    movq -648(%rbp), %rax
     pushq %rax
-    movq -512(%rbp), %rax
+    movq -552(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6072
-    movq -608(%rbp), %rax
+    jz .L6142
+    movq -648(%rbp), %rax
     pushq %rax
     movq $32, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    leaq -568(%rbp), %rbx
+    leaq -608(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -552(%rbp), %rax
-    addq -568(%rbp), %rax
+    movq -592(%rbp), %rax
+    addq -608(%rbp), %rax
     pushq %rax
-    leaq -576(%rbp), %rbx
+    leaq -616(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
     pushq %rax
-    movq -576(%rbp), %rax
+    movq -616(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -25745,31 +26056,31 @@ parser_parse_match_statement:
     popq %rax
     movq %rax, (%rbx)
     movq $0, %rax
-    movq %rax, -616(%rbp)
+    movq %rax, -656(%rbp)
     movq $0, %rax
-    movq %rax, -624(%rbp)
-.L6081:    movq -624(%rbp), %rax
+    movq %rax, -664(%rbp)
+.L6151:    movq -664(%rbp), %rax
     pushq %rax
-    movq -448(%rbp), %rax
+    movq -488(%rbp), %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6082
-    movq -624(%rbp), %rax
+    jz .L6152
+    movq -664(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -440(%rbp), %rax
+    movq -480(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call memory_get_pointer@PLT
-    movq %rax, -632(%rbp)
-    movq -632(%rbp), %rax
+    movq %rax, -672(%rbp)
+    movq -672(%rbp), %rax
     pushq %rax
     movq -200(%rbp), %rax
     pushq %rax
@@ -25783,29 +26094,29 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6091
+    jz .L6161
     movq $1, %rax
     pushq %rax
-    leaq -616(%rbp), %rbx
+    leaq -656(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -448(%rbp), %rax
+    movq -488(%rbp), %rax
     pushq %rax
-    leaq -624(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6092
-.L6091:
-.L6092:
-    movq -624(%rbp), %rax
+    jmp .L6162
+.L6161:
+.L6162:
+    movq -664(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -624(%rbp), %rbx
+    leaq -664(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6081
-.L6082:
-    movq -616(%rbp), %rax
+    jmp .L6151
+.L6152:
+    movq -656(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25813,8 +26124,8 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6101
-    movq -600(%rbp), %rax
+    jz .L6171
+    movq -640(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -25822,12 +26133,12 @@ parser_parse_match_statement:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6111
+    jz .L6181
     leaq .STR75(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    movq -592(%rbp), %rax
+    movq -632(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -25838,12 +26149,12 @@ parser_parse_match_statement:
     call print_newline
     movq $1, %rax
     pushq %rax
-    leaq -600(%rbp), %rbx
+    leaq -640(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6112
-.L6111:
-.L6112:
+    jmp .L6182
+.L6181:
+.L6182:
     leaq .STR77(%rip), %rax
     pushq %rax
     popq %rdi
@@ -25853,43 +26164,43 @@ parser_parse_match_statement:
     popq %rdi
     call print_string
     call print_newline
-    jmp .L6102
-.L6101:
-.L6102:
-    movq -608(%rbp), %rax
+    jmp .L6172
+.L6171:
+.L6172:
+    movq -648(%rbp), %rax
     addq $1, %rax
     pushq %rax
-    leaq -608(%rbp), %rbx
+    leaq -648(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6071
-.L6072:
+    jmp .L6141
+.L6142:
+    jmp .L6132
+.L6131:
+.L6132:
+    jmp .L6082
+.L6081:
+.L6082:
     jmp .L6062
 .L6061:
 .L6062:
-    jmp .L6012
-.L6011:
-.L6012:
-    jmp .L5992
-.L5991:
-.L5992:
-    movq -440(%rbp), %rax
+    movq -480(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L5952
-.L5951:
-.L5952:
+    jmp .L6022
+.L6021:
+.L6022:
     movq $32, %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -640(%rbp)
+    movq %rax, -680(%rbp)
     movq $8, %rax  # Load compile-time constant STMT_MATCH
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq -640(%rbp), %rax
+    movq -680(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -25899,7 +26210,7 @@ parser_parse_match_statement:
     pushq %rax
     movq $8, %rax  # Load compile-time constant STMT_MATCH_EXPR
     pushq %rax
-    movq -640(%rbp), %rax
+    movq -680(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -25909,7 +26220,7 @@ parser_parse_match_statement:
     pushq %rax
     movq $16, %rax  # Load compile-time constant STMT_MATCH_WHEN_CLAUSES
     pushq %rax
-    movq -640(%rbp), %rax
+    movq -680(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -25919,13 +26230,13 @@ parser_parse_match_statement:
     pushq %rax
     movq $24, %rax  # Load compile-time constant STMT_MATCH_WHEN_COUNT
     pushq %rax
-    movq -640(%rbp), %rax
+    movq -680(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq -640(%rbp), %rax
+    movq -680(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -26053,7 +26364,7 @@ parser_read_raw_assembly_until_end:
     movq %rax, -40(%rbp)
     movq $1, %rax
     movq %rax, -48(%rbp)
-.L6121:    movq -48(%rbp), %rax
+.L6191:    movq -48(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -26061,7 +26372,7 @@ parser_read_raw_assembly_until_end:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6122
+    jz .L6192
     movq $20, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -26078,14 +26389,14 @@ parser_read_raw_assembly_until_end:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6131
+    jz .L6201
     movq $0, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6132
-.L6131:
+    jmp .L6202
+.L6201:
     movq $69, %rax
     movq %rax, -64(%rbp)
     movq -56(%rbp), %rax
@@ -26096,7 +26407,7 @@ parser_read_raw_assembly_until_end:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6141
+    jz .L6211
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -26110,14 +26421,14 @@ parser_read_raw_assembly_until_end:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6151
+    jz .L6221
     movq $0, %rax
     pushq %rax
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6152
-.L6151:
+    jmp .L6222
+.L6221:
     movq -56(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -26139,9 +26450,9 @@ parser_read_raw_assembly_until_end:
     popq %rdi
     call lexer_advance
     movq %rax, -80(%rbp)
-.L6152:
-    jmp .L6142
-.L6141:
+.L6222:
+    jmp .L6212
+.L6211:
     movq -56(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -26166,8 +26477,8 @@ parser_read_raw_assembly_until_end:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6142:
-.L6132:
+.L6212:
+.L6202:
     movq -40(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -26177,7 +26488,7 @@ parser_read_raw_assembly_until_end:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6161
+    jz .L6231
     leaq .STR78(%rip), %rax
     pushq %rax
     popq %rdi
@@ -26186,11 +26497,11 @@ parser_read_raw_assembly_until_end:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L6162
-.L6161:
-.L6162:
-    jmp .L6121
-.L6122:
+    jmp .L6232
+.L6231:
+.L6232:
+    jmp .L6191
+.L6192:
     movq $0, %rax
     pushq %rax
     movq -40(%rbp), %rax
@@ -26254,7 +26565,7 @@ parser_try_match_end_assembly:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6171
+    jz .L6241
     movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -26279,9 +26590,9 @@ parser_try_match_end_assembly:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6172
-.L6171:
-.L6172:
+    jmp .L6242
+.L6241:
+.L6242:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -26303,7 +26614,7 @@ parser_try_match_end_assembly:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6181
+    jz .L6251
     movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -26328,9 +26639,9 @@ parser_try_match_end_assembly:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6182
-.L6181:
-.L6182:
+    jmp .L6252
+.L6251:
+.L6252:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -26351,7 +26662,7 @@ lexer_try_match_word:
     movq %rax, -24(%rbp)
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L6191:    movq -32(%rbp), %rax
+.L6261:    movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     popq %rbx
@@ -26359,7 +26670,7 @@ lexer_try_match_word:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6192
+    jz .L6262
     movq -32(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -26384,14 +26695,14 @@ lexer_try_match_word:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6201
+    jz .L6271
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6202
-.L6201:
-.L6202:
+    jmp .L6272
+.L6271:
+.L6272:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -26403,8 +26714,8 @@ lexer_try_match_word:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6191
-.L6192:
+    jmp .L6261
+.L6262:
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -26418,7 +26729,7 @@ calculate_type_size:
     subq $2048, %rsp  # Pre-allocate generous stack space
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
-    leaq .STR22(%rip), %rax
+    leaq .STR25(%rip), %rax
     movq %rax, -24(%rbp)
     leaq .STR81(%rip), %rax
     movq %rax, -32(%rbp)
@@ -26440,13 +26751,13 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6211
+    jz .L6281
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6212
-.L6211:
+    jmp .L6282
+.L6281:
     movq -32(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -26461,13 +26772,13 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6221
+    jz .L6291
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6222
-.L6221:
+    jmp .L6292
+.L6291:
     movq -40(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -26482,13 +26793,13 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6231
+    jz .L6301
     movq $2, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6232
-.L6231:
+    jmp .L6302
+.L6301:
     movq -48(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -26503,17 +26814,17 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6241
+    jz .L6311
     movq $8, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6242
-.L6241:
-.L6242:
-.L6232:
-.L6222:
-.L6212:
+    jmp .L6312
+.L6311:
+.L6312:
+.L6302:
+.L6292:
+.L6282:
     movq -16(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -26522,7 +26833,7 @@ calculate_type_size:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6251
+    jz .L6321
     movq $24, %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -26543,7 +26854,7 @@ calculate_type_size:
     movq %rax, -72(%rbp)
     movq $1, %rax
     movq %rax, -80(%rbp)
-.L6261:    movq -80(%rbp), %rax
+.L6331:    movq -80(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -26551,7 +26862,7 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6262
+    jz .L6332
     movq $0, %rax
     movq %rax, -88(%rbp)
     movq -72(%rbp), %rax
@@ -26562,15 +26873,15 @@ calculate_type_size:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6271
+    jz .L6341
     movq $1, %rax
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6272
-.L6271:
-.L6272:
+    jmp .L6342
+.L6341:
+.L6342:
     movq -88(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -26579,15 +26890,15 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6281
+    jz .L6351
     movq $0, %rax
     pushq %rax
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6282
-.L6281:
-.L6282:
+    jmp .L6352
+.L6351:
+.L6352:
     movq -88(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -26596,7 +26907,7 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6291
+    jz .L6361
     movq $8, %rax
     movq %rax, -96(%rbp)
     movq -72(%rbp), %rax
@@ -26640,7 +26951,7 @@ calculate_type_size:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6301
+    jz .L6371
     movq $40, %rax
     pushq %rax
     movq -120(%rbp), %rax
@@ -26653,23 +26964,23 @@ calculate_type_size:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6302
-.L6301:
-.L6302:
+    jmp .L6372
+.L6371:
+.L6372:
     movq -72(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6292
-.L6291:
-.L6292:
-    jmp .L6261
-.L6262:
-    jmp .L6252
-.L6251:
-.L6252:
+    jmp .L6362
+.L6361:
+.L6362:
+    jmp .L6331
+.L6332:
+    jmp .L6322
+.L6321:
+.L6322:
     leaq .STR84(%rip), %rax
     movq %rax, -152(%rbp)
     movq -152(%rbp), %rax
@@ -26735,7 +27046,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6311
+    jz .L6381
     movq $2, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -26773,7 +27084,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6321
+    jz .L6391
     leaq .STR86(%rip), %rax
     pushq %rax
     popq %rdi
@@ -26795,9 +27106,9 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6322
-.L6321:
-.L6322:
+    jmp .L6392
+.L6391:
+.L6392:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -26889,7 +27200,7 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6331:    movq -32(%rbp), %rax
+.L6401:    movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax
     popq %rbx
@@ -26897,7 +27208,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6332
+    jz .L6402
     movq $0, %rax
     movq %rax, -72(%rbp)
     movq -32(%rbp), %rax
@@ -26908,15 +27219,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6341
+    jz .L6411
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6342
-.L6341:
-.L6342:
+    jmp .L6412
+.L6411:
+.L6412:
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -26930,15 +27241,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6351
+    jz .L6421
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6352
-.L6351:
-.L6352:
+    jmp .L6422
+.L6421:
+.L6422:
     movq -32(%rbp), %rax
     pushq %rax
     movq $151, %rax
@@ -26947,15 +27258,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6361
+    jz .L6431
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6362
-.L6361:
-.L6362:
+    jmp .L6432
+.L6431:
+.L6432:
     movq -32(%rbp), %rax
     pushq %rax
     movq $150, %rax
@@ -26964,15 +27275,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6371
+    jz .L6441
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6372
-.L6371:
-.L6372:
+    jmp .L6442
+.L6441:
+.L6442:
     movq -32(%rbp), %rax
     pushq %rax
     movq $132, %rax
@@ -26981,15 +27292,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6381
+    jz .L6451
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6382
-.L6381:
-.L6382:
+    jmp .L6452
+.L6451:
+.L6452:
     movq -32(%rbp), %rax
     pushq %rax
     movq $50, %rax
@@ -26998,15 +27309,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6391
+    jz .L6461
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6392
-.L6391:
-.L6392:
+    jmp .L6462
+.L6461:
+.L6462:
     movq -32(%rbp), %rax
     pushq %rax
     movq $155, %rax
@@ -27015,15 +27326,15 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6401
+    jz .L6471
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6402
-.L6401:
-.L6402:
+    jmp .L6472
+.L6471:
+.L6472:
     movq -72(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -27032,7 +27343,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6411
+    jz .L6481
     leaq .STR49(%rip), %rax
     pushq %rax
     popq %rdi
@@ -27069,9 +27380,9 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6412
-.L6411:
-.L6412:
+    jmp .L6482
+.L6481:
+.L6482:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -27145,7 +27456,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6421
+    jz .L6491
     movq -48(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -27154,9 +27465,9 @@ parser_parse_type_definition:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6422
-.L6421:
-    leaq .STR22(%rip), %rax
+    jmp .L6492
+.L6491:
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
@@ -27164,7 +27475,7 @@ parser_parse_type_definition:
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6422:
+.L6492:
     movq -32(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27202,7 +27513,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6431
+    jz .L6501
     movq $127, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27212,7 +27523,7 @@ parser_parse_type_definition:
     call parser_eat
     movq $1, %rax
     movq %rax, -104(%rbp)
-.L6441:    movq -104(%rbp), %rax
+.L6511:    movq -104(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -27220,7 +27531,7 @@ parser_parse_type_definition:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6442
+    jz .L6512
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -27251,16 +27562,16 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6451
+    jz .L6521
     movq -104(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6452
-.L6451:
-.L6452:
+    jmp .L6522
+.L6521:
+.L6522:
     movq -32(%rbp), %rax
     pushq %rax
     movq $128, %rax
@@ -27269,16 +27580,16 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6461
+    jz .L6531
     movq -104(%rbp), %rax
     subq $1, %rax
     pushq %rax
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6462
-.L6461:
-.L6462:
+    jmp .L6532
+.L6531:
+.L6532:
     movq -32(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27286,11 +27597,11 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6441
-.L6442:
-    jmp .L6432
-.L6431:
-.L6432:
+    jmp .L6511
+.L6512:
+    jmp .L6502
+.L6501:
+.L6502:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -27321,7 +27632,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6471
+    jz .L6541
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27329,9 +27640,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6472
-.L6471:
-.L6472:
+    jmp .L6542
+.L6541:
+.L6542:
     movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET
     pushq %rax
     movq -16(%rbp), %rax
@@ -27377,7 +27688,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6481
+    jz .L6551
     movq -136(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -27386,8 +27697,8 @@ parser_parse_type_definition:
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6482
-.L6481:
+    jmp .L6552
+.L6551:
     movq -136(%rbp), %rax
     pushq %rax
     movq -128(%rbp), %rax
@@ -27399,7 +27710,7 @@ parser_parse_type_definition:
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6482:
+.L6552:
     movq -144(%rbp), %rax
     pushq %rax
     movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET
@@ -27506,8 +27817,8 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6331
-.L6332:
+    jmp .L6401
+.L6402:
     movq -64(%rbp), %rax
     pushq %rax
     movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
@@ -27536,9 +27847,9 @@ parser_parse_type_definition:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L6312
-.L6311:
-.L6312:
+    jmp .L6382
+.L6381:
+.L6382:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -27569,7 +27880,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6491
+    jz .L6561
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -27650,7 +27961,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6501
+    jz .L6571
     movq $126, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -27695,7 +28006,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6511
+    jz .L6581
     leaq .STR88(%rip), %rax
     pushq %rax
     popq %rdi
@@ -27720,9 +28031,9 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6512
-.L6511:
-.L6512:
+    jmp .L6582
+.L6581:
+.L6582:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -27792,8 +28103,8 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6521
-    leaq .STR22(%rip), %rax
+    jz .L6591
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -27808,9 +28119,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6522
-.L6521:
-.L6522:
+    jmp .L6592
+.L6591:
+.L6592:
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -27819,8 +28130,8 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6531
-    leaq .STR24(%rip), %rax
+    jz .L6601
+    leaq .STR27(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -27835,9 +28146,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6532
-.L6531:
-.L6532:
+    jmp .L6602
+.L6601:
+.L6602:
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -27846,8 +28157,8 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6541
-    leaq .STR26(%rip), %rax
+    jz .L6611
+    leaq .STR29(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -27862,9 +28173,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6542
-.L6541:
-.L6542:
+    jmp .L6612
+.L6611:
+.L6612:
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -27873,7 +28184,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6551
+    jz .L6621
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -27900,9 +28211,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6552
-.L6551:
-.L6552:
+    jmp .L6622
+.L6621:
+.L6622:
     movq -200(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -27911,7 +28222,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6561
+    jz .L6631
     leaq .STR89(%rip), %rax
     pushq %rax
     popq %rdi
@@ -27936,9 +28247,9 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6562
-.L6561:
-.L6562:
+    jmp .L6632
+.L6631:
+.L6632:
     movq $3, %rax  # Load compile-time constant TYPE_KIND_ARRAY
     pushq %rax
     movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
@@ -28009,8 +28320,8 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6502
-.L6501:
+    jmp .L6572
+.L6571:
     movq -32(%rbp), %rax
     pushq %rax
     movq $124, %rax
@@ -28019,7 +28330,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6571
+    jz .L6641
     movq $124, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28121,7 +28432,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6581
+    jz .L6651
     movq $32, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28136,9 +28447,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6582
-.L6581:
-.L6582:
+    jmp .L6652
+.L6651:
+.L6652:
     movq -32(%rbp), %rax
     pushq %rax
     movq $33, %rax
@@ -28147,7 +28458,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6591
+    jz .L6661
     movq $33, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28155,9 +28466,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6592
-.L6591:
-.L6592:
+    jmp .L6662
+.L6661:
+.L6662:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -28188,7 +28499,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6601
+    jz .L6671
     movq $2, %rax
     movq %rax, -216(%rbp)
     movq -216(%rbp), %rax
@@ -28212,7 +28523,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $1, %rax
     movq %rax, -232(%rbp)
-.L6611:    movq -232(%rbp), %rax
+.L6681:    movq -232(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -28220,7 +28531,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6612
+    jz .L6682
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -28229,7 +28540,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6621
+    jz .L6691
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28244,9 +28555,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6622
-.L6621:
-.L6622:
+    jmp .L6692
+.L6691:
+.L6692:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -28308,7 +28619,7 @@ parser_parse_type_definition:
     setge %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6631
+    jz .L6701
     movq -216(%rbp), %rax
     pushq %rax
     movq $2, %rax
@@ -28345,9 +28656,9 @@ parser_parse_type_definition:
     leaq -224(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6632
-.L6631:
-.L6632:
+    jmp .L6702
+.L6701:
+.L6702:
     movq -248(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -28408,7 +28719,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6641
+    jz .L6711
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28416,9 +28727,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6642
-.L6641:
-.L6642:
+    jmp .L6712
+.L6711:
+.L6712:
     movq -32(%rbp), %rax
     pushq %rax
     movq $30, %rax
@@ -28427,7 +28738,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6651
+    jz .L6721
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28435,19 +28746,19 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6652
-.L6651:
+    jmp .L6722
+.L6721:
     movq $0, %rax
     pushq %rax
     leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6652:
-    jmp .L6611
-.L6612:
-    jmp .L6602
-.L6601:
-.L6602:
+.L6722:
+    jmp .L6681
+.L6682:
+    jmp .L6672
+.L6671:
+.L6672:
     movq $3, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28485,8 +28796,8 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6661
-    leaq .STR22(%rip), %rax
+    jz .L6731
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -28508,9 +28819,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6662
-.L6661:
-.L6662:
+    jmp .L6732
+.L6731:
+.L6732:
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -28519,8 +28830,8 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6671
-    leaq .STR24(%rip), %rax
+    jz .L6741
+    leaq .STR27(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -28545,9 +28856,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6672
-.L6671:
-.L6672:
+    jmp .L6742
+.L6741:
+.L6742:
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -28556,8 +28867,8 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6681
-    leaq .STR26(%rip), %rax
+    jz .L6751
+    leaq .STR29(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -28582,9 +28893,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6682
-.L6681:
-.L6682:
+    jmp .L6752
+.L6751:
+.L6752:
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -28593,7 +28904,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6691
+    jz .L6761
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -28630,8 +28941,8 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6692
-.L6691:
+    jmp .L6762
+.L6761:
     leaq .STR90(%rip), %rax
     pushq %rax
     popq %rdi
@@ -28656,7 +28967,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-.L6692:
+.L6762:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28671,8 +28982,8 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6572
-.L6571:
+    jmp .L6642
+.L6641:
     movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
     pushq %rax
     movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
@@ -28725,7 +29036,7 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6701:    movq -32(%rbp), %rax
+.L6771:    movq -32(%rbp), %rax
     pushq %rax
     movq $111, %rax
     popq %rbx
@@ -28733,7 +29044,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6702
+    jz .L6772
     movq $111, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28787,7 +29098,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6711
+    jz .L6781
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -28796,7 +29107,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6721
+    jz .L6791
     leaq .STR91(%rip), %rax
     pushq %rax
     popq %rdi
@@ -28821,12 +29132,12 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6722
-.L6721:
-.L6722:
-    jmp .L6712
-.L6711:
-.L6712:
+    jmp .L6792
+.L6791:
+.L6792:
+    jmp .L6782
+.L6781:
+.L6782:
     movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
     pushq %rax
     movq -16(%rbp), %rax
@@ -28977,7 +29288,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6731
+    jz .L6801
     movq $34, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -28995,7 +29306,7 @@ parser_parse_type_definition:
     leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6741:    movq -232(%rbp), %rax
+.L6811:    movq -232(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -29003,7 +29314,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6742
+    jz .L6812
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -29034,7 +29345,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6751
+    jz .L6821
     leaq .STR92(%rip), %rax
     pushq %rax
     popq %rdi
@@ -29059,9 +29370,9 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6752
-.L6751:
-.L6752:
+    jmp .L6822
+.L6821:
+.L6822:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -29125,7 +29436,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6761
+    jz .L6831
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -29134,7 +29445,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6771
+    jz .L6841
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -29143,7 +29454,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6781
+    jz .L6851
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -29152,7 +29463,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6791
+    jz .L6861
     leaq .STR93(%rip), %rax
     pushq %rax
     popq %rdi
@@ -29177,18 +29488,18 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6792
-.L6791:
-.L6792:
-    jmp .L6782
-.L6781:
-.L6782:
-    jmp .L6772
-.L6771:
-.L6772:
-    jmp .L6762
-.L6761:
-.L6762:
+    jmp .L6862
+.L6861:
+.L6862:
+    jmp .L6852
+.L6851:
+.L6852:
+    jmp .L6842
+.L6841:
+.L6842:
+    jmp .L6832
+.L6831:
+.L6832:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -29381,7 +29692,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6801
+    jz .L6871
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29389,16 +29700,16 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6802
-.L6801:
+    jmp .L6872
+.L6871:
     movq $0, %rax
     pushq %rax
     leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6802:
-    jmp .L6741
-.L6742:
+.L6872:
+    jmp .L6811
+.L6812:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -29421,9 +29732,9 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6732
-.L6731:
-.L6732:
+    jmp .L6802
+.L6801:
+.L6802:
     movq -32(%rbp), %rax
     pushq %rax
     movq $114, %rax
@@ -29432,7 +29743,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6811
+    jz .L6881
     movq $114, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29450,7 +29761,7 @@ parser_parse_type_definition:
     leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6821:    movq -232(%rbp), %rax
+.L6891:    movq -232(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -29458,7 +29769,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6822
+    jz .L6892
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -29489,7 +29800,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6831
+    jz .L6901
     leaq .STR92(%rip), %rax
     pushq %rax
     popq %rdi
@@ -29514,9 +29825,9 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6832
-.L6831:
-.L6832:
+    jmp .L6902
+.L6901:
+.L6902:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -29580,7 +29891,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6841
+    jz .L6911
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -29589,7 +29900,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6851
+    jz .L6921
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -29598,7 +29909,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6861
+    jz .L6931
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -29607,7 +29918,7 @@ parser_parse_type_definition:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6871
+    jz .L6941
     leaq .STR93(%rip), %rax
     pushq %rax
     popq %rdi
@@ -29632,18 +29943,18 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6872
-.L6871:
-.L6872:
-    jmp .L6862
-.L6861:
-.L6862:
-    jmp .L6852
-.L6851:
-.L6852:
-    jmp .L6842
-.L6841:
-.L6842:
+    jmp .L6942
+.L6941:
+.L6942:
+    jmp .L6932
+.L6931:
+.L6932:
+    jmp .L6922
+.L6921:
+.L6922:
+    jmp .L6912
+.L6911:
+.L6912:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -29671,7 +29982,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6881
+    jz .L6951
     movq $4, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29679,9 +29990,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6882
-.L6881:
-.L6882:
+    jmp .L6952
+.L6951:
+.L6952:
     movq -32(%rbp), %rax
     pushq %rax
     movq $5, %rax
@@ -29690,7 +30001,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6891
+    jz .L6961
     movq $5, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29698,9 +30009,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6892
-.L6891:
-.L6892:
+    jmp .L6962
+.L6961:
+.L6962:
     movq -32(%rbp), %rax
     pushq %rax
     movq $6, %rax
@@ -29709,7 +30020,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6901
+    jz .L6971
     movq $6, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29717,9 +30028,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6902
-.L6901:
-.L6902:
+    jmp .L6972
+.L6971:
+.L6972:
     movq -32(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -29728,7 +30039,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6911
+    jz .L6981
     movq $53, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29736,9 +30047,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6912
-.L6911:
-.L6912:
+    jmp .L6982
+.L6981:
+.L6982:
     movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
     pushq %rax
     movq -352(%rbp), %rax
@@ -29926,7 +30237,7 @@ parser_parse_type_definition:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6921
+    jz .L6991
     movq $30, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -29934,19 +30245,19 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L6922
-.L6921:
+    jmp .L6992
+.L6991:
     movq $0, %rax
     pushq %rax
     leaq -232(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L6922:
-    jmp .L6821
-.L6822:
-    jmp .L6812
-.L6811:
-.L6812:
+.L6992:
+    jmp .L6891
+.L6892:
+    jmp .L6882
+.L6881:
+.L6882:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -29969,8 +30280,8 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6701
-.L6702:
+    jmp .L6771
+.L6772:
     movq $8, %rax
     pushq %rax
     movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
@@ -30005,7 +30316,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq $0, %rax
     movq %rax, -432(%rbp)
-.L6931:    movq -432(%rbp), %rax
+.L7001:    movq -432(%rbp), %rax
     pushq %rax
     movq -296(%rbp), %rax
     popq %rbx
@@ -30013,7 +30324,7 @@ parser_parse_type_definition:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6932
+    jz .L7002
     movq -432(%rbp), %rax
     pushq %rax
     movq $32, %rax  # Load compile-time constant VARIANT_SIZE
@@ -30055,7 +30366,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq $0, %rax
     movq %rax, -448(%rbp)
-.L6941:    movq -448(%rbp), %rax
+.L7011:    movq -448(%rbp), %rax
     pushq %rax
     movq -376(%rbp), %rax
     popq %rbx
@@ -30063,7 +30374,7 @@ parser_parse_type_definition:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6942
+    jz .L7012
     movq -448(%rbp), %rax
     pushq %rax
     movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
@@ -30102,8 +30413,8 @@ parser_parse_type_definition:
     leaq -448(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6941
-.L6942:
+    jmp .L7011
+.L7012:
     movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
     pushq %rax
     movq -16(%rbp), %rax
@@ -30120,7 +30431,7 @@ parser_parse_type_definition:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6951
+    jz .L7021
     movq -440(%rbp), %rax
     pushq %rax
     movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
@@ -30131,17 +30442,17 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L6952
-.L6951:
-.L6952:
+    jmp .L7022
+.L7021:
+.L7022:
     movq -432(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -432(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6931
-.L6932:
+    jmp .L7001
+.L7002:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30156,10 +30467,10 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
+.L6642:
 .L6572:
-.L6502:
-    jmp .L6492
-.L6491:
+    jmp .L6562
+.L6561:
     leaq .STR94(%rip), %rax
     pushq %rax
     popq %rdi
@@ -30191,7 +30502,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call exit
-.L6492:
+.L6562:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -30242,7 +30553,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6961
+    jz .L7031
     leaq .STR95(%rip), %rax
     pushq %rax
     popq %rdi
@@ -30280,9 +30591,9 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6962
-.L6961:
-.L6962:
+    jmp .L7032
+.L7031:
+.L7032:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -16(%rbp), %rax
@@ -30299,7 +30610,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6971
+    jz .L7041
     leaq .STR97(%rip), %rax
     pushq %rax
     popq %rdi
@@ -30308,9 +30619,9 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L6972
-.L6971:
-.L6972:
+    jmp .L7042
+.L7041:
+.L7042:
     movq -40(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -30323,7 +30634,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    leaq .STR22(%rip), %rax
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate@PLT
@@ -30366,7 +30677,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6981
+    jz .L7051
     movq $32, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30396,9 +30707,9 @@ parser_parse_function:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L6982
-.L6981:
-.L6982:
+    jmp .L7052
+.L7051:
+.L7052:
     movq -24(%rbp), %rax
     pushq %rax
     movq $33, %rax
@@ -30407,7 +30718,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L6991
+    jz .L7061
     movq $33, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30455,8 +30766,8 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7001
-    leaq .STR31(%rip), %rax
+    jz .L7071
+    leaq .STR23(%rip), %rax
     pushq %rax
     movq -72(%rbp), %rax
     pushq %rax
@@ -30467,9 +30778,9 @@ parser_parse_function:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7002
-.L7001:
-.L7002:
+    jmp .L7072
+.L7071:
+.L7072:
     movq -80(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -30478,7 +30789,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7011
+    jz .L7081
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30486,9 +30797,9 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7012
-.L7011:
-.L7012:
+    jmp .L7082
+.L7081:
+.L7082:
     movq -80(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -30497,7 +30808,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7021
+    jz .L7091
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -30533,7 +30844,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7031
+    jz .L7101
     leaq .STR98(%rip), %rax
     pushq %rax
     popq %rdi
@@ -30558,9 +30869,9 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L7032
-.L7031:
-.L7032:
+    jmp .L7102
+.L7101:
+.L7102:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -16(%rbp), %rax
@@ -30634,7 +30945,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7041
+    jz .L7111
     movq -40(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -30643,9 +30954,9 @@ parser_parse_function:
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7042
-.L7041:
-    leaq .STR22(%rip), %rax
+    jmp .L7112
+.L7111:
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
@@ -30653,7 +30964,7 @@ parser_parse_function:
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L7042:
+.L7112:
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30697,15 +31008,15 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7051
+    jz .L7121
     movq $1, %rax
     pushq %rax
     leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7052
-.L7051:
-.L7052:
+    jmp .L7122
+.L7121:
+.L7122:
     movq -120(%rbp), %rax
     pushq %rax
     movq $30, %rax
@@ -30714,16 +31025,16 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7061
+    jz .L7131
     movq $1, %rax
     pushq %rax
     leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7062
-.L7061:
-.L7062:
-.L7071:    movq -128(%rbp), %rax
+    jmp .L7132
+.L7131:
+.L7132:
+.L7141:    movq -128(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -30731,7 +31042,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7072
+    jz .L7142
     movq -120(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30768,7 +31079,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7081
+    jz .L7151
     leaq .STR99(%rip), %rax
     pushq %rax
     popq %rdi
@@ -30790,9 +31101,9 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L7082
-.L7081:
-.L7082:
+    jmp .L7152
+.L7151:
+.L7152:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -136(%rbp), %rax
@@ -30855,7 +31166,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7091
+    jz .L7161
     movq -192(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -30864,9 +31175,9 @@ parser_parse_function:
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7092
-.L7091:
-    leaq .STR22(%rip), %rax
+    jmp .L7162
+.L7161:
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
@@ -30874,7 +31185,7 @@ parser_parse_function:
     leaq -104(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L7092:
+.L7162:
     movq -184(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -30927,15 +31238,15 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7101
+    jz .L7171
     movq $1, %rax
     pushq %rax
     leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7102
-.L7101:
-.L7102:
+    jmp .L7172
+.L7171:
+.L7172:
     movq -120(%rbp), %rax
     pushq %rax
     movq $30, %rax
@@ -30944,23 +31255,23 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7111
+    jz .L7181
     movq $1, %rax
     pushq %rax
     leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7112
-.L7111:
-.L7112:
-    jmp .L7071
-.L7072:
-    jmp .L7022
-.L7021:
-.L7022:
-    jmp .L6992
-.L6991:
-.L6992:
+    jmp .L7182
+.L7181:
+.L7182:
+    jmp .L7141
+.L7142:
+    jmp .L7092
+.L7091:
+.L7092:
+    jmp .L7062
+.L7061:
+.L7062:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -30993,7 +31304,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7121
+    jz .L7191
     movq $3, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31006,9 +31317,9 @@ parser_parse_function:
     leaq -200(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7122
-.L7121:
-.L7122:
+    jmp .L7192
+.L7191:
+.L7192:
     leaq .STR100(%rip), %rax
     pushq %rax
     popq %rdi
@@ -31022,7 +31333,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7131
+    jz .L7201
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -31064,7 +31375,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7141
+    jz .L7211
     movq -40(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31073,9 +31384,9 @@ parser_parse_function:
     leaq -208(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7142
-.L7141:
-    leaq .STR22(%rip), %rax
+    jmp .L7212
+.L7211:
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
@@ -31083,7 +31394,7 @@ parser_parse_function:
     leaq -208(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L7142:
+.L7212:
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31091,9 +31402,9 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7132
-.L7131:
-.L7132:
+    jmp .L7202
+.L7201:
+.L7202:
     movq -208(%rbp), %rax
     pushq %rax
     movq $24, %rax
@@ -31134,7 +31445,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7151
+    jz .L7221
     movq $127, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31144,7 +31455,7 @@ parser_parse_function:
     call parser_eat
     movq $1, %rax
     movq %rax, -216(%rbp)
-.L7161:    movq -216(%rbp), %rax
+.L7231:    movq -216(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -31152,7 +31463,7 @@ parser_parse_function:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7162
+    jz .L7232
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -31183,16 +31494,16 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7171
+    jz .L7241
     movq -216(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -216(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7172
-.L7171:
-.L7172:
+    jmp .L7242
+.L7241:
+.L7242:
     movq -24(%rbp), %rax
     pushq %rax
     movq $128, %rax
@@ -31201,16 +31512,16 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7181
+    jz .L7251
     movq -216(%rbp), %rax
     subq $1, %rax
     pushq %rax
     leaq -216(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7182
-.L7181:
-.L7182:
+    jmp .L7252
+.L7251:
+.L7252:
     movq -24(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31218,11 +31529,11 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7161
-.L7162:
-    jmp .L7152
-.L7151:
-.L7152:
+    jmp .L7231
+.L7232:
+    jmp .L7222
+.L7221:
+.L7222:
     movq $1, %rax
     movq %rax, -224(%rbp)
     movq -224(%rbp), %rax
@@ -31233,7 +31544,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7191
+    jz .L7261
     leaq .STR90(%rip), %rax
     pushq %rax
     popq %rdi
@@ -31258,9 +31569,9 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call exit
-    jmp .L7192
-.L7191:
-.L7192:
+    jmp .L7262
+.L7261:
+.L7262:
     movq $9, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31284,7 +31595,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -240(%rbp)
-.L7201:    movq -240(%rbp), %rax
+.L7271:    movq -240(%rbp), %rax
     pushq %rax
     movq $7, %rax
     popq %rbx
@@ -31292,7 +31603,7 @@ parser_parse_function:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7202
+    jz .L7272
     movq -240(%rbp), %rax
     pushq %rax
     movq $8, %rax
@@ -31301,11 +31612,11 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7211
-    jmp .L7202
-    jmp .L7212
-.L7211:
-.L7212:
+    jz .L7281
+    jmp .L7272
+    jmp .L7282
+.L7281:
+.L7282:
     movq -240(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -31314,11 +31625,11 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7221
-    jmp .L7202
-    jmp .L7222
-.L7221:
-.L7222:
+    jz .L7291
+    jmp .L7272
+    jmp .L7292
+.L7291:
+.L7292:
     movq $0, %rax
     movq %rax, -248(%rbp)
     movq -240(%rbp), %rax
@@ -31329,151 +31640,11 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7231
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_let_statement
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7232
-.L7231:
-.L7232:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $14, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L7241
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_set_statement
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7242
-.L7241:
-.L7242:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $18, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L7251
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_if_statement
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7252
-.L7251:
-.L7252:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $20, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L7261
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_while_statement
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7262
-.L7261:
-.L7262:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $180, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L7271
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_loop_forever
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7272
-.L7271:
-.L7272:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $112, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L7281
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_match_statement
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7282
-.L7281:
-.L7282:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $47, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L7291
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call parser_parse_print_statement
-    pushq %rax
-    leaq -248(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L7292
-.L7291:
-.L7292:
-    movq -240(%rbp), %rax
-    pushq %rax
-    movq $172, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L7301
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_print_statement
+    call parser_parse_let_statement
     pushq %rax
     leaq -248(%rbp), %rbx
     popq %rax
@@ -31483,13 +31654,153 @@ parser_parse_function:
 .L7302:
     movq -240(%rbp), %rax
     pushq %rax
-    movq $171, %rax
+    movq $14, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7311
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_set_statement
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7312
+.L7311:
+.L7312:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $18, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7321
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_if_statement
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7322
+.L7321:
+.L7322:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $20, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7331
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_while_statement
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7332
+.L7331:
+.L7332:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $180, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7341
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_loop_forever
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7342
+.L7341:
+.L7342:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $112, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7351
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_match_statement
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7352
+.L7351:
+.L7352:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7361
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_print_statement
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7362
+.L7361:
+.L7362:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $172, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7371
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call parser_parse_print_statement
+    pushq %rax
+    leaq -248(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L7372
+.L7371:
+.L7372:
+    movq -240(%rbp), %rax
+    pushq %rax
+    movq $171, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L7381
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31503,9 +31814,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7312
-.L7311:
-.L7312:
+    jmp .L7382
+.L7381:
+.L7382:
     movq -240(%rbp), %rax
     pushq %rax
     movq $183, %rax
@@ -31514,7 +31825,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7321
+    jz .L7391
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31523,9 +31834,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7322
-.L7321:
-.L7322:
+    jmp .L7392
+.L7391:
+.L7392:
     movq -240(%rbp), %rax
     pushq %rax
     movq $121, %rax
@@ -31534,7 +31845,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7331
+    jz .L7401
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31543,9 +31854,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7332
-.L7331:
-.L7332:
+    jmp .L7402
+.L7401:
+.L7402:
     movq -240(%rbp), %rax
     pushq %rax
     movq $143, %rax
@@ -31554,7 +31865,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7341
+    jz .L7411
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31563,9 +31874,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7342
-.L7341:
-.L7342:
+    jmp .L7412
+.L7411:
+.L7412:
     movq -240(%rbp), %rax
     pushq %rax
     movq $139, %rax
@@ -31574,7 +31885,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7351
+    jz .L7421
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31586,9 +31897,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7352
-.L7351:
-.L7352:
+    jmp .L7422
+.L7421:
+.L7422:
     movq -240(%rbp), %rax
     pushq %rax
     movq $140, %rax
@@ -31597,7 +31908,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7361
+    jz .L7431
     movq $1, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31609,9 +31920,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7362
-.L7361:
-.L7362:
+    jmp .L7432
+.L7431:
+.L7432:
     movq -240(%rbp), %rax
     pushq %rax
     movq $141, %rax
@@ -31620,7 +31931,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7371
+    jz .L7441
     movq $2, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31632,9 +31943,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7372
-.L7371:
-.L7372:
+    jmp .L7442
+.L7441:
+.L7442:
     movq -240(%rbp), %rax
     pushq %rax
     movq $142, %rax
@@ -31643,7 +31954,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7381
+    jz .L7451
     movq $3, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31655,9 +31966,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7382
-.L7381:
-.L7382:
+    jmp .L7452
+.L7451:
+.L7452:
     movq -240(%rbp), %rax
     pushq %rax
     movq $167, %rax
@@ -31666,7 +31977,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7391
+    jz .L7461
     movq $167, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31774,9 +32085,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7392
-.L7391:
-.L7392:
+    jmp .L7462
+.L7461:
+.L7462:
     movq -240(%rbp), %rax
     pushq %rax
     movq $169, %rax
@@ -31785,7 +32096,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7401
+    jz .L7471
     movq $169, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -31893,9 +32204,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7402
-.L7401:
-.L7402:
+    jmp .L7472
+.L7471:
+.L7472:
     movq -240(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -31904,7 +32215,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7411
+    jz .L7481
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31918,9 +32229,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7412
-.L7411:
-.L7412:
+    jmp .L7482
+.L7481:
+.L7482:
     movq -240(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31934,7 +32245,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7421
+    jz .L7491
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -31948,9 +32259,9 @@ parser_parse_function:
     leaq -248(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7422
-.L7421:
-.L7422:
+    jmp .L7492
+.L7491:
+.L7492:
     movq -248(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -31959,7 +32270,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7431
+    jz .L7501
     leaq .STR101(%rip), %rax
     pushq %rax
     popq %rdi
@@ -31993,9 +32304,9 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L7432
-.L7431:
-.L7432:
+    jmp .L7502
+.L7501:
+.L7502:
     movq -248(%rbp), %rax
     pushq %rax
     movq -64(%rbp), %rax
@@ -32025,8 +32336,8 @@ parser_parse_function:
     leaq -240(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7201
-.L7202:
+    jmp .L7271
+.L7272:
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -32057,7 +32368,7 @@ parser_parse_function:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7441
+    jz .L7511
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -32070,9 +32381,9 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call function_add_statement
-    jmp .L7442
-.L7441:
-.L7442:
+    jmp .L7512
+.L7511:
+.L7512:
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -32138,14 +32449,14 @@ parser_create:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7451
+    jz .L7521
     leaq .STR103(%rip), %rax
     pushq %rax
     popq %rdi
     call print_string
-    jmp .L7452
-.L7451:
-.L7452:
+    jmp .L7522
+.L7521:
+.L7522:
     movq -32(%rbp), %rax
     pushq %rax
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN
@@ -32176,7 +32487,7 @@ parser_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7461
+    jz .L7531
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN
     pushq %rax
     movq -8(%rbp), %rax
@@ -32193,21 +32504,21 @@ parser_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7471
+    jz .L7541
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
     call token_destroy
-    jmp .L7472
-.L7471:
-.L7472:
+    jmp .L7542
+.L7541:
+.L7542:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L7462
-.L7461:
-.L7462:
+    jmp .L7532
+.L7531:
+.L7532:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -32249,7 +32560,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7481
+    jz .L7551
     leaq .STR104(%rip), %rax
     pushq %rax
     popq %rdi
@@ -32259,9 +32570,9 @@ parser_parse_program:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L7482
-.L7481:
-.L7482:
+    jmp .L7552
+.L7551:
+.L7552:
     movq $0, %rax
     pushq %rax
     movq $32, %rax  # Load compile-time constant PROGRAM_IMPORTS
@@ -32394,7 +32705,7 @@ parser_parse_program:
     call memory_set_pointer@PLT
     movq $1, %rax
     movq %rax, -40(%rbp)
-.L7491:    movq -40(%rbp), %rax
+.L7561:    movq -40(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -32402,7 +32713,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7492
+    jz .L7562
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -32419,7 +32730,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7501
+    jz .L7571
     leaq .STR105(%rip), %rax
     pushq %rax
     popq %rdi
@@ -32428,9 +32739,9 @@ parser_parse_program:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L7502
-.L7501:
-.L7502:
+    jmp .L7572
+.L7571:
+.L7572:
     movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
     pushq %rax
     movq -48(%rbp), %rax
@@ -32449,15 +32760,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7511
+    jz .L7581
     movq $1, %rax
     pushq %rax
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7512
-.L7511:
-.L7512:
+    jmp .L7582
+.L7581:
+.L7582:
     movq -64(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32466,15 +32777,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7521
+    jz .L7591
     movq $0, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7522
-.L7521:
-.L7522:
+    jmp .L7592
+.L7591:
+.L7592:
     movq -64(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -32483,7 +32794,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7531
+    jz .L7601
     movq $0, %rax
     movq %rax, -72(%rbp)
     movq -56(%rbp), %rax
@@ -32494,15 +32805,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7541
+    jz .L7611
     movq $1, %rax
     pushq %rax
     leaq -72(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7542
-.L7541:
-.L7542:
+    jmp .L7612
+.L7611:
+.L7612:
     movq -72(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32511,7 +32822,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7551
+    jz .L7621
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -32525,7 +32836,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7561
+    jz .L7631
     leaq .STR106(%rip), %rax
     pushq %rax
     popq %rdi
@@ -32534,9 +32845,9 @@ parser_parse_program:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L7562
-.L7561:
-.L7562:
+    jmp .L7632
+.L7631:
+.L7632:
     movq -80(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -32544,9 +32855,9 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call program_add_import
-    jmp .L7552
-.L7551:
-.L7552:
+    jmp .L7622
+.L7621:
+.L7622:
     movq $0, %rax
     movq %rax, -88(%rbp)
     movq -56(%rbp), %rax
@@ -32557,15 +32868,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7571
+    jz .L7641
     movq $1, %rax
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7572
-.L7571:
-.L7572:
+    jmp .L7642
+.L7641:
+.L7642:
     movq -88(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32574,7 +32885,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7581
+    jz .L7651
     movq $144, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -32584,7 +32895,7 @@ parser_parse_program:
     call parser_eat
     movq $1, %rax
     movq %rax, -96(%rbp)
-.L7591:    movq -96(%rbp), %rax
+.L7661:    movq -96(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -32592,7 +32903,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7592
+    jz .L7662
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -32627,7 +32938,7 @@ parser_parse_program:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7601
+    jz .L7671
     leaq .STR107(%rip), %rax
     pushq %rax
     movq -120(%rbp), %rax
@@ -32639,9 +32950,9 @@ parser_parse_program:
     leaq -128(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7602
-.L7601:
-.L7602:
+    jmp .L7672
+.L7671:
+.L7672:
     movq -128(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32650,7 +32961,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7611
+    jz .L7681
     movq -112(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -32660,7 +32971,7 @@ parser_parse_program:
     call parser_eat
     movq $1, %rax
     movq %rax, -136(%rbp)
-.L7621:    movq -136(%rbp), %rax
+.L7691:    movq -136(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -32668,7 +32979,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7622
+    jz .L7692
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -32716,7 +33027,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7631
+    jz .L7701
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -32724,23 +33035,23 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7632
-.L7631:
+    jmp .L7702
+.L7701:
     movq $0, %rax
     pushq %rax
     leaq -136(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L7632:
-    jmp .L7621
-.L7622:
+.L7702:
+    jmp .L7691
+.L7692:
     movq $0, %rax
     pushq %rax
     leaq -96(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7612
-.L7611:
+    jmp .L7682
+.L7681:
     movq -112(%rbp), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -32748,12 +33059,12 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-.L7612:
-    jmp .L7591
-.L7592:
-    jmp .L7582
-.L7581:
-.L7582:
+.L7682:
+    jmp .L7661
+.L7662:
+    jmp .L7652
+.L7651:
+.L7652:
     movq $0, %rax
     movq %rax, -176(%rbp)
     movq -56(%rbp), %rax
@@ -32764,15 +33075,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7641
+    jz .L7711
     movq $1, %rax
     pushq %rax
     leaq -176(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7642
-.L7641:
-.L7642:
+    jmp .L7712
+.L7711:
+.L7712:
     movq -176(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32781,7 +33092,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7651
+    jz .L7721
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -32794,9 +33105,9 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call program_add_type
-    jmp .L7652
-.L7651:
-.L7652:
+    jmp .L7722
+.L7721:
+.L7722:
     movq $0, %rax
     movq %rax, -192(%rbp)
     movq -56(%rbp), %rax
@@ -32807,15 +33118,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7661
+    jz .L7731
     movq $1, %rax
     pushq %rax
     leaq -192(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7662
-.L7661:
-.L7662:
+    jmp .L7732
+.L7731:
+.L7732:
     movq -192(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32824,7 +33135,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7671
+    jz .L7741
     movq $163, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -32862,7 +33173,7 @@ parser_parse_program:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7681
+    jz .L7751
     leaq .STR108(%rip), %rax
     pushq %rax
     popq %rdi
@@ -32872,12 +33183,12 @@ parser_parse_program:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L7682
-.L7681:
-.L7682:
-    jmp .L7672
-.L7671:
-.L7672:
+    jmp .L7752
+.L7751:
+.L7752:
+    jmp .L7742
+.L7741:
+.L7742:
     movq $0, %rax
     movq %rax, -200(%rbp)
     movq -56(%rbp), %rax
@@ -32888,7 +33199,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7691
+    jz .L7761
     movq $1, %rax
     pushq %rax
     leaq -200(%rbp), %rbx
@@ -32923,9 +33234,9 @@ parser_parse_program:
     leaq -56(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7692
-.L7691:
-.L7692:
+    jmp .L7762
+.L7761:
+.L7762:
     movq $0, %rax
     movq %rax, -208(%rbp)
     movq -56(%rbp), %rax
@@ -32936,15 +33247,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7701
+    jz .L7771
     movq $1, %rax
     pushq %rax
     leaq -208(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7702
-.L7701:
-.L7702:
+    jmp .L7772
+.L7771:
+.L7772:
     movq -208(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32953,7 +33264,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7711
+    jz .L7781
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -32967,7 +33278,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7721
+    jz .L7791
     leaq .STR109(%rip), %rax
     pushq %rax
     popq %rdi
@@ -32976,9 +33287,9 @@ parser_parse_program:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L7722
-.L7721:
-.L7722:
+    jmp .L7792
+.L7791:
+.L7792:
     movq -192(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -32987,7 +33298,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7731
+    jz .L7801
     movq $1, %rax
     pushq %rax
     movq $44, %rax
@@ -32998,9 +33309,9 @@ parser_parse_program:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    jmp .L7732
-.L7731:
-.L7732:
+    jmp .L7802
+.L7801:
+.L7802:
     movq -216(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
@@ -33008,9 +33319,9 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call program_add_function
-    jmp .L7712
-.L7711:
-.L7712:
+    jmp .L7782
+.L7781:
+.L7782:
     movq $0, %rax
     movq %rax, -224(%rbp)
     movq -56(%rbp), %rax
@@ -33021,15 +33332,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7741
+    jz .L7811
     movq $1, %rax
     pushq %rax
     leaq -224(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7742
-.L7741:
-.L7742:
+    jmp .L7812
+.L7811:
+.L7812:
     movq -224(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33038,7 +33349,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7751
+    jz .L7821
     movq $12, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -33070,7 +33381,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7761
+    jz .L7831
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -232(%rbp), %rax
@@ -33113,7 +33424,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7771
+    jz .L7841
     movq $13, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -33145,7 +33456,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7781
+    jz .L7851
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -272(%rbp), %rax
@@ -33186,7 +33497,7 @@ parser_parse_program:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    leaq .STR22(%rip), %rax
+    leaq .STR25(%rip), %rax
     pushq %rax
     popq %rdi
     call string_duplicate_parser
@@ -33216,18 +33527,18 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call program_add_global
-    jmp .L7782
-.L7781:
-.L7782:
-    jmp .L7772
-.L7771:
-.L7772:
-    jmp .L7762
-.L7761:
-.L7762:
-    jmp .L7752
-.L7751:
-.L7752:
+    jmp .L7852
+.L7851:
+.L7852:
+    jmp .L7842
+.L7841:
+.L7842:
+    jmp .L7832
+.L7831:
+.L7832:
+    jmp .L7822
+.L7821:
+.L7822:
     movq $0, %rax
     movq %rax, -320(%rbp)
     movq -56(%rbp), %rax
@@ -33238,15 +33549,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7791
+    jz .L7861
     movq $1, %rax
     pushq %rax
     leaq -320(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7792
-.L7791:
-.L7792:
+    jmp .L7862
+.L7861:
+.L7862:
     movq -320(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33255,7 +33566,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7801
+    jz .L7871
     movq $164, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -33292,7 +33603,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7811
+    jz .L7881
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -328(%rbp), %rax
@@ -33385,7 +33696,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7821
+    jz .L7891
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -384(%rbp), %rax
@@ -33414,8 +33725,8 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7822
-.L7821:
+    jmp .L7892
+.L7891:
     movq -392(%rbp), %rax
     pushq %rax
     movq $10, %rax
@@ -33424,7 +33735,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7831
+    jz .L7901
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -384(%rbp), %rax
@@ -33451,8 +33762,8 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7832
-.L7831:
+    jmp .L7902
+.L7901:
     movq -392(%rbp), %rax
     pushq %rax
     movq $17, %rax
@@ -33461,7 +33772,7 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7841
+    jz .L7911
     movq $17, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -33508,8 +33819,8 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L7842
-.L7841:
+    jmp .L7912
+.L7911:
     movq $0, %rax
     pushq %rax
     popq %rdi
@@ -33525,9 +33836,9 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-.L7842:
-.L7832:
-.L7822:
+.L7912:
+.L7902:
+.L7892:
     movq $24, %rax
     pushq %rax
     popq %rdi
@@ -33570,12 +33881,12 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call program_add_global
-    jmp .L7812
-.L7811:
-.L7812:
-    jmp .L7802
-.L7801:
-.L7802:
+    jmp .L7882
+.L7881:
+.L7882:
+    jmp .L7872
+.L7871:
+.L7872:
     movq $0, %rax
     movq %rax, -472(%rbp)
     movq -72(%rbp), %rax
@@ -33586,15 +33897,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7851
+    jz .L7921
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7852
-.L7851:
-.L7852:
+    jmp .L7922
+.L7921:
+.L7922:
     movq -176(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33603,15 +33914,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7861
+    jz .L7931
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7862
-.L7861:
-.L7862:
+    jmp .L7932
+.L7931:
+.L7932:
     movq -208(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33620,15 +33931,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7871
+    jz .L7941
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7872
-.L7871:
-.L7872:
+    jmp .L7942
+.L7941:
+.L7942:
     movq -224(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33637,15 +33948,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7881
+    jz .L7951
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7882
-.L7881:
-.L7882:
+    jmp .L7952
+.L7951:
+.L7952:
     movq -320(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33654,15 +33965,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7891
+    jz .L7961
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7892
-.L7891:
-.L7892:
+    jmp .L7962
+.L7961:
+.L7962:
     movq -192(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33671,15 +33982,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7901
+    jz .L7971
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7902
-.L7901:
-.L7902:
+    jmp .L7972
+.L7971:
+.L7972:
     movq -88(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -33688,15 +33999,15 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7911
+    jz .L7981
     movq $1, %rax
     pushq %rax
     leaq -472(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L7912
-.L7911:
-.L7912:
+    jmp .L7982
+.L7981:
+.L7982:
     movq -472(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -33705,19 +34016,19 @@ parser_parse_program:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7921
+    jz .L7991
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L7922
-.L7921:
-.L7922:
-    jmp .L7532
-.L7531:
-.L7532:
-    jmp .L7491
-.L7492:
+    jmp .L7992
+.L7991:
+.L7992:
+    jmp .L7602
+.L7601:
+.L7602:
+    jmp .L7561
+.L7562:
     movq -16(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -33743,14 +34054,14 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7931
+    jz .L8001
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L7932
-.L7931:
-.L7932:
+    jmp .L8002
+.L8001:
+.L8002:
     movq $0, %rax  # Load compile-time constant EXPR_TYPE
     pushq %rax
     movq -8(%rbp), %rax
@@ -33767,7 +34078,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7941
+    jz .L8011
     movq $8, %rax  # Load compile-time constant EXPR_BINARY_LEFT
     pushq %rax
     movq -8(%rbp), %rax
@@ -33792,8 +34103,8 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L7942
-.L7941:
+    jmp .L8012
+.L8011:
     movq -16(%rbp), %rax
     pushq %rax
     movq $11, %rax  # Load compile-time constant EXPR_UNARY
@@ -33802,7 +34113,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7951
+    jz .L8021
     movq $8, %rax  # Load compile-time constant EXPR_UNARY_OPERAND
     pushq %rax
     movq -8(%rbp), %rax
@@ -33815,8 +34126,8 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L7952
-.L7951:
+    jmp .L8022
+.L8021:
     movq -16(%rbp), %rax
     pushq %rax
     movq $4, %rax  # Load compile-time constant EXPR_CALL
@@ -33825,7 +34136,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7961
+    jz .L8031
     movq $8, %rax  # Load compile-time constant EXPR_CALL_NAME
     pushq %rax
     movq -8(%rbp), %rax
@@ -33838,8 +34149,8 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call string_destroy
-    jmp .L7962
-.L7961:
+    jmp .L8032
+.L8031:
     movq -16(%rbp), %rax
     pushq %rax
     movq $6, %rax  # Load compile-time constant EXPR_FIELD_ACCESS
@@ -33848,7 +34159,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7971
+    jz .L8041
     movq $8, %rax  # Load compile-time constant EXPR_FIELD_OBJECT
     pushq %rax
     movq -8(%rbp), %rax
@@ -33873,8 +34184,8 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call string_destroy
-    jmp .L7972
-.L7971:
+    jmp .L8042
+.L8041:
     movq -16(%rbp), %rax
     pushq %rax
     movq $16, %rax  # Load compile-time constant EXPR_ARRAY_ACCESS
@@ -33883,7 +34194,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7981
+    jz .L8051
     movq $8, %rax  # Load compile-time constant EXPR_ARRAY_OBJECT
     pushq %rax
     movq -8(%rbp), %rax
@@ -33908,8 +34219,8 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L7982
-.L7981:
+    jmp .L8052
+.L8051:
     movq -16(%rbp), %rax
     pushq %rax
     movq $1, %rax  # Load compile-time constant EXPR_IDENTIFIER
@@ -33918,7 +34229,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L7991
+    jz .L8061
     movq $8, %rax  # Load compile-time constant EXPR_IDENTIFIER_NAME
     pushq %rax
     movq -8(%rbp), %rax
@@ -33931,8 +34242,8 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call string_destroy
-    jmp .L7992
-.L7991:
+    jmp .L8062
+.L8061:
     movq -16(%rbp), %rax
     pushq %rax
     movq $5, %rax  # Load compile-time constant EXPR_STRING_LITERAL
@@ -33941,7 +34252,7 @@ expression_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8001
+    jz .L8071
     movq $8, %rax  # Load compile-time constant EXPR_STRING_VALUE
     pushq %rax
     movq -8(%rbp), %rax
@@ -33954,15 +34265,15 @@ expression_destroy:
     pushq %rax
     popq %rdi
     call string_destroy
-    jmp .L8002
-.L8001:
-.L8002:
-.L7992:
-.L7982:
-.L7972:
-.L7962:
-.L7952:
-.L7942:
+    jmp .L8072
+.L8071:
+.L8072:
+.L8062:
+.L8052:
+.L8042:
+.L8032:
+.L8022:
+.L8012:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -33987,14 +34298,14 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8011
+    jz .L8081
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8012
-.L8011:
-.L8012:
+    jmp .L8082
+.L8081:
+.L8082:
     movq $0, %rax  # Load compile-time constant STMT_TYPE
     pushq %rax
     movq -8(%rbp), %rax
@@ -34011,7 +34322,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8021
+    jz .L8091
     movq $8, %rax  # Load compile-time constant STMT_LET_NAME
     pushq %rax
     movq -8(%rbp), %rax
@@ -34048,8 +34359,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call type_destroy
-    jmp .L8022
-.L8021:
+    jmp .L8092
+.L8091:
     movq -16(%rbp), %rax
     pushq %rax
     movq $2, %rax  # Load compile-time constant STMT_SET
@@ -34058,7 +34369,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8031
+    jz .L8101
     movq $8, %rax  # Load compile-time constant STMT_SET_NAME
     pushq %rax
     movq -8(%rbp), %rax
@@ -34083,8 +34394,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8032
-.L8031:
+    jmp .L8102
+.L8101:
     movq -16(%rbp), %rax
     pushq %rax
     movq $5, %rax  # Load compile-time constant STMT_IF
@@ -34093,7 +34404,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8041
+    jz .L8111
     movq $8, %rax  # Load compile-time constant STMT_IF_CONDITION
     pushq %rax
     movq -8(%rbp), %rax
@@ -34106,8 +34417,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8042
-.L8041:
+    jmp .L8112
+.L8111:
     movq -16(%rbp), %rax
     pushq %rax
     movq $6, %rax  # Load compile-time constant STMT_WHILE
@@ -34116,7 +34427,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8051
+    jz .L8121
     movq $8, %rax  # Load compile-time constant STMT_WHILE_CONDITION
     pushq %rax
     movq -8(%rbp), %rax
@@ -34129,8 +34440,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8052
-.L8051:
+    jmp .L8122
+.L8121:
     movq -16(%rbp), %rax
     pushq %rax
     movq $11, %rax  # Load compile-time constant STMT_FOR
@@ -34139,7 +34450,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8061
+    jz .L8131
     movq $8, %rax  # Load compile-time constant STMT_FOR_VAR
     pushq %rax
     movq -8(%rbp), %rax
@@ -34176,8 +34487,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8062
-.L8061:
+    jmp .L8132
+.L8131:
     movq -16(%rbp), %rax
     pushq %rax
     movq $12, %rax  # Load compile-time constant STMT_FOR_EACH
@@ -34186,7 +34497,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8071
+    jz .L8141
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -34211,8 +34522,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8072
-.L8071:
+    jmp .L8142
+.L8141:
     movq -16(%rbp), %rax
     pushq %rax
     movq $3, %rax  # Load compile-time constant STMT_RETURN
@@ -34221,7 +34532,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8081
+    jz .L8151
     movq $8, %rax  # Load compile-time constant STMT_RETURN_VALUE
     pushq %rax
     movq -8(%rbp), %rax
@@ -34234,8 +34545,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8082
-.L8081:
+    jmp .L8152
+.L8151:
     movq -16(%rbp), %rax
     pushq %rax
     movq $7, %rax  # Load compile-time constant STMT_EXPRESSION
@@ -34244,7 +34555,7 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8091
+    jz .L8161
     movq $8, %rax  # Load compile-time constant STMT_EXPR_VALUE
     pushq %rax
     movq -8(%rbp), %rax
@@ -34257,8 +34568,8 @@ statement_destroy:
     pushq %rax
     popq %rdi
     call expression_destroy
-    jmp .L8092
-.L8091:
+    jmp .L8162
+.L8161:
     movq -16(%rbp), %rax
     pushq %rax
     movq $9, %rax  # Load compile-time constant STMT_BREAK
@@ -34267,9 +34578,9 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8101
-    jmp .L8102
-.L8101:
+    jz .L8171
+    jmp .L8172
+.L8171:
     movq -16(%rbp), %rax
     pushq %rax
     movq $10, %rax  # Load compile-time constant STMT_CONTINUE
@@ -34278,19 +34589,19 @@ statement_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8111
-    jmp .L8112
-.L8111:
+    jz .L8181
+    jmp .L8182
+.L8181:
+.L8182:
+.L8172:
+.L8162:
+.L8152:
+.L8142:
+.L8132:
+.L8122:
 .L8112:
 .L8102:
 .L8092:
-.L8082:
-.L8072:
-.L8062:
-.L8052:
-.L8042:
-.L8032:
-.L8022:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -34315,14 +34626,14 @@ function_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8121
+    jz .L8191
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8122
-.L8121:
-.L8122:
+    jmp .L8192
+.L8191:
+.L8192:
     movq $0, %rax  # Load compile-time constant FUNCTION_NAME
     pushq %rax
     movq -8(%rbp), %rax
@@ -34362,14 +34673,14 @@ type_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8131
+    jz .L8201
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8132
-.L8131:
-.L8132:
+    jmp .L8202
+.L8201:
+.L8202:
     movq $0, %rax  # Load compile-time constant TYPE_KIND
     pushq %rax
     movq -8(%rbp), %rax
@@ -34386,9 +34697,9 @@ type_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8141
-    jmp .L8142
-.L8141:
+    jz .L8211
+    jmp .L8212
+.L8211:
     movq -16(%rbp), %rax
     pushq %rax
     movq $1, %rax  # Load compile-time constant TYPE_STRUCT
@@ -34397,7 +34708,7 @@ type_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8151
+    jz .L8221
     movq $8, %rax  # Load compile-time constant TYPE_STRUCT_NAME
     pushq %rax
     movq -8(%rbp), %rax
@@ -34410,8 +34721,8 @@ type_destroy:
     pushq %rax
     popq %rdi
     call string_destroy
-    jmp .L8152
-.L8151:
+    jmp .L8222
+.L8221:
     movq -16(%rbp), %rax
     pushq %rax
     movq $2, %rax  # Load compile-time constant TYPE_ARRAY
@@ -34420,7 +34731,7 @@ type_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8161
+    jz .L8231
     movq $8, %rax  # Load compile-time constant TYPE_ARRAY_ELEMENT_TYPE
     pushq %rax
     movq -8(%rbp), %rax
@@ -34433,8 +34744,8 @@ type_destroy:
     pushq %rax
     popq %rdi
     call type_destroy
-    jmp .L8162
-.L8161:
+    jmp .L8232
+.L8231:
     movq -16(%rbp), %rax
     pushq %rax
     movq $3, %rax  # Load compile-time constant TYPE_POINTER
@@ -34443,7 +34754,7 @@ type_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8171
+    jz .L8241
     movq $8, %rax  # Load compile-time constant TYPE_POINTER_TARGET_TYPE
     pushq %rax
     movq -8(%rbp), %rax
@@ -34456,12 +34767,12 @@ type_destroy:
     pushq %rax
     popq %rdi
     call type_destroy
-    jmp .L8172
-.L8171:
-.L8172:
-.L8162:
-.L8152:
-.L8142:
+    jmp .L8242
+.L8241:
+.L8242:
+.L8232:
+.L8222:
+.L8212:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -34486,14 +34797,14 @@ program_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8181
+    jz .L8251
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8182
-.L8181:
-.L8182:
+    jmp .L8252
+.L8251:
+.L8252:
     movq $8, %rax  # Load compile-time constant PROGRAM_FUNCTION_COUNT
     pushq %rax
     movq -8(%rbp), %rax
@@ -34518,10 +34829,10 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8191
+    jz .L8261
     movq $0, %rax
     movq %rax, -32(%rbp)
-.L8201:    movq -32(%rbp), %rax
+.L8271:    movq -32(%rbp), %rax
     pushq %rax
     movq -16(%rbp), %rax
     popq %rbx
@@ -34529,7 +34840,7 @@ program_destroy:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8202
+    jz .L8272
     movq $8, %rax
     movq %rax, -40(%rbp)
     movq -32(%rbp), %rax
@@ -34557,25 +34868,25 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8211
+    jz .L8281
     movq -64(%rbp), %rax
     pushq %rax
     popq %rdi
     call function_destroy
-    jmp .L8212
-.L8211:
-.L8212:
+    jmp .L8282
+.L8281:
+.L8282:
     movq -32(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8201
-.L8202:
-    jmp .L8192
-.L8191:
-.L8192:
+    jmp .L8271
+.L8272:
+    jmp .L8262
+.L8261:
+.L8262:
     movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
     pushq %rax
     movq -8(%rbp), %rax
@@ -34600,10 +34911,10 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8221
+    jz .L8291
     movq $0, %rax
     movq %rax, -88(%rbp)
-.L8231:    movq -88(%rbp), %rax
+.L8301:    movq -88(%rbp), %rax
     pushq %rax
     movq -72(%rbp), %rax
     popq %rbx
@@ -34611,7 +34922,7 @@ program_destroy:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8232
+    jz .L8302
     movq $8, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
@@ -34645,25 +34956,25 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8241
+    jz .L8311
     movq -104(%rbp), %rax
     pushq %rax
     popq %rdi
     call type_destroy
-    jmp .L8242
-.L8241:
-.L8242:
+    jmp .L8312
+.L8311:
+.L8312:
     movq -88(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8231
-.L8232:
-    jmp .L8222
-.L8221:
-.L8222:
+    jmp .L8301
+.L8302:
+    jmp .L8292
+.L8291:
+.L8292:
     movq $40, %rax  # Load compile-time constant PROGRAM_IMPORT_COUNT
     pushq %rax
     movq -8(%rbp), %rax
@@ -34688,10 +34999,10 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8251
-    jmp .L8252
-.L8251:
-.L8252:
+    jz .L8321
+    jmp .L8322
+.L8321:
+.L8322:
     movq $56, %rax  # Load compile-time constant PROGRAM_GLOBAL_COUNT
     pushq %rax
     movq -8(%rbp), %rax
@@ -34716,10 +35027,10 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8261
+    jz .L8331
     movq $0, %rax
     movq %rax, -144(%rbp)
-.L8271:    movq -144(%rbp), %rax
+.L8341:    movq -144(%rbp), %rax
     pushq %rax
     movq -128(%rbp), %rax
     popq %rbx
@@ -34727,7 +35038,7 @@ program_destroy:
     setl %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8272
+    jz .L8342
     movq $8, %rax
     pushq %rax
     leaq -40(%rbp), %rbx
@@ -34761,29 +35072,29 @@ program_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8281
+    jz .L8351
     movq -160(%rbp), %rax
     pushq %rax
     popq %rdi
     call statement_destroy
-    jmp .L8282
-.L8281:
-.L8282:
+    jmp .L8352
+.L8351:
+.L8352:
     movq -144(%rbp), %rax
     addq $1, %rax
     pushq %rax
     leaq -144(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8271
-.L8272:
+    jmp .L8341
+.L8342:
     movq -136(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L8262
-.L8261:
-.L8262:
+    jmp .L8332
+.L8331:
+.L8332:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -34808,14 +35119,14 @@ string_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8291
+    jz .L8361
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L8292
-.L8291:
-.L8292:
+    jmp .L8362
+.L8361:
+.L8362:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -34836,14 +35147,14 @@ param_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8301
+    jz .L8371
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8302
-.L8301:
-.L8302:
+    jmp .L8372
+.L8371:
+.L8372:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -34888,14 +35199,14 @@ field_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8311
+    jz .L8381
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8312
-.L8311:
-.L8312:
+    jmp .L8382
+.L8381:
+.L8382:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -34940,14 +35251,14 @@ import_destroy:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8321
+    jz .L8391
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8322
-.L8321:
-.L8322:
+    jmp .L8392
+.L8391:
+.L8392:
     movq $0, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -35013,7 +35324,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8331
+    jz .L8401
     movq $144, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -35080,7 +35391,7 @@ parser_parse_import:
     call parser_eat
     movq $1, %rax
     movq %rax, -80(%rbp)
-.L8341:    movq -80(%rbp), %rax
+.L8411:    movq -80(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -35088,7 +35399,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8342
+    jz .L8412
     movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
     pushq %rax
     movq -8(%rbp), %rax
@@ -35136,7 +35447,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8351
+    jz .L8421
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -35144,16 +35455,16 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L8352
-.L8351:
+    jmp .L8422
+.L8421:
     movq $0, %rax
     pushq %rax
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L8352:
-    jmp .L8341
-.L8342:
+.L8422:
+    jmp .L8411
+.L8412:
     movq $16, %rax
     pushq %rax
     popq %rdi
@@ -35186,9 +35497,9 @@ parser_parse_import:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8332
-.L8331:
-.L8332:
+    jmp .L8402
+.L8401:
+.L8402:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -35207,15 +35518,15 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8361
+    jz .L8431
     movq $1, %rax
     pushq %rax
     leaq -136(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8362
-.L8361:
-.L8362:
+    jmp .L8432
+.L8431:
+.L8432:
     movq -32(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -35229,15 +35540,15 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8371
+    jz .L8441
     movq $1, %rax
     pushq %rax
     leaq -136(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8372
-.L8371:
-.L8372:
+    jmp .L8442
+.L8441:
+.L8442:
     movq -136(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -35246,7 +35557,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8381
+    jz .L8451
     movq -128(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -35285,15 +35596,15 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8391
+    jz .L8461
     movq $1, %rax
     pushq %rax
     leaq -176(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8392
-.L8391:
-.L8392:
+    jmp .L8462
+.L8461:
+.L8462:
     movq -168(%rbp), %rax
     pushq %rax
     movq $52, %rax
@@ -35302,8 +35613,8 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8401
-.L8411:    movq -168(%rbp), %rax
+    jz .L8471
+.L8481:    movq -168(%rbp), %rax
     pushq %rax
     movq $52, %rax
     popq %rbx
@@ -35311,7 +35622,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8412
+    jz .L8482
     movq $52, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -35364,8 +35675,8 @@ parser_parse_import:
     leaq -168(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8411
-.L8412:
+    jmp .L8481
+.L8482:
     movq -168(%rbp), %rax
     pushq %rax
     movq $144, %rax
@@ -35374,18 +35685,18 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8421
+    jz .L8491
     movq $1, %rax
     pushq %rax
     leaq -176(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L8422
-.L8421:
-.L8422:
-    jmp .L8402
-.L8401:
-.L8402:
+    jmp .L8492
+.L8491:
+.L8492:
+    jmp .L8472
+.L8471:
+.L8472:
     movq -176(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -35394,7 +35705,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8431
+    jz .L8501
     movq $144, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -35465,7 +35776,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8441
+    jz .L8511
     movq $34, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -35510,9 +35821,9 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    jmp .L8442
-.L8441:
-.L8442:
+    jmp .L8512
+.L8511:
+.L8512:
     movq $16, %rax
     pushq %rax
     popq %rdi
@@ -35542,9 +35853,9 @@ parser_parse_import:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8432
-.L8431:
-.L8432:
+    jmp .L8502
+.L8501:
+.L8502:
     movq $16, %rax
     pushq %rax
     popq %rdi
@@ -35580,9 +35891,9 @@ parser_parse_import:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L8382
-.L8381:
-.L8382:
+    jmp .L8452
+.L8451:
+.L8452:
     movq -32(%rbp), %rax
     pushq %rax
     movq $10, %rax
@@ -35591,7 +35902,7 @@ parser_parse_import:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8451
+    jz .L8521
     leaq .STR110(%rip), %rax
     pushq %rax
     popq %rdi
@@ -35605,9 +35916,9 @@ parser_parse_import:
     pushq %rax
     popq %rdi
     call exit_with_code@PLT
-    jmp .L8452
-.L8451:
-.L8452:
+    jmp .L8522
+.L8521:
+.L8522:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -24(%rbp), %rax
@@ -35650,7 +35961,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8461
+    jz .L8531
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -35685,7 +35996,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8471
+    jz .L8541
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -328(%rbp), %rax
@@ -35705,8 +36016,8 @@ parser_parse_import:
     popq %rdi
     call parser_advance
     movq %rax, -352(%rbp)
-    jmp .L8472
-.L8471:
+    jmp .L8542
+.L8541:
     movq -336(%rbp), %rax
     pushq %rax
     movq $53, %rax
@@ -35715,7 +36026,7 @@ parser_parse_import:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L8481
+    jz .L8551
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -328(%rbp), %rax
@@ -35735,8 +36046,8 @@ parser_parse_import:
     popq %rdi
     call parser_advance
     movq %rax, -360(%rbp)
-    jmp .L8482
-.L8481:
+    jmp .L8552
+.L8551:
     movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
     pushq %rax
     movq -328(%rbp), %rax
@@ -35756,10 +36067,10 @@ parser_parse_import:
     popq %rdi
     call parser_advance
     movq %rax, -368(%rbp)
-.L8482:
-.L8472:
-    jmp .L8462
-.L8461:
+.L8552:
+.L8542:
+    jmp .L8532
+.L8531:
     movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -35768,7 +36079,7 @@ parser_parse_import:
     leaq -312(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-.L8462:
+.L8532:
     movq $16, %rax
     pushq %rax
     popq %rdi

@@ -132,6 +132,12 @@ Process called "token_can_be_identifier" takes token_type as Integer returns Int
         Return 1
     Otherwise If token_type is equal to 183:  Note: TOKEN_CALL (used as variant/field/identifier name in non-statement context)
         Return 1
+    Otherwise If token_type is equal to 4:  Note: TOKEN_INTEGER_TYPE (acts as module name in "proc X from Integer with args")
+        Return 1
+    Otherwise If token_type is equal to 5:  Note: TOKEN_STRING_TYPE (acts as module name in "proc X from String with args")
+        Return 1
+    Otherwise If token_type is equal to 6:  Note: TOKEN_CHARACTER_TYPE (acts as module name in "proc X from Character with args")
+        Return 1
     End If
 
     Return 0
@@ -483,14 +489,13 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             End If
         End While
 
-        Note: Create EXPR_LAMBDA_CALL expression
-        Note: Structure: type(int32), lambda_expr(ptr at 8), arguments(ptr at 16), arg_count(int32 at 24)
-        Let lambda_call be memory_allocate(32)
-        memory_set_int32(lambda_call, 0, 24)  Note: EXPR_LAMBDA_CALL
-        memory_set_pointer(lambda_call, 8, left)  Note: The lambda expression (closure)
-        memory_set_pointer(lambda_call, 16, arguments)
-        memory_set_int32(lambda_call, 24, argument_count)
-        Set left to lambda_call
+        Note: Decide between a regular function call and a lambda invocation.
+        Note: When left is an EXPR_VARIABLE the "with" form names a top-level function
+        Note: (e.g. "create_lua_function with arg1 and arg2"); the codegen for
+        Note: EXPR_LAMBDA_CALL requires a closure structure and segfaults on a plain
+        Note: variable.  Lower this case to EXPR_FUNCTION_CALL using the variable's
+        Note: name so it routes through the normal function-call codegen path.
+        Set left to with_promote_to_call_or_lambda(left, arguments, argument_count)
     End If
 
     Note: Handle field access and array indexing (highest precedence)
@@ -516,7 +521,14 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
 
             Let token_value be memory_get_pointer(current_token2, 8)
             Let field_name be string_duplicate_parser(token_value)
-            parser_eat(parser, 53)
+            Note: Eat the actual token class — keyword-class tokens like TOKEN_LENGTH
+            Note: are accepted as field names via token_can_be_identifier, but a hard-coded
+            Note: parser_eat(parser, 53) would fail on those.
+            If dot_can_id is equal to 1:
+                parser_eat(parser, token_type2)
+            Otherwise:
+                parser_eat(parser, 53)
+            End If
 
             Note: Check if this is module.function() by peeking for '('
             Let next_token be memory_get_pointer(parser, 8)
@@ -1411,6 +1423,475 @@ Process called "parser_peek_struct_field_after_comma" takes parser as Integer re
     Return result
 End Process
 
+Note: Parse "a value of type T [with field as value, ...]" — struct constructor in
+Note: the canonical "a value of type" form.  The leading 'a' has been consumed; the
+Note: caller passes the token type that 'value' carried (so we can eat it generically).
+Note: Returns EXPR_STRUCT_CONSTRUCTION.  Extracted from parser_parse_primary to keep
+Note: that function's body small enough for the stage compiler ([BF-0011]).
+Process called "parser_parse_a_value_of_type" takes parser as Integer, value_kw_type as Integer returns Integer:
+    parser_eat(parser, value_kw_type)  Note: Eat 'value'
+    parser_eat(parser, 125)  Note: Eat 'of' (TOKEN_OF)
+
+    Note: Eat 'type' (TOKEN_TYPE=50 or lowercase identifier)
+    Let avot_type_kw be memory_get_pointer(parser, 8)
+    Let avot_type_kw_type be memory_get_integer(avot_type_kw, 0)
+    If avot_type_kw_type is equal to 50:
+        parser_eat(parser, 50)
+    Otherwise:
+        parser_eat(parser, avot_type_kw_type)
+    End If
+
+    Note: Capture the type name.
+    Let avot_name_token be memory_get_pointer(parser, 8)
+    Let avot_name_type be memory_get_integer(avot_name_token, 0)
+    Let avot_type_name be string_duplicate(memory_get_pointer(avot_name_token, 8))
+    Let avot_name_can_id be token_can_be_identifier(avot_name_type)
+    If avot_name_can_id is equal to 1:
+        parser_eat(parser, avot_name_type)
+    Otherwise:
+        parser_eat(parser, 53)
+    End If
+
+    Let avot_next be memory_get_pointer(parser, 8)
+    Let avot_next_type be memory_get_integer(avot_next, 0)
+    Let avot_field_count be 0
+    Let avot_names be 0
+    Let avot_values be 0
+
+    If avot_next_type is equal to 114:
+        Note: TOKEN_WITH — parse field initializers.
+        parser_eat(parser, 114)
+
+        Set avot_names to memory_allocate(128)
+        Set avot_values to memory_allocate(128)
+        Let avot_parsing_fields be 1
+
+        While avot_parsing_fields is equal to 1:
+            Let avot_field_token be memory_get_pointer(parser, 8)
+            Let avot_field_tt be memory_get_integer(avot_field_token, 0)
+
+            Let avot_is_field be token_can_be_identifier(avot_field_tt)
+            If avot_is_field is equal to 0:
+                Set avot_parsing_fields to 0
+            Otherwise:
+                Let avot_field_name_raw be memory_get_pointer(avot_field_token, 8)
+                Let avot_field_name be string_duplicate(avot_field_name_raw)
+                parser_eat(parser, avot_field_tt)
+                parser_eat(parser, 34)  Note: TOKEN_AS
+                Let avot_val_expr be parser_parse_expression(parser)
+                Let avot_val_offset be avot_field_count multiplied by 8
+                memory_set_pointer(avot_names, avot_val_offset, avot_field_name)
+                memory_set_pointer(avot_values, avot_val_offset, avot_val_expr)
+                Set avot_field_count to avot_field_count plus 1
+
+                Let avot_comma_check be memory_get_pointer(parser, 8)
+                Let avot_comma_type be memory_get_integer(avot_comma_check, 0)
+                If avot_comma_type is equal to 52:
+                    parser_eat(parser, 52)
+                Otherwise:
+                    Set avot_parsing_fields to 0
+                End If
+            End If
+        End While
+    End If
+
+    Let avot_struct_expr be memory_allocate(40)
+    memory_set_int32(avot_struct_expr, 0, 20)  Note: EXPR_STRUCT_CONSTRUCTION
+    memory_set_pointer(avot_struct_expr, 8, avot_type_name)
+    memory_set_pointer(avot_struct_expr, 16, avot_names)
+    memory_set_pointer(avot_struct_expr, 24, avot_values)
+    memory_set_int32(avot_struct_expr, 32, avot_field_count)
+    Return avot_struct_expr
+End Process
+
+Note: Parse a `proc func_name [from Module | .field] [with arg1, arg2, ...]` expression.
+Note: Returns either an EXPR_FUNCTION_CALL (no module qualifier) or an EXPR_QUALIFIED_CALL.
+Note: The 'proc' token has not yet been consumed when this helper is called.
+Note: Extracted from parser_parse_primary to keep its body small enough for the stage
+Note: compiler ([BF-0011]).
+Process called "parser_parse_proc_expression" takes parser as Integer returns Integer:
+    parser_eat(parser, 171)  Note: Eat 'proc'
+
+    Let proc_name_token be memory_get_pointer(parser, 8)
+    Let proc_name_type be memory_get_integer(proc_name_token, 0)
+    Let proc_func_name be string_duplicate(memory_get_pointer(proc_name_token, 8))
+    Let proc_can_be_id be token_can_be_identifier(proc_name_type)
+    If proc_can_be_id is equal to 1:
+        parser_eat(parser, proc_name_type)
+    Otherwise:
+        parser_eat(parser, 53)
+    End If
+
+    Note: Optional dot notation: proc Module.function
+    Let proc_dot_check be memory_get_pointer(parser, 8)
+    Let proc_dot_type be memory_get_integer(proc_dot_check, 0)
+    Let proc_module_name be 0
+    If proc_dot_type is equal to 51:
+        parser_eat(parser, 51)
+        Set proc_module_name to proc_func_name
+        Let proc_real_name_token be memory_get_pointer(parser, 8)
+        Let proc_real_name_type be memory_get_integer(proc_real_name_token, 0)
+        Set proc_func_name to string_duplicate(memory_get_pointer(proc_real_name_token, 8))
+        Let proc_real_can_id be token_can_be_identifier(proc_real_name_type)
+        If proc_real_can_id is equal to 1:
+            parser_eat(parser, proc_real_name_type)
+        Otherwise:
+            parser_eat(parser, 53)
+        End If
+    End If
+
+    Note: Optional 'from Module'
+    Let proc_check be memory_get_pointer(parser, 8)
+    Let proc_check_type be memory_get_integer(proc_check, 0)
+    If proc_check_type is equal to 144:
+        parser_eat(parser, 144)
+        Let proc_mod_token be memory_get_pointer(parser, 8)
+        Let proc_mod_type be memory_get_integer(proc_mod_token, 0)
+        Set proc_module_name to string_duplicate(memory_get_pointer(proc_mod_token, 8))
+        Let proc_mod_can_id be token_can_be_identifier(proc_mod_type)
+        If proc_mod_can_id is equal to 1:
+            parser_eat(parser, proc_mod_type)
+        Otherwise:
+            parser_eat(parser, 53)
+        End If
+    End If
+
+    Note: Build call name (Module_func or just func)
+    Let proc_call_name be proc_func_name
+    If proc_module_name is not equal to 0:
+        Let proc_underscore be "_"
+        Let proc_temp be string_concat(proc_module_name, proc_underscore)
+        Set proc_call_name to string_concat(proc_temp, proc_func_name)
+    End If
+
+    Note: Optional 'with args'
+    Set proc_check to memory_get_pointer(parser, 8)
+    Set proc_check_type to memory_get_integer(proc_check, 0)
+
+    Let proc_arguments be 0
+    Let proc_arg_count be 0
+
+    If proc_check_type is equal to 114:
+        parser_eat(parser, 114)
+
+        Let proc_arg_capacity be 8
+        Let proc_arg_size be proc_arg_capacity multiplied by 8
+        Set proc_arguments to memory_allocate(proc_arg_size)
+
+        Let proc_arg_continue be 1
+        While proc_arg_continue is equal to 1:
+            If proc_arg_count is greater than or equal to proc_arg_capacity:
+                Set proc_arg_capacity to proc_arg_capacity multiplied by 2
+                Set proc_arg_size to proc_arg_capacity multiplied by 8
+                Set proc_arguments to memory_reallocate(proc_arguments, proc_arg_size)
+            End If
+
+            Let proc_arg_expr be parser_parse_expression(parser)
+            Let proc_arg_offset be proc_arg_count multiplied by 8
+            memory_set_pointer(proc_arguments, proc_arg_offset, proc_arg_expr)
+            Set proc_arg_count to proc_arg_count plus 1
+
+            Let proc_comma_check be memory_get_pointer(parser, 8)
+            Let proc_comma_type be memory_get_integer(proc_comma_check, 0)
+            If proc_comma_type is equal to 52:
+                Note: Disambiguate proc-arg comma vs struct-field separator (BF-0012).
+                Let proc_field_ahead be parser_peek_struct_field_after_comma(parser)
+                If proc_field_ahead is equal to 1:
+                    Set proc_arg_continue to 0
+                Otherwise:
+                    parser_eat(parser, 52)
+                End If
+            Otherwise:
+                Set proc_arg_continue to 0
+            End If
+        End While
+    End If
+
+    If proc_module_name is not equal to 0:
+        Let proc_qual_call be memory_allocate(40)
+        memory_set_integer(proc_qual_call, 0, 25)  Note: EXPR_QUALIFIED_CALL
+        memory_set_pointer(proc_qual_call, 8, proc_module_name)
+        memory_set_pointer(proc_qual_call, 16, proc_func_name)
+        memory_set_pointer(proc_qual_call, 24, proc_arguments)
+        memory_set_integer(proc_qual_call, 32, proc_arg_count)
+        Return proc_qual_call
+    End If
+    Return expression_create_function_call(proc_call_name, proc_arguments, proc_arg_count)
+End Process
+
+Note: Promote an "EXPR with args" construct to either a function call (when left is
+Note: a plain variable naming a top-level proc) or a lambda invocation otherwise.
+Note: Extracted from parser_parse_primary_with_postfix to keep that function's body
+Note: small enough for the stage compiler ([BF-0011]).
+Process called "with_promote_to_call_or_lambda" takes left as Integer, arguments as Integer, argument_count as Integer returns Integer:
+    Let with_left_type be memory_get_integer(left, 0)
+    If with_left_type is equal to 1:
+        Note: EXPR_VARIABLE — lower to EXPR_FUNCTION_CALL.  expression_create_function_call
+        Note: duplicates the name string internally, so it is safe to free the variable
+        Note: shell after we read its name pointer.
+        Let with_var_name be memory_get_pointer(left, 8)
+        Let with_func_call be expression_create_function_call(with_var_name, arguments, argument_count)
+        deallocate(left)
+        Return with_func_call
+    End If
+
+    Note: Genuine lambda invocation — left is an EXPR_LAMBDA, EXPR_FIELD_ACCESS, or
+    Note: another expression yielding a closure value.
+    Let lambda_call be memory_allocate(32)
+    memory_set_int32(lambda_call, 0, 24)  Note: EXPR_LAMBDA_CALL
+    memory_set_pointer(lambda_call, 8, left)
+    memory_set_pointer(lambda_call, 16, arguments)
+    memory_set_int32(lambda_call, 24, argument_count)
+    Return lambda_call
+End Process
+
+Note: Parse "a list containing nothing" or "a list containing [:] elem, elem, ..."
+Note: into an EXPR_LIST_LITERAL.  Caller has consumed 'a' but not 'list'.
+Note: list_kw_type is the token class for 'list' (TOKEN_LIST=159 or TOKEN_IDENTIFIER).
+Note: Extracted from parser_parse_primary to keep its body small enough for the stage
+Note: compiler ([BF-0011]).
+Process called "parser_parse_a_list_literal" takes parser as Integer, list_kw_type as Integer returns Integer:
+    parser_eat(parser, list_kw_type)  Note: Eat 'list'
+    parser_eat(parser, 156)  Note: Eat 'containing' (TOKEN_CONTAINING)
+
+    Note: Empty form: "containing nothing".
+    Let ll_after_containing be memory_get_pointer(parser, 8)
+    Let ll_after_type be memory_get_integer(ll_after_containing, 0)
+    Let ll_after_val be memory_get_pointer(ll_after_containing, 8)
+    Let ll_is_nothing be 0
+    If ll_after_type is equal to 174:
+        Set ll_is_nothing to 1
+    End If
+    If ll_after_val is not equal to 0:
+        If string_equals(ll_after_val, "nothing") is equal to 1:
+            Set ll_is_nothing to 1
+        End If
+    End If
+    If ll_is_nothing is equal to 1:
+        parser_eat(parser, ll_after_type)
+        Let empty_list be memory_allocate(24)
+        memory_set_int32(empty_list, 0, 17)
+        memory_set_pointer(empty_list, 8, 0)
+        memory_set_integer(empty_list, 16, 0)
+        Return empty_list
+    End If
+
+    Note: Optional ':' before first element.
+    Let ll_colon_check be memory_get_pointer(parser, 8)
+    Let ll_colon_type be memory_get_integer(ll_colon_check, 0)
+    If ll_colon_type is equal to 9:
+        parser_eat(parser, 9)
+    End If
+
+    Let ll_elements be memory_allocate(128)
+    Let ll_elem_count be 0
+    Let ll_capacity be 16
+    Let ll_parsing be 1
+
+    While ll_parsing is equal to 1:
+        Let ll_peek be memory_get_pointer(parser, 8)
+        Let ll_peek_type be memory_get_integer(ll_peek, 0)
+
+        Let ll_is_end be 0
+        If ll_peek_type is equal to 8:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 0:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 19:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 7:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 12:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 14:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 18:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 47:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 172:
+            Set ll_is_end to 1
+        End If
+        If ll_peek_type is equal to 143:
+            Set ll_is_end to 1
+        End If
+
+        If ll_is_end is equal to 1:
+            Set ll_parsing to 0
+        Otherwise:
+            If ll_elem_count is greater than or equal to ll_capacity:
+                Set ll_capacity to ll_capacity multiplied by 2
+                Let ll_new_size be ll_capacity multiplied by 8
+                Set ll_elements to memory_reallocate(ll_elements, ll_new_size)
+            End If
+
+            Let ll_elem be parser_parse_expression(parser)
+            Let ll_offset be ll_elem_count multiplied by 8
+            memory_set_pointer(ll_elements, ll_offset, ll_elem)
+            Set ll_elem_count to ll_elem_count plus 1
+
+            Let ll_comma be memory_get_pointer(parser, 8)
+            Let ll_comma_t be memory_get_integer(ll_comma, 0)
+            If ll_comma_t is equal to 52:
+                Let ll_field_ahead be parser_peek_struct_field_after_comma(parser)
+                If ll_field_ahead is equal to 1:
+                    Set ll_parsing to 0
+                Otherwise:
+                    parser_eat(parser, 52)
+                End If
+            End If
+        End If
+    End While
+
+    Let ll_result be memory_allocate(24)
+    memory_set_int32(ll_result, 0, 17)
+    memory_set_pointer(ll_result, 8, ll_elements)
+    memory_set_integer(ll_result, 16, ll_elem_count)
+    Return ll_result
+End Process
+
+Note: Parse "a dictionary containing nothing" or "a dictionary containing : k as v, ..."
+Note: into an EXPR_DICT_LITERAL.  Caller has already consumed the leading 'a' but not
+Note: 'dictionary'.  dict_kw_type is the token class for 'dictionary' (TOKEN_IDENTIFIER
+Note: in the current lexer, but pass-through-tolerant to TOKEN_DICTIONARY).  Extracted
+Note: out of parser_parse_primary because the stage compiler miscompiles primary's body
+Note: when it grows past a certain size ([BF-0011]).
+Process called "parser_parse_a_dictionary_literal" takes parser as Integer, dict_kw_type as Integer returns Integer:
+    parser_eat(parser, dict_kw_type)  Note: Eat 'dictionary'
+    parser_eat(parser, 156)  Note: Eat 'containing'
+
+    Note: Empty form: "containing nothing".  Detect by both token type and value
+    Note: because TOKEN_NOTHING (174) is declared but unassigned by the lexer's
+    Note: keyword tables today.
+    Let dl_after_containing be memory_get_pointer(parser, 8)
+    Let dl_after_type be memory_get_integer(dl_after_containing, 0)
+    Let dl_after_val be memory_get_pointer(dl_after_containing, 8)
+    Let dl_is_nothing be 0
+    If dl_after_type is equal to 174:
+        Set dl_is_nothing to 1
+    End If
+    If dl_after_val is not equal to 0:
+        If string_equals(dl_after_val, "nothing") is equal to 1:
+            Set dl_is_nothing to 1
+        End If
+    End If
+    If dl_is_nothing is equal to 1:
+        parser_eat(parser, dl_after_type)
+        Let empty_dict be memory_allocate(32)
+        memory_set_int32(empty_dict, 0, 22)  Note: EXPR_DICT_LITERAL
+        memory_set_pointer(empty_dict, 8, 0)
+        memory_set_pointer(empty_dict, 16, 0)
+        memory_set_int32(empty_dict, 24, 0)
+        Return empty_dict
+    End If
+
+    Note: Optional ':' before first pair
+    If dl_after_type is equal to 9:
+        parser_eat(parser, 9)
+    End If
+
+    Let dl_capacity be 8
+    Let dl_pair_size be dl_capacity multiplied by 8
+    Let dl_keys be memory_allocate(dl_pair_size)
+    Let dl_values be memory_allocate(dl_pair_size)
+    Let dl_pair_count be 0
+    Let dl_continue be 1
+
+    While dl_continue is equal to 1:
+        Let dl_peek be memory_get_pointer(parser, 8)
+        Let dl_peek_type be memory_get_integer(dl_peek, 0)
+        Let dl_is_end be 0
+        If dl_peek_type is equal to 8:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 0:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 19:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 7:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 12:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 14:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 18:
+            Set dl_is_end to 1
+        End If
+        If dl_peek_type is equal to 47:
+            Set dl_is_end to 1
+        End If
+
+        If dl_is_end is equal to 1:
+            Set dl_continue to 0
+        Otherwise:
+            If dl_pair_count is greater than or equal to dl_capacity:
+                Set dl_capacity to dl_capacity multiplied by 2
+                Set dl_pair_size to dl_capacity multiplied by 8
+                Set dl_keys to memory_reallocate(dl_keys, dl_pair_size)
+                Set dl_values to memory_reallocate(dl_values, dl_pair_size)
+            End If
+
+            Let dl_key_expr be parser_parse_additive(parser)
+            Let dl_as_tok be memory_get_pointer(parser, 8)
+            Let dl_as_type be memory_get_integer(dl_as_tok, 0)
+            If dl_as_type is not equal to 34:
+                print_string("[PARSER ERROR] Expected 'as' in dictionary literal at line ")
+                Let dl_err_line be memory_get_int32(dl_as_tok, 16)
+                print_integer(dl_err_line)
+                print_newline()
+                exit_with_code(1)
+            End If
+            parser_eat(parser, 34)
+            Let dl_value_expr be parser_parse_additive(parser)
+
+            Let dl_offset be dl_pair_count multiplied by 8
+            memory_set_pointer(dl_keys, dl_offset, dl_key_expr)
+            memory_set_pointer(dl_values, dl_offset, dl_value_expr)
+            Set dl_pair_count to dl_pair_count plus 1
+
+            Let dl_sep_tok be memory_get_pointer(parser, 8)
+            Let dl_sep_type be memory_get_integer(dl_sep_tok, 0)
+            If dl_sep_type is equal to 52:
+                Let dl_field_ahead be parser_peek_struct_field_after_comma(parser)
+                If dl_field_ahead is equal to 1:
+                    Set dl_continue to 0
+                Otherwise:
+                    parser_eat(parser, 52)
+                    Let dl_after_comma be memory_get_pointer(parser, 8)
+                    Let dl_after_comma_type be memory_get_integer(dl_after_comma, 0)
+                    If dl_after_comma_type is equal to 30:
+                        parser_eat(parser, 30)
+                    End If
+                End If
+            Otherwise If dl_sep_type is equal to 30:
+                parser_eat(parser, 30)
+            Otherwise:
+                Set dl_continue to 0
+            End If
+        End If
+    End While
+
+    Let dict_a_expr be memory_allocate(32)
+    memory_set_int32(dict_a_expr, 0, 22)  Note: EXPR_DICT_LITERAL
+    memory_set_pointer(dict_a_expr, 8, dl_keys)
+    memory_set_pointer(dict_a_expr, 16, dl_values)
+    memory_set_int32(dict_a_expr, 24, dl_pair_count)
+    Return dict_a_expr
+End Process
+
 Note: Check if token is builtin function
 Process called "parser_is_builtin_function_token" takes type as Integer returns Integer:
     Note: All builtin functions in order (54-120, excluding non-builtin tokens)
@@ -2240,9 +2721,9 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Let avot_check_type be memory_get_integer(avot_check, 0)
         Let avot_check_val be memory_get_pointer(avot_check, 8)
 
-        Note: Check for "a list containing:" (list literal). 'list' is currently
-        Note: TOKEN_LIST (159), but also detect by token-value to be robust if it
-        Note: regresses to TOKEN_IDENTIFIER (matches the same pattern as 'dictionary').
+        Note: Check for "a list containing ..." (list literal in 'a' form).  Body is
+        Note: extracted into a helper because parser_parse_primary triggers stage-
+        Note: compiler miscodegen at this size ([BF-0011]).
         Let avot_is_list_kw be 0
         If avot_check_type is equal to 159:
             Set avot_is_list_kw to 1
@@ -2253,506 +2734,41 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             End If
         End If
         If avot_is_list_kw is equal to 1:
-            parser_eat(parser, avot_check_type)  Note: Eat 'list' (whatever class)
-            parser_eat(parser, 156)  Note: Eat 'containing' (TOKEN_CONTAINING)
-
-            Note: Detect empty-list form "containing nothing" before requiring ':'.
-            Note: TOKEN_NOTHING (174) is currently a TOKEN_IDENTIFIER in the lexer's
-            Note: keyword tables, so detect by both type and value.
-            Let ll_after_containing be memory_get_pointer(parser, 8)
-            Let ll_after_type be memory_get_integer(ll_after_containing, 0)
-            Let ll_after_val be memory_get_pointer(ll_after_containing, 8)
-            Let ll_is_nothing be 0
-            If ll_after_type is equal to 174:
-                Set ll_is_nothing to 1
-            End If
-            If ll_after_val is not equal to 0:
-                If string_equals(ll_after_val, "nothing") is equal to 1:
-                    Set ll_is_nothing to 1
-                End If
-            End If
-            If ll_is_nothing is equal to 1:
-                parser_eat(parser, ll_after_type)  Note: Eat 'nothing'
-                Let empty_list be memory_allocate(24)
-                memory_set_int32(empty_list, 0, 17)  Note: EXPR_LIST_LITERAL
-                memory_set_pointer(empty_list, 8, 0)  Note: elements = NULL
-                memory_set_integer(empty_list, 16, 0) Note: count = 0
-                Return empty_list
-            End If
-
-            Note: Optional ':' before the first element. Older code required it; the
-            Note: spec also accepts inline form "a list containing 1, 2, 3" without ':'.
-            Let ll_colon_check be memory_get_pointer(parser, 8)
-            Let ll_colon_type be memory_get_integer(ll_colon_check, 0)
-            If ll_colon_type is equal to 9:
-                parser_eat(parser, 9)
-            End If
-
-            Note: Parse comma-separated elements until we hit a non-element token
-            Let ll_elements be memory_allocate(128)  Note: Space for up to 16 elements
-            Let ll_elem_count be 0
-            Let ll_capacity be 16
-            Let ll_parsing be 1
-
-            While ll_parsing is equal to 1:
-                Note: Check if next token could be an element (literal, identifier, expression)
-                Let ll_peek be memory_get_pointer(parser, 8)
-                Let ll_peek_type be memory_get_integer(ll_peek, 0)
-
-                Note: Stop on tokens that indicate end of list
-                Note: End (8), Otherwise (19), EOF (0), End Process, statement keywords
-                Let ll_is_end be 0
-                If ll_peek_type is equal to 8:
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 0:
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 19:
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 7:
-                    Note: TOKEN_RETURN
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 12:
-                    Note: TOKEN_LET
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 14:
-                    Note: TOKEN_SET
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 18:
-                    Note: TOKEN_IF
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 47:
-                    Note: TOKEN_PRINT/Display
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 172:
-                    Note: TOKEN_ALERT
-                    Set ll_is_end to 1
-                End If
-                If ll_peek_type is equal to 143:
-                    Note: TOKEN_FOR
-                    Set ll_is_end to 1
-                End If
-
-                If ll_is_end is equal to 1:
-                    Set ll_parsing to 0
-                Otherwise:
-                    Note: Grow if needed
-                    If ll_elem_count is greater than or equal to ll_capacity:
-                        Set ll_capacity to ll_capacity multiplied by 2
-                        Let ll_new_size be ll_capacity multiplied by 8
-                        Set ll_elements to memory_reallocate(ll_elements, ll_new_size)
-                    End If
-
-                    Note: Parse element expression
-                    Let ll_elem be parser_parse_expression(parser)
-                    Let ll_offset be ll_elem_count multiplied by 8
-                    memory_set_pointer(ll_elements, ll_offset, ll_elem)
-                    Set ll_elem_count to ll_elem_count plus 1
-
-                    Note: Check for comma (optional between elements). When the list
-                    Note: literal is being used as a struct field initializer value,
-                    Note: a trailing comma is the field separator of the enclosing
-                    Note: struct constructor, not another list element. Peek for
-                    Note: "IDENT as" after the comma and stop the list loop in that
-                    Note: case so the struct field loop can claim the comma.
-                    Let ll_comma be memory_get_pointer(parser, 8)
-                    Let ll_comma_t be memory_get_integer(ll_comma, 0)
-                    If ll_comma_t is equal to 52:
-                        Let ll_field_ahead be parser_peek_struct_field_after_comma(parser)
-                        If ll_field_ahead is equal to 1:
-                            Set ll_parsing to 0
-                        Otherwise:
-                            parser_eat(parser, 52)  Note: Eat comma
-                        End If
-                    End If
-                End If
-            End While
-
-            Note: Create EXPR_LIST_LITERAL node
-            Note: Layout: type(0)=17, elements_ptr(8), element_count(16)
-            Note: Matches codegen expectation at codegen.runa:2256-2257
-            Let ll_result be memory_allocate(24)
-            memory_set_int32(ll_result, 0, 17)  Note: EXPR_LIST_LITERAL
-            memory_set_pointer(ll_result, 8, ll_elements)
-            memory_set_integer(ll_result, 16, ll_elem_count)
-            Return ll_result
+            Return parser_parse_a_list_literal(parser, avot_check_type)
         End If
 
         Note: Check for "a dictionary containing ..." (dictionary literal in 'a' form)
-        Note: Empty dict: "a dictionary containing nothing" → EXPR_DICT_LITERAL with 0 pairs.
-        Note: Non-empty: "a dictionary containing : key as value, key as value, ..."
-        Note: 'dictionary' is currently lexed as TOKEN_IDENTIFIER (no keyword class), so we
-        Note: detect by token-value comparison rather than token type.
+        Note: Empty: "a dictionary containing nothing"; non-empty: "containing : k as v, ..."
+        Note: 'dictionary' is currently lexed as TOKEN_IDENTIFIER (no keyword class), so
+        Note: detect by token-value comparison.  Body extracted into a helper ([BF-0011])
+        Note: to keep parser_parse_primary's body small enough for the stage compiler.
         Let avot_is_dict_kw be 0
         If avot_check_val is not equal to 0:
             Set avot_is_dict_kw to string_equals(avot_check_val, "dictionary")
         End If
         If avot_is_dict_kw is equal to 1:
-            parser_eat(parser, avot_check_type)  Note: Eat 'dictionary' (whatever class it carries)
-            parser_eat(parser, 156)  Note: Eat 'containing'
-
-            Note: Check for empty dictionary form ("nothing") vs initializer list (":" or directly first key)
-            Note: TOKEN_NOTHING (174) is declared but not currently assigned by the lexer's
-            Note: keyword tables, so 'nothing' arrives as TOKEN_IDENTIFIER. Detect by both
-            Note: token type and token-value comparison so we work either way.
-            Let dl_after_containing be memory_get_pointer(parser, 8)
-            Let dl_after_type be memory_get_integer(dl_after_containing, 0)
-            Let dl_after_val be memory_get_pointer(dl_after_containing, 8)
-            Let dl_is_nothing be 0
-            If dl_after_type is equal to 174:
-                Set dl_is_nothing to 1
-            End If
-            If dl_after_val is not equal to 0:
-                If string_equals(dl_after_val, "nothing") is equal to 1:
-                    Set dl_is_nothing to 1
-                End If
-            End If
-            If dl_is_nothing is equal to 1:
-                parser_eat(parser, dl_after_type)  Note: Eat 'nothing'
-                Let empty_dict be memory_allocate(32)
-                memory_set_int32(empty_dict, 0, 22)  Note: EXPR_DICT_LITERAL
-                memory_set_pointer(empty_dict, 8, 0)   Note: keys = NULL
-                memory_set_pointer(empty_dict, 16, 0)  Note: values = NULL
-                memory_set_int32(empty_dict, 24, 0)    Note: pair_count = 0
-                Return empty_dict
-            End If
-
-            Note: Optional ':' before first pair
-            If dl_after_type is equal to 9:
-                parser_eat(parser, 9)
-            End If
-
-            Note: Parse zero-or-more "key as value" pairs separated by ',' or 'and'
-            Let dl_capacity be 8
-            Let dl_pair_size be dl_capacity multiplied by 8
-            Let dl_keys be memory_allocate(dl_pair_size)
-            Let dl_values be memory_allocate(dl_pair_size)
-            Let dl_pair_count be 0
-            Let dl_continue be 1
-
-            While dl_continue is equal to 1:
-                Note: Stop on tokens that cannot start a key expression.
-                Let dl_peek be memory_get_pointer(parser, 8)
-                Let dl_peek_type be memory_get_integer(dl_peek, 0)
-                Let dl_is_end be 0
-                If dl_peek_type is equal to 8:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 0:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 19:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 7:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 12:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 14:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 18:
-                    Set dl_is_end to 1
-                End If
-                If dl_peek_type is equal to 47:
-                    Set dl_is_end to 1
-                End If
-
-                If dl_is_end is equal to 1:
-                    Set dl_continue to 0
-                Otherwise:
-                    If dl_pair_count is greater than or equal to dl_capacity:
-                        Set dl_capacity to dl_capacity multiplied by 2
-                        Set dl_pair_size to dl_capacity multiplied by 8
-                        Set dl_keys to memory_reallocate(dl_keys, dl_pair_size)
-                        Set dl_values to memory_reallocate(dl_values, dl_pair_size)
-                    End If
-
-                    Let dl_key_expr be parser_parse_additive(parser)
-                    Let dl_as_tok be memory_get_pointer(parser, 8)
-                    Let dl_as_type be memory_get_integer(dl_as_tok, 0)
-                    If dl_as_type is not equal to 34:
-                        print_string("[PARSER ERROR] Expected 'as' in dictionary literal at line ")
-                        Let dl_err_line be memory_get_int32(dl_as_tok, 16)
-                        print_integer(dl_err_line)
-                        print_newline()
-                        exit_with_code(1)
-                    End If
-                    parser_eat(parser, 34)
-                    Let dl_value_expr be parser_parse_additive(parser)
-
-                    Let dl_offset be dl_pair_count multiplied by 8
-                    memory_set_pointer(dl_keys, dl_offset, dl_key_expr)
-                    memory_set_pointer(dl_values, dl_offset, dl_value_expr)
-                    Set dl_pair_count to dl_pair_count plus 1
-
-                    Note: Optional ',' or 'and' between pairs. As with the list literal
-                    Note: above, when the dict literal is used as a struct-field value the
-                    Note: trailing comma may belong to the outer struct constructor; peek
-                    Note: for "IDENT as" and stop in that case.
-                    Let dl_sep_tok be memory_get_pointer(parser, 8)
-                    Let dl_sep_type be memory_get_integer(dl_sep_tok, 0)
-                    If dl_sep_type is equal to 52:
-                        Let dl_field_ahead be parser_peek_struct_field_after_comma(parser)
-                        If dl_field_ahead is equal to 1:
-                            Set dl_continue to 0
-                        Otherwise:
-                            parser_eat(parser, 52)
-                            Let dl_after_comma be memory_get_pointer(parser, 8)
-                            Let dl_after_comma_type be memory_get_integer(dl_after_comma, 0)
-                            If dl_after_comma_type is equal to 30:
-                                parser_eat(parser, 30)
-                            End If
-                        End If
-                    Otherwise If dl_sep_type is equal to 30:
-                        parser_eat(parser, 30)
-                    Otherwise:
-                        Set dl_continue to 0
-                    End If
-                End If
-            End While
-
-            Let dict_a_expr be memory_allocate(32)
-            memory_set_int32(dict_a_expr, 0, 22)  Note: EXPR_DICT_LITERAL
-            memory_set_pointer(dict_a_expr, 8, dl_keys)
-            memory_set_pointer(dict_a_expr, 16, dl_values)
-            memory_set_int32(dict_a_expr, 24, dl_pair_count)
-            Return dict_a_expr
+            Return parser_parse_a_dictionary_literal(parser, avot_check_type)
         End If
 
-        Note: Check for "a value of type" (struct constructor)
+        Note: Check for "a value of type" (struct constructor).  Body extracted to
+        Note: parser_parse_a_value_of_type to keep parser_parse_primary's body small
+        Note: enough for the stage compiler ([BF-0011]).
         Let avot_is_value_keyword be 0
         If avot_check_val is not equal to 0:
             Set avot_is_value_keyword to string_equals(avot_check_val, "value")
         End If
         If avot_is_value_keyword is equal to 1:
-            parser_eat(parser, avot_check_type)  Note: Eat 'value'
-            parser_eat(parser, 125)  Note: Eat 'of' (TOKEN_OF)
-            Note: Eat 'type' keyword
-            Let avot_type_kw be memory_get_pointer(parser, 8)
-            Let avot_type_kw_type be memory_get_integer(avot_type_kw, 0)
-            If avot_type_kw_type is equal to 50:
-                parser_eat(parser, 50)  Note: Eat 'Type' keyword
-            Otherwise:
-                Note: Some files use lowercase 'type' as identifier
-                parser_eat(parser, avot_type_kw_type)
-            End If
-            Note: Get the type name
-            Let avot_name_token be memory_get_pointer(parser, 8)
-            Let avot_name_type be memory_get_integer(avot_name_token, 0)
-            Let avot_type_name be string_duplicate(memory_get_pointer(avot_name_token, 8))
-            Let avot_name_can_id be token_can_be_identifier(avot_name_type)
-            If avot_name_can_id is equal to 1:
-                parser_eat(parser, avot_name_type)
-            Otherwise:
-                parser_eat(parser, 53)
-            End If
-
-            Note: Check for 'with' (optional field initialization)
-            Let avot_next be memory_get_pointer(parser, 8)
-            Let avot_next_type be memory_get_integer(avot_next, 0)
-            Let avot_field_count be 0
-            Let avot_names be 0
-            Let avot_values be 0
-
-            If avot_next_type is equal to 114:
-                Note: TOKEN_WITH = 114 - parse field initializers
-                parser_eat(parser, 114)
-
-                Note: Capture field names AND values into parallel arrays so we can
-                Note: emit a proper EXPR_STRUCT_CONSTRUCTION node that preserves the
-                Note: object's type for later field access lowering.
-                Set avot_names to memory_allocate(128)  Note: Up to 16 field names
-                Set avot_values to memory_allocate(128)  Note: Up to 16 field values
-                Let avot_parsing_fields be 1
-
-                While avot_parsing_fields is equal to 1:
-                    Note: Parse field_name as value
-                    Let avot_field_token be memory_get_pointer(parser, 8)
-                    Let avot_field_tt be memory_get_integer(avot_field_token, 0)
-
-                    Note: Check if we've hit a non-field token (end of field list)
-                    Let avot_is_field be token_can_be_identifier(avot_field_tt)
-                    If avot_is_field is equal to 0:
-                        Set avot_parsing_fields to 0
-                    Otherwise:
-                        Note: Capture the field name BEFORE eating the token.
-                        Let avot_field_name_raw be memory_get_pointer(avot_field_token, 8)
-                        Let avot_field_name be string_duplicate(avot_field_name_raw)
-                        parser_eat(parser, avot_field_tt)
-                        Note: Eat 'as'
-                        parser_eat(parser, 34)
-                        Note: Parse the value expression
-                        Let avot_val_expr be parser_parse_expression(parser)
-                        Note: Store name and value in parallel arrays
-                        Let avot_val_offset be avot_field_count multiplied by 8
-                        memory_set_pointer(avot_names, avot_val_offset, avot_field_name)
-                        memory_set_pointer(avot_values, avot_val_offset, avot_val_expr)
-                        Set avot_field_count to avot_field_count plus 1
-
-                        Note: Comma separates fields; absence of comma terminates the
-                        Note: constructor. This is required because tokens like Set/Let/Type/etc.
-                        Note: can be identifiers so we cannot rely solely on the identifier check.
-                        Let avot_comma_check be memory_get_pointer(parser, 8)
-                        Let avot_comma_type be memory_get_integer(avot_comma_check, 0)
-                        If avot_comma_type is equal to 52:
-                            parser_eat(parser, 52)
-                        Otherwise:
-                            Set avot_parsing_fields to 0
-                        End If
-                    End If
-                End While
-            End If
-
-            Note: Build EXPR_STRUCT_CONSTRUCTION node so the type name survives.
-            Note: Layout: type(int32 at 0), type_name(ptr at 8), field_names(ptr at 16),
-            Note:         field_values(ptr at 24), field_count(int32 at 32) - matches
-            Note:         the codegen handler for EXPR_STRUCT_CONSTRUCTION.
-            Let avot_struct_expr be memory_allocate(40)
-            memory_set_int32(avot_struct_expr, 0, 20)  Note: EXPR_STRUCT_CONSTRUCTION
-            memory_set_pointer(avot_struct_expr, 8, avot_type_name)
-            memory_set_pointer(avot_struct_expr, 16, avot_names)
-            memory_set_pointer(avot_struct_expr, 24, avot_values)
-            memory_set_int32(avot_struct_expr, 32, avot_field_count)
-            Return avot_struct_expr
-        Otherwise:
-            Note: 'a' is NOT followed by 'value' - treat as a variable named 'a'
-            Return expression_create_variable(string_duplicate_parser("a"))
+            Return parser_parse_a_value_of_type(parser, avot_check_type)
         End If
+        Note: 'a' is NOT followed by 'value' - treat as a variable named 'a'
+        Return expression_create_variable(string_duplicate_parser("a"))
     End If
 
     Note: Handle proc expression: proc func_name [from Module] [with arg1, arg2, ...]
+    Note: Body extracted to helper because parser_parse_primary triggers stage-compiler
+    Note: miscodegen at this size ([BF-0011]).
     If token_type is equal to 171:
-        parser_eat(parser, 171)  Note: Eat 'proc' token
-
-        Note: Get function name
-        Let proc_name_token be memory_get_pointer(parser, 8)
-        Let proc_name_type be memory_get_integer(proc_name_token, 0)
-        Let proc_func_name be string_duplicate(memory_get_pointer(proc_name_token, 8))
-        Let proc_can_be_id be token_can_be_identifier(proc_name_type)
-        If proc_can_be_id is equal to 1:
-            parser_eat(parser, proc_name_type)
-        Otherwise:
-            parser_eat(parser, 53)
-        End If
-
-        Note: Check for dot notation: proc Module.function
-        Let proc_dot_check be memory_get_pointer(parser, 8)
-        Let proc_dot_type be memory_get_integer(proc_dot_check, 0)
-        Let proc_module_name be 0
-        If proc_dot_type is equal to 51:
-            Note: TOKEN_DOT - what we read was module name, next is function name
-            parser_eat(parser, 51)
-            Set proc_module_name to proc_func_name
-            Let proc_real_name_token be memory_get_pointer(parser, 8)
-            Let proc_real_name_type be memory_get_integer(proc_real_name_token, 0)
-            Set proc_func_name to string_duplicate(memory_get_pointer(proc_real_name_token, 8))
-            Let proc_real_can_id be token_can_be_identifier(proc_real_name_type)
-            If proc_real_can_id is equal to 1:
-                parser_eat(parser, proc_real_name_type)
-            Otherwise:
-                parser_eat(parser, 53)
-            End If
-        End If
-
-        Note: Check for 'from Module' (optional - alternative to dot notation)
-        Let proc_check be memory_get_pointer(parser, 8)
-        Let proc_check_type be memory_get_integer(proc_check, 0)
-        If proc_check_type is equal to 144:
-            Note: TOKEN_FROM = 144
-            parser_eat(parser, 144)
-            Let proc_mod_token be memory_get_pointer(parser, 8)
-            Let proc_mod_type be memory_get_integer(proc_mod_token, 0)
-            Set proc_module_name to string_duplicate(memory_get_pointer(proc_mod_token, 8))
-            Let proc_mod_can_id be token_can_be_identifier(proc_mod_type)
-            If proc_mod_can_id is equal to 1:
-                parser_eat(parser, proc_mod_type)
-            Otherwise:
-                parser_eat(parser, 53)
-            End If
-        End If
-
-        Note: Build the actual function name (Module_func or just func)
-        Let proc_call_name be proc_func_name
-        If proc_module_name is not equal to 0:
-            Note: Concatenate: Module_func_name
-            Let proc_underscore be "_"
-            Let proc_temp be string_concat(proc_module_name, proc_underscore)
-            Set proc_call_name to string_concat(proc_temp, proc_func_name)
-        End If
-
-        Note: Check for 'with args' (optional)
-        Set proc_check to memory_get_pointer(parser, 8)
-        Set proc_check_type to memory_get_integer(proc_check, 0)
-
-        Let proc_arguments be 0
-        Let proc_arg_count be 0
-
-        If proc_check_type is equal to 114:
-            Note: TOKEN_WITH = 114
-            parser_eat(parser, 114)
-
-            Note: Parse arguments (comma-separated expressions)
-            Let proc_arg_capacity be 8
-            Let proc_arg_size be proc_arg_capacity multiplied by 8
-            Set proc_arguments to memory_allocate(proc_arg_size)
-
-            Let proc_arg_continue be 1
-            While proc_arg_continue is equal to 1:
-                Note: Grow if needed
-                If proc_arg_count is greater than or equal to proc_arg_capacity:
-                    Set proc_arg_capacity to proc_arg_capacity multiplied by 2
-                    Set proc_arg_size to proc_arg_capacity multiplied by 8
-                    Set proc_arguments to memory_reallocate(proc_arguments, proc_arg_size)
-                End If
-
-                Let proc_arg_expr be parser_parse_expression(parser)
-                Let proc_arg_offset be proc_arg_count multiplied by 8
-                memory_set_pointer(proc_arguments, proc_arg_offset, proc_arg_expr)
-                Set proc_arg_count to proc_arg_count plus 1
-
-                Note: Check for comma
-                Let proc_comma_check be memory_get_pointer(parser, 8)
-                Let proc_comma_type be memory_get_integer(proc_comma_check, 0)
-                If proc_comma_type is equal to 52:
-                    Note: Disambiguate proc-arg comma vs struct-field separator.
-                    Note: Pattern "IDENT as" after the comma means the comma actually
-                    Note: terminates this proc call's argument list and the next field
-                    Note: of the enclosing struct constructor begins.
-                    Let proc_field_ahead be parser_peek_struct_field_after_comma(parser)
-                    If proc_field_ahead is equal to 1:
-                        Set proc_arg_continue to 0
-                    Otherwise:
-                        parser_eat(parser, 52)
-                    End If
-                Otherwise:
-                    Set proc_arg_continue to 0
-                End If
-            End While
-        End If
-
-        Note: Create function call expression
-        If proc_module_name is not equal to 0:
-            Note: Qualified call
-            Let proc_qual_call be memory_allocate(40)
-            memory_set_integer(proc_qual_call, 0, 25)  Note: EXPR_QUALIFIED_CALL
-            memory_set_pointer(proc_qual_call, 8, proc_module_name)
-            memory_set_pointer(proc_qual_call, 16, proc_func_name)
-            memory_set_pointer(proc_qual_call, 24, proc_arguments)
-            memory_set_integer(proc_qual_call, 32, proc_arg_count)
-            Return proc_qual_call
-        Otherwise:
-            Return expression_create_function_call(proc_call_name, proc_arguments, proc_arg_count)
-        End If
+        Return parser_parse_proc_expression(parser)
     End If
 
     Note: Handle __load(ptr, offset) intrinsic as expression
@@ -4757,7 +4773,9 @@ End Process
 Note: Parser parse while statement - handles "While condition: ... End While"
 Process called "parser_parse_while_statement" takes parser as Integer returns Integer:
     Let dummy1 be parser_eat(parser, 20)
-    Let condition be parser_parse_comparison(parser)
+    Note: Use full expression parsing so compound boolean conditions
+    Note: ("X is less than Y and Z is equal to W") work, not just a single comparison.
+    Let condition be parser_parse_expression(parser)
     Let dummy2 be parser_eat(parser, 9)
 
     Let body_count_ptr be memory_allocate(8)
@@ -5080,6 +5098,27 @@ Process called "parser_parse_match_statement" takes parser as Integer returns In
                         Note: Not "of type" - could be variant or variable
                         Note: Use the already-duplicated identifier value
                         Let variant_name be ident_value
+
+                        Note: Optional "from Module" qualifier on the variant name.
+                        Note: Canonical Runa allows "When VariantName from Module: ..." to
+                        Note: pin the variant to a specific module's ADT. The bootstrap
+                        Note: doesn't yet do per-module variant resolution, so we parse
+                        Note: and discard the qualifier — the variant name alone is
+                        Note: sufficient because the codegen looks up variants by name in
+                        Note: the merged program scope.
+                        Let from_check_token be memory_get_pointer(parser, 8)
+                        Let from_check_type be memory_get_int32(from_check_token, 0)
+                        If from_check_type is equal to 144:  Note: TOKEN_FROM
+                            parser_eat(parser, 144)
+                            Let from_mod_token be memory_get_pointer(parser, 8)
+                            Let from_mod_type be memory_get_int32(from_mod_token, 0)
+                            Let from_mod_can_id be token_can_be_identifier(from_mod_type)
+                            If from_mod_can_id is equal to 1:
+                                parser_eat(parser, from_mod_type)
+                            Otherwise:
+                                parser_eat(parser, 53)
+                            End If
+                        End If
 
                         Note: Check next token
                         Let next_token be memory_get_pointer(parser, 8)
