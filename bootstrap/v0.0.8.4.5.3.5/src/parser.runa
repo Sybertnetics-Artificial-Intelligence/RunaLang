@@ -919,6 +919,68 @@ Process called "parser_parse_let_statement" takes parser as Integer returns Inte
     Let var_name be string_duplicate_parser(token_value)
     parser_eat(parser, token_type)
 
+    Note: Optional "as Type" annotation: "Let X as Type be Y".  When present,
+    Note: codegen registers X with the explicit struct type so field access works
+    Note: even when the RHS expression's inferred type is opaque (Integer pointer).
+    Let let_type_token be memory_get_pointer(parser, 8)
+    Let let_type_token_type be memory_get_integer(let_type_token, 0)
+    Let let_type_name be 0
+    If let_type_token_type is equal to 34:
+        parser_eat(parser, 34)
+        Let let_type_name_token be memory_get_pointer(parser, 8)
+        Let let_type_name_type be memory_get_integer(let_type_name_token, 0)
+        Let let_type_name_val be memory_get_pointer(let_type_name_token, 8)
+        If let_type_name_val is not equal to 0:
+            Set let_type_name to string_duplicate_parser(let_type_name_val)
+        End If
+        Let let_type_name_can_id be token_can_be_identifier(let_type_name_type)
+        If let_type_name_can_id is equal to 1:
+            parser_eat(parser, let_type_name_type)
+        Otherwise:
+            parser_eat(parser, 53)
+        End If
+
+        Note: Optional ".QualifiedTypeName" suffix.  Use the part after the dot
+        Note: as the resolved type name (the module prefix is source-level only —
+        Note: codegen looks types up by their bare name in the merged program scope).
+        Let let_type_dot_check be memory_get_pointer(parser, 8)
+        Let let_type_dot_type be memory_get_integer(let_type_dot_check, 0)
+        If let_type_dot_type is equal to 51:
+            parser_eat(parser, 51)
+            Let let_qual_token be memory_get_pointer(parser, 8)
+            Let let_qual_type be memory_get_integer(let_qual_token, 0)
+            Let let_qual_val be memory_get_pointer(let_qual_token, 8)
+            If let_qual_val is not equal to 0:
+                Set let_type_name to string_duplicate_parser(let_qual_val)
+            End If
+            Let let_qual_can_id be token_can_be_identifier(let_qual_type)
+            If let_qual_can_id is equal to 1:
+                parser_eat(parser, let_qual_type)
+            Otherwise:
+                parser_eat(parser, 53)
+            End If
+        End If
+
+        Note: Skip generic params after the type name (e.g. "as List[Integer]")
+        Let let_type_after be memory_get_pointer(parser, 8)
+        Let let_type_after_type be memory_get_integer(let_type_after, 0)
+        If let_type_after_type is equal to 127:
+            parser_eat(parser, 127)
+            Let let_bracket_depth be 1
+            While let_bracket_depth is greater than 0:
+                Set let_type_after to memory_get_pointer(parser, 8)
+                Set let_type_after_type to memory_get_integer(let_type_after, 0)
+                If let_type_after_type is equal to 127:
+                    Set let_bracket_depth to let_bracket_depth plus 1
+                End If
+                If let_type_after_type is equal to 128:
+                    Set let_bracket_depth to let_bracket_depth minus 1
+                End If
+                parser_eat(parser, let_type_after_type)
+            End While
+        End If
+    End If
+
     parser_eat(parser, 13)
 
     Note: Debug check before expression parsing
@@ -930,7 +992,11 @@ Process called "parser_parse_let_statement" takes parser as Integer returns Inte
 
     Let expr be parser_parse_expression(parser)
 
-    Return statement_create_let(var_name, expr)
+    Let let_stmt be statement_create_let(var_name, expr)
+    If let_type_name is not equal to 0:
+        statement_set_let_type(let_stmt, let_type_name)
+    End If
+    Return let_stmt
 End Process
 
 Note: Parser parse set statement - handles "Set target to expression"
@@ -1470,6 +1536,32 @@ Process called "parser_parse_a_value_of_type" takes parser as Integer, value_kw_
         parser_eat(parser, avot_name_type)
     Otherwise:
         parser_eat(parser, 53)
+    End If
+
+    Note: Skip generic params after the type name (e.g. "Dictionary[String, Any]")
+    Note: TOKEN_LBRACKET = 127, TOKEN_RBRACKET = 128.  Eat all tokens until the
+    Note: matching close bracket (handle nested brackets too).
+    Let avot_gen_check be memory_get_pointer(parser, 8)
+    Let avot_gen_type be memory_get_integer(avot_gen_check, 0)
+    If avot_gen_type is equal to 127:
+        parser_eat(parser, 127)
+        Let avot_gen_depth be 1
+        While avot_gen_depth is greater than 0:
+            Let avot_gen_inner_tok be memory_get_pointer(parser, 8)
+            Let avot_gen_inner_type be memory_get_integer(avot_gen_inner_tok, 0)
+            If avot_gen_inner_type is equal to 127:
+                Set avot_gen_depth to avot_gen_depth plus 1
+                parser_eat(parser, 127)
+            Otherwise If avot_gen_inner_type is equal to 128:
+                Set avot_gen_depth to avot_gen_depth minus 1
+                parser_eat(parser, 128)
+            Otherwise If avot_gen_inner_type is equal to 0:
+                Note: TOKEN_EOF — bail out to avoid infinite loop
+                Set avot_gen_depth to 0
+            Otherwise:
+                parser_eat(parser, avot_gen_inner_type)
+            End If
+        End While
     End If
 
     Let avot_next be memory_get_pointer(parser, 8)
@@ -2305,13 +2397,32 @@ End Process
 
 Note: Create let statement
 Process called "statement_create_let" takes var_name as Integer, expr as Integer returns Integer:
-    Let stmt_size be 24
+    Note: Layout: type(0)=STMT_LET, name(8), expr(16), type_name(24).  type_name is
+    Note: NULL by default; set by parser_parse_let_statement when the source uses
+    Note: the optional "Let X as Type be Y" annotation form so codegen can resolve
+    Note: struct fields on X without ambiguity.
+    Let stmt_size be 32
     Let stmt be memory_allocate(stmt_size)
     memory_set_int32(stmt, 0, STMT_LET)
     Let dup_name be string_duplicate_parser(var_name)
     memory_set_pointer(stmt, 8, dup_name)   Note: variable_name at offset 8
     memory_set_pointer(stmt, 16, expr)      Note: expression at offset 16
+    memory_set_pointer(stmt, 24, 0)         Note: type_name pointer (NULL = no annotation)
     Return stmt
+End Process
+
+Note: Set the optional type annotation on a Let statement.  Used by
+Note: parser_parse_let_statement when source has "Let X as Type be Y".
+Process called "statement_set_let_type" takes stmt as Integer, type_name as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+    If type_name is equal to 0:
+        Return 0
+    End If
+    Let dup_type be string_duplicate_parser(type_name)
+    memory_set_pointer(stmt, 24, dup_type)
+    Return 0
 End Process
 
 Note: Create set statement
@@ -3004,13 +3115,49 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Let len_next_type be memory_get_int32(len_next, TOKEN_TYPE_OFFSET)
         If len_next_type is equal to 125:
             parser_eat(parser, 125)  Note: Eat 'of'
-            Let len_operand be parser_parse_primary(parser)
+            Let len_operand be parser_parse_primary_with_postfix(parser)
             Let len_args be allocate(8)
             memory_set_pointer(len_args, 0, len_operand)
             Return expression_create_function_call(string_duplicate_parser("string_length"), len_args, 1)
         Otherwise:
             Note: Not "length of" - treat as variable named "length"
             Return expression_create_variable(string_duplicate_parser("length"))
+        End If
+    End If
+
+    Note: Handle "string representation of X" → desugars to int_to_string(X) call.
+    Note: Source uses lowercase `string` (TOKEN_IDENTIFIER value="string") followed
+    Note: by `representation` (also identifier) and TOKEN_OF (125).
+    If token_type is equal to 53:
+        Let sr_check_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Let sr_check_val be memory_get_pointer(sr_check_tok, TOKEN_VALUE_OFFSET)
+        Let sr_is_string_kw be 0
+        If sr_check_val is not equal to 0:
+            Set sr_is_string_kw to string_equals(sr_check_val, "string")
+        End If
+        If sr_is_string_kw is equal to 1:
+            parser_eat(parser, 53)
+            Let sr_next be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Let sr_next_type be memory_get_int32(sr_next, TOKEN_TYPE_OFFSET)
+            Let sr_next_val be memory_get_pointer(sr_next, TOKEN_VALUE_OFFSET)
+            Let sr_is_repr be 0
+            If sr_next_val is not equal to 0:
+                Set sr_is_repr to string_equals(sr_next_val, "representation")
+            End If
+            If sr_is_repr is equal to 1:
+                parser_eat(parser, sr_next_type)
+                Let sr_after be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Let sr_after_type be memory_get_int32(sr_after, TOKEN_TYPE_OFFSET)
+                If sr_after_type is equal to 125:
+                    parser_eat(parser, 125)
+                    Let sr_operand be parser_parse_primary_with_postfix(parser)
+                    Let sr_args be allocate(8)
+                    memory_set_pointer(sr_args, 0, sr_operand)
+                    Return expression_create_function_call(string_duplicate_parser("int_to_string"), sr_args, 1)
+                End If
+                Return expression_create_variable(string_duplicate_parser("representation"))
+            End If
+            Return expression_create_variable(string_duplicate_parser("string"))
         End If
     End If
 
