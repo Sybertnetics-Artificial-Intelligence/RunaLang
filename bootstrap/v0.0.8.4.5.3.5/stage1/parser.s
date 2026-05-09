@@ -1178,7 +1178,7 @@ token_can_be_identifier:
 .L431:
     movq -8(%rbp), %rax
     pushq %rax
-    movq $161, %rax
+    movq $162, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -2792,7 +2792,7 @@ parser_parse_primary_with_postfix:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_additive
+    call parser_parse_expression
     movq %rax, -168(%rbp)
     movq -112(%rbp), %rax
     pushq %rax
@@ -3403,7 +3403,7 @@ parser_parse_primary_with_postfix:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call parser_parse_additive
+    call parser_parse_expression
     movq %rax, -424(%rbp)
     movq -368(%rbp), %rax
     pushq %rax
