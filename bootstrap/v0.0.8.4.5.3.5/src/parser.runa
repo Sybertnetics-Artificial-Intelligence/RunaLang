@@ -292,7 +292,7 @@ Process called "parser_parse_multiplicative" takes parser as Integer returns Int
                                         Set right to parser_parse_primary_with_postfix(parser)
                                         Set left to expression_create_binary_op(left, operator, right)
                                     Otherwise:
-                                        Note: Handle "bitwise and/or/xor" multi-word operators
+                                        Note: Handle "bitwise and/or/xor [by]" multi-word operators
                                         If token_type is equal to 175:
                                             parser_eat(parser, 175)  Note: Eat 'bitwise'
                                             Let bw_next be memory_get_pointer(parser, 8)
@@ -320,6 +320,14 @@ Process called "parser_parse_multiplicative" takes parser as Integer returns Int
                                                     Note: Unknown bitwise operator - default to and
                                                     parser_eat(parser, bw_next_type)
                                                 End If
+                                            End If
+                                            Note: Optional 'by' between operator and operand (canonical
+                                            Note: form is "bitwise and/or/xor by N" mirroring "multiplied
+                                            Note: by"; older code accepted the operator without 'by').
+                                            Let bw_after_op be memory_get_pointer(parser, 8)
+                                            Let bw_after_op_type be memory_get_integer(bw_after_op, 0)
+                                            If bw_after_op_type is equal to 38:
+                                                parser_eat(parser, 38)
                                             End If
                                             Set right to parser_parse_primary_with_postfix(parser)
                                             Set left to expression_create_binary_op(left, operator, right)
@@ -636,26 +644,33 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             End If
         End If
 
-        If token_type is equal to 148:  Note: TOKEN_AT (canonical: "at index")
-            Note: Peek ahead to check if "index" follows
+        If token_type is equal to 148:  Note: TOKEN_AT (canonical: "at index" or "at key")
+            Note: Peek ahead to check if "index" or "key" follows
             parser_eat(parser, 148)  Note: at
             Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
             Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
 
-            If token_type is equal to 149:  Note: TOKEN_INDEX
-                parser_eat(parser, 149)  Note: index
+            Note: Both "at index" (list/array indexing) and "at key" (dictionary keying)
+            Note: lower to EXPR_ARRAY_INDEX — codegen distinguishes by runtime type.
+            Let at_is_index be 0
+            If token_type is equal to 149:
+                Set at_is_index to 1
+            End If
+            If token_type is equal to 150:
+                Set at_is_index to 1
+            End If
+            If at_is_index is equal to 1:
+                parser_eat(parser, token_type)  Note: index or key
 
-                Note: Parse index expression
                 Let index be parser_parse_additive(parser)
 
-                Let array_index be memory_allocate(32)  Note: sizeof(Expression)
+                Let array_index be memory_allocate(32)
                 memory_set_integer(array_index, 0, 16)  Note: EXPR_ARRAY_INDEX
-                memory_set_pointer(array_index, 8, left)  Note: array_index.array
-                memory_set_pointer(array_index, 16, index)  Note: array_index.index
+                memory_set_pointer(array_index, 8, left)
+                memory_set_pointer(array_index, 16, index)
                 Set left to array_index
             Otherwise:
-                Note: TOKEN_AT without "index" - syntax error
-                print_string("[PARSER ERROR] Expected 'index' after 'at' at line ")
+                print_string("[PARSER ERROR] Expected 'index' or 'key' after 'at' at line ")
                 Let error_line be memory_get_int32(current_token, TOKEN_LINE_OFFSET)
                 print_integer(error_line)
                 print_newline()
@@ -2960,6 +2975,17 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Return neg_expr
     End If
 
+    Note: Handle prefix "not EXPR" — logical negation. Lowered to EXPR_UNARY with the
+    Note: TOKEN_NOT operator code (29).  The codegen for EXPR_UNARY treats it as a
+    Note: zero/non-zero flip.  Without this, "not X" was being parsed as variable "not"
+    Note: followed by a stray X, producing "Expected 9 (COLON) got 53 (IDENT)" errors
+    Note: in `If not ctx.foo:` patterns common across the *_semantic.runa frontends.
+    If token_type is equal to 29:  Note: TOKEN_NOT
+        parser_eat(parser, 29)
+        Let not_operand be parser_parse_primary_with_postfix(parser)
+        Return expression_create_unary_op(29, not_operand)
+    End If
+
     Note: Handle "length of X" → string_length(X)
     Note: Only if TOKEN_LENGTH is followed by TOKEN_OF (otherwise it's a variable name)
     If token_type is equal to 151:  Note: TOKEN_LENGTH
@@ -4074,9 +4100,16 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             Let variant_name be name
             Let adt_type be 0
 
-            Note: Find the ADT type that contains this variant
+            Note: Find the ADT type that contains this variant.
+            Note: PROGRAM_TYPE_COUNT, TypeDefinition.kind, and the per-variant count
+            Note: are all int32 fields; reading them with memory_get_integer (8 bytes)
+            Note: pulls in the next int32 of padding and produces a bogus high count
+            Note: that walks the loop past the valid types array and crashes at
+            Note: memory_get_integer(type_def, 8) on a NULL type_def.  This was the
+            Note: SEGV trigger for "Type X" + "fn with arg" combinations in the v0.0.8.5
+            Note: source ([BF-0011] was the wrong diagnosis — it's a real source bug).
             If prog is not equal to 0:
-                Set type_count to memory_get_integer(prog, PROGRAM_TYPE_COUNT)
+                Set type_count to memory_get_int32(prog, PROGRAM_TYPE_COUNT)
                 Set types to memory_get_pointer(prog, PROGRAM_TYPES)
                 Set i to 0
                 Let continue_outer be 1
@@ -4093,7 +4126,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                         Set offset to i multiplied by ptr_size
                         Set type_ptr to types plus offset
                         Set type_def to memory_get_pointer(type_ptr, 0)
-                        Set type_kind to memory_get_integer(type_def, 8)
+                        Set type_kind to memory_get_int32(type_def, 8)
 
                         Note: Check if this is a variant type
                         Let is_variant_type be 0
@@ -4101,7 +4134,7 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                             Set is_variant_type to 1
                         End If
                         If is_variant_type is equal to 1:
-                            Set variant_count to memory_get_integer(type_def, 24)
+                            Set variant_count to memory_get_int32(type_def, 24)
                             Set variants to memory_get_pointer(type_def, 16)
                             Let j be 0
                             Let continue_inner be 1
@@ -4714,19 +4747,57 @@ Process called "parser_parse_statement_block" takes parser as Integer, count_ptr
                 Set stmt to parser_parse_call_statement(parser)
             End If
 
-            Note: Handle identifier - could be function call or expression
+            Note: Handle identifier - could be function call or expression.
+            Note: Special-case "Add VALUE to end of LIST" — canonical Runa list-append
+            Note: statement (lexer keeps "Add" as TOKEN_IDENTIFIER).
             If token_type is equal to 53:
-                Let expr be parser_parse_expression(parser)
-                Let expr_type_blk be memory_get_int32(expr, 0)
-                If expr_type_blk is not equal to 4:
-                    If expr_type_blk is not equal to 25:
-                        print_string("[PARSER WARNING] Expression statement (type=")
-                        print_integer(expr_type_blk)
-                        print_string(") - may not have intended effect")
-                        print_newline()
-                    End If
+                Let id_value_str be memory_get_pointer(current_token, 8)
+                Let id_is_add be 0
+                If id_value_str is not equal to 0:
+                    Set id_is_add to string_equals(id_value_str, "Add")
                 End If
-                Set stmt to statement_create_expression(expr)
+                If id_is_add is equal to 1:
+                    parser_eat(parser, 53)  Note: Eat 'Add'
+                    Note: Parse the value expression to add (stop at TOKEN_TO).
+                    Let add_value_expr be parser_parse_additive(parser)
+                    parser_eat(parser, 15)  Note: Eat 'to'
+                    Note: Optional 'end of' qualifier (canonical form).  If 'end' follows,
+                    Note: eat it and the subsequent 'of'; the bare "Add X to LIST" form is
+                    Note: also accepted for terseness.
+                    Let add_after_to be memory_get_pointer(parser, 8)
+                    Let add_after_to_type be memory_get_integer(add_after_to, 0)
+                    Let add_after_to_val be memory_get_pointer(add_after_to, 8)
+                    Let add_is_end be 0
+                    If add_after_to_val is not equal to 0:
+                        If string_equals(add_after_to_val, "end") is equal to 1:
+                            Set add_is_end to 1
+                        End If
+                    End If
+                    If add_is_end is equal to 1:
+                        parser_eat(parser, add_after_to_type)  Note: Eat 'end'
+                        parser_eat(parser, 125)  Note: Eat 'of' (TOKEN_OF)
+                    End If
+                    Let add_list_expr be parser_parse_expression(parser)
+                    Note: Lower to list_append(list, value).  Codegen treats the
+                    Note: function name as a runtime symbol (PLT-linked).
+                    Let add_args be memory_allocate(16)
+                    memory_set_pointer(add_args, 0, add_list_expr)
+                    memory_set_pointer(add_args, 8, add_value_expr)
+                    Let add_call be expression_create_function_call(string_duplicate("list_append"), add_args, 2)
+                    Set stmt to statement_create_expression(add_call)
+                Otherwise:
+                    Let expr be parser_parse_expression(parser)
+                    Let expr_type_blk be memory_get_int32(expr, 0)
+                    If expr_type_blk is not equal to 4:
+                        If expr_type_blk is not equal to 25:
+                            print_string("[PARSER WARNING] Expression statement (type=")
+                            print_integer(expr_type_blk)
+                            print_string(") - may not have intended effect")
+                            print_newline()
+                        End If
+                    End If
+                    Set stmt to statement_create_expression(expr)
+                End If
             End If
 
             Note: Handle builtin function calls
@@ -4830,7 +4901,7 @@ Process called "parser_parse_for_range_statement" takes parser as Integer return
     Let peek_token be memory_get_pointer(parser, 8)
     Let peek_token_type be memory_get_int32(peek_token, 0)
 
-    Note: Handle "For each item in collection"
+    Note: Handle "For each item in collection" or "For each item from N to M"
     If peek_token_type is equal to 145:  Note: TOKEN_EACH
         parser_eat(parser, 145)  Note: TOKEN_EACH
 
@@ -4840,6 +4911,32 @@ Process called "parser_parse_for_range_statement" takes parser as Integer return
         Let var_name_temp be memory_get_pointer(current_token, 8)
         Let var_name be string_duplicate(var_name_temp)
         parser_eat(parser, token_type)
+
+        Note: Branch on TOKEN_IN (for-each) vs TOKEN_FROM (for-range with redundant 'each').
+        Let fe_next be memory_get_pointer(parser, 8)
+        Let fe_next_type be memory_get_integer(fe_next, 0)
+        If fe_next_type is equal to 144:
+            Note: "For each i from N to M [by step]" — same shape as for-range.
+            parser_eat(parser, 144)
+            Let fer_start_expr be parser_parse_expression(parser)
+            parser_eat(parser, 15)  Note: TOKEN_TO
+            Let fer_end_expr be parser_parse_expression(parser)
+            Let fer_after_to be memory_get_pointer(parser, 8)
+            Let fer_after_to_type be memory_get_integer(fer_after_to, 0)
+            Let fer_step_expr be 0
+            If fer_after_to_type is equal to 38:
+                parser_eat(parser, 38)
+                Set fer_step_expr to parser_parse_expression(parser)
+            End If
+            parser_eat(parser, 9)  Note: ':'
+            Let fer_body_count_ptr be memory_allocate(8)
+            Let fer_body be parser_parse_statement_block(parser, fer_body_count_ptr)
+            Let fer_body_count be memory_get_integer(fer_body_count_ptr, 0)
+            deallocate(fer_body_count_ptr)
+            parser_eat(parser, 8)
+            parser_eat(parser, 143)
+            Return statement_create_for_range(var_name, fer_start_expr, fer_end_expr, fer_step_expr, fer_body, fer_body_count)
+        End If
 
         parser_eat(parser, 152)  Note: TOKEN_IN
         Let collection_expr be parser_parse_expression(parser)
@@ -6323,6 +6420,25 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
         Note: Eat the type token regardless of specific type
         parser_eat(parser, token_type)
 
+        Note: Skip generic type parameters: List[Integer], Dictionary[K, V], etc.
+        Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+        Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+        If token_type is equal to 127:
+            parser_eat(parser, 127)
+            Let pt0_bracket_depth be 1
+            While pt0_bracket_depth is greater than 0:
+                Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                Set token_type to memory_get_int32(current_token, TOKEN_TYPE_OFFSET)
+                If token_type is equal to 127:
+                    Set pt0_bracket_depth to pt0_bracket_depth plus 1
+                End If
+                If token_type is equal to 128:
+                    Set pt0_bracket_depth to pt0_bracket_depth minus 1
+                End If
+                parser_eat(parser, token_type)
+            End While
+        End If
+
         function_add_parameter(func, param_name, param_type)
 
         Note: Parse additional parameters separated by commas or 'and'
@@ -6368,6 +6484,26 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             End If
             Note: Eat the type token regardless of specific type
             parser_eat(parser, paramtype_token_type)
+
+            Note: Skip generic type parameters: List[Integer], Dictionary[K, V], etc.
+            Note: Mirrors the same handling done for the function return type below.
+            Let pt_after be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+            Let pt_after_type be memory_get_int32(pt_after, TOKEN_TYPE_OFFSET)
+            If pt_after_type is equal to 127:
+                parser_eat(parser, 127)
+                Let pt_bracket_depth be 1
+                While pt_bracket_depth is greater than 0:
+                    Set pt_after to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                    Set pt_after_type to memory_get_int32(pt_after, TOKEN_TYPE_OFFSET)
+                    If pt_after_type is equal to 127:
+                        Set pt_bracket_depth to pt_bracket_depth plus 1
+                    End If
+                    If pt_after_type is equal to 128:
+                        Set pt_bracket_depth to pt_bracket_depth minus 1
+                    End If
+                    parser_eat(parser, pt_after_type)
+                End While
+            End If
 
             function_add_parameter(func, param_name, param_type)
 
@@ -6541,10 +6677,41 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             Set stmt to statement_create_expression(store8_call)
         End If
         If body_token_type is equal to 53:
-            Note: Try to parse as expression (could be a function call)
-            Let expr be parser_parse_expression(parser)
-            Note: Accept expression as statement - warn if not a function call
-            Set stmt to statement_create_expression(expr)
+            Note: Special-case "Add VALUE to end of LIST" — canonical Runa list-append.
+            Let body_id_val be memory_get_pointer(body_current_token, TOKEN_VALUE_OFFSET)
+            Let body_is_add be 0
+            If body_id_val is not equal to 0:
+                Set body_is_add to string_equals(body_id_val, "Add")
+            End If
+            If body_is_add is equal to 1:
+                parser_eat(parser, 53)
+                Let body_add_value_expr be parser_parse_additive(parser)
+                parser_eat(parser, 15)  Note: 'to'
+                Let body_add_after_to be memory_get_pointer(parser, 8)
+                Let body_add_after_to_type be memory_get_integer(body_add_after_to, 0)
+                Let body_add_after_to_val be memory_get_pointer(body_add_after_to, 8)
+                Let body_add_is_end be 0
+                If body_add_after_to_val is not equal to 0:
+                    If string_equals(body_add_after_to_val, "end") is equal to 1:
+                        Set body_add_is_end to 1
+                    End If
+                End If
+                If body_add_is_end is equal to 1:
+                    parser_eat(parser, body_add_after_to_type)
+                    parser_eat(parser, 125)
+                End If
+                Let body_add_list_expr be parser_parse_expression(parser)
+                Let body_add_args be memory_allocate(16)
+                memory_set_pointer(body_add_args, 0, body_add_list_expr)
+                memory_set_pointer(body_add_args, 8, body_add_value_expr)
+                Let body_add_call be expression_create_function_call(string_duplicate("list_append"), body_add_args, 2)
+                Set stmt to statement_create_expression(body_add_call)
+            Otherwise:
+                Note: Try to parse as expression (could be a function call)
+                Let expr be parser_parse_expression(parser)
+                Note: Accept expression as statement - warn if not a function call
+                Set stmt to statement_create_expression(expr)
+            End If
         End If
 
         Let is_builtin be parser_is_builtin_function_token(body_token_type)
