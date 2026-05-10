@@ -608,7 +608,7 @@ print_integer:
 string_copy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $0, %rax
@@ -677,7 +677,7 @@ string_copy:
 string_copy_n:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -732,7 +732,7 @@ string_copy_n:
 string_set_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -756,7 +756,7 @@ string_set_char:
 lexer_advance:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -928,7 +928,7 @@ lexer_advance:
 lexer_skip_whitespace:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -1005,7 +1005,7 @@ lexer_skip_whitespace:
 lexer_skip_to_eol:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -1129,7 +1129,7 @@ lexer_skip_to_eol:
 lexer_skip_note_comment:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $20, %rax
     pushq %rax
@@ -2003,7 +2003,7 @@ lexer_skip_note_comment:
 token_create_owned:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -2065,7 +2065,7 @@ token_create_owned:
 token_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -2154,7 +2154,7 @@ token_create:
 lexer_read_string_literal:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2357,7 +2357,7 @@ lexer_read_string_literal:
 lexer_read_word:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2518,7 +2518,7 @@ lexer_read_word:
 lexer_read_integer:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -3119,7 +3119,7 @@ lexer_read_integer:
 lexer_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $40, %rax
@@ -3225,7 +3225,7 @@ lexer_create:
 lexer_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3270,7 +3270,7 @@ lexer_next_token:
     subq $16384, %rax  # Check if we have 16KB stack space
     cmpq $0x100000, %rax  # Compare against 1MB limit
     jb .stack_overflow_panic
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $1, %rax
     movq %rax, -16(%rbp)
@@ -3899,7 +3899,7 @@ lexer_next_token:
 determine_token_type:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $0, %rax
     pushq %rax
@@ -4608,7 +4608,7 @@ determine_token_type:
 check_keywords_P:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR9(%rip), %rax
     pushq %rax
@@ -4686,7 +4686,7 @@ check_keywords_P:
 check_keywords_c:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR12(%rip), %rax
     pushq %rax
@@ -4764,7 +4764,7 @@ check_keywords_c:
 check_keywords_r:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR15(%rip), %rax
     pushq %rax
@@ -4820,7 +4820,7 @@ check_keywords_r:
 check_keywords_I:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR17(%rip), %rax
     pushq %rax
@@ -4942,7 +4942,7 @@ check_keywords_I:
 check_keywords_A:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR22(%rip), %rax
     pushq %rax
@@ -4998,7 +4998,7 @@ check_keywords_A:
 check_keywords_S:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR24(%rip), %rax
     pushq %rax
@@ -5054,7 +5054,7 @@ check_keywords_S:
 check_keywords_C:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR26(%rip), %rax
     pushq %rax
@@ -5154,7 +5154,7 @@ check_keywords_C:
 check_keywords_R:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR30(%rip), %rax
     pushq %rax
@@ -5188,7 +5188,7 @@ check_keywords_R:
 check_keywords_E:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR0(%rip), %rax
     pushq %rax
@@ -5266,7 +5266,7 @@ check_keywords_E:
 check_keywords_L:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR33(%rip), %rax
     pushq %rax
@@ -5322,7 +5322,7 @@ check_keywords_L:
 check_keywords_b:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR35(%rip), %rax
     pushq %rax
@@ -5576,7 +5576,7 @@ check_keywords_b:
 check_keywords_s:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR46(%rip), %rax
     pushq %rax
@@ -5610,7 +5610,7 @@ check_keywords_s:
 check_keywords_t:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR47(%rip), %rax
     pushq %rax
@@ -5754,7 +5754,7 @@ check_keywords_t:
 check_keywords_p:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR53(%rip), %rax
     pushq %rax
@@ -5810,7 +5810,7 @@ check_keywords_p:
 check_keywords_m:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR55(%rip), %rax
     pushq %rax
@@ -5888,7 +5888,7 @@ check_keywords_m:
 check_keywords_i:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR58(%rip), %rax
     pushq %rax
@@ -5988,7 +5988,7 @@ check_keywords_i:
 check_keywords_e:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR62(%rip), %rax
     pushq %rax
@@ -6044,7 +6044,7 @@ check_keywords_e:
 check_keywords_l:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR64(%rip), %rax
     pushq %rax
@@ -6166,7 +6166,7 @@ check_keywords_l:
 check_keywords_g:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR69(%rip), %rax
     pushq %rax
@@ -6222,7 +6222,7 @@ check_keywords_g:
 check_keywords_n:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR71(%rip), %rax
     pushq %rax
@@ -6278,7 +6278,7 @@ check_keywords_n:
 check_keywords_N:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR1(%rip), %rax
     pushq %rax
@@ -6312,7 +6312,7 @@ check_keywords_N:
 check_keywords_a:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR73(%rip), %rax
     pushq %rax
@@ -6456,7 +6456,7 @@ check_keywords_a:
 check_keywords_o:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR79(%rip), %rax
     pushq %rax
@@ -6512,7 +6512,7 @@ check_keywords_o:
 check_keywords_O:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR81(%rip), %rax
     pushq %rax
@@ -6546,7 +6546,7 @@ check_keywords_O:
 check_keywords_W:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR82(%rip), %rax
     pushq %rax
@@ -6602,7 +6602,7 @@ check_keywords_W:
 check_keywords_T:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR84(%rip), %rax
     pushq %rax
@@ -6636,7 +6636,7 @@ check_keywords_T:
 check_keywords_B:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR85(%rip), %rax
     pushq %rax
@@ -6670,7 +6670,7 @@ check_keywords_B:
 check_keywords_f:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR86(%rip), %rax
     pushq %rax
@@ -6748,7 +6748,7 @@ check_keywords_f:
 check_keywords_d:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR89(%rip), %rax
     pushq %rax
@@ -6804,7 +6804,7 @@ check_keywords_d:
 check_keywords_D:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR91(%rip), %rax
     pushq %rax
@@ -6882,7 +6882,7 @@ check_keywords_D:
 check_keywords_M:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR94(%rip), %rax
     pushq %rax
@@ -6938,7 +6938,7 @@ check_keywords_M:
 check_keywords_F:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR96(%rip), %rax
     pushq %rax
@@ -6972,7 +6972,7 @@ check_keywords_F:
 check_keywords_w:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR97(%rip), %rax
     pushq %rax
@@ -7028,7 +7028,7 @@ check_keywords_w:
 check_keywords_k:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR99(%rip), %rax
     pushq %rax
@@ -7062,7 +7062,7 @@ check_keywords_k:
 check_builtin_functions:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR85(%rip), %rax
     movq %rax, -16(%rbp)
@@ -7279,7 +7279,7 @@ check_builtin_functions:
 check_more_builtins:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     leaq .STR101(%rip), %rax
     movq %rax, -16(%rbp)
@@ -7554,7 +7554,7 @@ check_single_char_token:
     subq $16384, %rax  # Check if we have 16KB stack space
     cmpq $0x100000, %rax  # Compare against 1MB limit
     jb .stack_overflow_panic
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -8865,7 +8865,7 @@ check_single_char_token:
 token_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -8917,7 +8917,7 @@ token_destroy:
 is_alnum_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -8955,7 +8955,7 @@ is_alnum_char:
 print_char:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $2, %rax
     pushq %rax
@@ -9000,7 +9000,7 @@ print_char:
 print_newline:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $10, %rax
     movq %rax, -16(%rbp)
