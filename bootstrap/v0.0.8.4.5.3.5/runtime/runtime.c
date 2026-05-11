@@ -596,7 +596,9 @@ typedef struct {
 #if 1
 
 // Create a new empty set with initial capacity of 16
-int64_t set_create() {
+// static: file-local to avoid colliding with the Runa version in containers.runa.
+// Internal callers (set_union/set_intersection below) still reach this via C scoping.
+static int64_t set_create() {
     RunaSet* set = (RunaSet*)calloc(1, sizeof(RunaSet));
     set->capacity = 16;
     set->count = 0;
@@ -651,7 +653,7 @@ static void set_resize(RunaSet* set, int64_t new_capacity) {
 }
 
 // Add element to set (returns 1 if added, 0 if already exists)
-int64_t set_add(int64_t set_ptr, int64_t value) {
+static int64_t set_add(int64_t set_ptr, int64_t value) {
     RunaSet* set = (RunaSet*)set_ptr;
 
     // Resize if load factor > 0.7
@@ -677,7 +679,7 @@ int64_t set_add(int64_t set_ptr, int64_t value) {
 }
 
 // Check if set contains element (returns 1 if yes, 0 if no)
-int64_t set_contains(int64_t set_ptr, int64_t value) {
+static int64_t set_contains(int64_t set_ptr, int64_t value) {
     RunaSet* set = (RunaSet*)set_ptr;
 
     int64_t index = set_hash(value, set->capacity);
@@ -696,7 +698,7 @@ int64_t set_contains(int64_t set_ptr, int64_t value) {
 }
 
 // Remove element from set (returns 1 if removed, 0 if not found)
-int64_t set_remove(int64_t set_ptr, int64_t value) {
+static int64_t set_remove(int64_t set_ptr, int64_t value) {
     RunaSet* set = (RunaSet*)set_ptr;
 
     int64_t index = set_hash(value, set->capacity);
@@ -729,7 +731,7 @@ int64_t set_remove(int64_t set_ptr, int64_t value) {
 }
 
 // Get number of elements in set
-int64_t set_size(int64_t set_ptr) {
+static int64_t set_size(int64_t set_ptr) {
     RunaSet* set = (RunaSet*)set_ptr;
     return set->count;
 }
@@ -793,7 +795,7 @@ int64_t set_to_list(int64_t set_ptr) {
 }
 
 // Destroy set and free memory
-int64_t set_destroy(int64_t set_ptr) {
+static int64_t set_destroy(int64_t set_ptr) {
     RunaSet* set = (RunaSet*)set_ptr;
     free(set->data);
     free(set->used);

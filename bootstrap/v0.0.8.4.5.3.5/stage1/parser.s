@@ -2541,7 +2541,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     call parser_parse_primary
     movq %rax, -16(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -2549,7 +2549,7 @@ parser_parse_primary_with_postfix:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -24(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -2573,7 +2573,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -2581,7 +2581,7 @@ parser_parse_primary_with_postfix:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -40(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -40(%rbp), %rax
     pushq %rax
@@ -2712,7 +2712,7 @@ parser_parse_primary_with_postfix:
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant EXPR_VARIABLE
+    movq EXPR_VARIABLE(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -3371,7 +3371,7 @@ parser_parse_primary_with_postfix:
     movq %rax, -360(%rbp)
     movq -360(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant EXPR_VARIABLE
+    movq EXPR_VARIABLE(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     setne %al
@@ -3550,7 +3550,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -480(%rbp)
-    movq $25, %rax  # Load compile-time constant EXPR_QUALIFIED_CALL
+    movq EXPR_QUALIFIED_CALL(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -3850,7 +3850,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -3861,7 +3861,7 @@ parser_parse_primary_with_postfix:
     leaq -280(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -280(%rbp), %rax
     pushq %rax
@@ -3975,7 +3975,7 @@ parser_parse_primary_with_postfix:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -280(%rbp), %rax
     pushq %rax
@@ -4303,7 +4303,7 @@ parser_parse_primary_with_postfix:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -760(%rbp)
-    movq $25, %rax  # Load compile-time constant EXPR_QUALIFIED_CALL
+    movq EXPR_QUALIFIED_CALL(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -4998,7 +4998,7 @@ parser_parse_comparison:
     jmp .L1402
 .L1401:
 .L1402:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -5006,7 +5006,7 @@ parser_parse_comparison:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -120(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -120(%rbp), %rax
     pushq %rax
@@ -5014,7 +5014,7 @@ parser_parse_comparison:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -128(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -120(%rbp), %rax
     pushq %rax
@@ -5231,7 +5231,7 @@ parser_parse_comparison:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -5239,7 +5239,7 @@ parser_parse_comparison:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -184(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -184(%rbp), %rax
     pushq %rax
@@ -5247,7 +5247,7 @@ parser_parse_comparison:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -192(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -184(%rbp), %rax
     pushq %rax
@@ -5271,7 +5271,7 @@ parser_parse_comparison:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -5279,7 +5279,7 @@ parser_parse_comparison:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -208(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -208(%rbp), %rax
     pushq %rax
@@ -5400,7 +5400,7 @@ parser_parse_comparison:
     popq %rdi
     call string_duplicate_parser
     movq %rax, -240(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -5408,7 +5408,7 @@ parser_parse_comparison:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -248(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -248(%rbp), %rax
     pushq %rax
@@ -11357,7 +11357,7 @@ expression_create_integer:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $0, %rax  # Load compile-time constant EXPR_INTEGER
+    movq EXPR_INTEGER(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -11396,7 +11396,7 @@ expression_create_variable:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $1, %rax  # Load compile-time constant EXPR_VARIABLE
+    movq EXPR_VARIABLE(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -11442,7 +11442,7 @@ expression_create_binary_op:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -40(%rbp)
-    movq $2, %rax  # Load compile-time constant EXPR_BINARY_OP
+    movq EXPR_BINARY_OP(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -11503,7 +11503,7 @@ expression_create_comparison:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -40(%rbp)
-    movq $3, %rax  # Load compile-time constant EXPR_COMPARISON
+    movq EXPR_COMPARISON(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -11614,7 +11614,7 @@ expression_create_function_call:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -40(%rbp)
-    movq $4, %rax  # Load compile-time constant EXPR_FUNCTION_CALL
+    movq EXPR_FUNCTION_CALL(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -11678,7 +11678,7 @@ expression_create_string_literal_owned:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $5, %rax  # Load compile-time constant EXPR_STRING_LITERAL
+    movq EXPR_STRING_LITERAL(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12485,7 +12485,7 @@ expression_create_lambda:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -32(%rbp)
-    movq $23, %rax  # Load compile-time constant EXPR_LAMBDA
+    movq EXPR_LAMBDA(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12541,7 +12541,7 @@ expression_create_lambda_multi:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -40(%rbp)
-    movq $23, %rax  # Load compile-time constant EXPR_LAMBDA
+    movq EXPR_LAMBDA(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12631,7 +12631,7 @@ statement_create_let:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -32(%rbp)
-    movq $1, %rax  # Load compile-time constant STMT_LET
+    movq STMT_LET(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12756,7 +12756,7 @@ statement_create_set:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -32(%rbp)
-    movq $2, %rax  # Load compile-time constant STMT_SET
+    movq STMT_SET(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12807,7 +12807,7 @@ statement_create_compound_assign:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -40(%rbp)
-    movq $17, %rax  # Load compile-time constant STMT_COMPOUND_ASSIGN
+    movq STMT_COMPOUND_ASSIGN(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12871,7 +12871,7 @@ statement_create_for_range:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -64(%rbp)
-    movq $11, %rax  # Load compile-time constant STMT_FOR
+    movq STMT_FOR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -12963,7 +12963,7 @@ statement_create_for_each:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -48(%rbp)
-    movq $12, %rax  # Load compile-time constant STMT_FOR_EACH
+    movq STMT_FOR_EACH(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13032,7 +13032,7 @@ statement_create_return:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $3, %rax  # Load compile-time constant STMT_RETURN
+    movq STMT_RETURN(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13071,7 +13071,7 @@ statement_create_print:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $4, %rax  # Load compile-time constant STMT_PRINT
+    movq STMT_PRINT(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13110,7 +13110,7 @@ statement_create_expression:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $7, %rax  # Load compile-time constant STMT_EXPRESSION
+    movq STMT_EXPRESSION(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13153,7 +13153,7 @@ statement_create_if:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -56(%rbp)
-    movq $5, %rax  # Load compile-time constant STMT_IF
+    movq STMT_IF(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13234,7 +13234,7 @@ statement_create_while:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -40(%rbp)
-    movq $6, %rax  # Load compile-time constant STMT_WHILE
+    movq STMT_WHILE(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13293,7 +13293,7 @@ statement_create_break:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $9, %rax  # Load compile-time constant STMT_BREAK
+    movq STMT_BREAK(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -13322,7 +13322,7 @@ statement_create_continue:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
-    movq $10, %rax  # Load compile-time constant STMT_CONTINUE
+    movq STMT_CONTINUE(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -15656,7 +15656,7 @@ parser_parse_primary:
     movq %rax, -408(%rbp)
     movq $0, %rax
     movq %rax, -416(%rbp)
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -15673,7 +15673,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4031
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -15681,7 +15681,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -432(%rbp)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -15804,7 +15804,7 @@ parser_parse_primary:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $7, %rax  # Load compile-time constant EXPR_TYPE_NAME
+    movq EXPR_TYPE_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -16095,7 +16095,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4121
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16110,7 +16110,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16118,7 +16118,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -600(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -600(%rbp), %rax
     pushq %rax
@@ -16203,7 +16203,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4141
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16211,7 +16211,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -632(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -632(%rbp), %rax
     pushq %rax
@@ -16260,7 +16260,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16268,7 +16268,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -656(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -656(%rbp), %rax
     pushq %rax
@@ -16285,7 +16285,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4171
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -656(%rbp), %rax
     pushq %rax
@@ -16305,7 +16305,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16313,7 +16313,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -688(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -688(%rbp), %rax
     pushq %rax
@@ -16391,7 +16391,7 @@ parser_parse_primary:
     leaq -712(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16399,7 +16399,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -744(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -744(%rbp), %rax
     pushq %rax
@@ -16499,7 +16499,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4221
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16507,7 +16507,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -768(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -768(%rbp), %rax
     pushq %rax
@@ -16556,7 +16556,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16564,7 +16564,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -792(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -792(%rbp), %rax
     pushq %rax
@@ -16593,7 +16593,7 @@ parser_parse_primary:
     popq %rdi
     call parser_parse_primary_with_postfix
     movq %rax, -808(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16601,7 +16601,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -816(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -816(%rbp), %rax
     pushq %rax
@@ -16728,7 +16728,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4271
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16736,7 +16736,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -856(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -856(%rbp), %rax
     pushq %rax
@@ -16785,7 +16785,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16793,7 +16793,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -880(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -880(%rbp), %rax
     pushq %rax
@@ -16801,7 +16801,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -888(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -880(%rbp), %rax
     pushq %rax
@@ -16850,7 +16850,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16858,7 +16858,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -912(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -912(%rbp), %rax
     pushq %rax
@@ -16966,7 +16966,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -16974,7 +16974,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -944(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -944(%rbp), %rax
     pushq %rax
@@ -20775,7 +20775,7 @@ parser_parse_primary:
     leaq -416(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -20807,7 +20807,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L4961
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -20830,7 +20830,7 @@ parser_parse_primary:
     jmp .L4972
 .L4971:
 .L4972:
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -21025,7 +21025,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5051
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -21036,7 +21036,7 @@ parser_parse_primary:
     leaq -432(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -21084,7 +21084,7 @@ parser_parse_primary:
     leaq -464(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    movq TYPEDEFINITION_KIND_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -464(%rbp), %rax
     pushq %rax
@@ -21094,14 +21094,14 @@ parser_parse_primary:
     movq %rax, -1560(%rbp)
     movq -1560(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    movq TYPE_KIND_VARIANT(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5071
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -464(%rbp), %rax
     pushq %rax
@@ -21109,7 +21109,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -1568(%rbp)
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -464(%rbp), %rax
     pushq %rax
@@ -21130,7 +21130,7 @@ parser_parse_primary:
     jz .L5082
     movq -1584(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq VARIANT_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -1592(%rbp)
@@ -21401,7 +21401,7 @@ parser_parse_primary:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    movq EXPR_VARIANT_CONSTRUCTOR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -21748,7 +21748,7 @@ parser_parse_primary:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    movq EXPR_VARIANT_CONSTRUCTOR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -22153,7 +22153,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5321
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -22161,7 +22161,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -1776(%rbp)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -22198,7 +22198,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -1808(%rbp)
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    movq TYPEDEFINITION_KIND_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -1808(%rbp), %rax
     pushq %rax
@@ -22208,14 +22208,14 @@ parser_parse_primary:
     movq %rax, -1816(%rbp)
     movq -1816(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    movq TYPE_KIND_VARIANT(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5341
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -1808(%rbp), %rax
     pushq %rax
@@ -22223,7 +22223,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -1824(%rbp)
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -1808(%rbp), %rax
     pushq %rax
@@ -22246,7 +22246,7 @@ parser_parse_primary:
     pushq %rax
     movq -1840(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq VARIANT_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     popq %rbx
@@ -22340,7 +22340,7 @@ parser_parse_primary:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    movq EXPR_VARIANT_CONSTRUCTOR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -22443,7 +22443,7 @@ parser_parse_primary:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L5391
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -22454,7 +22454,7 @@ parser_parse_primary:
     leaq -432(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -424(%rbp), %rax
     pushq %rax
@@ -22572,7 +22572,7 @@ parser_parse_primary:
     movq %rax, -1920(%rbp)
     movq -1560(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    movq TYPE_KIND_VARIANT(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -22678,7 +22678,7 @@ parser_parse_primary:
     jz .L5491
     movq -1928(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq VARIANT_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
@@ -22784,7 +22784,7 @@ parser_parse_primary:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $9, %rax  # Load compile-time constant EXPR_VARIANT_CONSTRUCTOR
+    movq EXPR_VARIANT_CONSTRUCTOR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -23505,7 +23505,7 @@ parser_parse_primary:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $7, %rax  # Load compile-time constant EXPR_TYPE_NAME
+    movq EXPR_TYPE_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -23532,7 +23532,7 @@ parser_parse_primary:
     jmp .L5682
 .L5681:
 .L5682:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -23540,7 +23540,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -2080(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -2080(%rbp), %rax
     pushq %rax
@@ -23753,7 +23753,7 @@ parser_parse_primary:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -23761,7 +23761,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -2176(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -2176(%rbp), %rax
     pushq %rax
@@ -23769,7 +23769,7 @@ parser_parse_primary:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -2184(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -2176(%rbp), %rax
     pushq %rax
@@ -26234,7 +26234,7 @@ parser_parse_loop_forever:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -26242,7 +26242,7 @@ parser_parse_loop_forever:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -16(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -26296,7 +26296,7 @@ parser_parse_loop_forever:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -26304,7 +26304,7 @@ parser_parse_loop_forever:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -56(%rbp), %rax
     pushq %rax
@@ -27637,7 +27637,7 @@ parser_parse_match_statement:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -80(%rbp)
-    movq $0, %rax  # Load compile-time constant PATTERN_LITERAL
+    movq PATTERN_LITERAL(%rip), %rax  # Load global variable
     movq %rax, -88(%rbp)
     movq $0, %rax
     movq %rax, -96(%rbp)
@@ -27654,7 +27654,7 @@ parser_parse_match_statement:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L6651
-    movq $2, %rax  # Load compile-time constant PATTERN_WILDCARD
+    movq PATTERN_WILDCARD(%rip), %rax  # Load global variable
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
@@ -27842,7 +27842,7 @@ parser_parse_match_statement:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $3, %rax  # Load compile-time constant PATTERN_TYPE
+    movq PATTERN_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
@@ -27963,7 +27963,7 @@ parser_parse_match_statement:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L6731
-    movq $1, %rax  # Load compile-time constant PATTERN_VARIANT
+    movq PATTERN_VARIANT(%rip), %rax  # Load global variable
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
@@ -27984,7 +27984,7 @@ parser_parse_match_statement:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L6741
-    movq $1, %rax  # Load compile-time constant PATTERN_VARIANT
+    movq PATTERN_VARIANT(%rip), %rax  # Load global variable
     pushq %rax
     leaq -88(%rbp), %rbx
     popq %rax
@@ -28351,7 +28351,7 @@ parser_parse_match_statement:
     movq %rax, -400(%rbp)
     movq -88(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
+    movq WHEN_PATTERN_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28361,7 +28361,7 @@ parser_parse_match_statement:
     call memory_set_int32@PLT
     movq -96(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
+    movq WHEN_PATTERN_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28371,7 +28371,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq -104(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant WHEN_FIELD_BINDINGS
+    movq WHEN_FIELD_BINDINGS(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28381,7 +28381,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq -112(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant WHEN_FIELD_COUNT
+    movq WHEN_FIELD_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28391,7 +28391,7 @@ parser_parse_match_statement:
     call memory_set_int32@PLT
     movq -376(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant WHEN_BODY_STMTS
+    movq WHEN_BODY_STMTS(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28401,7 +28401,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq -384(%rbp), %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant WHEN_BODY_COUNT
+    movq WHEN_BODY_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28510,9 +28510,9 @@ parser_parse_match_statement:
     movq -32(%rbp), %rax
     addq -432(%rbp), %rax
     movq %rax, -440(%rbp)
-    movq $2, %rax  # Load compile-time constant PATTERN_WILDCARD
+    movq PATTERN_WILDCARD(%rip), %rax  # Load global variable
     pushq %rax
-    movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
+    movq WHEN_PATTERN_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -440(%rbp), %rax
     pushq %rax
@@ -28522,7 +28522,7 @@ parser_parse_match_statement:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
+    movq WHEN_PATTERN_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -440(%rbp), %rax
     pushq %rax
@@ -28532,7 +28532,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant WHEN_FIELD_BINDINGS
+    movq WHEN_FIELD_BINDINGS(%rip), %rax  # Load global variable
     pushq %rax
     movq -440(%rbp), %rax
     pushq %rax
@@ -28542,7 +28542,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant WHEN_FIELD_COUNT
+    movq WHEN_FIELD_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -440(%rbp), %rax
     pushq %rax
@@ -28552,7 +28552,7 @@ parser_parse_match_statement:
     call memory_set_int32@PLT
     movq -416(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant WHEN_BODY_STMTS
+    movq WHEN_BODY_STMTS(%rip), %rax  # Load global variable
     pushq %rax
     movq -440(%rbp), %rax
     pushq %rax
@@ -28562,7 +28562,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq -424(%rbp), %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant WHEN_BODY_COUNT
+    movq WHEN_BODY_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -440(%rbp), %rax
     pushq %rax
@@ -28649,7 +28649,7 @@ parser_parse_match_statement:
     leaq -400(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
+    movq WHEN_PATTERN_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28730,7 +28730,7 @@ parser_parse_match_statement:
     leaq -400(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant WHEN_PATTERN_TYPE
+    movq WHEN_PATTERN_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28750,7 +28750,7 @@ parser_parse_match_statement:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L6881
-    movq $8, %rax  # Load compile-time constant WHEN_PATTERN_VALUE
+    movq WHEN_PATTERN_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -400(%rbp), %rax
     pushq %rax
@@ -28834,7 +28834,7 @@ parser_parse_match_statement:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L6901
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -29241,7 +29241,7 @@ parser_parse_match_statement:
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -680(%rbp)
-    movq $8, %rax  # Load compile-time constant STMT_MATCH
+    movq STMT_MATCH(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -29253,7 +29253,7 @@ parser_parse_match_statement:
     call memory_set_int32@PLT
     movq -16(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant STMT_MATCH_EXPR
+    movq STMT_MATCH_EXPR(%rip), %rax  # Load global variable
     pushq %rax
     movq -680(%rbp), %rax
     pushq %rax
@@ -29263,7 +29263,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq -32(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant STMT_MATCH_WHEN_CLAUSES
+    movq STMT_MATCH_WHEN_CLAUSES(%rip), %rax  # Load global variable
     pushq %rax
     movq -680(%rbp), %rax
     pushq %rax
@@ -29273,7 +29273,7 @@ parser_parse_match_statement:
     call memory_set_pointer@PLT
     movq -40(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant STMT_MATCH_WHEN_COUNT
+    movq STMT_MATCH_WHEN_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -680(%rbp), %rax
     pushq %rax
@@ -30062,12 +30062,12 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $48, %rax  # Load compile-time constant TypeDefinition_SIZE
+    movq TypeDefinition_SIZE(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -16(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30075,7 +30075,7 @@ parser_parse_type_definition:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -24(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30099,7 +30099,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30110,7 +30110,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30134,7 +30134,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30154,7 +30154,7 @@ parser_parse_type_definition:
     jmp .L7232
 .L7231:
 .L7232:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30169,7 +30169,7 @@ parser_parse_type_definition:
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TYPEDEFINITION_NAME_OFFSET
+    movq TYPEDEFINITION_NAME_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30191,9 +30191,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $0, %rax  # Load compile-time constant TYPE_KIND_STRUCT
+    movq TYPE_KIND_STRUCT(%rip), %rax  # Load global variable
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    movq TYPEDEFINITION_KIND_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30203,7 +30203,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET
+    movq TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30213,7 +30213,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30223,7 +30223,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq $0, %rax
     movq %rax, -64(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30234,7 +30234,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30393,7 +30393,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30428,7 +30428,7 @@ parser_parse_type_definition:
     jmp .L7322
 .L7321:
 .L7322:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30458,7 +30458,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30469,7 +30469,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30480,7 +30480,7 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30528,7 +30528,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30539,7 +30539,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30577,7 +30577,7 @@ parser_parse_type_definition:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7352
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30588,7 +30588,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30647,7 +30647,7 @@ parser_parse_type_definition:
     jmp .L7342
 .L7341:
 .L7342:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30658,7 +30658,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30688,7 +30688,7 @@ parser_parse_type_definition:
     jmp .L7382
 .L7381:
 .L7382:
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30701,7 +30701,7 @@ parser_parse_type_definition:
     movq %rax, -120(%rbp)
     movq -120(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30709,7 +30709,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET
+    movq TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30719,7 +30719,7 @@ parser_parse_type_definition:
     movq %rax, -128(%rbp)
     movq -120(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -136(%rbp)
@@ -30758,7 +30758,7 @@ parser_parse_type_definition:
 .L7392:
     movq -144(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET
+    movq TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30771,7 +30771,7 @@ parser_parse_type_definition:
     movq %rax, -152(%rbp)
     movq -152(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -160(%rbp)
@@ -30780,7 +30780,7 @@ parser_parse_type_definition:
     movq %rax, -168(%rbp)
     movq -88(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TYPEFIELD_NAME_OFFSET
+    movq TYPEFIELD_NAME_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -30790,7 +30790,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -96(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEFIELD_TYPE_OFFSET
+    movq TYPEFIELD_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -30800,7 +30800,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -64(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEFIELD_OFFSET_OFFSET
+    movq TYPEFIELD_OFFSET_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -30808,7 +30808,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30826,7 +30826,7 @@ parser_parse_type_definition:
     movq %rax, -184(%rbp)
     movq -184(%rbp), %rax
     pushq %rax
-    movq $20, %rax  # Load compile-time constant TYPEFIELD_SIZE_OFFSET
+    movq TYPEFIELD_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -30840,7 +30840,7 @@ parser_parse_type_definition:
     leaq -64(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30851,7 +30851,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30866,7 +30866,7 @@ parser_parse_type_definition:
 .L7242:
     movq -64(%rbp), %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
+    movq TYPEDEFINITION_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30895,7 +30895,7 @@ parser_parse_type_definition:
     jmp .L7222
 .L7221:
 .L7222:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30906,7 +30906,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30926,7 +30926,7 @@ parser_parse_type_definition:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7401
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -30947,7 +30947,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -56(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TYPEDEFINITION_NAME_OFFSET
+    movq TYPEDEFINITION_NAME_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -30976,7 +30976,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -30987,7 +30987,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31021,7 +31021,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31032,7 +31032,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31056,7 +31056,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31079,7 +31079,7 @@ parser_parse_type_definition:
     jmp .L7422
 .L7421:
 .L7422:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31118,7 +31118,7 @@ parser_parse_type_definition:
     call parser_eat
     movq $0, %rax
     movq %rax, -200(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31129,7 +31129,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31230,7 +31230,7 @@ parser_parse_type_definition:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7461
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31272,7 +31272,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31295,9 +31295,9 @@ parser_parse_type_definition:
     jmp .L7472
 .L7471:
 .L7472:
-    movq $3, %rax  # Load compile-time constant TYPE_KIND_ARRAY
+    movq TYPE_KIND_ARRAY(%rip), %rax  # Load global variable
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    movq TYPEDEFINITION_KIND_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31307,7 +31307,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq -200(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_ARRAY_ELEMENT_TYPE_OFFSET
+    movq TYPEDEFINITION_DATA_ARRAY_ELEMENT_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31317,7 +31317,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -192(%rbp), %rax
     pushq %rax
-    movq $28, %rax  # Load compile-time constant TYPEDEFINITION_DATA_ARRAY_LENGTH_OFFSET
+    movq TYPEDEFINITION_DATA_ARRAY_LENGTH_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31327,7 +31327,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq $8, %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_ARRAY_ELEMENT_SIZE_OFFSET
+    movq TYPEDEFINITION_DATA_ARRAY_ELEMENT_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31343,7 +31343,7 @@ parser_parse_type_definition:
     movq %rax, -208(%rbp)
     movq -208(%rbp), %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
+    movq TYPEDEFINITION_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31397,9 +31397,9 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $2, %rax  # Load compile-time constant TYPE_KIND_FUNCTION
+    movq TYPE_KIND_FUNCTION(%rip), %rax  # Load global variable
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    movq TYPEDEFINITION_KIND_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31409,7 +31409,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_PARAM_TYPES_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_PARAM_TYPES_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31419,7 +31419,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31429,7 +31429,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31439,7 +31439,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $8, %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
+    movq TYPEDEFINITION_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31447,7 +31447,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31458,7 +31458,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31514,7 +31514,7 @@ parser_parse_type_definition:
     jmp .L7502
 .L7501:
 .L7502:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31525,7 +31525,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31558,7 +31558,7 @@ parser_parse_type_definition:
     movq %rax, -224(%rbp)
     movq -224(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_PARAM_TYPES_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_PARAM_TYPES_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31603,7 +31603,7 @@ parser_parse_type_definition:
     jmp .L7532
 .L7531:
 .L7532:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31614,7 +31614,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31625,7 +31625,7 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31648,7 +31648,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31688,7 +31688,7 @@ parser_parse_type_definition:
     movq %rax, -256(%rbp)
     movq -256(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_PARAM_TYPES_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_PARAM_TYPES_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31726,7 +31726,7 @@ parser_parse_type_definition:
     movq %rax, -272(%rbp)
     movq -272(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_PARAM_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31734,7 +31734,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31745,7 +31745,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31811,7 +31811,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -31822,7 +31822,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31849,7 +31849,7 @@ parser_parse_type_definition:
     movq %rax, -280(%rbp)
     movq -280(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31886,7 +31886,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -280(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31923,7 +31923,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -280(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31950,7 +31950,7 @@ parser_parse_type_definition:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7601
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -31971,7 +31971,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -280(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET
+    movq TYPEDEFINITION_DATA_FUNCTION_RETURN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -31992,7 +31992,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32029,9 +32029,9 @@ parser_parse_type_definition:
     call parser_eat
     jmp .L7482
 .L7481:
-    movq $1, %rax  # Load compile-time constant TYPE_KIND_VARIANT
+    movq TYPE_KIND_VARIANT(%rip), %rax  # Load global variable
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEDEFINITION_KIND_OFFSET
+    movq TYPEDEFINITION_KIND_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32041,7 +32041,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32051,7 +32051,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32059,7 +32059,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32070,7 +32070,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32097,7 +32097,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32108,7 +32108,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32119,7 +32119,7 @@ parser_parse_type_definition:
     leaq -32(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32157,7 +32157,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32183,7 +32183,7 @@ parser_parse_type_definition:
     jmp .L7622
 .L7621:
 .L7622:
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32196,7 +32196,7 @@ parser_parse_type_definition:
     movq %rax, -304(%rbp)
     movq -304(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32204,7 +32204,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32214,7 +32214,7 @@ parser_parse_type_definition:
     movq %rax, -312(%rbp)
     movq -304(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq VARIANT_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -320(%rbp)
@@ -32228,7 +32228,7 @@ parser_parse_type_definition:
     movq %rax, -328(%rbp)
     movq -328(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -32241,7 +32241,7 @@ parser_parse_type_definition:
     movq %rax, -336(%rbp)
     movq -336(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq VARIANT_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -344(%rbp)
@@ -32258,7 +32258,7 @@ parser_parse_type_definition:
     movq %rax, -368(%rbp)
     movq -368(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant VARIANT_NAME_OFFSET
+    movq VARIANT_NAME_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32268,7 +32268,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant VARIANT_FIELDS_OFFSET
+    movq VARIANT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32278,7 +32278,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
+    movq VARIANT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32288,7 +32288,7 @@ parser_parse_type_definition:
     call memory_set_int32@PLT
     movq -360(%rbp), %rax
     pushq %rax
-    movq $20, %rax  # Load compile-time constant VARIANT_TAG_OFFSET
+    movq VARIANT_TAG_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32303,7 +32303,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32314,7 +32314,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32360,7 +32360,7 @@ parser_parse_type_definition:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7652
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32371,7 +32371,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32395,7 +32395,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32418,7 +32418,7 @@ parser_parse_type_definition:
     jmp .L7662
 .L7661:
 .L7662:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32451,7 +32451,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32462,7 +32462,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32513,7 +32513,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32545,7 +32545,7 @@ parser_parse_type_definition:
     jmp .L7672
 .L7671:
 .L7672:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32571,7 +32571,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
+    movq VARIANT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32584,7 +32584,7 @@ parser_parse_type_definition:
     movq %rax, -384(%rbp)
     movq -384(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
+    movq VARIANT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32592,7 +32592,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $8, %rax  # Load compile-time constant VARIANT_FIELDS_OFFSET
+    movq VARIANT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32602,7 +32602,7 @@ parser_parse_type_definition:
     movq %rax, -392(%rbp)
     movq -384(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -400(%rbp)
@@ -32616,7 +32616,7 @@ parser_parse_type_definition:
     movq %rax, -408(%rbp)
     movq -408(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant VARIANT_FIELDS_OFFSET
+    movq VARIANT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -32629,7 +32629,7 @@ parser_parse_type_definition:
     movq %rax, -416(%rbp)
     movq -416(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     movq %rax, -424(%rbp)
@@ -32641,7 +32641,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -88(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TYPEFIELD_NAME_OFFSET
+    movq TYPEFIELD_NAME_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -32651,7 +32651,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -96(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEFIELD_TYPE_OFFSET
+    movq TYPEFIELD_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -32661,7 +32661,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -160(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEFIELD_OFFSET_OFFSET
+    movq TYPEFIELD_OFFSET_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -32669,7 +32669,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32693,7 +32693,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -184(%rbp), %rax
     pushq %rax
-    movq $20, %rax  # Load compile-time constant TYPEFIELD_SIZE_OFFSET
+    movq TYPEFIELD_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -32707,7 +32707,7 @@ parser_parse_type_definition:
     leaq -160(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32718,7 +32718,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32755,7 +32755,7 @@ parser_parse_type_definition:
 .L7712:
     jmp .L7651
 .L7652:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32766,7 +32766,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32815,7 +32815,7 @@ parser_parse_type_definition:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7732
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32826,7 +32826,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32850,7 +32850,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32873,7 +32873,7 @@ parser_parse_type_definition:
     jmp .L7742
 .L7741:
 .L7742:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32906,7 +32906,7 @@ parser_parse_type_definition:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -32917,7 +32917,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -32968,7 +32968,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -33000,7 +33000,7 @@ parser_parse_type_definition:
     jmp .L7752
 .L7751:
 .L7752:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -33095,7 +33095,7 @@ parser_parse_type_definition:
     jmp .L7822
 .L7821:
 .L7822:
-    movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
+    movq VARIANT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -33114,7 +33114,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -384(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
+    movq VARIANT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -33122,7 +33122,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $8, %rax  # Load compile-time constant VARIANT_FIELDS_OFFSET
+    movq VARIANT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -33135,7 +33135,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -384(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
@@ -33155,7 +33155,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -408(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant VARIANT_FIELDS_OFFSET
+    movq VARIANT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -33171,7 +33171,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -416(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
@@ -33186,7 +33186,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -88(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TYPEFIELD_NAME_OFFSET
+    movq TYPEFIELD_NAME_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -33196,7 +33196,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -96(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant TYPEFIELD_TYPE_OFFSET
+    movq TYPEFIELD_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -33206,7 +33206,7 @@ parser_parse_type_definition:
     call memory_set_pointer@PLT
     movq -160(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TYPEFIELD_OFFSET_OFFSET
+    movq TYPEFIELD_OFFSET_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -33214,7 +33214,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33238,7 +33238,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq -184(%rbp), %rax
     pushq %rax
-    movq $20, %rax  # Load compile-time constant TYPEFIELD_SIZE_OFFSET
+    movq TYPEFIELD_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -33252,7 +33252,7 @@ parser_parse_type_definition:
     leaq -160(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33263,7 +33263,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -33303,7 +33303,7 @@ parser_parse_type_definition:
     jmp .L7722
 .L7721:
 .L7722:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33314,7 +33314,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -33329,7 +33329,7 @@ parser_parse_type_definition:
 .L7612:
     movq $8, %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
+    movq TYPEDEFINITION_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33337,7 +33337,7 @@ parser_parse_type_definition:
     popq %rsi
     popq %rdx
     call memory_set_int32@PLT
-    movq $24, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANT_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33348,7 +33348,7 @@ parser_parse_type_definition:
     leaq -296(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET
+    movq TYPEDEFINITION_DATA_VARIANT_VARIANTS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33372,7 +33372,7 @@ parser_parse_type_definition:
     jz .L7842
     movq -432(%rbp), %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant VARIANT_SIZE
+    movq VARIANT_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
@@ -33387,7 +33387,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     movq $8, %rax
     movq %rax, -440(%rbp)
-    movq $16, %rax  # Load compile-time constant VARIANT_FIELD_COUNT_OFFSET
+    movq VARIANT_FIELD_COUNT_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -33398,7 +33398,7 @@ parser_parse_type_definition:
     leaq -376(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant VARIANT_FIELDS_OFFSET
+    movq VARIANT_FIELDS_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -352(%rbp), %rax
     pushq %rax
@@ -33422,7 +33422,7 @@ parser_parse_type_definition:
     jz .L7852
     movq -448(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant TYPEFIELD_SIZE
+    movq TYPEFIELD_SIZE(%rip), %rax  # Load global variable
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
@@ -33435,7 +33435,7 @@ parser_parse_type_definition:
     leaq -168(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $20, %rax  # Load compile-time constant TYPEFIELD_SIZE_OFFSET
+    movq TYPEFIELD_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
@@ -33460,7 +33460,7 @@ parser_parse_type_definition:
     movq %rax, (%rbx)
     jmp .L7851
 .L7852:
-    movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
+    movq TYPEDEFINITION_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33479,7 +33479,7 @@ parser_parse_type_definition:
     jz .L7861
     movq -440(%rbp), %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant TYPEDEFINITION_SIZE_OFFSET
+    movq TYPEDEFINITION_SIZE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33520,7 +33520,7 @@ parser_parse_type_definition:
     pushq %rax
     popq %rdi
     call print_string
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33531,7 +33531,7 @@ parser_parse_type_definition:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -33574,7 +33574,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33582,7 +33582,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -16(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33619,7 +33619,7 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33639,7 +33639,7 @@ parser_parse_function:
     jmp .L7872
 .L7871:
 .L7872:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33692,7 +33692,7 @@ parser_parse_function:
     popq %rsi
     call function_create
     movq %rax, -64(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33703,7 +33703,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33730,7 +33730,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33741,7 +33741,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33771,7 +33771,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33782,7 +33782,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33793,7 +33793,7 @@ parser_parse_function:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33854,7 +33854,7 @@ parser_parse_function:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7931
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33865,7 +33865,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33894,7 +33894,7 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33917,7 +33917,7 @@ parser_parse_function:
     jmp .L7942
 .L7941:
 .L7942:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33947,7 +33947,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -33958,7 +33958,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -33969,7 +33969,7 @@ parser_parse_function:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34017,7 +34017,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34028,7 +34028,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34066,7 +34066,7 @@ parser_parse_function:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L7972
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34077,7 +34077,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34146,7 +34146,7 @@ parser_parse_function:
     popq %rsi
     popq %rdx
     call function_add_parameter
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34154,7 +34154,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -120(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -120(%rbp), %rax
     pushq %rax
@@ -34214,7 +34214,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34222,7 +34222,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -144(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -144(%rbp), %rax
     pushq %rax
@@ -34248,7 +34248,7 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -144(%rbp), %rax
     pushq %rax
@@ -34268,7 +34268,7 @@ parser_parse_function:
     jmp .L8032
 .L8031:
 .L8032:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -144(%rbp), %rax
     pushq %rax
@@ -34298,7 +34298,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34306,7 +34306,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -184(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -184(%rbp), %rax
     pushq %rax
@@ -34314,7 +34314,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -192(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -184(%rbp), %rax
     pushq %rax
@@ -34357,7 +34357,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34365,7 +34365,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -208(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -208(%rbp), %rax
     pushq %rax
@@ -34400,7 +34400,7 @@ parser_parse_function:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8062
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34411,7 +34411,7 @@ parser_parse_function:
     leaq -208(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -208(%rbp), %rax
     pushq %rax
@@ -34480,7 +34480,7 @@ parser_parse_function:
     popq %rsi
     popq %rdx
     call function_add_parameter
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34491,7 +34491,7 @@ parser_parse_function:
     leaq -120(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -120(%rbp), %rax
     pushq %rax
@@ -34549,7 +34549,7 @@ parser_parse_function:
     jmp .L7902
 .L7901:
 .L7902:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34560,7 +34560,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34611,7 +34611,7 @@ parser_parse_function:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8121
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34622,7 +34622,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34633,7 +34633,7 @@ parser_parse_function:
     leaq -24(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34692,7 +34692,7 @@ parser_parse_function:
     popq %rsi
     popq %rdx
     call memory_set_pointer@PLT
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34703,7 +34703,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34741,7 +34741,7 @@ parser_parse_function:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8152
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34752,7 +34752,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34826,7 +34826,7 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -34856,7 +34856,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -34864,7 +34864,7 @@ parser_parse_function:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -264(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -264(%rbp), %rax
     pushq %rax
@@ -35493,7 +35493,7 @@ parser_parse_function:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8401
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -264(%rbp), %rax
     pushq %rax
@@ -35755,7 +35755,7 @@ parser_parse_function:
     pushq %rax
     popq %rdi
     call print_string
-    movq $16, %rax  # Load compile-time constant TOKEN_LINE_OFFSET
+    movq TOKEN_LINE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -264(%rbp), %rax
     pushq %rax
@@ -35794,7 +35794,7 @@ parser_parse_function:
     popq %rdi
     popq %rsi
     call function_add_statement
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -35805,7 +35805,7 @@ parser_parse_function:
     leaq -264(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -264(%rbp), %rax
     pushq %rax
@@ -35818,7 +35818,7 @@ parser_parse_function:
     movq %rax, (%rbx)
     jmp .L8191
 .L8192:
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -35829,7 +35829,7 @@ parser_parse_function:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -35891,14 +35891,14 @@ parser_create:
     subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
-    movq $32, %rax  # Load compile-time constant SIZEOF_PARSER
+    movq SIZEOF_PARSER(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -24(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant PARSER_LEXER
+    movq PARSER_LEXER(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -35908,7 +35908,7 @@ parser_create:
     call memory_set_pointer@PLT
     movq -16(%rbp), %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant PARSER_ARENA
+    movq PARSER_ARENA(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -35939,7 +35939,7 @@ parser_create:
 .L8492:
     movq -32(%rbp), %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN
+    movq PARSER_CURRENT_TOKEN(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -35968,7 +35968,7 @@ parser_destroy:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8501
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN
+    movq PARSER_CURRENT_TOKEN(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36011,12 +36011,12 @@ parser_parse_program:
     movq %rsp, %rbp
     subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
-    movq $64, %rax  # Load compile-time constant SIZEOF_PROGRAM
+    movq SIZEOF_PROGRAM(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
     movq %rax, -16(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36024,7 +36024,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -24(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -36055,7 +36055,7 @@ parser_parse_program:
 .L8522:
     movq $0, %rax
     pushq %rax
-    movq $32, %rax  # Load compile-time constant PROGRAM_IMPORTS
+    movq PROGRAM_IMPORTS(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36065,7 +36065,7 @@ parser_parse_program:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36075,7 +36075,7 @@ parser_parse_program:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant PROGRAM_FUNCTIONS
+    movq PROGRAM_FUNCTIONS(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36085,7 +36085,7 @@ parser_parse_program:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $48, %rax  # Load compile-time constant PROGRAM_GLOBAL_VARS
+    movq PROGRAM_GLOBAL_VARS(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36095,7 +36095,7 @@ parser_parse_program:
     call memory_set_pointer@PLT
     movq $0, %rax
     pushq %rax
-    movq $8, %rax  # Load compile-time constant PROGRAM_FUNCTION_COUNT
+    movq PROGRAM_FUNCTION_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36105,7 +36105,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36115,7 +36115,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $40, %rax  # Load compile-time constant PROGRAM_IMPORT_COUNT
+    movq PROGRAM_IMPORT_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36125,7 +36125,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $56, %rax  # Load compile-time constant PROGRAM_GLOBAL_COUNT
+    movq PROGRAM_GLOBAL_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36135,7 +36135,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $12, %rax  # Load compile-time constant PROGRAM_FUNCTION_CAPACITY
+    movq PROGRAM_FUNCTION_CAPACITY(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36145,7 +36145,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $28, %rax  # Load compile-time constant PROGRAM_TYPE_CAPACITY
+    movq PROGRAM_TYPE_CAPACITY(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36155,7 +36155,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $44, %rax  # Load compile-time constant PROGRAM_IMPORT_CAPACITY
+    movq PROGRAM_IMPORT_CAPACITY(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36165,7 +36165,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq $0, %rax
     pushq %rax
-    movq $60, %rax  # Load compile-time constant PROGRAM_GLOBAL_CAPACITY
+    movq PROGRAM_GLOBAL_CAPACITY(%rip), %rax  # Load global variable
     pushq %rax
     movq -16(%rbp), %rax
     pushq %rax
@@ -36175,7 +36175,7 @@ parser_parse_program:
     call memory_set_int32@PLT
     movq -16(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant PARSER_CURRENT_PROGRAM_OFFSET
+    movq PARSER_CURRENT_PROGRAM_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36194,7 +36194,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8532
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36222,7 +36222,7 @@ parser_parse_program:
     jmp .L8542
 .L8541:
 .L8542:
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -48(%rbp), %rax
     pushq %rax
@@ -36384,7 +36384,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8632
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36392,7 +36392,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -104(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
@@ -36400,7 +36400,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -112(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
@@ -36460,7 +36460,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8662
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36468,7 +36468,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -144(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -144(%rbp), %rax
     pushq %rax
@@ -36483,7 +36483,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36491,7 +36491,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -160(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -160(%rbp), %rax
     pushq %rax
@@ -36623,7 +36623,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36634,7 +36634,7 @@ parser_parse_program:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -48(%rbp), %rax
     pushq %rax
@@ -36692,7 +36692,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36703,7 +36703,7 @@ parser_parse_program:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -48(%rbp), %rax
     pushq %rax
@@ -36837,7 +36837,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36845,7 +36845,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -232(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -232(%rbp), %rax
     pushq %rax
@@ -36862,7 +36862,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8801
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -232(%rbp), %rax
     pushq %rax
@@ -36880,7 +36880,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36888,7 +36888,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -256(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -256(%rbp), %rax
     pushq %rax
@@ -36912,7 +36912,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -36920,7 +36920,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -272(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -272(%rbp), %rax
     pushq %rax
@@ -36937,7 +36937,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8821
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -272(%rbp), %rax
     pushq %rax
@@ -37054,7 +37054,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37062,7 +37062,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -328(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax
@@ -37084,7 +37084,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8851
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax
@@ -37109,7 +37109,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37117,7 +37117,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -360(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -360(%rbp), %rax
     pushq %rax
@@ -37125,7 +37125,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -368(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -360(%rbp), %rax
     pushq %rax
@@ -37150,7 +37150,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37158,7 +37158,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -384(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -384(%rbp), %rax
     pushq %rax
@@ -37177,7 +37177,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8861
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -384(%rbp), %rax
     pushq %rax
@@ -37216,7 +37216,7 @@ parser_parse_program:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8871
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -384(%rbp), %rax
     pushq %rax
@@ -37260,7 +37260,7 @@ parser_parse_program:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37268,7 +37268,7 @@ parser_parse_program:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -432(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -432(%rbp), %rax
     pushq %rax
@@ -37542,7 +37542,7 @@ expression_destroy:
     jmp .L8972
 .L8971:
 .L8972:
-    movq $0, %rax  # Load compile-time constant EXPR_TYPE
+    movq EXPR_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37552,14 +37552,14 @@ expression_destroy:
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
     pushq %rax
-    movq $2, %rax  # Load compile-time constant EXPR_BINARY
+    movq EXPR_BINARY(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8981
-    movq $8, %rax  # Load compile-time constant EXPR_BINARY_LEFT
+    movq EXPR_BINARY_LEFT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37567,7 +37567,7 @@ expression_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -24(%rbp)
-    movq $16, %rax  # Load compile-time constant EXPR_BINARY_RIGHT
+    movq EXPR_BINARY_RIGHT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37587,14 +37587,14 @@ expression_destroy:
 .L8981:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $11, %rax  # Load compile-time constant EXPR_UNARY
+    movq EXPR_UNARY(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L8991
-    movq $8, %rax  # Load compile-time constant EXPR_UNARY_OPERAND
+    movq EXPR_UNARY_OPERAND(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37610,14 +37610,14 @@ expression_destroy:
 .L8991:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $4, %rax  # Load compile-time constant EXPR_CALL
+    movq EXPR_CALL(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9001
-    movq $8, %rax  # Load compile-time constant EXPR_CALL_NAME
+    movq EXPR_CALL_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37633,14 +37633,14 @@ expression_destroy:
 .L9001:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $6, %rax  # Load compile-time constant EXPR_FIELD_ACCESS
+    movq EXPR_FIELD_ACCESS(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9011
-    movq $8, %rax  # Load compile-time constant EXPR_FIELD_OBJECT
+    movq EXPR_FIELD_OBJECT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37648,7 +37648,7 @@ expression_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -56(%rbp)
-    movq $16, %rax  # Load compile-time constant EXPR_FIELD_NAME
+    movq EXPR_FIELD_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37668,14 +37668,14 @@ expression_destroy:
 .L9011:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant EXPR_ARRAY_ACCESS
+    movq EXPR_ARRAY_ACCESS(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9021
-    movq $8, %rax  # Load compile-time constant EXPR_ARRAY_OBJECT
+    movq EXPR_ARRAY_OBJECT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37683,7 +37683,7 @@ expression_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -72(%rbp)
-    movq $16, %rax  # Load compile-time constant EXPR_ARRAY_INDEX_OFFSET
+    movq EXPR_ARRAY_INDEX_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37703,14 +37703,14 @@ expression_destroy:
 .L9021:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant EXPR_IDENTIFIER
+    movq EXPR_IDENTIFIER(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9031
-    movq $8, %rax  # Load compile-time constant EXPR_IDENTIFIER_NAME
+    movq EXPR_IDENTIFIER_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37726,14 +37726,14 @@ expression_destroy:
 .L9031:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $5, %rax  # Load compile-time constant EXPR_STRING_LITERAL
+    movq EXPR_STRING_LITERAL(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9041
-    movq $8, %rax  # Load compile-time constant EXPR_STRING_VALUE
+    movq EXPR_STRING_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37786,7 +37786,7 @@ statement_destroy:
     jmp .L9052
 .L9051:
 .L9052:
-    movq $0, %rax  # Load compile-time constant STMT_TYPE
+    movq STMT_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37796,14 +37796,14 @@ statement_destroy:
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant STMT_LET
+    movq STMT_LET(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9061
-    movq $8, %rax  # Load compile-time constant STMT_LET_NAME
+    movq STMT_LET_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37811,7 +37811,7 @@ statement_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -24(%rbp)
-    movq $16, %rax  # Load compile-time constant STMT_LET_VALUE
+    movq STMT_LET_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37819,7 +37819,7 @@ statement_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -32(%rbp)
-    movq $24, %rax  # Load compile-time constant STMT_LET_TYPE
+    movq STMT_LET_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37843,14 +37843,14 @@ statement_destroy:
 .L9061:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $2, %rax  # Load compile-time constant STMT_SET
+    movq STMT_SET(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9071
-    movq $8, %rax  # Load compile-time constant STMT_SET_NAME
+    movq STMT_SET_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37858,7 +37858,7 @@ statement_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -48(%rbp)
-    movq $16, %rax  # Load compile-time constant STMT_SET_VALUE
+    movq STMT_SET_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37878,14 +37878,14 @@ statement_destroy:
 .L9071:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $5, %rax  # Load compile-time constant STMT_IF
+    movq STMT_IF(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9081
-    movq $8, %rax  # Load compile-time constant STMT_IF_CONDITION
+    movq STMT_IF_CONDITION(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37901,14 +37901,14 @@ statement_destroy:
 .L9081:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $6, %rax  # Load compile-time constant STMT_WHILE
+    movq STMT_WHILE(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9091
-    movq $8, %rax  # Load compile-time constant STMT_WHILE_CONDITION
+    movq STMT_WHILE_CONDITION(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37924,14 +37924,14 @@ statement_destroy:
 .L9091:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $11, %rax  # Load compile-time constant STMT_FOR
+    movq STMT_FOR(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9101
-    movq $8, %rax  # Load compile-time constant STMT_FOR_VAR
+    movq STMT_FOR_VAR(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37939,7 +37939,7 @@ statement_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -80(%rbp)
-    movq $16, %rax  # Load compile-time constant STMT_FOR_START
+    movq STMT_FOR_START(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37947,7 +37947,7 @@ statement_destroy:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -88(%rbp)
-    movq $24, %rax  # Load compile-time constant STMT_FOR_END
+    movq STMT_FOR_END(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -37971,7 +37971,7 @@ statement_destroy:
 .L9101:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $12, %rax  # Load compile-time constant STMT_FOR_EACH
+    movq STMT_FOR_EACH(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -38006,14 +38006,14 @@ statement_destroy:
 .L9111:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $3, %rax  # Load compile-time constant STMT_RETURN
+    movq STMT_RETURN(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9121
-    movq $8, %rax  # Load compile-time constant STMT_RETURN_VALUE
+    movq STMT_RETURN_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38029,14 +38029,14 @@ statement_destroy:
 .L9121:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $7, %rax  # Load compile-time constant STMT_EXPRESSION
+    movq STMT_EXPRESSION(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9131
-    movq $8, %rax  # Load compile-time constant STMT_EXPR_VALUE
+    movq STMT_EXPR_VALUE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38052,7 +38052,7 @@ statement_destroy:
 .L9131:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $9, %rax  # Load compile-time constant STMT_BREAK
+    movq STMT_BREAK(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -38063,7 +38063,7 @@ statement_destroy:
 .L9141:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $10, %rax  # Load compile-time constant STMT_CONTINUE
+    movq STMT_CONTINUE(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -38114,7 +38114,7 @@ function_destroy:
     jmp .L9162
 .L9161:
 .L9162:
-    movq $0, %rax  # Load compile-time constant FUNCTION_NAME
+    movq FUNCTION_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38161,7 +38161,7 @@ type_destroy:
     jmp .L9172
 .L9171:
 .L9172:
-    movq $0, %rax  # Load compile-time constant TYPE_KIND
+    movq TYPE_KIND(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38171,7 +38171,7 @@ type_destroy:
     movq %rax, -16(%rbp)
     movq -16(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TYPE_PRIMITIVE
+    movq TYPE_PRIMITIVE(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -38182,14 +38182,14 @@ type_destroy:
 .L9181:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $1, %rax  # Load compile-time constant TYPE_STRUCT
+    movq TYPE_STRUCT(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9191
-    movq $8, %rax  # Load compile-time constant TYPE_STRUCT_NAME
+    movq TYPE_STRUCT_NAME(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38205,14 +38205,14 @@ type_destroy:
 .L9191:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $2, %rax  # Load compile-time constant TYPE_ARRAY
+    movq TYPE_ARRAY(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9201
-    movq $8, %rax  # Load compile-time constant TYPE_ARRAY_ELEMENT_TYPE
+    movq TYPE_ARRAY_ELEMENT_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38228,14 +38228,14 @@ type_destroy:
 .L9201:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $3, %rax  # Load compile-time constant TYPE_POINTER
+    movq TYPE_POINTER(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9211
-    movq $8, %rax  # Load compile-time constant TYPE_POINTER_TARGET_TYPE
+    movq TYPE_POINTER_TARGET_TYPE(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38285,7 +38285,7 @@ program_destroy:
     jmp .L9222
 .L9221:
 .L9222:
-    movq $8, %rax  # Load compile-time constant PROGRAM_FUNCTION_COUNT
+    movq PROGRAM_FUNCTION_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38293,7 +38293,7 @@ program_destroy:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -16(%rbp)
-    movq $0, %rax  # Load compile-time constant PROGRAM_FUNCTIONS
+    movq PROGRAM_FUNCTIONS(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38367,7 +38367,7 @@ program_destroy:
     jmp .L9232
 .L9231:
 .L9232:
-    movq $24, %rax  # Load compile-time constant PROGRAM_TYPE_COUNT
+    movq PROGRAM_TYPE_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38375,7 +38375,7 @@ program_destroy:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -72(%rbp)
-    movq $16, %rax  # Load compile-time constant PROGRAM_TYPES
+    movq PROGRAM_TYPES(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38455,7 +38455,7 @@ program_destroy:
     jmp .L9262
 .L9261:
 .L9262:
-    movq $40, %rax  # Load compile-time constant PROGRAM_IMPORT_COUNT
+    movq PROGRAM_IMPORT_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38463,7 +38463,7 @@ program_destroy:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -112(%rbp)
-    movq $32, %rax  # Load compile-time constant PROGRAM_IMPORTS
+    movq PROGRAM_IMPORTS(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38483,7 +38483,7 @@ program_destroy:
     jmp .L9292
 .L9291:
 .L9292:
-    movq $56, %rax  # Load compile-time constant PROGRAM_GLOBAL_COUNT
+    movq PROGRAM_GLOBAL_COUNT(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38491,7 +38491,7 @@ program_destroy:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -128(%rbp)
-    movq $48, %rax  # Load compile-time constant PROGRAM_GLOBAL_VARS
+    movq PROGRAM_GLOBAL_VARS(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38780,7 +38780,7 @@ parser_parse_import:
     popq %rdi
     call parser_advance
     movq %rax, -16(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38788,7 +38788,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -24(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -38812,7 +38812,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38820,7 +38820,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -40(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -40(%rbp), %rax
     pushq %rax
@@ -38828,7 +38828,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -48(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -40(%rbp), %rax
     pushq %rax
@@ -38846,7 +38846,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38854,7 +38854,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -64(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -64(%rbp), %rax
     pushq %rax
@@ -38880,7 +38880,7 @@ parser_parse_import:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9382
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38888,7 +38888,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -88(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -88(%rbp), %rax
     pushq %rax
@@ -38903,7 +38903,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -38911,7 +38911,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -104(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
@@ -38980,7 +38980,7 @@ parser_parse_import:
     jmp .L9372
 .L9371:
 .L9372:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -39050,7 +39050,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39058,7 +39058,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -160(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -160(%rbp), %rax
     pushq %rax
@@ -39110,7 +39110,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39118,7 +39118,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -184(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -184(%rbp), %rax
     pushq %rax
@@ -39133,7 +39133,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39144,7 +39144,7 @@ parser_parse_import:
     leaq -160(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -160(%rbp), %rax
     pushq %rax
@@ -39193,7 +39193,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39201,7 +39201,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -200(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -200(%rbp), %rax
     pushq %rax
@@ -39209,7 +39209,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -208(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -200(%rbp), %rax
     pushq %rax
@@ -39227,7 +39227,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39235,7 +39235,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -224(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -224(%rbp), %rax
     pushq %rax
@@ -39264,7 +39264,7 @@ parser_parse_import:
     popq %rdi
     popq %rsi
     call parser_eat
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39272,7 +39272,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -248(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -248(%rbp), %rax
     pushq %rax
@@ -39280,7 +39280,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_int32@PLT
     movq %rax, -256(%rbp)
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -248(%rbp), %rax
     pushq %rax
@@ -39399,7 +39399,7 @@ parser_parse_import:
     jmp .L9492
 .L9491:
 .L9492:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
@@ -39415,7 +39415,7 @@ parser_parse_import:
     popq %rdi
     call parser_advance
     movq %rax, -288(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39423,7 +39423,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -296(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -296(%rbp), %rax
     pushq %rax
@@ -39447,7 +39447,7 @@ parser_parse_import:
     popq %rdi
     call parser_advance
     movq %rax, -320(%rbp)
-    movq $8, %rax  # Load compile-time constant PARSER_CURRENT_TOKEN_OFFSET
+    movq PARSER_CURRENT_TOKEN_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -8(%rbp), %rax
     pushq %rax
@@ -39455,7 +39455,7 @@ parser_parse_import:
     popq %rsi
     call memory_get_pointer@PLT
     movq %rax, -328(%rbp)
-    movq $0, %rax  # Load compile-time constant TOKEN_TYPE_OFFSET
+    movq TOKEN_TYPE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax
@@ -39477,7 +39477,7 @@ parser_parse_import:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9511
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax
@@ -39507,7 +39507,7 @@ parser_parse_import:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L9521
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax
@@ -39528,7 +39528,7 @@ parser_parse_import:
     movq %rax, -360(%rbp)
     jmp .L9522
 .L9521:
-    movq $8, %rax  # Load compile-time constant TOKEN_VALUE_OFFSET
+    movq TOKEN_VALUE_OFFSET(%rip), %rax  # Load global variable
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax

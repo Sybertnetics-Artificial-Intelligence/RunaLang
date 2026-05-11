@@ -3375,7 +3375,7 @@ lexer_next_token:
     pushq %rax
     movq -72(%rbp), %rax
     pushq %rax
-    movq $10, %rax  # Load compile-time constant TOKEN_STRING_LITERAL
+    movq TOKEN_STRING_LITERAL(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3418,7 +3418,7 @@ lexer_next_token:
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
-    movq $129, %rax  # Load compile-time constant TOKEN_ERROR
+    movq TOKEN_ERROR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3597,7 +3597,7 @@ lexer_next_token:
     pushq %rax
     movq -192(%rbp), %rax
     pushq %rax
-    movq $11, %rax  # Load compile-time constant TOKEN_INTEGER
+    movq TOKEN_INTEGER(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3649,7 +3649,7 @@ lexer_next_token:
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
-    movq $11, %rax  # Load compile-time constant TOKEN_INTEGER
+    movq TOKEN_INTEGER(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3827,7 +3827,7 @@ lexer_next_token:
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
-    movq $129, %rax  # Load compile-time constant TOKEN_ERROR
+    movq TOKEN_ERROR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3878,7 +3878,7 @@ lexer_next_token:
     pushq %rax
     movq $0, %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant TOKEN_EOF
+    movq TOKEN_EOF(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -4221,14 +4221,14 @@ determine_token_type:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1111
-    movq $182, %rax  # Load compile-time constant TOKEN_JOINED
+    movq TOKEN_JOINED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1112
 .L1111:
 .L1112:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4625,7 +4625,7 @@ check_keywords_P:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1301
-    movq $1, %rax  # Load compile-time constant TOKEN_PROCESS
+    movq TOKEN_PROCESS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4646,7 +4646,7 @@ check_keywords_P:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1311
-    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
+    movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4667,7 +4667,7 @@ check_keywords_P:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1321
-    movq $173, %rax  # Load compile-time constant TOKEN_PRIVATE
+    movq TOKEN_PRIVATE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4676,7 +4676,7 @@ check_keywords_P:
 .L1322:
 .L1312:
 .L1302:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4703,7 +4703,7 @@ check_keywords_c:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1331
-    movq $2, %rax  # Load compile-time constant TOKEN_CALLED
+    movq TOKEN_CALLED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4724,7 +4724,7 @@ check_keywords_c:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1341
-    movq $156, %rax  # Load compile-time constant TOKEN_CONTAINING
+    movq TOKEN_CONTAINING(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4745,7 +4745,7 @@ check_keywords_c:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1351
-    movq $179, %rax  # Load compile-time constant TOKEN_CONTAINS
+    movq TOKEN_CONTAINS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4754,7 +4754,7 @@ check_keywords_c:
 .L1352:
 .L1342:
 .L1332:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4781,7 +4781,7 @@ check_keywords_r:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1361
-    movq $3, %rax  # Load compile-time constant TOKEN_RETURNS
+    movq TOKEN_RETURNS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4802,7 +4802,7 @@ check_keywords_r:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1371
-    movq $178, %rax  # Load compile-time constant TOKEN_RIGHT
+    movq TOKEN_RIGHT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4810,7 +4810,7 @@ check_keywords_r:
 .L1371:
 .L1372:
 .L1362:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4837,7 +4837,7 @@ check_keywords_I:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1381
-    movq $4, %rax  # Load compile-time constant TOKEN_INTEGER_TYPE
+    movq TOKEN_INTEGER_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4858,7 +4858,7 @@ check_keywords_I:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1391
-    movq $18, %rax  # Load compile-time constant TOKEN_IF
+    movq TOKEN_IF(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4879,7 +4879,7 @@ check_keywords_I:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1401
-    movq $139, %rax  # Load compile-time constant TOKEN_INCREASE
+    movq TOKEN_INCREASE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4900,7 +4900,7 @@ check_keywords_I:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1411
-    movq $121, %rax  # Load compile-time constant TOKEN_INLINE
+    movq TOKEN_INLINE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4921,7 +4921,7 @@ check_keywords_I:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1421
-    movq $56, %rax  # Load compile-time constant TOKEN_IMPORT
+    movq TOKEN_IMPORT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4932,7 +4932,7 @@ check_keywords_I:
 .L1402:
 .L1392:
 .L1382:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4959,7 +4959,7 @@ check_keywords_A:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1431
-    movq $122, %rax  # Load compile-time constant TOKEN_ASSEMBLY
+    movq TOKEN_ASSEMBLY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4980,7 +4980,7 @@ check_keywords_A:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1441
-    movq $172, %rax  # Load compile-time constant TOKEN_ALERT
+    movq TOKEN_ALERT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4988,7 +4988,7 @@ check_keywords_A:
 .L1441:
 .L1442:
 .L1432:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5015,7 +5015,7 @@ check_keywords_S:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1451
-    movq $5, %rax  # Load compile-time constant TOKEN_STRING_TYPE
+    movq TOKEN_STRING_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5036,7 +5036,7 @@ check_keywords_S:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1461
-    movq $14, %rax  # Load compile-time constant TOKEN_SET
+    movq TOKEN_SET(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5044,7 +5044,7 @@ check_keywords_S:
 .L1461:
 .L1462:
 .L1452:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5071,7 +5071,7 @@ check_keywords_C:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1471
-    movq $6, %rax  # Load compile-time constant TOKEN_CHARACTER_TYPE
+    movq TOKEN_CHARACTER_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5092,7 +5092,7 @@ check_keywords_C:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1481
-    movq $45, %rax  # Load compile-time constant TOKEN_CONTINUE
+    movq TOKEN_CONTINUE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5113,7 +5113,7 @@ check_keywords_C:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1491
-    movq $164, %rax  # Load compile-time constant TOKEN_CONSTANT
+    movq TOKEN_CONSTANT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5134,7 +5134,7 @@ check_keywords_C:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1501
-    movq $183, %rax  # Load compile-time constant TOKEN_CALL
+    movq TOKEN_CALL(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5144,7 +5144,7 @@ check_keywords_C:
 .L1492:
 .L1482:
 .L1472:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5171,14 +5171,14 @@ check_keywords_R:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1511
-    movq $7, %rax  # Load compile-time constant TOKEN_RETURN
+    movq TOKEN_RETURN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1512
 .L1511:
 .L1512:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5205,7 +5205,7 @@ check_keywords_E:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1521
-    movq $8, %rax  # Load compile-time constant TOKEN_END
+    movq TOKEN_END(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5226,7 +5226,7 @@ check_keywords_E:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1531
-    movq $163, %rax  # Load compile-time constant TOKEN_EXPORT
+    movq TOKEN_EXPORT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5247,7 +5247,7 @@ check_keywords_E:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1541
-    movq $145, %rax  # Load compile-time constant TOKEN_EACH
+    movq TOKEN_EACH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5256,7 +5256,7 @@ check_keywords_E:
 .L1542:
 .L1532:
 .L1522:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5283,7 +5283,7 @@ check_keywords_L:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1551
-    movq $12, %rax  # Load compile-time constant TOKEN_LET
+    movq TOKEN_LET(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5304,7 +5304,7 @@ check_keywords_L:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1561
-    movq $180, %rax  # Load compile-time constant TOKEN_LOOP
+    movq TOKEN_LOOP(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5312,7 +5312,7 @@ check_keywords_L:
 .L1561:
 .L1562:
 .L1552:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5339,7 +5339,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1571
-    movq $13, %rax  # Load compile-time constant TOKEN_BE
+    movq TOKEN_BE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5360,7 +5360,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1581
-    movq $38, %rax  # Load compile-time constant TOKEN_BY
+    movq TOKEN_BY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5381,7 +5381,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1591
-    movq $39, %rax  # Load compile-time constant TOKEN_BIT_AND
+    movq TOKEN_BIT_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5402,7 +5402,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1601
-    movq $40, %rax  # Load compile-time constant TOKEN_BIT_OR
+    movq TOKEN_BIT_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5423,7 +5423,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1611
-    movq $41, %rax  # Load compile-time constant TOKEN_BIT_XOR
+    movq TOKEN_BIT_XOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5444,7 +5444,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1621
-    movq $42, %rax  # Load compile-time constant TOKEN_BIT_SHIFT_LEFT
+    movq TOKEN_BIT_SHIFT_LEFT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5465,7 +5465,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1631
-    movq $43, %rax  # Load compile-time constant TOKEN_BIT_SHIFT_RIGHT
+    movq TOKEN_BIT_SHIFT_RIGHT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5486,7 +5486,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1641
-    movq $175, %rax  # Load compile-time constant TOKEN_BITWISE
+    movq TOKEN_BITWISE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5507,7 +5507,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1651
-    movq $39, %rax  # Load compile-time constant TOKEN_BIT_AND
+    movq TOKEN_BIT_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5528,7 +5528,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1661
-    movq $40, %rax  # Load compile-time constant TOKEN_BIT_OR
+    movq TOKEN_BIT_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5549,7 +5549,7 @@ check_keywords_b:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1671
-    movq $41, %rax  # Load compile-time constant TOKEN_BIT_XOR
+    movq TOKEN_BIT_XOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5566,7 +5566,7 @@ check_keywords_b:
 .L1592:
 .L1582:
 .L1572:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5593,14 +5593,14 @@ check_keywords_s:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1681
-    movq $176, %rax  # Load compile-time constant TOKEN_SHIFTED
+    movq TOKEN_SHIFTED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1682
 .L1681:
 .L1682:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5627,7 +5627,7 @@ check_keywords_t:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1691
-    movq $15, %rax  # Load compile-time constant TOKEN_TO
+    movq TOKEN_TO(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5648,7 +5648,7 @@ check_keywords_t:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1701
-    movq $33, %rax  # Load compile-time constant TOKEN_TAKES
+    movq TOKEN_TAKES(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5669,7 +5669,7 @@ check_keywords_t:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1711
-    movq $28, %rax  # Load compile-time constant TOKEN_THAN
+    movq TOKEN_THAN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5690,7 +5690,7 @@ check_keywords_t:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1721
-    movq $32, %rax  # Load compile-time constant TOKEN_THAT
+    movq TOKEN_THAT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5711,7 +5711,7 @@ check_keywords_t:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1731
-    movq $134, %rax  # Load compile-time constant TOKEN_TRUE
+    movq TOKEN_TRUE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5732,7 +5732,7 @@ check_keywords_t:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1741
-    movq $158, %rax  # Load compile-time constant TOKEN_THE
+    movq TOKEN_THE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5744,7 +5744,7 @@ check_keywords_t:
 .L1712:
 .L1702:
 .L1692:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5771,7 +5771,7 @@ check_keywords_p:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1751
-    movq $16, %rax  # Load compile-time constant TOKEN_PLUS
+    movq TOKEN_PLUS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5792,7 +5792,7 @@ check_keywords_p:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1761
-    movq $171, %rax  # Load compile-time constant TOKEN_PROC
+    movq TOKEN_PROC(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5800,7 +5800,7 @@ check_keywords_p:
 .L1761:
 .L1762:
 .L1752:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5827,7 +5827,7 @@ check_keywords_m:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1771
-    movq $17, %rax  # Load compile-time constant TOKEN_MINUS
+    movq TOKEN_MINUS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5848,7 +5848,7 @@ check_keywords_m:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1781
-    movq $35, %rax  # Load compile-time constant TOKEN_MULTIPLIED
+    movq TOKEN_MULTIPLIED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5869,7 +5869,7 @@ check_keywords_m:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1791
-    movq $37, %rax  # Load compile-time constant TOKEN_MODULO
+    movq TOKEN_MODULO(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5878,7 +5878,7 @@ check_keywords_m:
 .L1792:
 .L1782:
 .L1772:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5905,7 +5905,7 @@ check_keywords_i:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1801
-    movq $21, %rax  # Load compile-time constant TOKEN_IS
+    movq TOKEN_IS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5926,7 +5926,7 @@ check_keywords_i:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1811
-    movq $152, %rax  # Load compile-time constant TOKEN_IN
+    movq TOKEN_IN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5947,7 +5947,7 @@ check_keywords_i:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1821
-    movq $149, %rax  # Load compile-time constant TOKEN_INDEX
+    movq TOKEN_INDEX(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5968,7 +5968,7 @@ check_keywords_i:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1831
-    movq $137, %rax  # Load compile-time constant TOKEN_INCREASED
+    movq TOKEN_INCREASED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -5978,7 +5978,7 @@ check_keywords_i:
 .L1822:
 .L1812:
 .L1802:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6005,7 +6005,7 @@ check_keywords_e:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1841
-    movq $22, %rax  # Load compile-time constant TOKEN_EQUAL
+    movq TOKEN_EQUAL(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6026,7 +6026,7 @@ check_keywords_e:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1851
-    movq $145, %rax  # Load compile-time constant TOKEN_EACH
+    movq TOKEN_EACH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6034,7 +6034,7 @@ check_keywords_e:
 .L1851:
 .L1852:
 .L1842:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6061,7 +6061,7 @@ check_keywords_l:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1861
-    movq $24, %rax  # Load compile-time constant TOKEN_LESS
+    movq TOKEN_LESS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6082,7 +6082,7 @@ check_keywords_l:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1871
-    movq $151, %rax  # Load compile-time constant TOKEN_LENGTH
+    movq TOKEN_LENGTH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6103,7 +6103,7 @@ check_keywords_l:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1881
-    movq $162, %rax  # Load compile-time constant TOKEN_LAMBDA
+    movq TOKEN_LAMBDA(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6124,7 +6124,7 @@ check_keywords_l:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1891
-    movq $177, %rax  # Load compile-time constant TOKEN_LEFT
+    movq TOKEN_LEFT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6145,7 +6145,7 @@ check_keywords_l:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1901
-    movq $159, %rax  # Load compile-time constant TOKEN_LIST
+    movq TOKEN_LIST(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6156,7 +6156,7 @@ check_keywords_l:
 .L1882:
 .L1872:
 .L1862:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6183,7 +6183,7 @@ check_keywords_g:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1911
-    movq $25, %rax  # Load compile-time constant TOKEN_GREATER
+    movq TOKEN_GREATER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6204,7 +6204,7 @@ check_keywords_g:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1921
-    movq $136, %rax  # Load compile-time constant TOKEN_GETS
+    movq TOKEN_GETS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6212,7 +6212,7 @@ check_keywords_g:
 .L1921:
 .L1922:
 .L1912:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6239,7 +6239,7 @@ check_keywords_n:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1931
-    movq $29, %rax  # Load compile-time constant TOKEN_NOT
+    movq TOKEN_NOT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6260,7 +6260,7 @@ check_keywords_n:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1941
-    movq $133, %rax  # Load compile-time constant TOKEN_NEGATIVE
+    movq TOKEN_NEGATIVE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6268,7 +6268,7 @@ check_keywords_n:
 .L1941:
 .L1942:
 .L1932:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6295,14 +6295,14 @@ check_keywords_N:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1951
-    movq $123, %rax  # Load compile-time constant TOKEN_NOTE
+    movq TOKEN_NOTE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1952
 .L1951:
 .L1952:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6329,7 +6329,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1961
-    movq $30, %rax  # Load compile-time constant TOKEN_AND
+    movq TOKEN_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6350,7 +6350,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1971
-    movq $34, %rax  # Load compile-time constant TOKEN_AS
+    movq TOKEN_AS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6371,7 +6371,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1981
-    movq $148, %rax  # Load compile-time constant TOKEN_AT
+    movq TOKEN_AT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6392,7 +6392,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L1991
-    movq $154, %rax  # Load compile-time constant TOKEN_AN
+    movq TOKEN_AN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6413,7 +6413,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2001
-    movq $126, %rax  # Load compile-time constant TOKEN_ARRAY
+    movq TOKEN_ARRAY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6434,7 +6434,7 @@ check_keywords_a:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2011
-    movq $155, %rax  # Load compile-time constant TOKEN_A
+    movq TOKEN_A(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6446,7 +6446,7 @@ check_keywords_a:
 .L1982:
 .L1972:
 .L1962:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6473,7 +6473,7 @@ check_keywords_o:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2021
-    movq $31, %rax  # Load compile-time constant TOKEN_OR
+    movq TOKEN_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6494,7 +6494,7 @@ check_keywords_o:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2031
-    movq $125, %rax  # Load compile-time constant TOKEN_OF
+    movq TOKEN_OF(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6502,7 +6502,7 @@ check_keywords_o:
 .L2031:
 .L2032:
 .L2022:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6529,14 +6529,14 @@ check_keywords_O:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2041
-    movq $19, %rax  # Load compile-time constant TOKEN_OTHERWISE
+    movq TOKEN_OTHERWISE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L2042
 .L2041:
 .L2042:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6563,7 +6563,7 @@ check_keywords_W:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2051
-    movq $20, %rax  # Load compile-time constant TOKEN_WHILE
+    movq TOKEN_WHILE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6584,7 +6584,7 @@ check_keywords_W:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2061
-    movq $113, %rax  # Load compile-time constant TOKEN_WHEN
+    movq TOKEN_WHEN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6592,7 +6592,7 @@ check_keywords_W:
 .L2061:
 .L2062:
 .L2052:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6619,14 +6619,14 @@ check_keywords_T:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2071
-    movq $50, %rax  # Load compile-time constant TOKEN_TYPE
+    movq TOKEN_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L2072
 .L2071:
 .L2072:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6653,14 +6653,14 @@ check_keywords_B:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2081
-    movq $44, %rax  # Load compile-time constant TOKEN_BREAK
+    movq TOKEN_BREAK(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L2082
 .L2081:
 .L2082:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6687,7 +6687,7 @@ check_keywords_f:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2091
-    movq $135, %rax  # Load compile-time constant TOKEN_FALSE
+    movq TOKEN_FALSE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6708,7 +6708,7 @@ check_keywords_f:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2101
-    movq $144, %rax  # Load compile-time constant TOKEN_FROM
+    movq TOKEN_FROM(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6729,7 +6729,7 @@ check_keywords_f:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2111
-    movq $181, %rax  # Load compile-time constant TOKEN_FOREVER
+    movq TOKEN_FOREVER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6738,7 +6738,7 @@ check_keywords_f:
 .L2112:
 .L2102:
 .L2092:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6765,7 +6765,7 @@ check_keywords_d:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2121
-    movq $36, %rax  # Load compile-time constant TOKEN_DIVIDED
+    movq TOKEN_DIVIDED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6786,7 +6786,7 @@ check_keywords_d:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2131
-    movq $138, %rax  # Load compile-time constant TOKEN_DECREASED
+    movq TOKEN_DECREASED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6794,7 +6794,7 @@ check_keywords_d:
 .L2131:
 .L2132:
 .L2122:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6821,7 +6821,7 @@ check_keywords_D:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2141
-    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
+    movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6842,7 +6842,7 @@ check_keywords_D:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2151
-    movq $140, %rax  # Load compile-time constant TOKEN_DECREASE
+    movq TOKEN_DECREASE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6863,7 +6863,7 @@ check_keywords_D:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2161
-    movq $142, %rax  # Load compile-time constant TOKEN_DIVIDE
+    movq TOKEN_DIVIDE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6872,7 +6872,7 @@ check_keywords_D:
 .L2162:
 .L2152:
 .L2142:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6899,7 +6899,7 @@ check_keywords_M:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2171
-    movq $141, %rax  # Load compile-time constant TOKEN_MULTIPLY
+    movq TOKEN_MULTIPLY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6920,7 +6920,7 @@ check_keywords_M:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2181
-    movq $112, %rax  # Load compile-time constant TOKEN_MATCH
+    movq TOKEN_MATCH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6928,7 +6928,7 @@ check_keywords_M:
 .L2181:
 .L2182:
 .L2172:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6955,14 +6955,14 @@ check_keywords_F:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2191
-    movq $143, %rax  # Load compile-time constant TOKEN_FOR
+    movq TOKEN_FOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L2192
 .L2191:
 .L2192:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -6989,7 +6989,7 @@ check_keywords_w:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2201
-    movq $153, %rax  # Load compile-time constant TOKEN_WHERE
+    movq TOKEN_WHERE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7010,7 +7010,7 @@ check_keywords_w:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2211
-    movq $114, %rax  # Load compile-time constant TOKEN_WITH
+    movq TOKEN_WITH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7018,7 +7018,7 @@ check_keywords_w:
 .L2211:
 .L2212:
 .L2202:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7045,14 +7045,14 @@ check_keywords_k:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2221
-    movq $150, %rax  # Load compile-time constant TOKEN_KEY
+    movq TOKEN_KEY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L2222
 .L2221:
 .L2222:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7083,7 +7083,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2231
-    movq $44, %rax  # Load compile-time constant TOKEN_BREAK
+    movq TOKEN_BREAK(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7112,7 +7112,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2241
-    movq $45, %rax  # Load compile-time constant TOKEN_CONTINUE
+    movq TOKEN_CONTINUE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7141,7 +7141,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2251
-    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
+    movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7170,7 +7170,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2261
-    movq $47, %rax  # Load compile-time constant TOKEN_PRINT
+    movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7199,7 +7199,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2271
-    movq $50, %rax  # Load compile-time constant TOKEN_TYPE
+    movq TOKEN_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7228,7 +7228,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2281
-    movq $56, %rax  # Load compile-time constant TOKEN_IMPORT
+    movq TOKEN_IMPORT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7257,7 +7257,7 @@ check_builtin_functions:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2291
-    movq $57, %rax  # Load compile-time constant TOKEN_STRING_LENGTH
+    movq TOKEN_STRING_LENGTH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7300,7 +7300,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2301
-    movq $54, %rax  # Load compile-time constant TOKEN_READ_FILE
+    movq TOKEN_READ_FILE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7329,7 +7329,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2311
-    movq $55, %rax  # Load compile-time constant TOKEN_WRITE_FILE
+    movq TOKEN_WRITE_FILE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7358,7 +7358,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2321
-    movq $130, %rax  # Load compile-time constant TOKEN_MEMORY_GET_BYTE
+    movq TOKEN_MEMORY_GET_BYTE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7387,7 +7387,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2331
-    movq $131, %rax  # Load compile-time constant TOKEN_MEMORY_SET_BYTE
+    movq TOKEN_MEMORY_SET_BYTE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7416,7 +7416,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2341
-    movq $42, %rax  # Load compile-time constant TOKEN_BIT_SHIFT_LEFT
+    movq TOKEN_BIT_SHIFT_LEFT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7445,7 +7445,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2351
-    movq $43, %rax  # Load compile-time constant TOKEN_BIT_SHIFT_RIGHT
+    movq TOKEN_BIT_SHIFT_RIGHT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7474,7 +7474,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2361
-    movq $39, %rax  # Load compile-time constant TOKEN_BIT_AND
+    movq TOKEN_BIT_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7503,7 +7503,7 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2371
-    movq $40, %rax  # Load compile-time constant TOKEN_BIT_OR
+    movq TOKEN_BIT_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7532,14 +7532,14 @@ check_more_builtins:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L2381
-    movq $41, %rax  # Load compile-time constant TOKEN_BIT_XOR
+    movq TOKEN_BIT_XOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L2382
 .L2381:
 .L2382:
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -7583,7 +7583,7 @@ check_single_char_token:
     pushq %rax
     movq -56(%rbp), %rax
     pushq %rax
-    movq $17, %rax  # Load compile-time constant TOKEN_MINUS
+    movq TOKEN_MINUS(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7622,7 +7622,7 @@ check_single_char_token:
     pushq %rax
     movq -72(%rbp), %rax
     pushq %rax
-    movq $9, %rax  # Load compile-time constant TOKEN_COLON
+    movq TOKEN_COLON(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7664,7 +7664,7 @@ check_single_char_token:
     pushq %rax
     movq -80(%rbp), %rax
     pushq %rax
-    movq $48, %rax  # Load compile-time constant TOKEN_LPAREN
+    movq TOKEN_LPAREN(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7706,7 +7706,7 @@ check_single_char_token:
     pushq %rax
     movq -88(%rbp), %rax
     pushq %rax
-    movq $49, %rax  # Load compile-time constant TOKEN_RPAREN
+    movq TOKEN_RPAREN(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7748,7 +7748,7 @@ check_single_char_token:
     pushq %rax
     movq -96(%rbp), %rax
     pushq %rax
-    movq $127, %rax  # Load compile-time constant TOKEN_LBRACKET
+    movq TOKEN_LBRACKET(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7790,7 +7790,7 @@ check_single_char_token:
     pushq %rax
     movq -104(%rbp), %rax
     pushq %rax
-    movq $128, %rax  # Load compile-time constant TOKEN_RBRACKET
+    movq TOKEN_RBRACKET(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7832,7 +7832,7 @@ check_single_char_token:
     pushq %rax
     movq -112(%rbp), %rax
     pushq %rax
-    movq $51, %rax  # Load compile-time constant TOKEN_DOT
+    movq TOKEN_DOT(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7874,7 +7874,7 @@ check_single_char_token:
     pushq %rax
     movq -120(%rbp), %rax
     pushq %rax
-    movq $52, %rax  # Load compile-time constant TOKEN_COMMA
+    movq TOKEN_COMMA(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7916,7 +7916,7 @@ check_single_char_token:
     pushq %rax
     movq -128(%rbp), %rax
     pushq %rax
-    movq $111, %rax  # Load compile-time constant TOKEN_PIPE
+    movq TOKEN_PIPE(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -7958,7 +7958,7 @@ check_single_char_token:
     pushq %rax
     movq -136(%rbp), %rax
     pushq %rax
-    movq $157, %rax  # Load compile-time constant TOKEN_DOLLAR
+    movq TOKEN_DOLLAR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8000,7 +8000,7 @@ check_single_char_token:
     pushq %rax
     movq -144(%rbp), %rax
     pushq %rax
-    movq $16, %rax  # Load compile-time constant TOKEN_PLUS
+    movq TOKEN_PLUS(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8094,7 +8094,7 @@ check_single_char_token:
     pushq %rax
     leaq .STR117(%rip), %rax
     pushq %rax
-    movq $169, %rax  # Load compile-time constant TOKEN_INTRINSIC_STORE8
+    movq TOKEN_INTRINSIC_STORE8(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8133,7 +8133,7 @@ check_single_char_token:
     pushq %rax
     leaq .STR119(%rip), %rax
     pushq %rax
-    movq $167, %rax  # Load compile-time constant TOKEN_INTRINSIC_STORE
+    movq TOKEN_INTRINSIC_STORE(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8172,7 +8172,7 @@ check_single_char_token:
     pushq %rax
     leaq .STR121(%rip), %rax
     pushq %rax
-    movq $170, %rax  # Load compile-time constant TOKEN_INTRINSIC_LOAD8
+    movq TOKEN_INTRINSIC_LOAD8(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8211,7 +8211,7 @@ check_single_char_token:
     pushq %rax
     leaq .STR123(%rip), %rax
     pushq %rax
-    movq $168, %rax  # Load compile-time constant TOKEN_INTRINSIC_LOAD
+    movq TOKEN_INTRINSIC_LOAD(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8240,7 +8240,7 @@ check_single_char_token:
     pushq %rax
     movq -168(%rbp), %rax
     pushq %rax
-    movq $53, %rax  # Load compile-time constant TOKEN_IDENTIFIER
+    movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8413,7 +8413,7 @@ check_single_char_token:
     pushq %rax
     movq -200(%rbp), %rax
     pushq %rax
-    movq $161, %rax  # Load compile-time constant TOKEN_UNDERSCORE
+    movq TOKEN_UNDERSCORE(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8781,7 +8781,7 @@ check_single_char_token:
     pushq %rax
     movq -328(%rbp), %rax
     pushq %rax
-    movq $146, %rax  # Load compile-time constant TOKEN_LBRACE
+    movq TOKEN_LBRACE(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -8823,7 +8823,7 @@ check_single_char_token:
     pushq %rax
     movq -336(%rbp), %rax
     pushq %rax
-    movq $147, %rax  # Load compile-time constant TOKEN_RBRACE
+    movq TOKEN_RBRACE(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi

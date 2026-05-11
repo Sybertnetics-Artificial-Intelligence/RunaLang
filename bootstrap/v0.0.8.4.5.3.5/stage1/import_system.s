@@ -1087,7 +1087,7 @@ resolve_import_path:
     popq %rdx
     call string_substring@PLT
     movq %rax, -56(%rbp)
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1096,7 +1096,7 @@ resolve_import_path:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L241
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1105,9 +1105,9 @@ resolve_import_path:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L251
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -1189,7 +1189,7 @@ resolve_import_path:
     jmp .L212
 .L211:
 .L212:
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1200,7 +1200,7 @@ resolve_import_path:
     jz .L291
     movq -8(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -1255,7 +1255,7 @@ resolve_import_path:
     jmp .L292
 .L291:
 .L292:
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1266,7 +1266,7 @@ resolve_import_path:
     jz .L321
     movq -8(%rbp), %rax
     pushq %rax
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -1291,7 +1291,7 @@ resolve_import_path:
     jmp .L332
 .L331:
 .L332:
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     call extract_directory
@@ -1382,7 +1382,7 @@ resolve_import_path:
     jmp .L322
 .L321:
 .L322:
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1391,7 +1391,7 @@ resolve_import_path:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L381
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1400,9 +1400,9 @@ resolve_import_path:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L391
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -1790,21 +1790,21 @@ process_imports_with_context:
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
-    movq $0, %rax  # Load compile-time constant IMPORT_DEPTH
+    movq IMPORT_DEPTH(%rip), %rax  # Load global variable
     addq $1, %rax
     pushq %rax
     leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
     movq %rax, (%rbx)
-    movq $0, %rax  # Load compile-time constant IMPORT_DEPTH
+    movq IMPORT_DEPTH(%rip), %rax  # Load global variable
     pushq %rax
-    movq $2, %rax  # Load compile-time constant IMPORT_MAX_DEPTH
+    movq IMPORT_MAX_DEPTH(%rip), %rax  # Load global variable
     popq %rbx
     cmpq %rax, %rbx
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
     jz .L511
-    movq $0, %rax  # Load compile-time constant IMPORT_DEPTH
+    movq IMPORT_DEPTH(%rip), %rax  # Load global variable
     subq $1, %rax
     pushq %rax
     leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
@@ -1967,7 +1967,7 @@ process_imports_with_context:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L571
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1976,7 +1976,7 @@ process_imports_with_context:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L581
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -1985,9 +1985,9 @@ process_imports_with_context:
     movzbq %al, %rax
     testq %rax, %rax
     jz .L591
-    movq $0, %rax  # Load compile-time constant IMPORT_SOURCE_DIR
+    movq IMPORT_SOURCE_DIR(%rip), %rax  # Load global variable
     pushq %rax
-    movq $0, %rax  # Load compile-time constant IMPORT_BASE_DIR
+    movq IMPORT_BASE_DIR(%rip), %rax  # Load global variable
     pushq %rax
     popq %rdi
     popq %rsi
@@ -2526,7 +2526,7 @@ process_imports_with_context:
     movq %rax, (%rbx)
     jmp .L541
 .L542:
-    movq $0, %rax  # Load compile-time constant IMPORT_DEPTH
+    movq IMPORT_DEPTH(%rip), %rax  # Load global variable
     subq $1, %rax
     pushq %rax
     leaq IMPORT_DEPTH(%rip), %rbx  # Address of global variable    popq %rax
@@ -2630,11 +2630,8 @@ merge_imported_functions:
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
     popq %rdi
-    popq %rsi
-    call arena_allocate
+    call allocate@PLT
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
     pushq %rax
@@ -3216,11 +3213,8 @@ merge_imported_types:
     popq %rbx
     imulq %rbx, %rax
     pushq %rax
-    movq -24(%rbp), %rax
-    pushq %rax
     popq %rdi
-    popq %rsi
-    call arena_allocate
+    call allocate@PLT
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
     pushq %rax
