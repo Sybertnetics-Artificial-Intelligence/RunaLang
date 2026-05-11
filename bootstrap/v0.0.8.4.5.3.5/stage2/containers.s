@@ -118,7 +118,7 @@ print_integer:
 vector_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $16, %rax
     movq %rax, -16(%rbp)
@@ -137,7 +137,7 @@ vector_create:
 vector_create_with_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $32, %rax
     pushq %rax
@@ -241,7 +241,7 @@ vector_create_with_capacity:
 vector_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     call vector_create
     movq %rax, -16(%rbp)
@@ -277,7 +277,7 @@ vector_create_with_destructor:
 vector_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -405,7 +405,7 @@ vector_destroy:
 vector_push:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -569,7 +569,7 @@ vector_push:
 vector_pop:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -659,7 +659,7 @@ vector_pop:
 vector_get:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -734,7 +734,7 @@ vector_get:
 vector_set:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -852,7 +852,7 @@ vector_set:
 vector_insert:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -1085,7 +1085,7 @@ vector_insert:
 vector_remove:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1262,7 +1262,7 @@ vector_remove:
 vector_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1381,7 +1381,7 @@ vector_clear:
 vector_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1418,7 +1418,7 @@ vector_size:
 vector_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1455,7 +1455,7 @@ vector_capacity:
 vector_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1510,7 +1510,7 @@ vector_is_empty:
 vector_reserve:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1621,7 +1621,7 @@ vector_reserve:
 vector_shrink_to_fit:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1770,7 +1770,7 @@ vector_shrink_to_fit:
 vector_begin:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1807,7 +1807,7 @@ vector_begin:
 vector_end:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -1861,7 +1861,7 @@ vector_end:
 vector_foreach:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -1955,7 +1955,7 @@ vector_foreach:
 stack_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2020,7 +2020,7 @@ stack_create:
 stack_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $8, %rax
     pushq %rax
@@ -2088,7 +2088,7 @@ stack_create_with_destructor:
 stack_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2132,7 +2132,7 @@ stack_destroy:
 stack_push:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2180,7 +2180,7 @@ stack_push:
 stack_pop:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2224,7 +2224,7 @@ stack_pop:
 stack_peek:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2300,7 +2300,7 @@ stack_peek:
 stack_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2344,7 +2344,7 @@ stack_size:
 stack_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2385,7 +2385,7 @@ stack_is_empty:
 stack_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2421,7 +2421,7 @@ stack_clear:
 queue_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $16, %rax
     movq %rax, -16(%rbp)
@@ -2440,7 +2440,7 @@ queue_create:
 queue_create_with_capacity:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $48, %rax
     pushq %rax
@@ -2564,7 +2564,7 @@ queue_create_with_capacity:
 queue_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     call queue_create
     movq %rax, -16(%rbp)
@@ -2600,7 +2600,7 @@ queue_create_with_destructor:
 queue_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2648,7 +2648,7 @@ queue_destroy:
 queue_enqueue:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -2793,7 +2793,7 @@ queue_enqueue:
 queue_dequeue:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -2935,7 +2935,7 @@ queue_dequeue:
 queue_peek:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3015,7 +3015,7 @@ queue_peek:
 queue_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3052,7 +3052,7 @@ queue_size:
 queue_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3107,7 +3107,7 @@ queue_is_empty:
 queue_is_full:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3170,7 +3170,7 @@ queue_is_full:
 queue_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3303,7 +3303,7 @@ queue_clear:
 container_list_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $32, %rax
     pushq %rax
@@ -3376,7 +3376,7 @@ container_list_create:
 list_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     call container_list_create
     movq %rax, -16(%rbp)
@@ -3412,7 +3412,7 @@ list_create_with_destructor:
 container_list_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3448,7 +3448,7 @@ container_list_destroy:
 list_push_front:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -3602,7 +3602,7 @@ list_push_front:
 list_push_back:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -3756,7 +3756,7 @@ list_push_back:
 list_pop_front:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -3894,7 +3894,7 @@ list_pop_front:
 list_pop_back:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4032,7 +4032,7 @@ list_pop_back:
 list_front:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4093,7 +4093,7 @@ list_front:
 list_back:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4154,7 +4154,7 @@ list_back:
 list_insert_after:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4325,7 +4325,7 @@ list_insert_after:
 list_insert_before:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4496,7 +4496,7 @@ list_insert_before:
 list_remove_node:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -4689,7 +4689,7 @@ list_remove_node:
 container_list_find:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -4800,7 +4800,7 @@ container_list_find:
 list_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4837,7 +4837,7 @@ list_size:
 list_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -4892,7 +4892,7 @@ list_is_empty:
 container_list_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5026,7 +5026,7 @@ container_list_clear:
 list_begin:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5063,7 +5063,7 @@ list_begin:
 list_end:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq $0, %rax
     movq %rbp, %rsp
@@ -5075,7 +5075,7 @@ list_end:
 list_next:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5112,7 +5112,7 @@ list_next:
 list_prev:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5149,7 +5149,7 @@ list_prev:
 list_foreach:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5232,7 +5232,7 @@ list_foreach:
 set_create:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq $16, %rax
@@ -5319,7 +5319,7 @@ set_create:
 set_create_with_destructor:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq %rdx, -24(%rbp)
@@ -5381,7 +5381,7 @@ set_create_with_destructor:
 set_destroy:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5425,7 +5425,7 @@ set_destroy:
 set_add:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5473,7 +5473,7 @@ set_add:
 set_remove:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5521,7 +5521,7 @@ set_remove:
 set_contains:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq %rsi, -16(%rbp)
     movq -8(%rbp), %rax
@@ -5569,7 +5569,7 @@ set_contains:
 set_size:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5613,7 +5613,7 @@ set_size:
 set_is_empty:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5673,7 +5673,7 @@ set_is_empty:
 set_clear:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5709,7 +5709,7 @@ set_clear:
 free_string_item:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
@@ -5725,7 +5725,7 @@ free_string_item:
 free_integer_item:
     pushq %rbp
     movq %rsp, %rbp
-    subq $2048, %rsp  # Pre-allocate generous stack space
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
     movq %rdi, -8(%rbp)
     movq -8(%rbp), %rax
     pushq %rax
