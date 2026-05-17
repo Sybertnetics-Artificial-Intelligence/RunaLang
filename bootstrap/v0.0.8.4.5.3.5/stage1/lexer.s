@@ -375,6 +375,8 @@ TOKEN_CALL:    .quad 183
 TOKEN_CONVERT:    .quad 184
 .globl TOKEN_POSITION
 TOKEN_POSITION:    .quad 185
+.globl TOKEN_FLOAT_LITERAL
+TOKEN_FLOAT_LITERAL:    .quad 186
 
 .text
 print_string:
@@ -3147,95 +3149,24 @@ lexer_read_integer:
     leaq -16(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    movq -24(%rbp), %rax
-    movq %rax, -264(%rbp)
-    movq -24(%rbp), %rax
-    movq %rax, -272(%rbp)
-.L841:    movq -272(%rbp), %rax
-    pushq %rax
     movq -16(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L842
-    movq -40(%rbp), %rax
-    addq -272(%rbp), %rax
-    movq %rax, -280(%rbp)
-    movq $0, %rax
-    pushq %rax
-    movq -280(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call memory_get_byte@PLT
-    movq %rax, -288(%rbp)
-    movq -288(%rbp), %rax
-    pushq %rax
-    movq $46, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L851
-    movq -272(%rbp), %rax
-    pushq %rax
-    leaq -264(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    movq -16(%rbp), %rax
-    pushq %rax
-    leaq -272(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L852
-.L851:
-    movq -272(%rbp), %rax
-    addq $1, %rax
-    pushq %rax
-    leaq -272(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-.L852:
-    jmp .L841
-.L842:
-    movq -264(%rbp), %rax
-    pushq %rax
-    movq -24(%rbp), %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L861
-    movq -16(%rbp), %rax
-    pushq %rax
-    leaq -264(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L862
-.L861:
-.L862:
-    movq -264(%rbp), %rax
     subq -24(%rbp), %rax
-    movq %rax, -296(%rbp)
-    movq -296(%rbp), %rax
+    movq %rax, -264(%rbp)
+    movq -264(%rbp), %rax
     addq $1, %rax
-    movq %rax, -304(%rbp)
-    movq -304(%rbp), %rax
+    movq %rax, -272(%rbp)
+    movq -272(%rbp), %rax
     pushq %rax
     popq %rdi
     call memory_allocate@PLT
-    movq %rax, -312(%rbp)
-    movq -296(%rbp), %rax
+    movq %rax, -280(%rbp)
+    movq -264(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
     pushq %rax
     movq -40(%rbp), %rax
     pushq %rax
-    movq -312(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3244,15 +3175,91 @@ lexer_read_integer:
     call string_copy_n
     movq $0, %rax
     pushq %rax
-    movq -296(%rbp), %rax
+    movq -264(%rbp), %rax
     pushq %rax
-    movq -312(%rbp), %rax
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call string_set_char
-    movq -312(%rbp), %rax
+    movq -280(%rbp), %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+
+.globl lexer_numeric_string_is_float
+lexer_numeric_string_is_float:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)
+    movq %rdi, -8(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq $0, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L841
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L842
+.L841:
+.L842:
+    movq $0, %rax
+    movq %rax, -16(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call string_length@PLT
+    movq %rax, -24(%rbp)
+.L851:    movq -16(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L852
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call memory_get_byte@PLT
+    movq %rax, -32(%rbp)
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq $46, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L861
+    movq $1, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L862
+.L861:
+.L862:
+    movq -16(%rbp), %rax
+    addq $1, %rax
+    pushq %rax
+    leaq -16(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L851
+.L852:
+    movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -3730,10 +3737,43 @@ lexer_next_token:
     popq %rsi
     popq %rdx
     call memory_set_byte@PLT
+    movq -192(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call lexer_numeric_string_is_float
+    movq %rax, -216(%rbp)
     movq -168(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
+    movq -216(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L971
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -192(%rbp), %rax
+    pushq %rax
+    movq TOKEN_FLOAT_LITERAL(%rip), %rax  # Load global variable
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    call token_create_owned
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L972
+.L971:
     movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -3751,6 +3791,7 @@ lexer_next_token:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L972:
     movq -80(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
@@ -3768,8 +3809,8 @@ lexer_next_token:
     pushq %rax
     popq %rdi
     call is_digit@PLT
-    movq %rax, -216(%rbp)
-    movq -216(%rbp), %rax
+    movq %rax, -224(%rbp)
+    movq -224(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3777,7 +3818,7 @@ lexer_next_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L971
+    jz .L981
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -3786,6 +3827,39 @@ lexer_next_token:
     leaq -168(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    movq -168(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call lexer_numeric_string_is_float
+    movq %rax, -232(%rbp)
+    movq -232(%rbp), %rax
+    pushq %rax
+    movq $1, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L991
+    movq -40(%rbp), %rax
+    pushq %rax
+    movq -32(%rbp), %rax
+    pushq %rax
+    movq -168(%rbp), %rax
+    pushq %rax
+    movq TOKEN_FLOAT_LITERAL(%rip), %rax  # Load global variable
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    call token_create_owned
+    pushq %rax
+    leaq -80(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L992
+.L991:
     movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -3803,18 +3877,19 @@ lexer_next_token:
     leaq -80(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L992:
     movq -80(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L972
-.L971:
+    jmp .L982
+.L981:
     movq -24(%rbp), %rax
     pushq %rax
     popq %rdi
     call is_alpha
-    movq %rax, -224(%rbp)
-    movq -224(%rbp), %rax
+    movq %rax, -240(%rbp)
+    movq -240(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -3822,21 +3897,21 @@ lexer_next_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L981
+    jz .L1001
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_read_word
-    movq %rax, -232(%rbp)
+    movq %rax, -248(%rbp)
     leaq .STR1(%rip), %rax
     pushq %rax
-    movq -232(%rbp), %rax
+    movq -248(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     call string_equals@PLT
-    movq %rax, -240(%rbp)
-    movq -240(%rbp), %rax
+    movq %rax, -256(%rbp)
+    movq -256(%rbp), %rax
     pushq %rax
     movq $0, %rax
     popq %rbx
@@ -3844,19 +3919,19 @@ lexer_next_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L991
-    movq -232(%rbp), %rax
+    jz .L1011
+    movq -248(%rbp), %rax
     pushq %rax
     popq %rdi
     call determine_token_type
-    movq %rax, -248(%rbp)
+    movq %rax, -264(%rbp)
     movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
     pushq %rax
-    movq -232(%rbp), %rax
-    pushq %rax
     movq -248(%rbp), %rax
+    pushq %rax
+    movq -264(%rbp), %rax
     pushq %rax
     popq %rdi
     popq %rsi
@@ -3871,20 +3946,20 @@ lexer_next_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L992
-.L991:
-.L992:
+    jmp .L1012
+.L1011:
+.L1012:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call lexer_skip_note_comment
-    movq %rax, -256(%rbp)
-    movq -232(%rbp), %rax
+    movq %rax, -272(%rbp)
+    movq -248(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L982
-.L981:
+    jmp .L1002
+.L1001:
     movq -40(%rbp), %rax
     pushq %rax
     movq -32(%rbp), %rax
@@ -3910,13 +3985,13 @@ lexer_next_token:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1001
+    jz .L1021
     movq -80(%rbp), %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1002
-.L1001:
+    jmp .L1022
+.L1021:
     leaq .STR5(%rip), %rax
     pushq %rax
     leaq -88(%rbp), %rbx
@@ -3931,8 +4006,8 @@ lexer_next_token:
     popq %rdi
     call print_char
     leaq .STR6(%rip), %rax
-    movq %rax, -264(%rbp)
-    movq -264(%rbp), %rax
+    movq %rax, -280(%rbp)
+    movq -280(%rbp), %rax
     pushq %rax
     popq %rdi
     call print_string
@@ -3958,7 +4033,7 @@ lexer_next_token:
     pushq %rax
     popq %rdi
     call lexer_advance
-    movq %rax, -272(%rbp)
+    movq %rax, -288(%rbp)
     leaq .STR7(%rip), %rax
     pushq %rax
     leaq -104(%rbp), %rbx
@@ -3985,9 +4060,9 @@ lexer_next_token:
     movq %rbp, %rsp
     popq %rbp
     ret
+.L1022:
 .L1002:
 .L982:
-.L972:
 .L912:
 .L902:
 .L892:
@@ -4060,7 +4135,7 @@ determine_token_type:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1011
+    jz .L1031
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4068,47 +4143,11 @@ determine_token_type:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1012
-.L1011:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $99, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1021
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call check_keywords_c
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L1022
-.L1021:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $114, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1031
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call check_keywords_r
-    movq %rbp, %rsp
-    popq %rbp
-    ret
     jmp .L1032
 .L1031:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $73, %rax
+    movq $99, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4118,7 +4157,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_I
+    call check_keywords_c
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4126,7 +4165,7 @@ determine_token_type:
 .L1041:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $65, %rax
+    movq $114, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4136,7 +4175,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_A
+    call check_keywords_r
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4144,7 +4183,7 @@ determine_token_type:
 .L1051:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $83, %rax
+    movq $73, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4154,7 +4193,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_S
+    call check_keywords_I
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4162,7 +4201,7 @@ determine_token_type:
 .L1061:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $67, %rax
+    movq $65, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4172,7 +4211,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_C
+    call check_keywords_A
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4180,7 +4219,7 @@ determine_token_type:
 .L1071:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $82, %rax
+    movq $83, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4190,7 +4229,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_R
+    call check_keywords_S
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4198,7 +4237,7 @@ determine_token_type:
 .L1081:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $69, %rax
+    movq $67, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4208,7 +4247,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_E
+    call check_keywords_C
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4216,7 +4255,7 @@ determine_token_type:
 .L1091:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $76, %rax
+    movq $82, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4226,7 +4265,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_L
+    call check_keywords_R
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4234,7 +4273,7 @@ determine_token_type:
 .L1101:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $98, %rax
+    movq $69, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4244,7 +4283,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_b
+    call check_keywords_E
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4252,7 +4291,7 @@ determine_token_type:
 .L1111:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $115, %rax
+    movq $76, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4262,7 +4301,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_s
+    call check_keywords_L
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4270,7 +4309,7 @@ determine_token_type:
 .L1121:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $116, %rax
+    movq $98, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4280,7 +4319,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_t
+    call check_keywords_b
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4288,7 +4327,7 @@ determine_token_type:
 .L1131:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $112, %rax
+    movq $115, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4298,7 +4337,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_p
+    call check_keywords_s
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4306,7 +4345,7 @@ determine_token_type:
 .L1141:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $109, %rax
+    movq $116, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4316,7 +4355,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_m
+    call check_keywords_t
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4324,7 +4363,7 @@ determine_token_type:
 .L1151:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $105, %rax
+    movq $112, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4334,12 +4373,48 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_i
+    call check_keywords_p
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1162
 .L1161:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $109, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1171
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call check_keywords_m
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1172
+.L1171:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $105, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1181
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call check_keywords_i
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1182
+.L1181:
     movq -16(%rbp), %rax
     pushq %rax
     movq $106, %rax
@@ -4348,7 +4423,7 @@ determine_token_type:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1171
+    jz .L1191
     leaq .STR8(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4363,33 +4438,15 @@ determine_token_type:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1181
+    jz .L1201
     movq TOKEN_JOINED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1182
-.L1181:
-.L1182:
+    jmp .L1202
+.L1201:
+.L1202:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L1172
-.L1171:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $101, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1191
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call check_keywords_e
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4397,25 +4454,7 @@ determine_token_type:
 .L1191:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $108, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L1201
-    movq -8(%rbp), %rax
-    pushq %rax
-    popq %rdi
-    call check_keywords_l
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    jmp .L1202
-.L1201:
-    movq -16(%rbp), %rax
-    pushq %rax
-    movq $103, %rax
+    movq $101, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4425,7 +4464,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_g
+    call check_keywords_e
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4433,7 +4472,7 @@ determine_token_type:
 .L1211:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $110, %rax
+    movq $108, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4443,7 +4482,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_n
+    call check_keywords_l
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4451,7 +4490,7 @@ determine_token_type:
 .L1221:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $78, %rax
+    movq $103, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4461,7 +4500,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_N
+    call check_keywords_g
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4469,7 +4508,7 @@ determine_token_type:
 .L1231:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $97, %rax
+    movq $110, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4479,7 +4518,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_a
+    call check_keywords_n
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4487,7 +4526,7 @@ determine_token_type:
 .L1241:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $111, %rax
+    movq $78, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4497,7 +4536,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_o
+    call check_keywords_N
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4505,7 +4544,7 @@ determine_token_type:
 .L1251:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $79, %rax
+    movq $97, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4515,7 +4554,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_O
+    call check_keywords_a
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4523,7 +4562,7 @@ determine_token_type:
 .L1261:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $87, %rax
+    movq $111, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4533,7 +4572,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_W
+    call check_keywords_o
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4541,7 +4580,7 @@ determine_token_type:
 .L1271:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $84, %rax
+    movq $79, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4551,7 +4590,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_T
+    call check_keywords_O
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4559,7 +4598,7 @@ determine_token_type:
 .L1281:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $66, %rax
+    movq $87, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4569,7 +4608,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_B
+    call check_keywords_W
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4577,7 +4616,7 @@ determine_token_type:
 .L1291:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $102, %rax
+    movq $84, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4587,7 +4626,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_f
+    call check_keywords_T
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4595,7 +4634,7 @@ determine_token_type:
 .L1301:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $100, %rax
+    movq $66, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4605,7 +4644,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_d
+    call check_keywords_B
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4613,7 +4652,7 @@ determine_token_type:
 .L1311:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $68, %rax
+    movq $102, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4623,7 +4662,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_D
+    call check_keywords_f
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4631,7 +4670,7 @@ determine_token_type:
 .L1321:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $77, %rax
+    movq $100, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4641,7 +4680,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_M
+    call check_keywords_d
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4649,7 +4688,7 @@ determine_token_type:
 .L1331:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $70, %rax
+    movq $68, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4659,7 +4698,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_F
+    call check_keywords_D
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4667,7 +4706,7 @@ determine_token_type:
 .L1341:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $119, %rax
+    movq $77, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4677,7 +4716,7 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_w
+    call check_keywords_M
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -4685,7 +4724,7 @@ determine_token_type:
 .L1351:
     movq -16(%rbp), %rax
     pushq %rax
-    movq $107, %rax
+    movq $70, %rax
     popq %rbx
     cmpq %rax, %rbx
     sete %al
@@ -4695,12 +4734,50 @@ determine_token_type:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
-    call check_keywords_k
+    call check_keywords_F
     movq %rbp, %rsp
     popq %rbp
     ret
     jmp .L1362
 .L1361:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $119, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1371
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call check_keywords_w
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1372
+.L1371:
+    movq -16(%rbp), %rax
+    pushq %rax
+    movq $107, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L1381
+    movq -8(%rbp), %rax
+    pushq %rax
+    popq %rdi
+    call check_keywords_k
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    jmp .L1382
+.L1381:
+.L1382:
+.L1372:
 .L1362:
 .L1352:
 .L1342:
@@ -4717,8 +4794,8 @@ determine_token_type:
 .L1232:
 .L1222:
 .L1212:
-.L1202:
 .L1192:
+.L1182:
 .L1172:
 .L1162:
 .L1152:
@@ -4734,8 +4811,6 @@ determine_token_type:
 .L1052:
 .L1042:
 .L1032:
-.L1022:
-.L1012:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -4767,13 +4842,13 @@ check_keywords_P:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1371
+    jz .L1391
     movq TOKEN_PROCESS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1372
-.L1371:
+    jmp .L1392
+.L1391:
     leaq .STR10(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4788,13 +4863,13 @@ check_keywords_P:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1381
+    jz .L1401
     movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1382
-.L1381:
+    jmp .L1402
+.L1401:
     leaq .STR11(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4809,16 +4884,16 @@ check_keywords_P:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1391
+    jz .L1411
     movq TOKEN_PRIVATE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1392
-.L1391:
+    jmp .L1412
+.L1411:
+.L1412:
+.L1402:
 .L1392:
-.L1382:
-.L1372:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -4845,13 +4920,13 @@ check_keywords_c:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1401
+    jz .L1421
     movq TOKEN_CALLED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1402
-.L1401:
+    jmp .L1422
+.L1421:
     leaq .STR13(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4866,13 +4941,13 @@ check_keywords_c:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1411
+    jz .L1431
     movq TOKEN_CONTAINING(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1412
-.L1411:
+    jmp .L1432
+.L1431:
     leaq .STR14(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4887,13 +4962,13 @@ check_keywords_c:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1421
+    jz .L1441
     movq TOKEN_CONTAINS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1422
-.L1421:
+    jmp .L1442
+.L1441:
     leaq .STR15(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4908,17 +4983,17 @@ check_keywords_c:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1431
+    jz .L1451
     movq TOKEN_CONVERT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1432
-.L1431:
+    jmp .L1452
+.L1451:
+.L1452:
+.L1442:
 .L1432:
 .L1422:
-.L1412:
-.L1402:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -4945,13 +5020,13 @@ check_keywords_r:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1441
+    jz .L1461
     movq TOKEN_RETURNS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1442
-.L1441:
+    jmp .L1462
+.L1461:
     leaq .STR17(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -4966,15 +5041,15 @@ check_keywords_r:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1451
+    jz .L1471
     movq TOKEN_RIGHT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1452
-.L1451:
-.L1452:
-.L1442:
+    jmp .L1472
+.L1471:
+.L1472:
+.L1462:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5001,13 +5076,13 @@ check_keywords_I:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1461
+    jz .L1481
     movq TOKEN_INTEGER_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1462
-.L1461:
+    jmp .L1482
+.L1481:
     leaq .STR19(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5022,13 +5097,13 @@ check_keywords_I:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1471
+    jz .L1491
     movq TOKEN_IF(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1472
-.L1471:
+    jmp .L1492
+.L1491:
     leaq .STR20(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5043,13 +5118,13 @@ check_keywords_I:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1481
+    jz .L1501
     movq TOKEN_INCREASE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1482
-.L1481:
+    jmp .L1502
+.L1501:
     leaq .STR21(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5064,13 +5139,13 @@ check_keywords_I:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1491
+    jz .L1511
     movq TOKEN_INLINE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1492
-.L1491:
+    jmp .L1512
+.L1511:
     leaq .STR22(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5085,18 +5160,18 @@ check_keywords_I:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1501
+    jz .L1521
     movq TOKEN_IMPORT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1502
-.L1501:
+    jmp .L1522
+.L1521:
+.L1522:
+.L1512:
 .L1502:
 .L1492:
 .L1482:
-.L1472:
-.L1462:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5123,13 +5198,13 @@ check_keywords_A:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1511
+    jz .L1531
     movq TOKEN_ASSEMBLY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1512
-.L1511:
+    jmp .L1532
+.L1531:
     leaq .STR24(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5144,15 +5219,15 @@ check_keywords_A:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1521
+    jz .L1541
     movq TOKEN_ALERT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1522
-.L1521:
-.L1522:
-.L1512:
+    jmp .L1542
+.L1541:
+.L1542:
+.L1532:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5179,13 +5254,13 @@ check_keywords_S:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1531
+    jz .L1551
     movq TOKEN_STRING_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1532
-.L1531:
+    jmp .L1552
+.L1551:
     leaq .STR26(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5200,15 +5275,15 @@ check_keywords_S:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1541
+    jz .L1561
     movq TOKEN_SET(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1542
-.L1541:
-.L1542:
-.L1532:
+    jmp .L1562
+.L1561:
+.L1562:
+.L1552:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5235,13 +5310,13 @@ check_keywords_C:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1551
+    jz .L1571
     movq TOKEN_CHARACTER_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1552
-.L1551:
+    jmp .L1572
+.L1571:
     leaq .STR28(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5256,13 +5331,13 @@ check_keywords_C:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1561
+    jz .L1581
     movq TOKEN_CONTINUE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1562
-.L1561:
+    jmp .L1582
+.L1581:
     leaq .STR29(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5277,13 +5352,13 @@ check_keywords_C:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1571
+    jz .L1591
     movq TOKEN_CONSTANT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1572
-.L1571:
+    jmp .L1592
+.L1591:
     leaq .STR30(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5298,17 +5373,17 @@ check_keywords_C:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1581
+    jz .L1601
     movq TOKEN_CALL(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1582
-.L1581:
+    jmp .L1602
+.L1601:
+.L1602:
+.L1592:
 .L1582:
 .L1572:
-.L1562:
-.L1552:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5335,14 +5410,14 @@ check_keywords_R:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1591
+    jz .L1611
     movq TOKEN_RETURN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1592
-.L1591:
-.L1592:
+    jmp .L1612
+.L1611:
+.L1612:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5369,13 +5444,13 @@ check_keywords_E:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1601
+    jz .L1621
     movq TOKEN_END(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1602
-.L1601:
+    jmp .L1622
+.L1621:
     leaq .STR32(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5390,13 +5465,13 @@ check_keywords_E:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1611
+    jz .L1631
     movq TOKEN_EXPORT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1612
-.L1611:
+    jmp .L1632
+.L1631:
     leaq .STR33(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5411,16 +5486,16 @@ check_keywords_E:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1621
+    jz .L1641
     movq TOKEN_EACH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1622
-.L1621:
+    jmp .L1642
+.L1641:
+.L1642:
+.L1632:
 .L1622:
-.L1612:
-.L1602:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5447,13 +5522,13 @@ check_keywords_L:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1631
+    jz .L1651
     movq TOKEN_LET(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1632
-.L1631:
+    jmp .L1652
+.L1651:
     leaq .STR35(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5468,15 +5543,15 @@ check_keywords_L:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1641
+    jz .L1661
     movq TOKEN_LOOP(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1642
-.L1641:
-.L1642:
-.L1632:
+    jmp .L1662
+.L1661:
+.L1662:
+.L1652:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5503,13 +5578,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1651
+    jz .L1671
     movq TOKEN_BE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1652
-.L1651:
+    jmp .L1672
+.L1671:
     leaq .STR37(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5524,13 +5599,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1661
+    jz .L1681
     movq TOKEN_BY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1662
-.L1661:
+    jmp .L1682
+.L1681:
     leaq .STR38(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5545,13 +5620,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1671
+    jz .L1691
     movq TOKEN_BIT_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1672
-.L1671:
+    jmp .L1692
+.L1691:
     leaq .STR39(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5566,13 +5641,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1681
+    jz .L1701
     movq TOKEN_BIT_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1682
-.L1681:
+    jmp .L1702
+.L1701:
     leaq .STR40(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5587,13 +5662,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1691
+    jz .L1711
     movq TOKEN_BIT_XOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1692
-.L1691:
+    jmp .L1712
+.L1711:
     leaq .STR41(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5608,13 +5683,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1701
+    jz .L1721
     movq TOKEN_BIT_SHIFT_LEFT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1702
-.L1701:
+    jmp .L1722
+.L1721:
     leaq .STR42(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5629,13 +5704,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1711
+    jz .L1731
     movq TOKEN_BIT_SHIFT_RIGHT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1712
-.L1711:
+    jmp .L1732
+.L1731:
     leaq .STR43(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5650,13 +5725,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1721
+    jz .L1741
     movq TOKEN_BITWISE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1722
-.L1721:
+    jmp .L1742
+.L1741:
     leaq .STR44(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5671,13 +5746,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1731
+    jz .L1751
     movq TOKEN_BIT_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1732
-.L1731:
+    jmp .L1752
+.L1751:
     leaq .STR45(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5692,13 +5767,13 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1741
+    jz .L1761
     movq TOKEN_BIT_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1742
-.L1741:
+    jmp .L1762
+.L1761:
     leaq .STR46(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5713,13 +5788,15 @@ check_keywords_b:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1751
+    jz .L1771
     movq TOKEN_BIT_XOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1752
-.L1751:
+    jmp .L1772
+.L1771:
+.L1772:
+.L1762:
 .L1752:
 .L1742:
 .L1732:
@@ -5729,8 +5806,6 @@ check_keywords_b:
 .L1692:
 .L1682:
 .L1672:
-.L1662:
-.L1652:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5757,14 +5832,14 @@ check_keywords_s:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1761
+    jz .L1781
     movq TOKEN_SHIFTED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1762
-.L1761:
-.L1762:
+    jmp .L1782
+.L1781:
+.L1782:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5791,13 +5866,13 @@ check_keywords_t:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1771
+    jz .L1791
     movq TOKEN_TO(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1772
-.L1771:
+    jmp .L1792
+.L1791:
     leaq .STR49(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5812,13 +5887,13 @@ check_keywords_t:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1781
+    jz .L1801
     movq TOKEN_TAKES(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1782
-.L1781:
+    jmp .L1802
+.L1801:
     leaq .STR50(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5833,13 +5908,13 @@ check_keywords_t:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1791
+    jz .L1811
     movq TOKEN_THAN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1792
-.L1791:
+    jmp .L1812
+.L1811:
     leaq .STR51(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5854,13 +5929,13 @@ check_keywords_t:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1801
+    jz .L1821
     movq TOKEN_THAT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1802
-.L1801:
+    jmp .L1822
+.L1821:
     leaq .STR52(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5875,13 +5950,13 @@ check_keywords_t:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1811
+    jz .L1831
     movq TOKEN_TRUE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1812
-.L1811:
+    jmp .L1832
+.L1831:
     leaq .STR53(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5896,19 +5971,19 @@ check_keywords_t:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1821
+    jz .L1841
     movq TOKEN_THE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1822
-.L1821:
+    jmp .L1842
+.L1841:
+.L1842:
+.L1832:
 .L1822:
 .L1812:
 .L1802:
 .L1792:
-.L1782:
-.L1772:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5935,13 +6010,13 @@ check_keywords_p:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1831
+    jz .L1851
     movq TOKEN_PLUS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1832
-.L1831:
+    jmp .L1852
+.L1851:
     leaq .STR55(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -5956,15 +6031,15 @@ check_keywords_p:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1841
+    jz .L1861
     movq TOKEN_PROC(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1842
-.L1841:
-.L1842:
-.L1832:
+    jmp .L1862
+.L1861:
+.L1862:
+.L1852:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -5991,13 +6066,13 @@ check_keywords_m:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1851
+    jz .L1871
     movq TOKEN_MINUS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1852
-.L1851:
+    jmp .L1872
+.L1871:
     leaq .STR57(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6012,13 +6087,13 @@ check_keywords_m:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1861
+    jz .L1881
     movq TOKEN_MULTIPLIED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1862
-.L1861:
+    jmp .L1882
+.L1881:
     leaq .STR58(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6033,16 +6108,16 @@ check_keywords_m:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1871
+    jz .L1891
     movq TOKEN_MODULO(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1872
-.L1871:
+    jmp .L1892
+.L1891:
+.L1892:
+.L1882:
 .L1872:
-.L1862:
-.L1852:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6069,13 +6144,13 @@ check_keywords_i:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1881
+    jz .L1901
     movq TOKEN_IS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1882
-.L1881:
+    jmp .L1902
+.L1901:
     leaq .STR60(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6090,13 +6165,13 @@ check_keywords_i:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1891
+    jz .L1911
     movq TOKEN_IN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1892
-.L1891:
+    jmp .L1912
+.L1911:
     leaq .STR61(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6111,13 +6186,13 @@ check_keywords_i:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1901
+    jz .L1921
     movq TOKEN_INDEX(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1902
-.L1901:
+    jmp .L1922
+.L1921:
     leaq .STR62(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6132,17 +6207,17 @@ check_keywords_i:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1911
+    jz .L1931
     movq TOKEN_INCREASED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1912
-.L1911:
+    jmp .L1932
+.L1931:
+.L1932:
+.L1922:
 .L1912:
 .L1902:
-.L1892:
-.L1882:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6169,13 +6244,13 @@ check_keywords_e:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1921
+    jz .L1941
     movq TOKEN_EQUAL(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1922
-.L1921:
+    jmp .L1942
+.L1941:
     leaq .STR64(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6190,15 +6265,15 @@ check_keywords_e:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1931
+    jz .L1951
     movq TOKEN_EACH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1932
-.L1931:
-.L1932:
-.L1922:
+    jmp .L1952
+.L1951:
+.L1952:
+.L1942:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6225,13 +6300,13 @@ check_keywords_l:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1941
+    jz .L1961
     movq TOKEN_LESS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1942
-.L1941:
+    jmp .L1962
+.L1961:
     leaq .STR66(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6246,13 +6321,13 @@ check_keywords_l:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1951
+    jz .L1971
     movq TOKEN_LENGTH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1952
-.L1951:
+    jmp .L1972
+.L1971:
     leaq .STR67(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6267,13 +6342,13 @@ check_keywords_l:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1961
+    jz .L1981
     movq TOKEN_LAMBDA(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1962
-.L1961:
+    jmp .L1982
+.L1981:
     leaq .STR68(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6288,13 +6363,13 @@ check_keywords_l:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1971
+    jz .L1991
     movq TOKEN_LEFT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1972
-.L1971:
+    jmp .L1992
+.L1991:
     leaq .STR69(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6309,18 +6384,18 @@ check_keywords_l:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1981
+    jz .L2001
     movq TOKEN_LIST(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1982
-.L1981:
+    jmp .L2002
+.L2001:
+.L2002:
+.L1992:
 .L1982:
 .L1972:
 .L1962:
-.L1952:
-.L1942:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6347,13 +6422,13 @@ check_keywords_g:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L1991
+    jz .L2011
     movq TOKEN_GREATER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L1992
-.L1991:
+    jmp .L2012
+.L2011:
     leaq .STR71(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6368,15 +6443,15 @@ check_keywords_g:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2001
+    jz .L2021
     movq TOKEN_GETS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2002
-.L2001:
-.L2002:
-.L1992:
+    jmp .L2022
+.L2021:
+.L2022:
+.L2012:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6403,13 +6478,13 @@ check_keywords_n:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2011
+    jz .L2031
     movq TOKEN_NOT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2012
-.L2011:
+    jmp .L2032
+.L2031:
     leaq .STR73(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6424,15 +6499,15 @@ check_keywords_n:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2021
+    jz .L2041
     movq TOKEN_NEGATIVE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2022
-.L2021:
-.L2022:
-.L2012:
+    jmp .L2042
+.L2041:
+.L2042:
+.L2032:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6459,14 +6534,14 @@ check_keywords_N:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2031
+    jz .L2051
     movq TOKEN_NOTE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2032
-.L2031:
-.L2032:
+    jmp .L2052
+.L2051:
+.L2052:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6493,13 +6568,13 @@ check_keywords_a:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2041
+    jz .L2061
     movq TOKEN_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2042
-.L2041:
+    jmp .L2062
+.L2061:
     leaq .STR75(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6514,13 +6589,13 @@ check_keywords_a:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2051
+    jz .L2071
     movq TOKEN_AS(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2052
-.L2051:
+    jmp .L2072
+.L2071:
     leaq .STR76(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6535,13 +6610,13 @@ check_keywords_a:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2061
+    jz .L2081
     movq TOKEN_AT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2062
-.L2061:
+    jmp .L2082
+.L2081:
     leaq .STR77(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6556,13 +6631,13 @@ check_keywords_a:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2071
+    jz .L2091
     movq TOKEN_AN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2072
-.L2071:
+    jmp .L2092
+.L2091:
     leaq .STR78(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6577,13 +6652,13 @@ check_keywords_a:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2081
+    jz .L2101
     movq TOKEN_ARRAY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2082
-.L2081:
+    jmp .L2102
+.L2101:
     leaq .STR79(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6598,19 +6673,19 @@ check_keywords_a:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2091
+    jz .L2111
     movq TOKEN_A(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2092
-.L2091:
+    jmp .L2112
+.L2111:
+.L2112:
+.L2102:
 .L2092:
 .L2082:
 .L2072:
 .L2062:
-.L2052:
-.L2042:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6637,13 +6712,13 @@ check_keywords_o:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2101
+    jz .L2121
     movq TOKEN_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2102
-.L2101:
+    jmp .L2122
+.L2121:
     leaq .STR81(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6658,15 +6733,15 @@ check_keywords_o:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2111
+    jz .L2131
     movq TOKEN_OF(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2112
-.L2111:
-.L2112:
-.L2102:
+    jmp .L2132
+.L2131:
+.L2132:
+.L2122:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6693,14 +6768,14 @@ check_keywords_O:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2121
+    jz .L2141
     movq TOKEN_OTHERWISE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2122
-.L2121:
-.L2122:
+    jmp .L2142
+.L2141:
+.L2142:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6727,13 +6802,13 @@ check_keywords_W:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2131
+    jz .L2151
     movq TOKEN_WHILE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2132
-.L2131:
+    jmp .L2152
+.L2151:
     leaq .STR84(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6748,15 +6823,15 @@ check_keywords_W:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2141
+    jz .L2161
     movq TOKEN_WHEN(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2142
-.L2141:
-.L2142:
-.L2132:
+    jmp .L2162
+.L2161:
+.L2162:
+.L2152:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6783,14 +6858,14 @@ check_keywords_T:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2151
+    jz .L2171
     movq TOKEN_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2152
-.L2151:
-.L2152:
+    jmp .L2172
+.L2171:
+.L2172:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6817,14 +6892,14 @@ check_keywords_B:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2161
+    jz .L2181
     movq TOKEN_BREAK(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2162
-.L2161:
-.L2162:
+    jmp .L2182
+.L2181:
+.L2182:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6851,13 +6926,13 @@ check_keywords_f:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2171
+    jz .L2191
     movq TOKEN_FALSE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2172
-.L2171:
+    jmp .L2192
+.L2191:
     leaq .STR88(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6872,13 +6947,13 @@ check_keywords_f:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2181
+    jz .L2201
     movq TOKEN_FROM(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2182
-.L2181:
+    jmp .L2202
+.L2201:
     leaq .STR89(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6893,16 +6968,16 @@ check_keywords_f:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2191
+    jz .L2211
     movq TOKEN_FOREVER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2192
-.L2191:
+    jmp .L2212
+.L2211:
+.L2212:
+.L2202:
 .L2192:
-.L2182:
-.L2172:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6929,13 +7004,13 @@ check_keywords_d:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2201
+    jz .L2221
     movq TOKEN_DIVIDED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2202
-.L2201:
+    jmp .L2222
+.L2221:
     leaq .STR91(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -6950,15 +7025,15 @@ check_keywords_d:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2211
+    jz .L2231
     movq TOKEN_DECREASED(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2212
-.L2211:
-.L2212:
-.L2202:
+    jmp .L2232
+.L2231:
+.L2232:
+.L2222:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -6985,13 +7060,13 @@ check_keywords_D:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2221
+    jz .L2241
     movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2222
-.L2221:
+    jmp .L2242
+.L2241:
     leaq .STR93(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -7006,13 +7081,13 @@ check_keywords_D:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2231
+    jz .L2251
     movq TOKEN_DECREASE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2232
-.L2231:
+    jmp .L2252
+.L2251:
     leaq .STR94(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -7027,16 +7102,16 @@ check_keywords_D:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2241
+    jz .L2261
     movq TOKEN_DIVIDE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2242
-.L2241:
+    jmp .L2262
+.L2261:
+.L2262:
+.L2252:
 .L2242:
-.L2232:
-.L2222:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -7063,13 +7138,13 @@ check_keywords_M:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2251
+    jz .L2271
     movq TOKEN_MULTIPLY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2252
-.L2251:
+    jmp .L2272
+.L2271:
     leaq .STR96(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -7084,15 +7159,15 @@ check_keywords_M:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2261
+    jz .L2281
     movq TOKEN_MATCH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2262
-.L2261:
-.L2262:
-.L2252:
+    jmp .L2282
+.L2281:
+.L2282:
+.L2272:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -7119,14 +7194,14 @@ check_keywords_F:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2271
+    jz .L2291
     movq TOKEN_FOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2272
-.L2271:
-.L2272:
+    jmp .L2292
+.L2291:
+.L2292:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -7153,13 +7228,13 @@ check_keywords_w:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2281
+    jz .L2301
     movq TOKEN_WHERE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2282
-.L2281:
+    jmp .L2302
+.L2301:
     leaq .STR99(%rip), %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -7174,15 +7249,15 @@ check_keywords_w:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2291
+    jz .L2311
     movq TOKEN_WITH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2292
-.L2291:
-.L2292:
-.L2282:
+    jmp .L2312
+.L2311:
+.L2312:
+.L2302:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -7209,14 +7284,14 @@ check_keywords_k:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2301
+    jz .L2321
     movq TOKEN_KEY(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2302
-.L2301:
-.L2302:
+    jmp .L2322
+.L2321:
+.L2322:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -7247,14 +7322,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2311
+    jz .L2331
     movq TOKEN_BREAK(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2312
-.L2311:
-.L2312:
+    jmp .L2332
+.L2331:
+.L2332:
     leaq .STR28(%rip), %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
@@ -7276,14 +7351,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2321
+    jz .L2341
     movq TOKEN_CONTINUE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2322
-.L2321:
-.L2322:
+    jmp .L2342
+.L2341:
+.L2342:
     leaq .STR10(%rip), %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
@@ -7305,14 +7380,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2331
+    jz .L2351
     movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2332
-.L2331:
-.L2332:
+    jmp .L2352
+.L2351:
+.L2352:
     leaq .STR92(%rip), %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
@@ -7334,14 +7409,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2341
+    jz .L2361
     movq TOKEN_PRINT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2342
-.L2341:
-.L2342:
+    jmp .L2362
+.L2361:
+.L2362:
     leaq .STR85(%rip), %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rax
@@ -7363,14 +7438,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2351
+    jz .L2371
     movq TOKEN_TYPE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2352
-.L2351:
-.L2352:
+    jmp .L2372
+.L2371:
+.L2372:
     leaq .STR22(%rip), %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rax
@@ -7392,14 +7467,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2361
+    jz .L2381
     movq TOKEN_IMPORT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2362
-.L2361:
-.L2362:
+    jmp .L2382
+.L2381:
+.L2382:
     leaq .STR101(%rip), %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
@@ -7421,14 +7496,14 @@ check_builtin_functions:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2371
+    jz .L2391
     movq TOKEN_STRING_LENGTH(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2372
-.L2371:
-.L2372:
+    jmp .L2392
+.L2391:
+.L2392:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7464,14 +7539,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2381
+    jz .L2401
     movq TOKEN_READ_FILE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2382
-.L2381:
-.L2382:
+    jmp .L2402
+.L2401:
+.L2402:
     leaq .STR103(%rip), %rax
     movq %rax, -32(%rbp)
     movq -32(%rbp), %rax
@@ -7493,14 +7568,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2391
+    jz .L2411
     movq TOKEN_WRITE_FILE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2392
-.L2391:
-.L2392:
+    jmp .L2412
+.L2411:
+.L2412:
     leaq .STR104(%rip), %rax
     movq %rax, -40(%rbp)
     movq -40(%rbp), %rax
@@ -7522,14 +7597,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2401
+    jz .L2421
     movq TOKEN_MEMORY_GET_BYTE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2402
-.L2401:
-.L2402:
+    jmp .L2422
+.L2421:
+.L2422:
     leaq .STR105(%rip), %rax
     movq %rax, -48(%rbp)
     movq -48(%rbp), %rax
@@ -7551,14 +7626,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2411
+    jz .L2431
     movq TOKEN_MEMORY_SET_BYTE(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2412
-.L2411:
-.L2412:
+    jmp .L2432
+.L2431:
+.L2432:
     leaq .STR41(%rip), %rax
     movq %rax, -56(%rbp)
     movq -56(%rbp), %rax
@@ -7580,14 +7655,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2421
+    jz .L2441
     movq TOKEN_BIT_SHIFT_LEFT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2422
-.L2421:
-.L2422:
+    jmp .L2442
+.L2441:
+.L2442:
     leaq .STR42(%rip), %rax
     movq %rax, -64(%rbp)
     movq -64(%rbp), %rax
@@ -7609,14 +7684,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2431
+    jz .L2451
     movq TOKEN_BIT_SHIFT_RIGHT(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2432
-.L2431:
-.L2432:
+    jmp .L2452
+.L2451:
+.L2452:
     leaq .STR38(%rip), %rax
     movq %rax, -72(%rbp)
     movq -72(%rbp), %rax
@@ -7638,14 +7713,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2441
+    jz .L2461
     movq TOKEN_BIT_AND(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2442
-.L2441:
-.L2442:
+    jmp .L2462
+.L2461:
+.L2462:
     leaq .STR39(%rip), %rax
     movq %rax, -80(%rbp)
     movq -80(%rbp), %rax
@@ -7667,14 +7742,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2451
+    jz .L2471
     movq TOKEN_BIT_OR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2452
-.L2451:
-.L2452:
+    jmp .L2472
+.L2471:
+.L2472:
     leaq .STR40(%rip), %rax
     movq %rax, -88(%rbp)
     movq -88(%rbp), %rax
@@ -7696,14 +7771,14 @@ check_more_builtins:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2461
+    jz .L2481
     movq TOKEN_BIT_XOR(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2462
-.L2461:
-.L2462:
+    jmp .L2482
+.L2481:
+.L2482:
     movq TOKEN_IDENTIFIER(%rip), %rax  # Load global variable
     movq %rbp, %rsp
     popq %rbp
@@ -7734,7 +7809,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2471
+    jz .L2491
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7760,8 +7835,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2472
-.L2471:
+    jmp .L2492
+.L2491:
     movq -16(%rbp), %rax
     pushq %rax
     movq $58, %rax
@@ -7770,7 +7845,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2481
+    jz .L2501
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7802,8 +7877,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2482
-.L2481:
+    jmp .L2502
+.L2501:
     movq -16(%rbp), %rax
     pushq %rax
     movq $40, %rax
@@ -7812,7 +7887,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2491
+    jz .L2511
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7844,8 +7919,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2492
-.L2491:
+    jmp .L2512
+.L2511:
     movq -16(%rbp), %rax
     pushq %rax
     movq $41, %rax
@@ -7854,7 +7929,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2501
+    jz .L2521
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7886,8 +7961,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2502
-.L2501:
+    jmp .L2522
+.L2521:
     movq -16(%rbp), %rax
     pushq %rax
     movq $91, %rax
@@ -7896,7 +7971,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2511
+    jz .L2531
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7928,8 +8003,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2512
-.L2511:
+    jmp .L2532
+.L2531:
     movq -16(%rbp), %rax
     pushq %rax
     movq $93, %rax
@@ -7938,7 +8013,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2521
+    jz .L2541
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -7970,8 +8045,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2522
-.L2521:
+    jmp .L2542
+.L2541:
     movq -16(%rbp), %rax
     pushq %rax
     movq $46, %rax
@@ -7980,7 +8055,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2531
+    jz .L2551
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8012,8 +8087,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2532
-.L2531:
+    jmp .L2552
+.L2551:
     movq -16(%rbp), %rax
     pushq %rax
     movq $44, %rax
@@ -8022,7 +8097,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2541
+    jz .L2561
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8054,8 +8129,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2542
-.L2541:
+    jmp .L2562
+.L2561:
     movq -16(%rbp), %rax
     pushq %rax
     movq $124, %rax
@@ -8064,7 +8139,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2551
+    jz .L2571
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8096,8 +8171,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2552
-.L2551:
+    jmp .L2572
+.L2571:
     movq -16(%rbp), %rax
     pushq %rax
     movq $36, %rax
@@ -8106,7 +8181,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2561
+    jz .L2581
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8138,8 +8213,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2562
-.L2561:
+    jmp .L2582
+.L2581:
     movq -16(%rbp), %rax
     pushq %rax
     movq $43, %rax
@@ -8148,7 +8223,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2571
+    jz .L2591
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8180,8 +8255,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2572
-.L2571:
+    jmp .L2592
+.L2591:
     movq -16(%rbp), %rax
     pushq %rax
     movq $95, %rax
@@ -8190,7 +8265,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2581
+    jz .L2601
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8215,7 +8290,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2591
+    jz .L2611
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8237,7 +8312,7 @@ check_single_char_token:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2601
+    jz .L2621
     leaq .STR117(%rip), %rax
     pushq %rax
     movq -160(%rbp), %rax
@@ -8252,7 +8327,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2611
+    jz .L2631
     movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -8274,9 +8349,9 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2612
-.L2611:
-.L2612:
+    jmp .L2632
+.L2631:
+.L2632:
     leaq .STR119(%rip), %rax
     pushq %rax
     movq -160(%rbp), %rax
@@ -8291,7 +8366,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2621
+    jz .L2641
     movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -8313,9 +8388,9 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2622
-.L2621:
-.L2622:
+    jmp .L2642
+.L2641:
+.L2642:
     leaq .STR121(%rip), %rax
     pushq %rax
     movq -160(%rbp), %rax
@@ -8330,7 +8405,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2631
+    jz .L2651
     movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -8352,9 +8427,9 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2632
-.L2631:
-.L2632:
+    jmp .L2652
+.L2651:
+.L2652:
     leaq .STR123(%rip), %rax
     pushq %rax
     movq -160(%rbp), %rax
@@ -8369,7 +8444,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2641
+    jz .L2661
     movq -32(%rbp), %rax
     pushq %rax
     movq -24(%rbp), %rax
@@ -8391,12 +8466,12 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2642
-.L2641:
-.L2642:
-    jmp .L2602
-.L2601:
-.L2602:
+    jmp .L2662
+.L2661:
+.L2662:
+    jmp .L2622
+.L2621:
+.L2622:
     leaq .STR125(%rip), %rax
     movq %rax, -168(%rbp)
     movq -32(%rbp), %rax
@@ -8420,9 +8495,9 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2592
-.L2591:
-.L2592:
+    jmp .L2612
+.L2611:
+.L2612:
     movq $0, %rax
     movq %rax, -176(%rbp)
     movq -152(%rbp), %rax
@@ -8433,39 +8508,10 @@ check_single_char_token:
     setg %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2651
-    movq -152(%rbp), %rax
-    pushq %rax
-    movq $123, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setl %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L2661
-    movq $1, %rax
-    pushq %rax
-    leaq -176(%rbp), %rbx
-    popq %rax
-    movq %rax, (%rbx)
-    jmp .L2662
-.L2661:
-.L2662:
-    jmp .L2652
-.L2651:
-.L2652:
-    movq -152(%rbp), %rax
-    pushq %rax
-    movq $64, %rax
-    popq %rbx
-    cmpq %rax, %rbx
-    setg %al
-    movzbq %al, %rax
-    testq %rax, %rax
     jz .L2671
     movq -152(%rbp), %rax
     pushq %rax
-    movq $91, %rax
+    movq $123, %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
@@ -8485,7 +8531,7 @@ check_single_char_token:
 .L2672:
     movq -152(%rbp), %rax
     pushq %rax
-    movq $47, %rax
+    movq $64, %rax
     popq %rbx
     cmpq %rax, %rbx
     setg %al
@@ -8494,7 +8540,7 @@ check_single_char_token:
     jz .L2691
     movq -152(%rbp), %rax
     pushq %rax
-    movq $58, %rax
+    movq $91, %rax
     popq %rbx
     cmpq %rax, %rbx
     setl %al
@@ -8512,6 +8558,35 @@ check_single_char_token:
     jmp .L2692
 .L2691:
 .L2692:
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq $47, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setg %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2711
+    movq -152(%rbp), %rax
+    pushq %rax
+    movq $58, %rax
+    popq %rbx
+    cmpq %rax, %rbx
+    setl %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L2721
+    movq $1, %rax
+    pushq %rax
+    leaq -176(%rbp), %rbx
+    popq %rax
+    movq %rax, (%rbx)
+    jmp .L2722
+.L2721:
+.L2722:
+    jmp .L2712
+.L2711:
+.L2712:
     movq -176(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -8520,7 +8595,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2711
+    jz .L2731
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8534,7 +8609,7 @@ check_single_char_token:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2721
+    jz .L2741
     movq -184(%rbp), %rax
     pushq %rax
     leaq .STR126(%rip), %rax
@@ -8564,12 +8639,12 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2722
-.L2721:
-.L2722:
-    jmp .L2712
-.L2711:
-.L2712:
+    jmp .L2742
+.L2741:
+.L2742:
+    jmp .L2732
+.L2731:
+.L2732:
     leaq .STR126(%rip), %rax
     movq %rax, -200(%rbp)
     movq -32(%rbp), %rax
@@ -8593,8 +8668,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2582
-.L2581:
+    jmp .L2602
+.L2601:
     movq -16(%rbp), %rax
     pushq %rax
     movq $64, %rax
@@ -8603,7 +8678,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2731
+    jz .L2751
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8627,7 +8702,7 @@ check_single_char_token:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2741
+    jz .L2761
     movq $0, %rax
     pushq %rax
     movq -208(%rbp), %rax
@@ -8660,7 +8735,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2751
+    jz .L2771
     movq -232(%rbp), %rax
     pushq %rax
     movq $110, %rax
@@ -8669,7 +8744,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2761
+    jz .L2781
     movq -240(%rbp), %rax
     pushq %rax
     movq $100, %rax
@@ -8678,24 +8753,24 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2771
+    jz .L2791
     movq $1, %rax
     pushq %rax
     leaq -216(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    jmp .L2792
+.L2791:
+.L2792:
+    jmp .L2782
+.L2781:
+.L2782:
     jmp .L2772
 .L2771:
 .L2772:
     jmp .L2762
 .L2761:
 .L2762:
-    jmp .L2752
-.L2751:
-.L2752:
-    jmp .L2742
-.L2741:
-.L2742:
     movq -216(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -8704,7 +8779,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2781
+    jz .L2801
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8717,12 +8792,12 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2782
-.L2781:
-.L2782:
+    jmp .L2802
+.L2801:
+.L2802:
     movq $1, %rax
     movq %rax, -256(%rbp)
-.L2791:    movq -256(%rbp), %rax
+.L2811:    movq -256(%rbp), %rax
     pushq %rax
     movq $1, %rax
     popq %rbx
@@ -8730,7 +8805,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2792
+    jz .L2812
     movq $20, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -8747,14 +8822,14 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2801
+    jz .L2821
     movq $0, %rax
     pushq %rax
     leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2802
-.L2801:
+    jmp .L2822
+.L2821:
     movq -264(%rbp), %rax
     pushq %rax
     movq $64, %rax
@@ -8763,7 +8838,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2811
+    jz .L2831
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8785,7 +8860,7 @@ check_single_char_token:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2821
+    jz .L2841
     movq $0, %rax
     pushq %rax
     movq -272(%rbp), %rax
@@ -8828,7 +8903,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2831
+    jz .L2851
     movq -288(%rbp), %rax
     pushq %rax
     movq $110, %rax
@@ -8837,7 +8912,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2841
+    jz .L2861
     movq -296(%rbp), %rax
     pushq %rax
     movq $100, %rax
@@ -8846,7 +8921,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2851
+    jz .L2871
     movq -304(%rbp), %rax
     pushq %rax
     movq $0, %rax
@@ -8855,24 +8930,24 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2861
+    jz .L2881
     movq $1, %rax
     pushq %rax
     leaq -312(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+    jmp .L2882
+.L2881:
+.L2882:
+    jmp .L2872
+.L2871:
+.L2872:
     jmp .L2862
 .L2861:
 .L2862:
     jmp .L2852
 .L2851:
 .L2852:
-    jmp .L2842
-.L2841:
-.L2842:
-    jmp .L2832
-.L2831:
-.L2832:
     movq -312(%rbp), %rax
     pushq %rax
     movq $1, %rax
@@ -8881,7 +8956,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2871
+    jz .L2891
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8892,14 +8967,14 @@ check_single_char_token:
     leaq -256(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
-    jmp .L2872
-.L2871:
-.L2872:
-    jmp .L2822
-.L2821:
-.L2822:
-    jmp .L2812
-.L2811:
+    jmp .L2892
+.L2891:
+.L2892:
+    jmp .L2842
+.L2841:
+.L2842:
+    jmp .L2832
+.L2831:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8908,10 +8983,10 @@ check_single_char_token:
     leaq -48(%rbp), %rbx
     popq %rax
     movq %rax, (%rbx)
+.L2832:
+.L2822:
+    jmp .L2811
 .L2812:
-.L2802:
-    jmp .L2791
-.L2792:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8919,8 +8994,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2732
-.L2731:
+    jmp .L2752
+.L2751:
     movq -16(%rbp), %rax
     pushq %rax
     movq $123, %rax
@@ -8929,7 +9004,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2881
+    jz .L2901
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -8961,8 +9036,8 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2882
-.L2881:
+    jmp .L2902
+.L2901:
     movq -16(%rbp), %rax
     pushq %rax
     movq $125, %rax
@@ -8971,7 +9046,7 @@ check_single_char_token:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2891
+    jz .L2911
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
@@ -9003,11 +9078,13 @@ check_single_char_token:
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2892
-.L2891:
-.L2892:
-.L2882:
-.L2732:
+    jmp .L2912
+.L2911:
+.L2912:
+.L2902:
+.L2752:
+.L2602:
+.L2592:
 .L2582:
 .L2572:
 .L2562:
@@ -9018,8 +9095,6 @@ check_single_char_token:
 .L2512:
 .L2502:
 .L2492:
-.L2482:
-.L2472:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -9040,7 +9115,7 @@ token_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2901
+    jz .L2921
     movq $8, %rax
     pushq %rax
     movq -8(%rbp), %rax
@@ -9057,21 +9132,21 @@ token_destroy:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2911
+    jz .L2931
     movq -16(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L2912
-.L2911:
-.L2912:
+    jmp .L2932
+.L2931:
+.L2932:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi
     call deallocate@PLT
-    jmp .L2902
-.L2901:
-.L2902:
+    jmp .L2922
+.L2921:
+.L2922:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -9097,14 +9172,14 @@ is_alnum_char:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L2921
+    jz .L2941
     movq $1, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    jmp .L2922
-.L2921:
-.L2922:
+    jmp .L2942
+.L2941:
+.L2942:
     movq -8(%rbp), %rax
     pushq %rax
     popq %rdi

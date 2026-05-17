@@ -1,0 +1,344 @@
+Note: ============================================================================
+Note: FILE I/O - Convenience Wrappers Over io_core File Operations
+Note: ============================================================================
+Note: Higher-level file I/O primitives layered on top of io_core. The io_core
+Note: module exposes raw handles and byte buffers; this module exposes the
+Note: idiomatic "read whole file as string" / "write string to file" /
+Note: "append" / "line iteration" calls that the rest of the compiler reaches
+Note: for. Built on direct Linux syscalls (read=0, write=1, open=2, close=3)
+Note: through the existing runtime entry points.
+
+Note: Conventions:
+Note:   - Path arguments are null-terminated C strings (Integer pointers).
+Note:   - Return type Integer for content reads holds a pointer to a
+Note:     null-terminated heap-allocated buffer; caller takes ownership.
+Note:   - All write operations return bytes-written on success or a negative
+Note:     errno value on failure.
+Note: ============================================================================
+
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Note: ============================================================================
+Note: OPEN MODE CONSTANTS
+Note: ============================================================================
+Note: Mirror the POSIX O_* flags used by the open(2) syscall. Combine with
+Note: bitwise OR for compound modes (e.g. write_create_truncate).
+
+Constant FILE_MODE_READ_ONLY as Integer is 0
+Constant FILE_MODE_WRITE_ONLY as Integer is 1
+Constant FILE_MODE_READ_WRITE as Integer is 2
+Constant FILE_MODE_CREATE as Integer is 64
+Constant FILE_MODE_EXCLUSIVE as Integer is 128
+Constant FILE_MODE_TRUNCATE as Integer is 512
+Constant FILE_MODE_APPEND as Integer is 1024
+
+Note: Default permissions for newly-created files (0644 - owner read+write,
+Note: group/other read-only).
+Constant FILE_DEFAULT_PERMS as Integer is 420
+
+Note: Maximum file size accepted by read_entire_file. Files larger than this
+Note: are rejected to prevent unbounded memory allocation during compiler runs.
+Constant FILE_MAX_SIZE as Integer is 134217728
+
+Note: ============================================================================
+Note: SYSCALL WRAPPERS
+Note: ============================================================================
+Note: Direct Linux x86_64 syscall numbers. Other platforms route through the
+Note: runtime's syscall dispatcher (see runtime.c).
+
+Process called "fio_syscall0" takes syscall_num as Integer returns Integer:
+    Note: Zero-argument syscall (close, etc.)
+    Return 0
+End Process
+
+Process called "fio_syscall1" takes syscall_num as Integer, arg1 as Integer returns Integer:
+    Note: One-argument syscall - dispatched by the runtime.
+    Return 0
+End Process
+
+Process called "fio_syscall3" takes syscall_num as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer returns Integer:
+    Note: Three-argument syscall (read/write/open).
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: BASIC FILE OPERATIONS
+Note: ============================================================================
+
+Note: Open a file by path with the given combined mode flags. Returns the file
+Note: descriptor on success, or a negative errno on failure.
+Note: For read-only access prefer open_read; for fresh writes prefer
+Note: open_write_truncate; for log-style writes prefer open_append.
+Process called "fio_open" takes path as Integer, flags as Integer, perms as Integer returns Integer:
+    Note: syscall 2 = open on x86_64 Linux. The runtime dispatches by number.
+    Let fd be fio_syscall3(2, path, flags, perms)
+    Return fd
+End Process
+
+Note: Open for reading. Fails (negative return) if the path doesn't exist.
+Process called "fio_open_read" takes path as Integer returns Integer:
+    Return fio_open(path, FILE_MODE_READ_ONLY, 0)
+End Process
+
+Note: Open for writing, creating the file if missing and truncating to zero
+Note: length if it exists. Permissions default to 0644.
+Process called "fio_open_write_truncate" takes path as Integer returns Integer:
+    Let flags be FILE_MODE_WRITE_ONLY plus FILE_MODE_CREATE
+    Set flags to flags plus FILE_MODE_TRUNCATE
+    Return fio_open(path, flags, FILE_DEFAULT_PERMS)
+End Process
+
+Note: Open for appending. Creates the file if missing. Writes always land
+Note: at end-of-file regardless of seek position.
+Process called "fio_open_append" takes path as Integer returns Integer:
+    Let flags be FILE_MODE_WRITE_ONLY plus FILE_MODE_CREATE
+    Set flags to flags plus FILE_MODE_APPEND
+    Return fio_open(path, flags, FILE_DEFAULT_PERMS)
+End Process
+
+Note: Close a previously-opened file descriptor. Returns 0 on success.
+Process called "fio_close" takes fd as Integer returns Integer:
+    Return fio_syscall1(3, fd)
+End Process
+
+Note: Read up to count bytes from fd into buffer. Returns bytes actually read
+Note: (0 = EOF, negative = error).
+Process called "fio_read" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+    Return fio_syscall3(0, fd, buffer, count)
+End Process
+
+Note: Write count bytes from buffer to fd. Returns bytes actually written.
+Note: Short writes are possible - callers should loop until count is fully
+Note: written or an error is reported.
+Process called "fio_write" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+    Return fio_syscall3(1, fd, buffer, count)
+End Process
+
+Note: Reposition the file offset. whence: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END.
+Process called "fio_seek" takes fd as Integer, offset as Integer, whence as Integer returns Integer:
+    Return fio_syscall3(8, fd, offset, whence)
+End Process
+
+Note: Return current file length by seeking to end and back to start.
+Note: Returns -1 on error.
+Process called "fio_file_length" takes fd as Integer returns Integer:
+    Let length be fio_seek(fd, 0, 2)
+    If length is less than 0:
+        Return 0 minus 1
+    End If
+    Let restore be fio_seek(fd, 0, 0)
+    If restore is less than 0:
+        Return 0 minus 1
+    End If
+    Return length
+End Process
+
+Note: ============================================================================
+Note: HIGH-LEVEL CONVENIENCE WRAPPERS
+Note: ============================================================================
+
+Note: Read the entire contents of a file as a null-terminated string. Allocates
+Note: a fresh buffer sized to file length + 1. Returns 0 on error.
+Note: Caller takes ownership of the returned buffer.
+Process called "read_entire_file" takes path as Integer returns Integer:
+    Let fd be fio_open_read(path)
+    If fd is less than 0:
+        Return 0
+    End If
+
+    Let length be fio_file_length(fd)
+    If length is less than 0:
+        Let close_result be fio_close(fd)
+        Return 0
+    End If
+    If length is greater than FILE_MAX_SIZE:
+        Let close_result be fio_close(fd)
+        Return 0
+    End If
+
+    Let buffer be proc memory_allocate from MemoryCore with length plus 1
+    If buffer is equal to 0:
+        Let close_result be fio_close(fd)
+        Return 0
+    End If
+
+    Let total_read be 0
+    Let remaining be length
+    While remaining is greater than 0:
+        Let chunk be fio_read(fd, buffer plus total_read, remaining)
+        If chunk is less than 0:
+            proc memory_free from MemoryCore with buffer
+            Let close_result be fio_close(fd)
+            Return 0
+        End If
+        If chunk is equal to 0:
+            Set remaining to 0
+        Otherwise:
+            Set total_read to total_read plus chunk
+            Set remaining to remaining minus chunk
+        End If
+    End While
+
+    Let close_result be fio_close(fd)
+    Note: null-terminate
+    proc memory_set_byte from MemoryCore with buffer, total_read, 0
+    Return buffer
+End Process
+
+Note: Write content (a null-terminated string) to path, replacing any existing
+Note: contents. Creates the file if missing. Returns bytes written on success,
+Note: or a negative value on failure.
+Process called "write_entire_file" takes path as Integer, content as Integer returns Integer:
+    Let fd be fio_open_write_truncate(path)
+    If fd is less than 0:
+        Return fd
+    End If
+
+    Let length be proc string_length from StringCore with content
+    Let total_written be 0
+    While total_written is less than length:
+        Let remaining be length minus total_written
+        Let chunk be fio_write(fd, content plus total_written, remaining)
+        If chunk is less than 0:
+            Let close_result be fio_close(fd)
+            Return chunk
+        End If
+        If chunk is equal to 0:
+            Set total_written to length
+        Otherwise:
+            Set total_written to total_written plus chunk
+        End If
+    End While
+
+    Let close_result be fio_close(fd)
+    Return total_written
+End Process
+
+Note: Append content to the end of path. Creates the file if missing.
+Note: Returns bytes written.
+Process called "append_to_file" takes path as Integer, content as Integer returns Integer:
+    Let fd be fio_open_append(path)
+    If fd is less than 0:
+        Return fd
+    End If
+
+    Let length be proc string_length from StringCore with content
+    Let total_written be 0
+    While total_written is less than length:
+        Let remaining be length minus total_written
+        Let chunk be fio_write(fd, content plus total_written, remaining)
+        If chunk is less than 0:
+            Let close_result be fio_close(fd)
+            Return chunk
+        End If
+        If chunk is equal to 0:
+            Set total_written to length
+        Otherwise:
+            Set total_written to total_written plus chunk
+        End If
+    End While
+
+    Let close_result be fio_close(fd)
+    Return total_written
+End Process
+
+Note: True (1) if the path can be opened for reading.
+Process called "file_readable" takes path as Integer returns Integer:
+    Let fd be fio_open_read(path)
+    If fd is less than 0:
+        Return 0
+    End If
+    Let close_result be fio_close(fd)
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: LINE-ORIENTED HELPERS
+Note: ============================================================================
+
+Note: Locate the byte offset of the next newline (0x0A) starting from offset
+Note: in buffer of total length len. Returns the offset of the newline, or
+Note: len if no newline is found.
+Process called "find_next_newline" takes buffer as Integer, offset as Integer, len as Integer returns Integer:
+    Let i be offset
+    While i is less than len:
+        Let ch be proc memory_get_byte from MemoryCore with buffer, i
+        If ch is equal to 10:
+            Return i
+        End If
+        Set i to i plus 1
+    End While
+    Return len
+End Process
+
+Note: Count the number of lines in a string (newline-terminated regions). A
+Note: file with no trailing newline still counts the trailing fragment.
+Process called "count_lines" takes content as Integer returns Integer:
+    Let length be proc string_length from StringCore with content
+    If length is equal to 0:
+        Return 0
+    End If
+    Let count be 1
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from MemoryCore with content, i
+        If ch is equal to 10:
+            Note: Don't count trailing newline as a separate empty line.
+            If i is less than length minus 1:
+                Set count to count plus 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+    Return count
+End Process
+
+Note: ============================================================================
+Note: PATH UTILITIES
+Note: ============================================================================
+
+Note: Return 1 if path begins with '/' (absolute Unix path) or 'X:' (Windows).
+Process called "is_absolute_path" takes path as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+    Let first be proc memory_get_byte from MemoryCore with path, 0
+    If first is equal to 47:
+        Return 1
+    End If
+    Note: Windows drive letter form like "C:\..."
+    Let second be proc memory_get_byte from MemoryCore with path, 1
+    If second is equal to 58:
+        If first is greater than or equal to 65:
+            If first is less than or equal to 90:
+                Return 1
+            End If
+            If first is greater than or equal to 97:
+                If first is less than or equal to 122:
+                    Return 1
+                End If
+            End If
+        End If
+    End If
+    Return 0
+End Process
+
+Note: Find the byte offset of the last directory separator ('/' or '\') in
+Note: path. Returns -1 if no separator is present.
+Process called "last_separator_offset" takes path as Integer returns Integer:
+    Let length be proc string_length from StringCore with path
+    Let last be 0 minus 1
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from MemoryCore with path, i
+        If ch is equal to 47:
+            Set last to i
+        End If
+        If ch is equal to 92:
+            Set last to i
+        End If
+        Set i to i plus 1
+    End While
+    Return last
+End Process

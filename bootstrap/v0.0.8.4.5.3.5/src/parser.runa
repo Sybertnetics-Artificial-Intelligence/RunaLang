@@ -467,32 +467,35 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
         Note: This is a lambda invocation
         parser_eat(parser, 114)  Note: Eat "with"
 
-        Note: Parse arguments (may be multiple with "and" separator)
+        Note: Parse arguments (may be multiple with "and" separator).
+        Note: Parallel arg_names array tracks named-arg metadata. Each slot is
+        Note: NULL for positional args, or a heap string for `NAME as VAL`.
         Set arguments to 0
         Set argument_count to 0
         Let arg_capacity be 4
         Set arg_size to arg_capacity multiplied by 8
         Set arguments to memory_allocate(arg_size)
+        Let pf_arg_names be memory_allocate(arg_size)
+        Let pf_any_named be 0
+        Let pf_init_i be 0
+        While pf_init_i is less than arg_capacity:
+            memory_set_pointer(pf_arg_names, pf_init_i multiplied by 8, 0)
+            Set pf_init_i to pf_init_i plus 1
+        End While
 
-        Note: Parse first argument. Detect named-arg pattern `IDENT as VAL` and
-        Note: track whether we consumed an `as`, so the comma below can short-circuit
-        Note: the struct-field disambiguation (named-arg commas are arg separators,
-        Note: not the start of an outer struct-field initializer).
+        Let pf_name_slot be memory_allocate(8)
+
+        Note: Parse first argument. Detect named-arg pattern via capture helper.
         Set arg_expr to parser_parse_additive(parser)
+        Set arg_expr to parser_handle_named_arg_capture(parser, arg_expr, pf_name_slot)
+        Let pf_first_name be memory_get_pointer(pf_name_slot, 0)
         Let last_was_named be 0
-        Let na1_check be memory_get_pointer(parser, 8)
-        Let na1_check_type be memory_get_integer(na1_check, 0)
-        If na1_check_type is equal to 34:
-            If arg_expr is not equal to 0:
-                Let na1_node_type be memory_get_int32(arg_expr, 0)
-                If na1_node_type is equal to 1:
-                    parser_eat(parser, 34)
-                    Set arg_expr to parser_parse_expression(parser)
-                    Set last_was_named to 1
-                End If
-            End If
+        If pf_first_name is not equal to 0:
+            Set last_was_named to 1
+            Set pf_any_named to 1
         End If
         memory_set_pointer(arguments, 0, arg_expr)
+        memory_set_pointer(pf_arg_names, 0, pf_first_name)
         Set argument_count to 1
 
         Note: Parse additional arguments with "and" keyword OR comma separator.
@@ -516,8 +519,15 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 Note: But when the previous arg was a named arg (e.g.
                 Note: `with name as value, ...`), the comma is unambiguously an
                 Note: arg separator for the next named arg — skip the peek.
+                Note: Also: when we've already parsed ≥1 arg in this call AND the
+                Note: lookahead pattern is `IDENT as`, it's a NAMED arg in our
+                Note: list, not a sibling struct-field initializer. Outer struct
+                Note: ctor would have terminated us with the first comma; if we're
+                Note: still parsing after one arg, we own all subsequent commas.
                 Let take_separator be 0
                 If last_was_named is equal to 1:
+                    Set take_separator to 1
+                Otherwise If argument_count is greater than or equal to 1:
                     Set take_separator to 1
                 Otherwise:
                     Let lc_field_ahead be parser_peek_struct_field_after_comma(parser)
@@ -532,27 +542,41 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             End If
 
             If arg_separator_consumed is equal to 1:
+                If argument_count is greater than or equal to arg_capacity:
+                    Let pf_old_cap be arg_capacity
+                    Set arg_capacity to arg_capacity multiplied by 2
+                    Set arg_size to arg_capacity multiplied by 8
+                    Set arguments to memory_reallocate(arguments, arg_size)
+                    Set pf_arg_names to memory_reallocate(pf_arg_names, arg_size)
+                    Let pf_zi be pf_old_cap
+                    While pf_zi is less than arg_capacity:
+                        memory_set_pointer(pf_arg_names, pf_zi multiplied by 8, 0)
+                        Set pf_zi to pf_zi plus 1
+                    End While
+                End If
+
                 Let arg_expr2 be parser_parse_additive(parser)
+                Set arg_expr2 to parser_handle_named_arg_capture(parser, arg_expr2, pf_name_slot)
+                Let pf_next_name be memory_get_pointer(pf_name_slot, 0)
                 Set last_was_named to 0
-                Let na2_check be memory_get_pointer(parser, 8)
-                Let na2_check_type be memory_get_integer(na2_check, 0)
-                If na2_check_type is equal to 34:
-                    If arg_expr2 is not equal to 0:
-                        Let na2_node_type be memory_get_int32(arg_expr2, 0)
-                        If na2_node_type is equal to 1:
-                            parser_eat(parser, 34)
-                            Set arg_expr2 to parser_parse_expression(parser)
-                            Set last_was_named to 1
-                        End If
-                    End If
+                If pf_next_name is not equal to 0:
+                    Set last_was_named to 1
+                    Set pf_any_named to 1
                 End If
                 Set arg_offset to argument_count multiplied by 8
                 memory_set_pointer(arguments plus arg_offset, 0, arg_expr2)
+                memory_set_pointer(pf_arg_names plus arg_offset, 0, pf_next_name)
                 Set argument_count to argument_count plus 1
             Otherwise:
                 Set continue_args to 0
             End If
         End While
+        deallocate(pf_name_slot)
+
+        If pf_any_named is equal to 0:
+            deallocate(pf_arg_names)
+            Set pf_arg_names to 0
+        End If
 
         Note: Decide between a regular function call and a lambda invocation.
         Note: When left is an EXPR_VARIABLE the "with" form names a top-level function
@@ -561,6 +585,9 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
         Note: variable.  Lower this case to EXPR_FUNCTION_CALL using the variable's
         Note: name so it routes through the normal function-call codegen path.
         Set left to with_promote_to_call_or_lambda(left, arguments, argument_count)
+        If pf_arg_names is not equal to 0:
+            expression_attach_arg_names(left, pf_arg_names)
+        End If
     End If
 
     Note: Handle field access and array indexing (highest precedence)
@@ -644,12 +671,13 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 parser_eat(parser, 49)  Note: ')'
 
                 Note: Create EXPR_QUALIFIED_CALL: module_name, function_name, arguments, arg_count
-                Let qualified_call be memory_allocate(40)
+                Let qualified_call be memory_allocate(48)
                 memory_set_integer(qualified_call, 0, EXPR_QUALIFIED_CALL)
                 memory_set_pointer(qualified_call, 8, module_name)  Note: module_name
                 memory_set_pointer(qualified_call, 16, field_name)  Note: function_name
                 memory_set_pointer(qualified_call, 24, qual_args)  Note: arguments
                 memory_set_int32(qualified_call, 32, qual_argc)  Note: arg_count
+                memory_set_pointer(qualified_call, 40, 0)  Note: arg_names = NULL (positional)
                 deallocate(left)  Note: Free the EXPR_VARIABLE
                 Set left to qualified_call
             Otherwise:
@@ -758,23 +786,27 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
         Let pwp_arg_cap be 4
         Let pwp_arg_size be pwp_arg_cap multiplied by 8
         Set pwp_args to memory_allocate(pwp_arg_size)
+        Let pwp_arg_names be memory_allocate(pwp_arg_size)
+        Let pwp_any_named be 0
+        Let pwp_init_i be 0
+        While pwp_init_i is less than pwp_arg_cap:
+            memory_set_pointer(pwp_arg_names, pwp_init_i multiplied by 8, 0)
+            Set pwp_init_i to pwp_init_i plus 1
+        End While
+
+        Let pwp_name_slot be memory_allocate(8)
 
         Note: Parse first argument, with named-arg detection.
         Let pwp_arg_expr be parser_parse_additive(parser)
+        Set pwp_arg_expr to parser_handle_named_arg_capture(parser, pwp_arg_expr, pwp_name_slot)
+        Let pwp_first_name be memory_get_pointer(pwp_name_slot, 0)
         Let pwp_last_named be 0
-        Let pwp_na1_tok be memory_get_pointer(parser, 8)
-        Let pwp_na1_type be memory_get_integer(pwp_na1_tok, 0)
-        If pwp_na1_type is equal to 34:
-            If pwp_arg_expr is not equal to 0:
-                Let pwp_na1_node_type be memory_get_int32(pwp_arg_expr, 0)
-                If pwp_na1_node_type is equal to 1:
-                    parser_eat(parser, 34)
-                    Set pwp_arg_expr to parser_parse_expression(parser)
-                    Set pwp_last_named to 1
-                End If
-            End If
+        If pwp_first_name is not equal to 0:
+            Set pwp_last_named to 1
+            Set pwp_any_named to 1
         End If
         memory_set_pointer(pwp_args, 0, pwp_arg_expr)
+        memory_set_pointer(pwp_arg_names, 0, pwp_first_name)
         Set pwp_argc to 1
 
         Note: Parse additional arguments with `and` or `,` separator
@@ -803,27 +835,40 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 End If
             End If
             If pwp_sep_consumed is equal to 1:
+                If pwp_argc is greater than or equal to pwp_arg_cap:
+                    Let pwp_old_cap be pwp_arg_cap
+                    Set pwp_arg_cap to pwp_arg_cap multiplied by 2
+                    Set pwp_arg_size to pwp_arg_cap multiplied by 8
+                    Set pwp_args to memory_reallocate(pwp_args, pwp_arg_size)
+                    Set pwp_arg_names to memory_reallocate(pwp_arg_names, pwp_arg_size)
+                    Let pwp_zi be pwp_old_cap
+                    While pwp_zi is less than pwp_arg_cap:
+                        memory_set_pointer(pwp_arg_names, pwp_zi multiplied by 8, 0)
+                        Set pwp_zi to pwp_zi plus 1
+                    End While
+                End If
                 Let pwp_arg_expr2 be parser_parse_additive(parser)
+                Set pwp_arg_expr2 to parser_handle_named_arg_capture(parser, pwp_arg_expr2, pwp_name_slot)
+                Let pwp_next_name be memory_get_pointer(pwp_name_slot, 0)
                 Set pwp_last_named to 0
-                Let pwp_na2_tok be memory_get_pointer(parser, 8)
-                Let pwp_na2_type be memory_get_integer(pwp_na2_tok, 0)
-                If pwp_na2_type is equal to 34:
-                    If pwp_arg_expr2 is not equal to 0:
-                        Let pwp_na2_node_type be memory_get_int32(pwp_arg_expr2, 0)
-                        If pwp_na2_node_type is equal to 1:
-                            parser_eat(parser, 34)
-                            Set pwp_arg_expr2 to parser_parse_expression(parser)
-                            Set pwp_last_named to 1
-                        End If
-                    End If
+                If pwp_next_name is not equal to 0:
+                    Set pwp_last_named to 1
+                    Set pwp_any_named to 1
                 End If
                 Let pwp_arg_offset be pwp_argc multiplied by 8
                 memory_set_pointer(pwp_args plus pwp_arg_offset, 0, pwp_arg_expr2)
+                memory_set_pointer(pwp_arg_names plus pwp_arg_offset, 0, pwp_next_name)
                 Set pwp_argc to pwp_argc plus 1
             Otherwise:
                 Set pwp_continue to 0
             End If
         End While
+        deallocate(pwp_name_slot)
+
+        If pwp_any_named is equal to 0:
+            deallocate(pwp_arg_names)
+            Set pwp_arg_names to 0
+        End If
 
         Note: Lower to EXPR_QUALIFIED_CALL when left is EXPR_FIELD_ACCESS on a
         Note: bare module name (Module.method); otherwise lower to plain call.
@@ -836,18 +881,25 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
             If pwp_obj_type is equal to 1:
                 Note: object is EXPR_VARIABLE - module name
                 Let pwp_mod_name be memory_get_pointer(pwp_obj, 8)
-                Let pwp_qcall be memory_allocate(40)
+                Let pwp_qcall be memory_allocate(48)
                 memory_set_integer(pwp_qcall, 0, EXPR_QUALIFIED_CALL)
                 memory_set_pointer(pwp_qcall, 8, pwp_mod_name)
                 memory_set_pointer(pwp_qcall, 16, pwp_field_name)
                 memory_set_pointer(pwp_qcall, 24, pwp_args)
                 memory_set_int32(pwp_qcall, 32, pwp_argc)
+                memory_set_pointer(pwp_qcall, 40, pwp_arg_names)
                 Set left to pwp_qcall
             Otherwise:
                 Set left to with_promote_to_call_or_lambda(left, pwp_args, pwp_argc)
+                If pwp_arg_names is not equal to 0:
+                    expression_attach_arg_names(left, pwp_arg_names)
+                End If
             End If
         Otherwise:
             Set left to with_promote_to_call_or_lambda(left, pwp_args, pwp_argc)
+            If pwp_arg_names is not equal to 0:
+                expression_attach_arg_names(left, pwp_arg_names)
+            End If
         End If
     End If
 
@@ -1295,6 +1347,10 @@ Let EXPR_STRUCT_CONSTRUCTION be 20
 Let EXPR_LAMBDA be 23
 Let EXPR_LAMBDA_CALL be 24
 Let EXPR_QUALIFIED_CALL be 25  Note: module.function() calls
+Let EXPR_ARRAY_LITERAL_CONST be 26  Note: Compile-time array literal for global constants
+Let EXPR_CONVERT be 27  Note: convert X to Y - dispatches on source+target type at codegen
+Let EXPR_POSITION_OF be 28  Note: position of X in Y - dispatches on haystack type at codegen
+Let EXPR_FLOAT_LITERAL be 29  Note: 3.14 etc. - IEEE 754 double, stored as int64 bit pattern
 
 Note: Statement type constants - synchronized with codegen.runa
 Let STMT_LET be 1
@@ -1474,12 +1530,16 @@ Note: Let TOKEN_ERROR be 129
 Note: Let TOKEN_COUNT be 130
 
 Note: TypeDefinition constants (matching C struct layout)
-Let TypeDefinition_SIZE be 48
+Let TypeDefinition_SIZE be 56
 Let TYPEDEFINITION_NAME_OFFSET be 0
 Let TYPEDEFINITION_KIND_OFFSET be 8
 Let TYPEDEFINITION_DATA_STRUCT_FIELDS_OFFSET be 16
 Let TYPEDEFINITION_DATA_STRUCT_FIELD_COUNT_OFFSET be 24
 Let TYPEDEFINITION_SIZE_OFFSET be 40
+Note: source_file pointer added to support same-file struct-type disambiguation
+Note: in codegen_resolve_struct_via_structural. Pointer to the C-string path of the
+Note: file this type was parsed from (or 0 for synthesized/main-program types).
+Let TYPEDEFINITION_SOURCE_FILE_OFFSET be 48
 Let TYPEDEFINITION_DATA_ARRAY_ELEMENT_TYPE_OFFSET be 16
 Let TYPEDEFINITION_DATA_ARRAY_ELEMENT_SIZE_OFFSET be 24
 Let TYPEDEFINITION_DATA_ARRAY_LENGTH_OFFSET be 28
@@ -1608,6 +1668,8 @@ Process called "parser_parse_call_statement" takes parser as Integer returns Int
 
     Note: Optional 'with arg1, arg2, ...' (commas, 'and', or comma-and pairs accepted)
     Let call_arguments be 0
+    Let call_arg_names be 0
+    Let call_any_named be 0
     Let call_arg_count be 0
     Set call_check to memory_get_pointer(parser, 8)
     Set call_check_type to memory_get_integer(call_check, 0)
@@ -1616,19 +1678,39 @@ Process called "parser_parse_call_statement" takes parser as Integer returns Int
         Let call_arg_capacity be 8
         Let call_arg_size be call_arg_capacity multiplied by 8
         Set call_arguments to memory_allocate(call_arg_size)
+        Set call_arg_names to memory_allocate(call_arg_size)
+        Let call_init_i be 0
+        While call_init_i is less than call_arg_capacity:
+            memory_set_pointer(call_arg_names, call_init_i multiplied by 8, 0)
+            Set call_init_i to call_init_i plus 1
+        End While
 
+        Let call_name_slot be memory_allocate(8)
         Let call_arg_continue be 1
         While call_arg_continue is equal to 1:
             If call_arg_count is greater than or equal to call_arg_capacity:
+                Let call_old_cap be call_arg_capacity
                 Set call_arg_capacity to call_arg_capacity multiplied by 2
                 Set call_arg_size to call_arg_capacity multiplied by 8
                 Set call_arguments to memory_reallocate(call_arguments, call_arg_size)
+                Set call_arg_names to memory_reallocate(call_arg_names, call_arg_size)
+                Note: Zero the newly-allocated tail of arg_names so positional slots stay NULL.
+                Let call_zi be call_old_cap
+                While call_zi is less than call_arg_capacity:
+                    memory_set_pointer(call_arg_names, call_zi multiplied by 8, 0)
+                    Set call_zi to call_zi plus 1
+                End While
             End If
 
             Let call_arg_expr be parser_parse_expression(parser)
-            Set call_arg_expr to parser_handle_named_arg(parser, call_arg_expr)
+            Set call_arg_expr to parser_handle_named_arg_capture(parser, call_arg_expr, call_name_slot)
             Let call_arg_offset be call_arg_count multiplied by 8
             memory_set_pointer(call_arguments, call_arg_offset, call_arg_expr)
+            Let call_arg_name be memory_get_pointer(call_name_slot, 0)
+            memory_set_pointer(call_arg_names, call_arg_offset, call_arg_name)
+            If call_arg_name is not equal to 0:
+                Set call_any_named to 1
+            End If
             Set call_arg_count to call_arg_count plus 1
 
             Let call_comma_check be memory_get_pointer(parser, 8)
@@ -1646,18 +1728,30 @@ Process called "parser_parse_call_statement" takes parser as Integer returns Int
                 Set call_arg_continue to 0
             End If
         End While
+        deallocate(call_name_slot)
+    End If
+
+    Note: If no named args were used, drop the arg_names array (saves memory and
+    Note: signals to codegen that no reorder is needed).
+    If call_any_named is equal to 0:
+        If call_arg_names is not equal to 0:
+            deallocate(call_arg_names)
+            Set call_arg_names to 0
+        End If
     End If
 
     Let call_expr be 0
     If call_module_name is not equal to 0:
-        Set call_expr to memory_allocate(40)
+        Set call_expr to memory_allocate(48)
         memory_set_integer(call_expr, 0, 25)  Note: EXPR_QUALIFIED_CALL
         memory_set_pointer(call_expr, 8, call_module_name)
         memory_set_pointer(call_expr, 16, call_func_name)
         memory_set_pointer(call_expr, 24, call_arguments)
         memory_set_integer(call_expr, 32, call_arg_count)
+        memory_set_pointer(call_expr, 40, call_arg_names)
     Otherwise:
         Set call_expr to expression_create_function_call(call_func_name, call_arguments, call_arg_count)
+        expression_attach_arg_names(call_expr, call_arg_names)
     End If
 
     Return statement_create_expression(call_expr)
@@ -1910,6 +2004,8 @@ Process called "parser_parse_proc_expression" takes parser as Integer returns In
     Set proc_check_type to memory_get_integer(proc_check, 0)
 
     Let proc_arguments be 0
+    Let proc_arg_names be 0
+    Let proc_any_named be 0
     Let proc_arg_count be 0
 
     If proc_check_type is equal to 114:
@@ -1918,32 +2014,42 @@ Process called "parser_parse_proc_expression" takes parser as Integer returns In
         Let proc_arg_capacity be 8
         Let proc_arg_size be proc_arg_capacity multiplied by 8
         Set proc_arguments to memory_allocate(proc_arg_size)
+        Set proc_arg_names to memory_allocate(proc_arg_size)
+        Let proc_init_i be 0
+        While proc_init_i is less than proc_arg_capacity:
+            memory_set_pointer(proc_arg_names, proc_init_i multiplied by 8, 0)
+            Set proc_init_i to proc_init_i plus 1
+        End While
 
+        Let proc_name_slot be memory_allocate(8)
         Let proc_arg_continue be 1
         Let proc_last_was_named be 0
         While proc_arg_continue is equal to 1:
             If proc_arg_count is greater than or equal to proc_arg_capacity:
+                Let proc_old_cap be proc_arg_capacity
                 Set proc_arg_capacity to proc_arg_capacity multiplied by 2
                 Set proc_arg_size to proc_arg_capacity multiplied by 8
                 Set proc_arguments to memory_reallocate(proc_arguments, proc_arg_size)
+                Set proc_arg_names to memory_reallocate(proc_arg_names, proc_arg_size)
+                Let proc_zi be proc_old_cap
+                While proc_zi is less than proc_arg_capacity:
+                    memory_set_pointer(proc_arg_names, proc_zi multiplied by 8, 0)
+                    Set proc_zi to proc_zi plus 1
+                End While
             End If
 
             Let proc_arg_expr be parser_parse_expression(parser)
+            Set proc_arg_expr to parser_handle_named_arg_capture(parser, proc_arg_expr, proc_name_slot)
+            Let proc_arg_name be memory_get_pointer(proc_name_slot, 0)
             Set proc_last_was_named to 0
-            Let proc_na_check be memory_get_pointer(parser, 8)
-            Let proc_na_check_type be memory_get_integer(proc_na_check, 0)
-            If proc_na_check_type is equal to 34:
-                If proc_arg_expr is not equal to 0:
-                    Let proc_na_node_type be memory_get_int32(proc_arg_expr, 0)
-                    If proc_na_node_type is equal to 1:
-                        parser_eat(parser, 34)
-                        Set proc_arg_expr to parser_parse_expression(parser)
-                        Set proc_last_was_named to 1
-                    End If
-                End If
+            If proc_arg_name is not equal to 0:
+                Set proc_last_was_named to 1
+                Set proc_any_named to 1
             End If
+
             Let proc_arg_offset be proc_arg_count multiplied by 8
             memory_set_pointer(proc_arguments, proc_arg_offset, proc_arg_expr)
+            memory_set_pointer(proc_arg_names, proc_arg_offset, proc_arg_name)
             Set proc_arg_count to proc_arg_count plus 1
 
             Let proc_comma_check be memory_get_pointer(parser, 8)
@@ -1966,49 +2072,37 @@ Process called "parser_parse_proc_expression" takes parser as Integer returns In
                 Set proc_arg_continue to 0
             End If
         End While
+        deallocate(proc_name_slot)
+    End If
+
+    If proc_any_named is equal to 0:
+        If proc_arg_names is not equal to 0:
+            deallocate(proc_arg_names)
+            Set proc_arg_names to 0
+        End If
     End If
 
     If proc_module_name is not equal to 0:
-        Let proc_qual_call be memory_allocate(40)
+        Let proc_qual_call be memory_allocate(48)
         memory_set_integer(proc_qual_call, 0, 25)  Note: EXPR_QUALIFIED_CALL
         memory_set_pointer(proc_qual_call, 8, proc_module_name)
         memory_set_pointer(proc_qual_call, 16, proc_func_name)
         memory_set_pointer(proc_qual_call, 24, proc_arguments)
         memory_set_integer(proc_qual_call, 32, proc_arg_count)
+        memory_set_pointer(proc_qual_call, 40, proc_arg_names)
         Return proc_qual_call
     End If
-    Return expression_create_function_call(proc_call_name, proc_arguments, proc_arg_count)
-End Process
-
-Note: Detect named-argument syntax `name as value` after parsing one positional arg.
-Note: When the just-parsed arg is a simple variable AND the following token is TOKEN_AS,
-Note: the parser discards the variable (treating its name as a documentation hint) and
-Note: parses the real value expression. The bootstrap resolves named arguments by their
-Note: written position — callers must list arguments in the called function's parameter
-Note: declaration order, matching the canonical convention used throughout v0.0.8.5.
-Process called "parser_handle_named_arg" takes parser as Integer, arg_expr as Integer returns Integer:
-    Let na_check be memory_get_pointer(parser, 8)
-    Let na_check_type be memory_get_integer(na_check, 0)
-    If na_check_type is not equal to 34:
-        Return arg_expr
-    End If
-    If arg_expr is equal to 0:
-        Return arg_expr
-    End If
-    Let na_node_type be memory_get_int32(arg_expr, 0)
-    If na_node_type is not equal to 1:
-        Return arg_expr
-    End If
-    parser_eat(parser, 34)  Note: Eat 'as' (TOKEN_AS=34)
-    Return parser_parse_expression(parser)
+    Let proc_fc_expr be expression_create_function_call(proc_call_name, proc_arguments, proc_arg_count)
+    expression_attach_arg_names(proc_fc_expr, proc_arg_names)
+    Return proc_fc_expr
 End Process
 
 Note: Parse canonical `position of <needle> in <haystack>` expression.
 Note: Caller has already eaten the 'position' identifier and confirmed next is 'of'.
-Note: Desugars to a string_find(haystack, needle) function call. The bootstrap's
-Note: string_find runtime symbol takes (haystack, needle); v0.0.8.5 source-level
-Note: string_find has a 3-arg variant but compile-to-asm doesn't verify signatures,
-Note: only emits the call. Linking is the user's responsibility.
+Note: Emits an EXPR_POSITION_OF node carrying needle + haystack. Codegen inspects
+Note: haystack's actual type and emits string_find for String haystacks or
+Note: list_find for List haystacks. Polymorphic-by-source-type rather than blindly
+Note: string-only.
 Process called "parser_parse_position_expression" takes parser as Integer returns Integer:
     parser_eat(parser, 125)  Note: Eat 'of' (TOKEN_OF=125)
 
@@ -2018,18 +2112,24 @@ Process called "parser_parse_position_expression" takes parser as Integer return
 
     Let pos_haystack_expr be parser_parse_expression(parser)
 
-    Let pos_args be memory_allocate(16)
-    memory_set_pointer(pos_args, 0, pos_haystack_expr)
-    memory_set_pointer(pos_args, 8, pos_needle_expr)
-    Return expression_create_function_call(string_duplicate("string_find"), pos_args, 2)
+    Note: Build EXPR_POSITION_OF node. Layout (24 bytes):
+    Note:   offset 0:  expr type (EXPR_POSITION_OF = 28)
+    Note:   offset 8:  needle expression
+    Note:   offset 16: haystack expression
+    Let pos_expr be memory_allocate(24)
+    memory_set_int32(pos_expr, 0, 28)
+    memory_set_pointer(pos_expr, 8, pos_needle_expr)
+    memory_set_pointer(pos_expr, 16, pos_haystack_expr)
+    Return pos_expr
 End Process
 
 Note: Parse canonical conversion expression: `convert <expr> to <TypeName>`.
-Note: Desugars to a single-argument function call. Target Integer becomes
-Note: string_to_integer; Float becomes string_to_float; String becomes
-Note: integer_to_string. Other type names fall back to string_to_<TypeName>.
-Note: parser_parse_expression stops at TOKEN_TO because TOKEN_TO is not a
-Note: binary operator, so the value side parses cleanly.
+Note: Emits an EXPR_CONVERT node that carries the source expression and target
+Note: type name. Codegen inspects the source expression's actual type and emits
+Note: the correct runtime call (string_to_integer for String→Integer, etc.) or
+Note: errors when the conversion isn't supported. parser_parse_expression stops
+Note: at TOKEN_TO because TOKEN_TO is not a binary operator, so the value side
+Note: parses cleanly.
 Process called "parser_parse_convert_expression" takes parser as Integer returns Integer:
     parser_eat(parser, 184)  Note: Eat 'convert' (TOKEN_CONVERT=184)
 
@@ -2046,25 +2146,15 @@ Process called "parser_parse_convert_expression" takes parser as Integer returns
     End If
     parser_eat(parser, conv_type_tt)
 
-    Let conv_func_name be 0
-    If conv_type_name is not equal to 0:
-        If string_equals(conv_type_name, "Integer") is equal to 1:
-            Set conv_func_name to string_duplicate("string_to_integer")
-        Otherwise If string_equals(conv_type_name, "Float") is equal to 1:
-            Set conv_func_name to string_duplicate("string_to_float")
-        Otherwise If string_equals(conv_type_name, "String") is equal to 1:
-            Set conv_func_name to string_duplicate("integer_to_string")
-        Otherwise:
-            Let conv_prefix be string_duplicate("string_to_")
-            Set conv_func_name to string_concat(conv_prefix, conv_type_name)
-        End If
-    Otherwise:
-        Set conv_func_name to string_duplicate("string_to_integer")
-    End If
-
-    Let conv_args be memory_allocate(8)
-    memory_set_pointer(conv_args, 0, conv_value_expr)
-    Return expression_create_function_call(conv_func_name, conv_args, 1)
+    Note: Build EXPR_CONVERT node. Layout (24 bytes):
+    Note:   offset 0:  expr type (EXPR_CONVERT = 27)
+    Note:   offset 8:  source value expression pointer
+    Note:   offset 16: target type name string
+    Let conv_expr be memory_allocate(24)
+    memory_set_int32(conv_expr, 0, 27)
+    memory_set_pointer(conv_expr, 8, conv_value_expr)
+    memory_set_pointer(conv_expr, 16, conv_type_name)
+    Return conv_expr
 End Process
 
 Note: Promote an "EXPR with args" construct to either a function call (when left is
@@ -2613,14 +2703,80 @@ End Process
 
 Note: Create function call expression
 Process called "expression_create_function_call" takes function_name as Integer, arguments as Integer, argument_count as Integer returns Integer:
-    Let expr_size be 32
+    Note: Allocate 40 bytes so the optional arg_names slot at offset 32 exists.
+    Note: Default arg_names = NULL (no named-arg metadata).
+    Let expr_size be 40
     Let expr be memory_allocate(expr_size)
     memory_set_int32(expr, 0, EXPR_FUNCTION_CALL)
     Let dup_name be string_duplicate_parser(function_name)
     memory_set_pointer(expr, 8, dup_name)
     memory_set_pointer(expr, 16, arguments)
     memory_set_integer(expr, 24, argument_count)
+    memory_set_pointer(expr, 32, 0)  Note: arg_names = NULL (positional call)
     Return expr
+End Process
+
+Note: Attach an arg-names array (parallel to args) to a function call expression.
+Note: Each entry is either NULL (positional arg) or a heap-allocated string pointer
+Note: naming the parameter that the corresponding arg binds to. Codegen uses this
+Note: array to look up the function's parameter declaration and reorder the args
+Note: to match declaration order, so callers can write named args in any order.
+Process called "expression_attach_arg_names" takes expr as Integer, names as Integer returns Integer:
+    If expr is equal to 0:
+        Return 0
+    End If
+    If names is equal to 0:
+        Note: Positional call - nothing to attach.
+        Return 0
+    End If
+    Let etype be memory_get_int32(expr, 0)
+    If etype is equal to 4:
+        Note: EXPR_FUNCTION_CALL: arg_names at offset 32 (struct extended to 40 bytes)
+        memory_set_pointer(expr, 32, names)
+        Return 0
+    End If
+    If etype is equal to 25:
+        Note: EXPR_QUALIFIED_CALL: arg_names at offset 40 (struct extended to 48 bytes)
+        memory_set_pointer(expr, 40, names)
+        Return 0
+    End If
+    Note: Other expression types (EXPR_LAMBDA_CALL, etc.) don't accept named args.
+    Note: Refuse silently dropping the metadata - codegen wouldn't reorder anyway.
+    print_string("[PARSER ERROR] Named arguments are not supported on this call form (expression type ")
+    print_integer(etype)
+    print_string(")")
+    print_newline()
+    exit_with_code(1)
+    Return 0
+End Process
+
+Note: Out-parameter form of named-arg detection. If the next token is `as` and the
+Note: just-parsed arg is a simple variable, capture the variable's name into
+Note: name_slot (a 1-pointer scratch cell) and return the real value expression.
+Note: Otherwise write NULL to name_slot and return the original arg unchanged.
+Note: Caller is responsible for allocating name_slot (8 bytes).
+Process called "parser_handle_named_arg_capture" takes parser as Integer, arg_expr as Integer, name_slot as Integer returns Integer:
+    memory_set_pointer(name_slot, 0, 0)
+    Let nac_check be memory_get_pointer(parser, 8)
+    Let nac_check_type be memory_get_integer(nac_check, 0)
+    If nac_check_type is not equal to 34:
+        Return arg_expr
+    End If
+    If arg_expr is equal to 0:
+        Return arg_expr
+    End If
+    Let nac_node_type be memory_get_int32(arg_expr, 0)
+    If nac_node_type is not equal to 1:
+        Return arg_expr
+    End If
+    Let nac_raw_name be memory_get_pointer(arg_expr, 8)
+    Let nac_name be 0
+    If nac_raw_name is not equal to 0:
+        Set nac_name to string_duplicate_parser(nac_raw_name)
+    End If
+    memory_set_pointer(name_slot, 0, nac_name)
+    parser_eat(parser, 34)
+    Return parser_parse_expression(parser)
 End Process
 
 Note: Create string literal expression (takes ownership)
@@ -2811,17 +2967,19 @@ End Process
 
 Note: Create let statement
 Process called "statement_create_let" takes var_name as Integer, expr as Integer returns Integer:
-    Note: Layout: type(0)=STMT_LET, name(8), expr(16), type_name(24).  type_name is
-    Note: NULL by default; set by parser_parse_let_statement when the source uses
-    Note: the optional "Let X as Type be Y" annotation form so codegen can resolve
-    Note: struct fields on X without ambiguity.
-    Let stmt_size be 32
+    Note: Layout: type(0)=STMT_LET, name(8), expr(16), type_name(24), is_constant(32).
+    Note: type_name is NULL by default; set by parser_parse_let_statement when the
+    Note: source uses the optional "Let X as Type be Y" annotation. is_constant is
+    Note: 0 by default; set to 1 only by parser_parse_local_constant_statement so
+    Note: codegen can mark the variable read-only and reject subsequent Set writes.
+    Let stmt_size be 40
     Let stmt be memory_allocate(stmt_size)
     memory_set_int32(stmt, 0, STMT_LET)
     Let dup_name be string_duplicate_parser(var_name)
     memory_set_pointer(stmt, 8, dup_name)   Note: variable_name at offset 8
     memory_set_pointer(stmt, 16, expr)      Note: expression at offset 16
     memory_set_pointer(stmt, 24, 0)         Note: type_name pointer (NULL = no annotation)
+    memory_set_int32(stmt, 32, 0)           Note: is_constant flag (0 = mutable Let)
     Return stmt
 End Process
 
@@ -2837,6 +2995,51 @@ Process called "statement_set_let_type" takes stmt as Integer, type_name as Inte
     Let dup_type be string_duplicate_parser(type_name)
     memory_set_pointer(stmt, 24, dup_type)
     Return 0
+End Process
+
+Note: Mark a Let statement as the lowered form of a `Constant` declaration so
+Note: codegen registers the variable as immutable and reject subsequent Set.
+Process called "statement_set_let_constant" takes stmt as Integer returns Integer:
+    If stmt is equal to 0:
+        Return 0
+    End If
+    memory_set_int32(stmt, 32, 1)
+    Return 0
+End Process
+
+Note: Parse `Constant NAME as TYPE is VALUE` inside a function body and lower
+Note: it to a Let statement. The bootstrap codegen has no notion of local
+Note: immutability, so the constant just becomes a regular local. Callers should
+Note: use Set sparingly to preserve the intended semantics.
+Process called "parser_parse_local_constant_statement" takes parser as Integer returns Integer:
+    parser_eat(parser, 164)  Note: Eat 'Constant'
+    Let lc_name_tok be memory_get_pointer(parser, 8)
+    Let lc_name_type be memory_get_integer(lc_name_tok, 0)
+    Let lc_name_val be memory_get_pointer(lc_name_tok, 8)
+    Let lc_name be 0
+    If lc_name_val is not equal to 0:
+        Set lc_name to string_duplicate_parser(lc_name_val)
+    End If
+    Let lc_name_can_id be token_can_be_identifier(lc_name_type)
+    If lc_name_can_id is equal to 1:
+        parser_eat(parser, lc_name_type)
+    Otherwise:
+        parser_eat(parser, 53)
+    End If
+
+    parser_eat(parser, 34)  Note: Eat 'as'
+
+    Let lc_type_tok be memory_get_pointer(parser, 8)
+    Let lc_type_type be memory_get_integer(lc_type_tok, 0)
+    parser_eat(parser, lc_type_type)
+
+    parser_eat(parser, 21)  Note: Eat 'is'
+
+    Let lc_value be parser_parse_expression(parser)
+
+    Let lc_stmt be statement_create_let(lc_name, lc_value)
+    statement_set_let_constant(lc_stmt)
+    Return lc_stmt
 End Process
 
 Note: Create set statement
@@ -2874,15 +3077,20 @@ Process called "statement_create_for_range" takes var_name as Integer, start_exp
     Return stmt
 End Process
 
-Note: Create for-each statement
-Process called "statement_create_for_each" takes var_name as Integer, collection_expr as Integer, body as Integer, body_count as Integer returns Integer:
-    Let stmt_size be 40
+Note: Create for-each statement. type_name (offset 40) is optional - pass 0
+Note: when the loop variable has no explicit type annotation. When present, the
+Note: codegen registers the loop variable with that type so subsequent
+Note: `loopvar.field` accesses resolve directly instead of relying on
+Note: structural inference.
+Process called "statement_create_for_each" takes var_name as Integer, collection_expr as Integer, body as Integer, body_count as Integer, type_name as Integer returns Integer:
+    Let stmt_size be 48
     Let stmt be memory_allocate(stmt_size)
     memory_set_int32(stmt, 0, STMT_FOR_EACH)
     memory_set_pointer(stmt, 8, var_name)          Note: loop variable name at offset 8
     memory_set_pointer(stmt, 16, collection_expr)  Note: collection expression at offset 16
     memory_set_pointer(stmt, 24, body)             Note: body statements at offset 24
     memory_set_integer(stmt, 32, body_count)       Note: body count at offset 32
+    memory_set_pointer(stmt, 40, type_name)        Note: optional type annotation at offset 40 (0 if absent)
     Return stmt
 End Process
 
@@ -2955,7 +3163,12 @@ End Process
 
 Note: Create function
 Process called "function_create" takes name as Integer, return_type as Integer returns Integer:
-    Let func_size be 48  Note: name, parameters, parameter_count, return_type, statements, statement_count, is_exported
+    Note: Function layout (56 bytes): name(0), parameters(8), parameter_count(16),
+    Note: return_type(24), statements(32), statement_count(40), is_exported(44),
+    Note: source_file(48). source_file is set later by import_system or main when
+    Note: the function's origin path is known; used by codegen for same-file
+    Note: struct-type disambiguation when multiple imported types share field sets.
+    Let func_size be 56
     Let func be memory_allocate(func_size)
     Let dup_name be string_duplicate_parser(name)
     memory_set_pointer(func, 0, dup_name)
@@ -2966,7 +3179,52 @@ Process called "function_create" takes name as Integer, return_type as Integer r
     memory_set_pointer(func, 32, 0)  Note: statements = NULL
     memory_set_int32(func, 40, 0)  Note: statement_count = 0
     memory_set_int32(func, 44, 0)  Note: is_exported = 0 (default: not exported)
+    memory_set_pointer(func, 48, 0)  Note: source_file = NULL (filled in later)
     Return func
+End Process
+
+Note: Function struct offset for source_file pointer. See function_create.
+Let FUNCTION_SOURCE_FILE_OFFSET be 48
+
+Note: Set the source-file path on a function definition. Used by import_system
+Note: after parser_parse_program completes for an imported file, and by main
+Note: for the program's primary source file. The passed pointer is stored as-is;
+Note: the caller is responsible for keeping the string alive for the lifetime of
+Note: the program (in practice this is the resolved-path string in the import
+Note: context arena, or the input_filename allocated by main).
+Process called "function_set_source_file" takes func as Integer, file_path as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    memory_set_pointer(func, FUNCTION_SOURCE_FILE_OFFSET, file_path)
+    Return 1
+End Process
+
+Note: Read the source-file path. Returns 0 for functions that have not been
+Note: tagged (e.g. compiler-synthesized __module_init bodies, or older code paths
+Note: that pre-date source-file tracking). Callers must treat 0 as "unknown".
+Process called "function_get_source_file" takes func as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+    Return memory_get_pointer(func, FUNCTION_SOURCE_FILE_OFFSET)
+End Process
+
+Note: Same accessor pair for TypeDefinition. The source_file slot is at offset 48
+Note: of the 56-byte TypeDefinition struct (see TypeDefinition_SIZE).
+Process called "type_definition_set_source_file" takes type_def as Integer, file_path as Integer returns Integer:
+    If type_def is equal to 0:
+        Return 0
+    End If
+    memory_set_pointer(type_def, TYPEDEFINITION_SOURCE_FILE_OFFSET, file_path)
+    Return 1
+End Process
+
+Process called "type_definition_get_source_file" takes type_def as Integer returns Integer:
+    If type_def is equal to 0:
+        Return 0
+    End If
+    Return memory_get_pointer(type_def, TYPEDEFINITION_SOURCE_FILE_OFFSET)
 End Process
 
 Note: Add parameter to function
@@ -3453,6 +3711,20 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Let dummy5 be parser_eat(parser, 11)
         Set expr to expression_create_integer(value)
         Return expr
+    End If
+
+    Note: Handle float literal (TOKEN_FLOAT_LITERAL = 186). At parse time we
+    Note: call string_to_float to produce the IEEE 754 bit pattern stored in
+    Note: an int64; codegen later emits this as an immediate. EXPR_FLOAT_LITERAL
+    Note: layout: type(0)=29, bit_pattern(8) as int64.
+    If token_type is equal to 186:
+        Let flt_str be memory_get_pointer(current_token, 8)
+        Let flt_bits be string_to_float(flt_str)
+        parser_eat(parser, 186)
+        Let flt_expr be memory_allocate(16)
+        memory_set_int32(flt_expr, 0, 29)  Note: EXPR_FLOAT_LITERAL
+        memory_set_integer(flt_expr, 8, flt_bits)
+        Return flt_expr
     End If
 
     Note: Handle string literal
@@ -5413,6 +5685,10 @@ Process called "parser_parse_statement_block" takes parser as Integer, count_ptr
                 Set stmt to parser_parse_for_range_statement(parser)
             End If
 
+            If token_type is equal to 164:  Note: TOKEN_CONSTANT inside block (treat as Let)
+                Set stmt to parser_parse_local_constant_statement(parser)
+            End If
+
             Note: Handle implicit compound assignment: Increase/Decrease/Multiply/Divide X by Y
             Note: TOKEN_INCREASE is 139, TOKEN_DECREASE is 140
             Note: TOKEN_MULTIPLY is 141, TOKEN_DIVIDE is 142
@@ -5651,6 +5927,22 @@ Process called "parser_parse_for_range_statement" takes parser as Integer return
         Let var_name be string_duplicate(var_name_temp)
         parser_eat(parser, token_type)
 
+        Note: Optional type annotation: `For each X as Type in collection`.
+        Note: Captures the type name as a duplicated string so the codegen can
+        Note: register the loop variable with the declared type. Skipped when
+        Note: the next token is TOKEN_IN (untyped form) or TOKEN_FROM (range).
+        Let fe_loop_type_name be 0
+        Let fe_peek_as be memory_get_pointer(parser, 8)
+        Let fe_peek_as_type be memory_get_integer(fe_peek_as, 0)
+        If fe_peek_as_type is equal to 34:  Note: TOKEN_AS
+            parser_eat(parser, 34)
+            Let fe_type_tok be memory_get_pointer(parser, 8)
+            Let fe_type_tok_type be memory_get_int32(fe_type_tok, 0)
+            Let fe_type_value_ptr be memory_get_pointer(fe_type_tok, 8)
+            Set fe_loop_type_name to string_duplicate(fe_type_value_ptr)
+            parser_eat(parser, fe_type_tok_type)
+        End If
+
         Note: Branch on TOKEN_IN (for-each) vs TOKEN_FROM (for-range with redundant 'each').
         Let fe_next be memory_get_pointer(parser, 8)
         Let fe_next_type be memory_get_integer(fe_next, 0)
@@ -5689,7 +5981,7 @@ Process called "parser_parse_for_range_statement" takes parser as Integer return
         parser_eat(parser, 8)    Note: TOKEN_END
         parser_eat(parser, 143)  Note: TOKEN_FOR
 
-        Let foreach_stmt be statement_create_for_each(var_name, collection_expr, body, body_count)
+        Let foreach_stmt be statement_create_for_each(var_name, collection_expr, body, body_count, fe_loop_type_name)
         Return foreach_stmt
     End If
 
@@ -6037,17 +6329,25 @@ Process called "parser_parse_match_statement" takes parser as Integer returns In
                         End If
                     End If
                 Otherwise:
-                    Note: Parse as literal expression
-                    Set pattern_value to parser_parse_expression(parser)
+                    Note: Parse as literal expression. Use parser_parse_additive to
+                    Note: STOP at TOKEN_OR so it doesn't swallow the `or`-separated
+                    Note: pattern alternatives that follow. additive accepts integer
+                    Note: literals, float literals, string literals, and simple
+                    Note: arithmetic - which is what a literal pattern can validly be.
+                    Set pattern_value to parser_parse_additive(parser)
                 End If
 
-                Note: Detect `or`-separated alternative patterns: `When A or B or C:`
-                Note: All alternatives share one body. Only fieldless variants and
-                Note: literal identifiers may appear after `or` (field bindings on the
-                Note: first pattern would not be valid for matched alternatives that
-                Note: have different fields).
+                Note: Detect `or`-separated alternative patterns: `When A or B or C:`.
+                Note: All alternatives share one body. Each alt is parsed as a full
+                Note: primary pattern (literal expression, identifier referencing a
+                Note: variant or constant, wildcard, or type pattern). Field-binding
+                Note: variant alternatives (`Variant with field as binding`) are NOT
+                Note: allowed in alternatives because the bindings would only be valid
+                Note: when THAT alternative matches; the bootstrap codegen has no
+                Note: per-alternative scope for bindings. The alt array stores 16-byte
+                Note: entries: (pattern_type:int32, pattern_value:pointer) per alt.
                 Let alt_patterns_cap be 4
-                Let alt_pattern_values be memory_allocate(alt_patterns_cap multiplied by 8)
+                Let alt_pattern_values be memory_allocate(alt_patterns_cap multiplied by 16)
                 Let alt_pattern_count be 0
 
                 Let or_check_tok be memory_get_pointer(parser, 8)
@@ -6055,45 +6355,58 @@ Process called "parser_parse_match_statement" takes parser as Integer returns In
                 While or_check_type is equal to 31:
                     parser_eat(parser, 31)  Note: TOKEN_OR
 
-                    Note: Parse next pattern - identifier (variant or constant name)
                     Let alt_pat_tok be memory_get_pointer(parser, 8)
                     Let alt_pat_tok_type be memory_get_integer(alt_pat_tok, 0)
-                    Let alt_can_id be token_can_be_identifier(alt_pat_tok_type)
-                    If alt_can_id is not equal to 1:
-                        print_string("[PARSER ERROR] Expected identifier after 'or' in When pattern at line ")
-                        Let alt_err_line be memory_get_int32(alt_pat_tok, 16)
-                        print_integer(alt_err_line)
-                        print_newline()
-                        exit_with_code(1)
-                    End If
-                    Let alt_name_temp be memory_get_pointer(alt_pat_tok, 8)
-                    Let alt_name be string_duplicate_parser(alt_name_temp)
-                    parser_eat(parser, alt_pat_tok_type)
+                    Let alt_pt be 0  Note: PATTERN_LITERAL by default
+                    Let alt_pv be 0
 
-                    Note: Optional 'from Module' qualifier (discarded - codegen
-                    Note: uses merged global namespace for variant/constant lookup).
-                    Let alt_from_tok be memory_get_pointer(parser, 8)
-                    Let alt_from_type be memory_get_integer(alt_from_tok, 0)
-                    If alt_from_type is equal to 144:
-                        parser_eat(parser, 144)
-                        Let alt_mod_tok be memory_get_pointer(parser, 8)
-                        Let alt_mod_type be memory_get_integer(alt_mod_tok, 0)
-                        Let alt_mod_can_id be token_can_be_identifier(alt_mod_type)
-                        If alt_mod_can_id is equal to 1:
-                            parser_eat(parser, alt_mod_type)
+                    Note: Wildcard alt: `When A or _:`
+                    If alt_pat_tok_type is equal to 161:
+                        Set alt_pt to 2  Note: PATTERN_WILDCARD
+                        parser_eat(parser, 161)
+                    Otherwise:
+                        Let alt_can_id be token_can_be_identifier(alt_pat_tok_type)
+                        If alt_can_id is equal to 1:
+                            Note: Identifier alt - variant or constant name. Optional
+                            Note: `from Module` qualifier is consumed and discarded
+                            Note: (codegen looks up by name in the merged namespace).
+                            Let alt_name_temp be memory_get_pointer(alt_pat_tok, 8)
+                            Let alt_name be string_duplicate_parser(alt_name_temp)
+                            parser_eat(parser, alt_pat_tok_type)
+                            Let alt_from_tok be memory_get_pointer(parser, 8)
+                            Let alt_from_type be memory_get_integer(alt_from_tok, 0)
+                            If alt_from_type is equal to 144:
+                                parser_eat(parser, 144)
+                                Let alt_mod_tok be memory_get_pointer(parser, 8)
+                                Let alt_mod_type be memory_get_integer(alt_mod_tok, 0)
+                                Let alt_mod_can_id be token_can_be_identifier(alt_mod_type)
+                                If alt_mod_can_id is equal to 1:
+                                    parser_eat(parser, alt_mod_type)
+                                Otherwise:
+                                    parser_eat(parser, 53)
+                                End If
+                            End If
+                            Set alt_pt to 1  Note: PATTERN_VARIANT (codegen falls back to literal lookup if not an ADT variant)
+                            Set alt_pv to alt_name
                         Otherwise:
-                            parser_eat(parser, 53)
+                            Note: Literal alternative - integer, string, float, etc.
+                            Note: Parse as a primary expression so the codegen has a
+                            Note: regular EXPR_* node to compare against.
+                            Let alt_lit_expr be parser_parse_primary(parser)
+                            Set alt_pt to 0  Note: PATTERN_LITERAL
+                            Set alt_pv to alt_lit_expr
                         End If
                     End If
 
-                    Note: Grow alt array if needed
+                    Note: Grow alt array if needed (16 bytes per entry).
                     If alt_pattern_count is greater than or equal to alt_patterns_cap:
                         Set alt_patterns_cap to alt_patterns_cap multiplied by 2
-                        Set alt_pattern_values to memory_reallocate(alt_pattern_values, alt_patterns_cap multiplied by 8)
+                        Set alt_pattern_values to memory_reallocate(alt_pattern_values, alt_patterns_cap multiplied by 16)
                     End If
 
-                    Let alt_v_off be alt_pattern_count multiplied by 8
-                    memory_set_pointer(alt_pattern_values, alt_v_off, alt_name)
+                    Let alt_v_off be alt_pattern_count multiplied by 16
+                    memory_set_int32(alt_pattern_values plus alt_v_off, 0, alt_pt)
+                    memory_set_pointer(alt_pattern_values plus alt_v_off, 8, alt_pv)
                     Set alt_pattern_count to alt_pattern_count plus 1
 
                     Set or_check_tok to memory_get_pointer(parser, 8)
@@ -6129,16 +6442,20 @@ Process called "parser_parse_match_statement" takes parser as Integer returns In
                 Set when_count to when_count plus 1
 
                 Note: Emit additional When clauses for `or`-separated alternatives.
-                Note: All share the same body_stmts pointer; codegen generates the
-                Note: body code per clause (correct but duplicates body emission).
+                Note: All share the same body_stmts pointer; codegen detects the
+                Note: shared body via pointer-equality and emits the body code only
+                Note: once (see codegen STMT_MATCH for the shared-body optimization).
+                Note: Each alt was parsed with its own pattern_type/value pair so
+                Note: literal, variant, and wildcard alternatives all work.
                 Let alt_emit_i be 0
                 While alt_emit_i is less than alt_pattern_count:
                     Let alt_clause_offset be when_count multiplied by 48
                     Let alt_clause_ptr be when_clauses plus alt_clause_offset
-                    Let alt_emit_v_off be alt_emit_i multiplied by 8
-                    Let alt_emit_name be memory_get_pointer(alt_pattern_values, alt_emit_v_off)
-                    memory_set_int32(alt_clause_ptr, WHEN_PATTERN_TYPE, PATTERN_VARIANT)
-                    memory_set_pointer(alt_clause_ptr, WHEN_PATTERN_VALUE, alt_emit_name)
+                    Let alt_emit_v_off be alt_emit_i multiplied by 16
+                    Let alt_emit_pt be memory_get_int32(alt_pattern_values plus alt_emit_v_off, 0)
+                    Let alt_emit_pv be memory_get_pointer(alt_pattern_values plus alt_emit_v_off, 8)
+                    memory_set_int32(alt_clause_ptr, WHEN_PATTERN_TYPE, alt_emit_pt)
+                    memory_set_pointer(alt_clause_ptr, WHEN_PATTERN_VALUE, alt_emit_pv)
                     memory_set_pointer(alt_clause_ptr, WHEN_FIELD_BINDINGS, 0)
                     memory_set_int32(alt_clause_ptr, WHEN_FIELD_COUNT, 0)
                     memory_set_pointer(alt_clause_ptr, WHEN_BODY_STMTS, body_stmts)
@@ -7470,6 +7787,9 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
         If body_token_type is equal to 143:  Note: TOKEN_FOR
             Set stmt to parser_parse_for_range_statement(parser)
         End If
+        If body_token_type is equal to 164:  Note: TOKEN_CONSTANT inside function body
+            Set stmt to parser_parse_local_constant_statement(parser)
+        End If
         If body_token_type is equal to 139:  Note: TOKEN_INCREASE
             Set stmt to parser_parse_implicit_compound_assign(parser, 0)
         End If
@@ -7888,20 +8208,29 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
 
                         Let global_value_token be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
                         Let global_value_type be memory_get_int32(global_value_token, TOKEN_TYPE_OFFSET)
+                        Let initial_value be 0
                         If global_value_type is equal to 11:  Note: TOKEN_INTEGER
                             Let value_str be memory_get_pointer(global_value_token, TOKEN_VALUE_OFFSET)
                             Let int_value be string_to_integer(value_str)
-                            Let initial_value be expression_create_integer(int_value)
+                            Set initial_value to expression_create_integer(int_value)
                             parser_eat(parser, 11)
-
-                            Note: Create global variable entry using exact GlobalVariable struct layout
-                            Note: GlobalVariable: name(0), type(8), initial_value(16) - total 24 bytes
-                            Let global be memory_allocate(24)
-                            memory_set_pointer(global, 0, var_name)
-                            memory_set_pointer(global, 8, string_duplicate_parser("Integer"))
-                            memory_set_pointer(global, 16, initial_value)
-                            program_add_global(program, global)
+                        Otherwise:
+                            Note: Parse any expression as the initial value. The .data emission
+                            Note: emits `.quad 0` for non-constant initializers (function calls,
+                            Note: builtins, etc.); the actual value is filled in at runtime by
+                            Note: the caller. This is sufficient for `Let X be allocate(N)` and
+                            Note: similar runtime-initialized top-level Lets used as scratch
+                            Note: tables in v0.0.8.5 source.
+                            Set initial_value to parser_parse_expression(parser)
                         End If
+
+                        Note: Create global variable entry using exact GlobalVariable struct layout
+                        Note: GlobalVariable: name(0), type(8), initial_value(16) - total 24 bytes
+                        Let global be memory_allocate(24)
+                        memory_set_pointer(global, 0, var_name)
+                        memory_set_pointer(global, 8, string_duplicate_parser("Integer"))
+                        memory_set_pointer(global, 16, initial_value)
+                        program_add_global(program, global)
                     End If
                 End If
             End If
@@ -7938,7 +8267,230 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                     Let const_val_type be memory_get_int32(const_val_token, TOKEN_TYPE_OFFSET)
 
                     Let const_value be 0
-                    If const_val_type is equal to 11:
+                    Note: Detect array-literal constant: `Array[T, N] is [v1, v2, ..., vN]`.
+                    Note: The lexer emits "Array" (uppercase) as TOKEN_IDENTIFIER (53) since
+                    Note: it's not in the keyword tables; "array" lowercase is TOKEN_ARRAY (126).
+                    Note: Accept both forms.
+                    Let const_is_array be 0
+                    If const_val_type is equal to 126:
+                        Set const_is_array to 1
+                    End If
+                    If const_val_type is equal to 53:
+                        Let cv_name be memory_get_pointer(const_val_token, TOKEN_VALUE_OFFSET)
+                        If cv_name is not equal to 0:
+                            If string_equals(cv_name, "Array") is equal to 1:
+                                Set const_is_array to 1
+                            End If
+                        End If
+                    End If
+
+                    If const_is_array is equal to 1:
+                        parser_eat(parser, const_val_type)  Note: Eat Array
+                        parser_eat(parser, 127)  Note: Eat [
+                        Note: Capture element type name to validate each element. Element
+                        Note: types accepted: Integer, Float, String. The declared T
+                        Note: drives which token types are valid in the literal list.
+                        Let arr_etype_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                        Let arr_etype_type be memory_get_int32(arr_etype_tok, TOKEN_TYPE_OFFSET)
+                        Let arr_etype_name be memory_get_pointer(arr_etype_tok, TOKEN_VALUE_OFFSET)
+                        Let arr_elem_kind be 0  Note: 0=Integer (default), 1=Float, 2=String
+                        If arr_etype_name is not equal to 0:
+                            If string_equals(arr_etype_name, "Float") is equal to 1:
+                                Set arr_elem_kind to 1
+                            End If
+                            If string_equals(arr_etype_name, "String") is equal to 1:
+                                Set arr_elem_kind to 2
+                            End If
+                        End If
+                        parser_eat(parser, arr_etype_type)
+                        parser_eat(parser, 52)  Note: Eat ,
+                        Note: Eat size integer literal
+                        Let arr_size_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                        Let arr_size_str be memory_get_pointer(arr_size_tok, TOKEN_VALUE_OFFSET)
+                        Let arr_size_int be string_to_integer(arr_size_str)
+                        parser_eat(parser, 11)  Note: Eat size literal
+                        parser_eat(parser, 128)  Note: Eat ]
+                        parser_eat(parser, 21)  Note: Eat second 'is'
+                        parser_eat(parser, 127)  Note: Eat [
+
+                        Note: Parse comma-separated values (allow leading minus for negatives)
+                        Let arr_capacity be arr_size_int
+                        If arr_capacity is less than 8:
+                            Set arr_capacity to 8
+                        End If
+                        Let arr_values be memory_allocate(arr_capacity multiplied by 8)
+                        Let arr_count be 0
+
+                        Let arr_continue be 1
+                        While arr_continue is equal to 1:
+                            Let arr_peek_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                            Let arr_peek_type be memory_get_int32(arr_peek_tok, TOKEN_TYPE_OFFSET)
+                            If arr_peek_type is equal to 128:
+                                Set arr_continue to 0
+                            Otherwise:
+                                Let arr_v_neg be 0
+                                If arr_peek_type is equal to 17:
+                                    parser_eat(parser, 17)  Note: Eat minus
+                                    Set arr_v_neg to 1
+                                End If
+                                Let arr_v_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                                Let arr_v_type be memory_get_int32(arr_v_tok, TOKEN_TYPE_OFFSET)
+
+                                Note: Element parsing dispatches on the declared element kind:
+                                Note: Integer accepts integer literals and identifier refs to
+                                Note: integer Constants. Float accepts integer (auto-promoted),
+                                Note: float, and identifier refs to float Constants. String
+                                Note: accepts string literals. Each element is stored as an
+                                Note: int64 in arr_values: for Integer/Float it's the value or
+                                Note: IEEE 754 bit pattern; for String it's a pointer to the
+                                Note: duplicated string (codegen emits a .data label and
+                                Note: address). The leading-minus prefix only applies to
+                                Note: numeric elements.
+                                Let arr_v_int be 0
+                                If arr_v_type is equal to 11:
+                                    Note: Integer literal - parse value directly.
+                                    Let arr_v_str be memory_get_pointer(arr_v_tok, TOKEN_VALUE_OFFSET)
+                                    Let arr_v_raw_int be string_to_integer(arr_v_str)
+                                    If arr_elem_kind is equal to 1:
+                                        Note: Auto-promote Integer literal in Float array.
+                                        Set arr_v_int to integer_to_float(arr_v_raw_int)
+                                    Otherwise:
+                                        Set arr_v_int to arr_v_raw_int
+                                    End If
+                                    parser_eat(parser, 11)
+                                Otherwise If arr_v_type is equal to 186:
+                                    Note: Float literal - bit pattern already computed by lexer.
+                                    If arr_elem_kind is not equal to 1:
+                                        print_string("[PARSER ERROR] Float literal in non-Float array literal")
+                                        print_newline()
+                                        exit_with_code(1)
+                                    End If
+                                    Let arr_v_flt_str be memory_get_pointer(arr_v_tok, TOKEN_VALUE_OFFSET)
+                                    Set arr_v_int to string_to_float(arr_v_flt_str)
+                                    parser_eat(parser, 186)
+                                Otherwise If arr_v_type is equal to 10:
+                                    Note: String literal. The leading-minus prefix is invalid here.
+                                    If arr_v_neg is equal to 1:
+                                        print_string("[PARSER ERROR] Cannot apply unary minus to a String literal")
+                                        print_newline()
+                                        exit_with_code(1)
+                                    End If
+                                    If arr_elem_kind is not equal to 2:
+                                        print_string("[PARSER ERROR] String literal in non-String array literal")
+                                        print_newline()
+                                        exit_with_code(1)
+                                    End If
+                                    Let arr_v_sval be memory_get_pointer(arr_v_tok, TOKEN_VALUE_OFFSET)
+                                    Set arr_v_int to string_duplicate_parser(arr_v_sval)
+                                    parser_eat(parser, 10)
+                                Otherwise If arr_v_type is equal to 53:
+                                    Note: Identifier - resolve to a Constant declared earlier
+                                    Note: in the same program. Accept EXPR_INTEGER for Integer
+                                    Note: arrays, EXPR_FLOAT_LITERAL for Float arrays, and
+                                    Note: EXPR_STRING_LITERAL for String arrays.
+                                    Let arr_v_name be memory_get_pointer(arr_v_tok, TOKEN_VALUE_OFFSET)
+                                    Let arr_v_resolved be 0
+                                    Let arr_v_global_count be memory_get_int32(program, 56)
+                                    Let arr_v_globals be memory_get_pointer(program, 48)
+                                    Let arr_v_gi be 0
+                                    While arr_v_gi is less than arr_v_global_count:
+                                        Let arr_v_global be memory_get_pointer(arr_v_globals, arr_v_gi multiplied by 8)
+                                        If arr_v_global is not equal to 0:
+                                            Let arr_v_g_name be memory_get_pointer(arr_v_global, 0)
+                                            If arr_v_g_name is not equal to 0:
+                                                If string_equals(arr_v_g_name, arr_v_name) is equal to 1:
+                                                    Let arr_v_g_init be memory_get_pointer(arr_v_global, 16)
+                                                    If arr_v_g_init is not equal to 0:
+                                                        Let arr_v_g_etype be memory_get_int32(arr_v_g_init, 0)
+                                                        If arr_v_g_etype is equal to 0:
+                                                            If arr_elem_kind is equal to 0:
+                                                                Set arr_v_int to memory_get_pointer(arr_v_g_init, 8)
+                                                                Set arr_v_resolved to 1
+                                                            End If
+                                                            If arr_elem_kind is equal to 1:
+                                                                Note: Auto-promote stored integer to float bits.
+                                                                Set arr_v_int to integer_to_float(memory_get_pointer(arr_v_g_init, 8))
+                                                                Set arr_v_resolved to 1
+                                                            End If
+                                                        End If
+                                                        If arr_v_g_etype is equal to 29:  Note: EXPR_FLOAT_LITERAL
+                                                            If arr_elem_kind is equal to 1:
+                                                                Set arr_v_int to memory_get_integer(arr_v_g_init, 8)
+                                                                Set arr_v_resolved to 1
+                                                            End If
+                                                        End If
+                                                        If arr_v_g_etype is equal to 5:  Note: EXPR_STRING_LITERAL
+                                                            If arr_elem_kind is equal to 2:
+                                                                Set arr_v_int to memory_get_pointer(arr_v_g_init, 8)
+                                                                Set arr_v_resolved to 1
+                                                            End If
+                                                        End If
+                                                    End If
+                                                    Set arr_v_gi to arr_v_global_count
+                                                End If
+                                            End If
+                                        End If
+                                        Set arr_v_gi to arr_v_gi plus 1
+                                    End While
+                                    If arr_v_resolved is equal to 0:
+                                        print_string("[PARSER ERROR] Array literal element '")
+                                        print_string(arr_v_name)
+                                        print_string("' is not a Constant of the declared array element type")
+                                        print_newline()
+                                        exit_with_code(1)
+                                    End If
+                                    parser_eat(parser, 53)
+                                Otherwise:
+                                    print_string("[PARSER ERROR] Array literal element must be a literal of the declared element type or an identifier referencing such a Constant (got token type ")
+                                    print_integer(arr_v_type)
+                                    print_string(")")
+                                    print_newline()
+                                    exit_with_code(1)
+                                End If
+                                If arr_v_neg is equal to 1:
+                                    If arr_elem_kind is equal to 1:
+                                        Note: Negate Float by parsing the negated string.
+                                        Note: Avoids building INT64_MIN as a literal which the
+                                        Note: bootstrap stage compiler can't represent directly.
+                                        Note: This branch only fires when a separate minus token
+                                        Note: precedes a Float literal token, which is rare
+                                        Note: because the lexer attaches `-` to digit-starting
+                                        Note: tokens directly.
+                                        Set arr_v_int to integer_to_float(0 minus float_to_integer(arr_v_int))
+                                    Otherwise:
+                                        Set arr_v_int to 0 minus arr_v_int
+                                    End If
+                                End If
+
+                                If arr_count is greater than or equal to arr_capacity:
+                                    Set arr_capacity to arr_capacity multiplied by 2
+                                    Set arr_values to memory_reallocate(arr_values, arr_capacity multiplied by 8)
+                                End If
+                                memory_set_integer(arr_values plus (arr_count multiplied by 8), 0, arr_v_int)
+                                Set arr_count to arr_count plus 1
+
+                                Note: Optional comma between elements
+                                Let arr_sep_tok be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
+                                Let arr_sep_type be memory_get_int32(arr_sep_tok, TOKEN_TYPE_OFFSET)
+                                If arr_sep_type is equal to 52:
+                                    parser_eat(parser, 52)
+                                End If
+                            End If
+                        End While
+                        parser_eat(parser, 128)  Note: Eat closing ]
+
+                        Note: Create EXPR_ARRAY_LITERAL_CONST node (32 bytes):
+                        Note: type(0)=26, values_ptr(8), count(16), element_kind(20).
+                        Note: element_kind: 0=Integer (raw int64), 1=Float (bit pattern),
+                        Note: 2=String (pointer to heap string). Codegen uses element_kind
+                        Note: to decide whether each .data entry is `.quad <int>` or
+                        Note: `.quad <label>` for string interning.
+                        Set const_value to memory_allocate(32)
+                        memory_set_int32(const_value, 0, 26)  Note: EXPR_ARRAY_LITERAL_CONST
+                        memory_set_pointer(const_value, 8, arr_values)
+                        memory_set_int32(const_value, 16, arr_count)
+                        memory_set_int32(const_value, 20, arr_elem_kind)
+                    Otherwise If const_val_type is equal to 11:
                         Note: Integer literal
                         Let const_val_str be memory_get_pointer(const_val_token, TOKEN_VALUE_OFFSET)
                         Let const_int_val be string_to_integer(const_val_str)

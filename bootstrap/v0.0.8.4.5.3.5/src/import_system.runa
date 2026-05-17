@@ -97,14 +97,16 @@ Note:   offset 32: stack_depth (integer, 8 bytes)
 
 Process called "import_context_create" takes arena as Integer returns Integer:
     Note: Create simple import context for tracking visited files
+    Note: Arrays start at 256 entries and dynamically grow via context_grow_arrays.
 
     Let context be arena_allocate(arena, 40)
     If context is equal to 0:
         Return 0
     End If
 
-    Note: Allocate initial arrays
-    Let initial_capacity be 64  Note: Start with 64 files
+    Note: Allocate initial arrays. 256 covers most real import graphs in one shot;
+    Note: resize is automatic when count >= capacity.
+    Let initial_capacity be 256
     Let visited_array be arena_allocate(arena, initial_capacity multiplied by 8)
     Let stack_array be arena_allocate(arena, initial_capacity multiplied by 8)
 
@@ -124,6 +126,55 @@ Process called "import_context_create" takes arena as Integer returns Integer:
     memory_set_integer(context, 32, 0)  Note: stack_depth = 0
 
     Return context
+End Process
+
+Process called "import_context_grow_arrays" takes context as Integer, arena as Integer returns Integer:
+    Note: Double both visited_files and import_stack array capacity. Copies live
+    Note: contents to the new arena-allocated buffers and updates the context.
+    Note: Returns 1 on success, 0 if arena allocation fails.
+
+    Let old_capacity be memory_get_integer(context, 16)
+    Let new_capacity be old_capacity multiplied by 2
+    Let new_size_bytes be new_capacity multiplied by 8
+
+    Let new_visited be arena_allocate(arena, new_size_bytes)
+    If new_visited is equal to 0:
+        Return 0
+    End If
+
+    Let new_stack be arena_allocate(arena, new_size_bytes)
+    If new_stack is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy existing entries. The arena never frees old buffers, so leaving
+    Note: them in place is correct - they remain readable until arena destroy.
+    Let old_visited be memory_get_pointer(context, 0)
+    Let visited_count be memory_get_integer(context, 8)
+    Let old_stack be memory_get_pointer(context, 24)
+    Let stack_depth be memory_get_integer(context, 32)
+
+    Let i be 0
+    While i is less than visited_count:
+        Let offset be i multiplied by 8
+        Let ptr be memory_get_pointer(old_visited plus offset, 0)
+        memory_set_pointer(new_visited plus offset, 0, ptr)
+        Set i to i plus 1
+    End While
+
+    Set i to 0
+    While i is less than stack_depth:
+        Let offset be i multiplied by 8
+        Let ptr be memory_get_pointer(old_stack plus offset, 0)
+        memory_set_pointer(new_stack plus offset, 0, ptr)
+        Set i to i plus 1
+    End While
+
+    memory_set_pointer(context, 0, new_visited)
+    memory_set_pointer(context, 24, new_stack)
+    memory_set_integer(context, 16, new_capacity)
+
+    Return 1
 End Process
 
 Process called "import_context_is_visited" takes context as Integer, filename as Integer returns Integer:
@@ -148,17 +199,23 @@ Process called "import_context_is_visited" takes context as Integer, filename as
 End Process
 
 Process called "import_context_mark_visited" takes context as Integer, filename as Integer, arena as Integer returns Integer:
-    Note: Mark file as visited
+    Note: Mark file as visited. Grows the visited/stack arrays automatically when
+    Note: the import graph exceeds the current capacity.
 
-    Let visited_files be memory_get_pointer(context, 0)
     Let visited_count be memory_get_integer(context, 8)
     Let visited_capacity be memory_get_integer(context, 16)
 
-    Note: Check if we exceeded capacity
+    Note: Grow if at capacity. Hard-fail only if the arena itself is exhausted.
     If visited_count is greater than or equal to visited_capacity:
-        print_string("[IMPORT ERROR] Too many imported files (capacity exceeded)")
-        Return 0
+        Let grow_ok be import_context_grow_arrays(context, arena)
+        If grow_ok is equal to 0:
+            print_string("[IMPORT ERROR] Arena exhausted while growing visited-files table")
+            Return 0
+        End If
     End If
+
+    Note: Re-read after potential resize
+    Let visited_files be memory_get_pointer(context, 0)
 
     Note: Duplicate filename into arena
     Let filename_copy be arena_string_duplicate(arena, filename)
@@ -175,16 +232,23 @@ Process called "import_context_mark_visited" takes context as Integer, filename 
 End Process
 
 Process called "import_context_push_stack" takes context as Integer, filename as Integer, arena as Integer returns Integer:
-    Note: Push filename onto import stack for cycle detection
+    Note: Push filename onto import stack for cycle detection. Grows automatically
+    Note: when nested import depth exceeds the current capacity.
 
-    Let import_stack be memory_get_pointer(context, 24)
     Let stack_depth be memory_get_integer(context, 32)
     Let visited_capacity be memory_get_integer(context, 16)
 
-    Note: Check capacity
+    Note: Grow if at capacity. Hard-fail only if the arena itself is exhausted.
     If stack_depth is greater than or equal to visited_capacity:
-        Return 0  Note: Stack overflow
+        Let grow_ok be import_context_grow_arrays(context, arena)
+        If grow_ok is equal to 0:
+            print_string("[IMPORT ERROR] Arena exhausted while growing import stack")
+            Return 0
+        End If
     End If
+
+    Note: Re-read after potential resize
+    Let import_stack be memory_get_pointer(context, 24)
 
     Note: Duplicate filename
     Let filename_copy be arena_string_duplicate(arena, filename)
@@ -408,7 +472,14 @@ Note: Main Import Processing Engine
 Note: ============================================================================
 
 Let IMPORT_DEPTH be 0
-Let IMPORT_MAX_DEPTH be 2
+Note: Depth cap protects against pathological exponential expansion when
+Note: diamond imports lack proper dedup. The visited-files set already handles
+Note: dedup correctly, so depth 10 is generous coverage for real-world chains
+Note: (e.g. entry -> translation.runa -> erlang_emitter -> erlang_parser is 3
+Note: levels and was being silently truncated at depth=2). Pre-fix value of 2
+Note: caused swift_lexer.runa to fail because ErlangModule type was never
+Note: loaded through translation.runa's transitive imports.
+Let IMPORT_MAX_DEPTH be 10
 
 Process called "process_imports_recursive" takes program as Integer, arena as Integer returns Integer:
     Note: Main entry point - creates shared context and delegates
@@ -553,6 +624,40 @@ Process called "process_imports_with_context" takes program as Integer, arena as
             import_context_pop_stack(context)
             Set i to i plus 1
             Continue
+        End If
+
+        Note: Tag every function and type in the imported program with its source
+        Note: path. The codegen uses this in struct-type disambiguation: when
+        Note: multiple imported types share a field set (e.g. *EmitterResult
+        Note: across language backends), the type defined in the same file as the
+        Note: caller function is preferred. resolved_path is arena-allocated and
+        Note: lives for the entire compilation, so storing the raw pointer is safe.
+        Let tag_func_count be memory_get_int32(import_program, 8)
+        Let tag_funcs_ptr be memory_get_pointer(import_program, 0)
+        If tag_funcs_ptr is not equal to 0:
+            Let tag_fi be 0
+            While tag_fi is less than tag_func_count:
+                Let tag_off be tag_fi multiplied by 8
+                Let tag_func be memory_get_pointer(tag_funcs_ptr plus tag_off, 0)
+                If tag_func is not equal to 0:
+                    function_set_source_file(tag_func, resolved_path)
+                End If
+                Set tag_fi to tag_fi plus 1
+            End While
+        End If
+
+        Let tag_type_count be memory_get_int32(import_program, 24)
+        Let tag_types_ptr be memory_get_pointer(import_program, 16)
+        If tag_types_ptr is not equal to 0:
+            Let tag_ti be 0
+            While tag_ti is less than tag_type_count:
+                Let tag_type_off be tag_ti multiplied by 8
+                Let tag_type_def be memory_get_pointer(tag_types_ptr, tag_type_off)
+                If tag_type_def is not equal to 0:
+                    type_definition_set_source_file(tag_type_def, resolved_path)
+                End If
+                Set tag_ti to tag_ti plus 1
+            End While
         End If
 
         Note: RECURSIVE PROCESSING (shares context for deduplication)

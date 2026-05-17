@@ -278,6 +278,15 @@ int64_t call_function_pointer_2args(void* fn, void* arg1, void* arg2) {
     return ((func_ptr)fn)(arg1, arg2);
 }
 
+// Wall-clock time in microseconds since an arbitrary epoch. Used by the
+// Runa compiler driver for coarse phase-level profiling. CLOCK_MONOTONIC
+// is unaffected by NTP/system time adjustments.
+int64_t get_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+}
+
 // String functions needed by v0.0.7.3-generated code
 // These are already defined in the assembly:
 // void string_copy(char* dest, char* src) - in lexer.o
@@ -520,6 +529,63 @@ int64_t list_contains(int64_t list_ptr, int64_t value) {
         }
     }
     return 0;
+}
+
+// Find index of first matching element in list, or -1 if not found.
+// Pairs with the canonical `position of X in <list>` expression.
+// Integer match: direct equality.
+// String match: byte-by-byte (both must point at NUL-terminated strings).
+int64_t list_find(int64_t list_ptr, int64_t value) {
+    RunaList* list = (RunaList*)list_ptr;
+    for (int64_t i = 0; i < list->length; i++) {
+        if (list->data[i] == value) {
+            return i;
+        }
+        if (list->data[i] > 65536 && value > 65536) {
+            char* a = (char*)list->data[i];
+            char* b = (char*)value;
+            int match = 1;
+            for (int j = 0; a[j] != 0 || b[j] != 0; j++) {
+                if (a[j] != b[j]) { match = 0; break; }
+            }
+            if (match) return i;
+        }
+    }
+    return -1;
+}
+
+// Float<->Integer<->String conversions for the canonical `convert X to Y` form.
+// Bootstrap represents Float as the IEEE 754 bit pattern stored in an int64,
+// matching the convention used by softfloat.runa and the v0.0.8.5 source's
+// string_to_float runtime call.
+int64_t string_to_float(const char* s) {
+    if (!s) return 0;
+    double d = strtod(s, NULL);
+    int64_t bits;
+    memcpy(&bits, &d, 8);
+    return bits;
+}
+
+int64_t integer_to_float(int64_t n) {
+    double d = (double)n;
+    int64_t bits;
+    memcpy(&bits, &d, 8);
+    return bits;
+}
+
+int64_t float_to_integer(int64_t bits) {
+    double d;
+    memcpy(&d, &bits, 8);
+    return (int64_t)d;  // truncation toward zero, matching IEEE 754 default
+}
+
+char* float_to_string(int64_t bits) {
+    double d;
+    memcpy(&d, &bits, 8);
+    char* buf = (char*)malloc(32);
+    if (!buf) return NULL;
+    snprintf(buf, 32, "%.17g", d);  // 17 significant digits round-trips IEEE 754 double
+    return buf;
 }
 
 // Insert element at index, shifting elements right

@@ -138,6 +138,13 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
     If stmt is equal to 0:
         Return 0
     End If
+    Note: Pointer sanity guard - protect against garbage sub-statement pointers
+    Note: in malformed AST shapes that recursion would otherwise dereference
+    Note: into non-readable memory. See codegen_collect_field_names_in_stmt for
+    Note: the same pattern.
+    If stmt is less than 65536:
+        Return 0
+    End If
     Let stmt_type be memory_get_int32(stmt, 0)
     Note: STMT_SET = 2 (Set X to Y) - target at offset 8
     If stmt_type is equal to 2:
@@ -171,11 +178,13 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
             End If
         End If
     End If
-    Note: Recurse into nested statements
+    Note: Recurse into nested statements. Count fields are int32; reading them
+    Note: as 8-byte int pulls in adjacent bytes and produces a huge garbage
+    Note: count that walks the body pointer past valid memory and segfaults.
     Note: STMT_IF = 5: condition(8), if_body(16), if_body_count(24), else_body(32), else_body_count(40)
     If stmt_type is equal to 5:
         Let if_body be memory_get_pointer(stmt, 16)
-        Let if_count be memory_get_integer(stmt, 24)
+        Let if_count be memory_get_int32(stmt, 24)
         If if_body is not equal to 0:
             If if_count is greater than 0:
                 Let si be 0
@@ -188,7 +197,7 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
             End If
         End If
         Let else_body be memory_get_pointer(stmt, 32)
-        Let else_count be memory_get_integer(stmt, 40)
+        Let else_count be memory_get_int32(stmt, 40)
         If else_body is not equal to 0:
             If else_count is greater than 0:
                 Let sei be 0
@@ -204,7 +213,7 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
     Note: STMT_WHILE = 6: condition(8), body(16), body_count(24)
     If stmt_type is equal to 6:
         Let while_body be memory_get_pointer(stmt, 16)
-        Let while_count be memory_get_integer(stmt, 24)
+        Let while_count be memory_get_int32(stmt, 24)
         If while_body is not equal to 0:
             If while_count is greater than 0:
                 Let wi be 0
@@ -217,10 +226,10 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
             End If
         End If
     End If
-    Note: STMT_FOR_EACH = 12: var_name(8), collection(16), body(24), body_count(32)
+    Note: STMT_FOR_EACH = 12: var_name(8), collection(16), body(24), body_count(32), type_name(40)
     If stmt_type is equal to 12:
         Let for_body be memory_get_pointer(stmt, 24)
-        Let for_count be memory_get_integer(stmt, 32)
+        Let for_count be memory_get_int32(stmt, 32)
         If for_body is not equal to 0:
             If for_count is greater than 0:
                 Let fi be 0
@@ -236,7 +245,7 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
     Note: STMT_FOR = 11: var(8), start(16), end(24), body(32), body_count(40)
     If stmt_type is equal to 11:
         Let for_r_body be memory_get_pointer(stmt, 32)
-        Let for_r_count be memory_get_integer(stmt, 40)
+        Let for_r_count be memory_get_int32(stmt, 40)
         If for_r_body is not equal to 0:
             If for_r_count is greater than 0:
                 Let fri be 0
@@ -245,6 +254,36 @@ Process called "codegen_scan_set_targets" takes codegen as Integer, stmt as Inte
                     Let for_r_child be memory_get_pointer(for_r_body, fri_offset)
                     codegen_scan_set_targets(codegen, for_r_child, program)
                     Set fri to fri plus 1
+                End While
+            End If
+        End If
+    End If
+    Note: STMT_MATCH = 8: expr(8), when_clauses(16), when_count(24). Each
+    Note: when clause is 48 bytes with body_stmts at offset 32, body_count at
+    Note: offset 40. Walk every body to find Set statements that target globals.
+    If stmt_type is equal to 8:
+        Let match_clauses be memory_get_pointer(stmt, 16)
+        Let match_count be memory_get_int32(stmt, 24)
+        If match_clauses is not equal to 0:
+            If match_count is greater than 0:
+                Let mci be 0
+                While mci is less than match_count:
+                    Let mc_off be mci multiplied by 48
+                    Let mc_ptr be match_clauses plus mc_off
+                    Let mc_body be memory_get_pointer(mc_ptr, 32)
+                    Let mc_bcount be memory_get_int32(mc_ptr, 40)
+                    If mc_body is not equal to 0:
+                        If mc_bcount is greater than 0:
+                            Let mbi be 0
+                            While mbi is less than mc_bcount:
+                                Let mb_off be mbi multiplied by 8
+                                Let mb_child be memory_get_pointer(mc_body, mb_off)
+                                codegen_scan_set_targets(codegen, mb_child, program)
+                                Set mbi to mbi plus 1
+                            End While
+                        End If
+                    End If
+                    Set mci to mci plus 1
                 End While
             End If
         End If
@@ -356,8 +395,12 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
     Note: print_integer(variable_count)
     Note: print_integer(variable_capacity)
 
-    Note: Check for duplicate variable declaration (prevent Let shadowing)
-    Note: Skip check for parameters (they can shadow outer variables)
+    Note: Allow Let redeclaration only when the type matches (or refines a
+    Note: generic Integer placeholder). When the same name already exists as a
+    Note: local with a *different* concrete type, error out - this catches the
+    Note: dangerous case of `If: Let X be (struct A) Otherwise: Let X be (struct B)`
+    Note: where post-branch field access can't pick a valid type.
+    Note: Parameters are never collided with (they're added once at function entry).
     If is_parameter is equal to 0:
         Let check_i be 0
         While check_i is less than variable_count:
@@ -366,14 +409,51 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
             Let check_existing_name be memory_get_pointer(check_var_ptr, 0)
             Let check_is_param be memory_get_int32(check_var_ptr, 24)
 
-            Note: Only check against other non-parameter variables
             If check_is_param is equal to 0:
                 If string_equals(check_existing_name, name) is equal to 1:
-                    print_string("[CODEGEN ERROR] Variable '")
-                    print_string(name)
-                    print_string("' is already declared. Use 'Set' to reassign.")
-                    print_newline()
-                    exit_with_code(1)
+                    Note: Type compatibility check. The existing type is "Integer"
+                    Note: when no annotation was given (the bootstrap's generic-
+                    Note: pointer placeholder); in that case any incoming type
+                    Note: refines it and is accepted. When both sides carry a
+                    Note: specific non-Integer type, they must match exactly.
+                    Let check_existing_type be memory_get_pointer(check_var_ptr, 16)
+                    Let types_compatible be 1
+                    If type_name is not equal to 0:
+                        If check_existing_type is not equal to 0:
+                            Let existing_is_int be string_equals(check_existing_type, "Integer")
+                            Let new_is_int be string_equals(type_name, "Integer")
+                            If existing_is_int is equal to 0:
+                                If new_is_int is equal to 0:
+                                    Set types_compatible to string_equals(check_existing_type, type_name)
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    If types_compatible is equal to 0:
+                        print_string("[CODEGEN ERROR] Cannot redeclare '")
+                        print_string(name)
+                        print_string("' with incompatible type: existing '")
+                        print_string(check_existing_type)
+                        print_string("' vs new '")
+                        print_string(type_name)
+                        print_string("'")
+                        print_newline()
+                        exit_with_code(1)
+                    End If
+
+                    Note: Update the type slot only when the new declaration carries
+                    Note: a more specific type (refining Integer or matching).
+                    If type_name is not equal to 0:
+                        If check_existing_type is not equal to 0:
+                            If string_equals(check_existing_type, "Integer") is equal to 1:
+                                memory_set_pointer(check_var_ptr, 16, type_name)
+                            End If
+                        Otherwise:
+                            memory_set_pointer(check_var_ptr, 16, type_name)
+                        End If
+                    End If
+                    Return 0
                 End If
             End If
 
@@ -433,11 +513,43 @@ Process called "codegen_add_variable_with_type_and_param_flag" takes codegen as 
         memory_set_pointer(var_ptr, 16, string_duplicate(type_name)) Note: type_name
     End If
     memory_set_int32(var_ptr, 24, is_parameter)               Note: is_parameter (int)
+    memory_set_int32(var_ptr, 28, 0)                          Note: structural_resolved flag (0 = not yet tried)
+    memory_set_int32(var_ptr, 12, 0)                          Note: is_constant flag (offset 12 is struct padding)
 
     Note: Increment count
     memory_set_int32(codegen, 16, variable_count plus 1)  Note: codegen->variable_count (int)
 
     Return var_index
+End Process
+
+Note: Mark the most recently added variable as immutable. Called by the STMT_LET
+Note: codegen when the let statement carries is_constant=1 (lowered from
+Note: `Constant NAME as TYPE is VALUE` inside a function body).
+Process called "codegen_mark_last_variable_constant" takes codegen as Integer returns Integer:
+    Let mv_count be memory_get_int32(codegen, 16)
+    If mv_count is equal to 0:
+        Return 0
+    End If
+    Let mv_vars be memory_get_pointer(codegen, 8)
+    Let mv_idx be mv_count minus 1
+    Let mv_off be mv_idx multiplied by 32
+    Let mv_ptr be mv_vars plus mv_off
+    memory_set_int32(mv_ptr, 12, 1)
+    Return 0
+End Process
+
+Note: Return 1 if the variable named `name` is an immutable Constant, else 0.
+Note: Used by Set-statement codegen to reject writes to constants.
+Process called "codegen_variable_is_constant" takes codegen as Integer, name as Integer returns Integer:
+    Let vc_idx be codegen_find_variable(codegen, name)
+    If vc_idx is less than 0:
+        Return 0
+    End If
+    Let vc_vars be memory_get_pointer(codegen, 8)
+    Let vc_off be vc_idx multiplied by 32
+    Let vc_ptr be vc_vars plus vc_off
+    Let vc_flag be memory_get_int32(vc_ptr, 12)
+    Return vc_flag
 End Process
 
 Note: Add variable with type - equivalent to codegen_add_variable_with_type
@@ -680,6 +792,20 @@ Process called "codegen_collect_strings_from_expression" takes codegen as Intege
             codegen_collect_strings_from_expression(codegen, field_value_expr)
             Set field_i to field_i plus 1
         End While
+        Return 0
+    End If
+
+    If expr_type is equal to 27:  Note: EXPR_CONVERT
+        Let cv_source be memory_get_pointer(expr, 8)
+        codegen_collect_strings_from_expression(codegen, cv_source)
+        Return 0
+    End If
+
+    If expr_type is equal to 28:  Note: EXPR_POSITION_OF
+        Let po_needle_s be memory_get_pointer(expr, 8)
+        Let po_haystack_s be memory_get_pointer(expr, 16)
+        codegen_collect_strings_from_expression(codegen, po_needle_s)
+        codegen_collect_strings_from_expression(codegen, po_haystack_s)
         Return 0
     End If
 
@@ -1025,12 +1151,12 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
         Note: Get the type of the object
         Let object_type be codegen_get_expression_type(codegen, object)
 
-        Note: Structural fallback for nested field access through `Integer`-declared
+        Note: Structural fallback for chained field access through `Integer`-declared
         Note: locals/parameters. v0.0.8.5 source uses `param as Integer` as a generic
-        Note: pointer placeholder; the actual struct identity must be inferred from
-        Note: every field accessed on the variable. Without this fallback, chained
-        Note: accesses like `parser.current_token.value` fail because the inner
-        Note: `.current_token`'s type can't be resolved past the Integer placeholder.
+        Note: pointer placeholder. Without this fallback, chained accesses like
+        Note: `parser.current_token.value` fail because the inner `.current_token`
+        Note: can't resolve past Integer. We use a tried-flag at variable offset 28
+        Note: to make the resolver fire at most once per variable per function.
         Let need_structural be 0
         If object_type is equal to 0:
             Set need_structural to 1
@@ -1045,9 +1171,50 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
             If st_obj_t is equal to 1:  Note: EXPR_VARIABLE
                 Let st_obj_name be memory_get_pointer(object, 8)
                 If st_obj_name is not equal to 0:
-                    Let st_type be codegen_resolve_struct_via_structural(codegen, st_obj_name)
-                    If st_type is not equal to 0:
-                        Set object_type to memory_get_pointer(st_type, 0)
+                    Let st_var_idx be codegen_find_variable(codegen, st_obj_name)
+                    Let st_skip be 0
+                    If st_var_idx is greater than or equal to 0:
+                        Let st_vars be memory_get_pointer(codegen, 8)
+                        Let st_var_off be st_var_idx multiplied by 32
+                        Let st_var_ptr be st_vars plus st_var_off
+                        Let st_tried be memory_get_int32(st_var_ptr, 28)
+                        If st_tried is equal to 1:
+                            Set st_skip to 1
+                        End If
+                    End If
+                    If st_skip is equal to 0:
+                        Let st_type be codegen_resolve_struct_via_structural(codegen, st_obj_name)
+                        If st_var_idx is greater than or equal to 0:
+                            Let st_vars2 be memory_get_pointer(codegen, 8)
+                            Let st_var_off2 be st_var_idx multiplied by 32
+                            Let st_var_ptr2 be st_vars2 plus st_var_off2
+                            memory_set_int32(st_var_ptr2, 28, 1)
+                            If st_type is not equal to 0:
+                                Set object_type to memory_get_pointer(st_type, 0)
+                                memory_set_pointer(st_var_ptr2, 16, object_type)
+                            End If
+                        Otherwise:
+                            If st_type is not equal to 0:
+                                Set object_type to memory_get_pointer(st_type, 0)
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+            Note: Chained-access structural inference. When object is itself a
+            Note: EXPR_FIELD_ACCESS (e.g. `analyzer.current_scope` in
+            Note: `analyzer.current_scope.visibility`), use the inner field name
+            Note: as the virtual target for structural inference. The collector
+            Note: walks every `*.inner_field.X` access in the function body and
+            Note: finds the unique struct owning every collected outer field.
+            Note: Lets chained accesses through the `as Integer` placeholder
+            Note: convention without source-side type annotations.
+            If st_obj_t is equal to 6:  Note: EXPR_FIELD_ACCESS (chained)
+                Let st_inner_field be memory_get_pointer(object, 16)
+                If st_inner_field is not equal to 0:
+                    Let st_chain_type be codegen_resolve_struct_via_structural(codegen, st_inner_field)
+                    If st_chain_type is not equal to 0:
+                        Set object_type to memory_get_pointer(st_chain_type, 0)
                     End If
                 End If
             End If
@@ -1118,6 +1285,23 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
 
     If expr_type is equal to 5:  Note: EXPR_STRING_LITERAL
         Return "String"
+    End If
+
+    If expr_type is equal to 29:  Note: EXPR_FLOAT_LITERAL
+        Return "Float"
+    End If
+
+    If expr_type is equal to 27:  Note: EXPR_CONVERT
+        Note: The result type of `convert X to T` is T itself. Read the target
+        Note: type name from the convert node so chained conversions work
+        Note: (e.g. Let f be convert N to Float; Let n be convert f to Integer).
+        Let cv_target_name be memory_get_pointer(expr, 16)
+        Return cv_target_name
+    End If
+
+    If expr_type is equal to 28:  Note: EXPR_POSITION_OF
+        Note: position of returns an Integer index (-1 on miss).
+        Return "Integer"
     End If
 
     Note: Other expression types don't have determinable types in this context
@@ -1342,7 +1526,18 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
     End If
 
     Note: Invalid lvalue expression type
-    print_string("[CODEGEN ERROR] Invalid lvalue expression type")
+    print_string("[CODEGEN ERROR] Invalid lvalue expression type ")
+    print_integer(expr_type)
+    Let ilv_cur_fn be memory_get_pointer(codegen, 112)
+    If ilv_cur_fn is not equal to 0:
+        Let ilv_fn_name be memory_get_pointer(ilv_cur_fn, 0)
+        If ilv_fn_name is not equal to 0:
+            print_string(" in function '")
+            print_string(ilv_fn_name)
+            print_string("'")
+        End If
+    End If
+    print_newline()
     exit_with_code(1)
     Return 0
 End Process
@@ -1440,7 +1635,9 @@ Process called "codegen_generate_variable_expr" takes codegen as Integer, expr a
     Let variables be memory_get_pointer(codegen, 8)
     Let var_offset be var_index multiplied by 32
     Let var_ptr be variables plus var_offset
-    Let offset be memory_get_integer(var_ptr, 8)
+    Note: stack_offset is a 4-byte int at offset 8. Read as int32 - reading as
+    Note: int64 would also load bytes 12-15 which now hold the is_constant flag.
+    Let offset be memory_get_int32(var_ptr, 8)
     Let var_type be memory_get_pointer(var_ptr, 16)
 
     Note: Check if this is a closure variable (offset == -1, appears as 4294967295 unsigned)
@@ -1593,7 +1790,9 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
                     Let variables be memory_get_pointer(codegen, 8)
                     Let var_offset be var_index multiplied by 32
                     Let var_ptr be variables plus var_offset
-                    Let stack_offset be memory_get_integer(var_ptr, 8)
+                    Note: stack_offset is int32 at offset 8 - int64 read would
+                    Note: also pick up the is_constant flag at offset 12.
+                    Let stack_offset be memory_get_int32(var_ptr, 8)
                     Note: Check if this is a closure variable (offset == -1, appears as 4294967295 unsigned)
                     If stack_offset is equal to 4294967295:
                         Note: Closure variable, use general expression path
@@ -1627,7 +1826,8 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
                     Set variables to memory_get_pointer(codegen, 8)
                     Set var_offset to var_index multiplied by 32
                     Set var_ptr to variables plus var_offset
-                    Set stack_offset to memory_get_integer(var_ptr, 8)
+                    Note: stack_offset is int32 at offset 8 - read narrowly.
+                    Set stack_offset to memory_get_int32(var_ptr, 8)
                     Note: Check if this is a closure variable (offset == -1, appears as 4294967295 unsigned)
                     If stack_offset is equal to 4294967295:
                         Note: Closure variable, use general expression path
@@ -1887,12 +2087,204 @@ Process called "codegen_generate_comparison" takes codegen as Integer, expr as I
 End Process
 
 Note: Generate code for function call expressions
+Note: Reorder a function call's argument array based on named-arg metadata.
+Note: Looks up the target function by name in the current program; for each
+Note: named arg, finds the matching parameter declaration and moves the value
+Note: into that slot. Required by canonical Runa semantics: callers may write
+Note: `f with b as 1, a as 2` and the compiler must emit the call as f(2, 1)
+Note: when f's declaration is `Process called "f" that takes a as T, b as T`.
+Note: Modifies the arguments array in place. Does NOT validate the AST is
+Note: well-formed beyond name lookup; an unknown name aborts with a diagnostic.
+Note: Supports mixed positional+named: positional args fill their declared
+Note: parameter index (in declaration order, treating positional slots as
+Note: declared-order-from-the-start), named args bind to their named slot.
+Note: All slots must be filled; double-binding (positional AND named at same
+Note: slot) is rejected.
+Process called "codegen_reorder_named_args" takes codegen as Integer, function_name as Integer, arguments as Integer, arg_names as Integer, arg_count as Integer returns Integer:
+    If arg_names is equal to 0:
+        Return 0
+    End If
+    If arg_count is equal to 0:
+        Return 0
+    End If
+
+    Let rn_program be memory_get_pointer(codegen, 48)
+    If rn_program is equal to 0:
+        Return 0
+    End If
+    Let rn_func_count be memory_get_int32(rn_program, 8)
+    Let rn_funcs be memory_get_pointer(rn_program, 0)
+    If rn_funcs is equal to 0:
+        Return 0
+    End If
+
+    Note: Look up the target function by name.
+    Let rn_target_func be 0
+    Let rn_fi be 0
+    While rn_fi is less than rn_func_count:
+        Let rn_f be memory_get_pointer(rn_funcs, rn_fi multiplied by 8)
+        If rn_f is not equal to 0:
+            Let rn_fname be memory_get_pointer(rn_f, 0)
+            If rn_fname is not equal to 0:
+                If string_equals(rn_fname, function_name) is equal to 1:
+                    Set rn_target_func to rn_f
+                    Set rn_fi to rn_func_count
+                End If
+            End If
+        End If
+        Set rn_fi to rn_fi plus 1
+    End While
+
+    If rn_target_func is equal to 0:
+        Note: External or runtime function - we cannot validate names. Leave order
+        Note: as written; runtime functions don't accept named args, so this is
+        Note: only safe when the caller used names matching positional order.
+        Return 0
+    End If
+
+    Let rn_param_count be memory_get_int32(rn_target_func, 16)
+    Let rn_parameters be memory_get_pointer(rn_target_func, 8)
+
+    Note: For each arg, compute its target parameter slot:
+    Note: - named arg: find the matching parameter index by name
+    Note: - positional arg: use the next available parameter index
+    Note: Positional args advance a running pointer through parameter indices,
+    Note: skipping slots that are already filled by an earlier named arg. This
+    Note: matches Python/Ruby/Rust-like mixed-arg semantics.
+    Let rn_targets be memory_allocate(arg_count multiplied by 8)
+    Let rn_slot_filled be memory_allocate(rn_param_count multiplied by 8)
+    Let rn_init_si be 0
+    While rn_init_si is less than rn_param_count:
+        memory_set_integer(rn_slot_filled, rn_init_si multiplied by 8, 0)
+        Set rn_init_si to rn_init_si plus 1
+    End While
+
+    Note: Pass 1: resolve named args first so positional fills skip those slots.
+    Let rn_ai be 0
+    While rn_ai is less than arg_count:
+        Let rn_a_off be rn_ai multiplied by 8
+        Let rn_a_name be memory_get_pointer(arg_names, rn_a_off)
+        If rn_a_name is not equal to 0:
+            Let rn_found be 0 minus 1
+            Let rn_pj be 0
+            While rn_pj is less than rn_param_count:
+                Let rn_p_off be rn_pj multiplied by 16
+                Let rn_p_ptr be rn_parameters plus rn_p_off
+                Let rn_p_name be memory_get_pointer(rn_p_ptr, 0)
+                If rn_p_name is not equal to 0:
+                    If string_equals(rn_p_name, rn_a_name) is equal to 1:
+                        Set rn_found to rn_pj
+                        Set rn_pj to rn_param_count
+                    End If
+                End If
+                Set rn_pj to rn_pj plus 1
+            End While
+            If rn_found is less than 0:
+                print_string("[CODEGEN ERROR] Named argument '")
+                print_string(rn_a_name)
+                print_string("' does not match any parameter of '")
+                print_string(function_name)
+                print_string("'")
+                print_newline()
+                exit_with_code(1)
+            End If
+            Let rn_already be memory_get_integer(rn_slot_filled, rn_found multiplied by 8)
+            If rn_already is equal to 1:
+                print_string("[CODEGEN ERROR] Parameter '")
+                print_string(rn_a_name)
+                print_string("' bound more than once in call to '")
+                print_string(function_name)
+                print_string("'")
+                print_newline()
+                exit_with_code(1)
+            End If
+            memory_set_integer(rn_slot_filled, rn_found multiplied by 8, 1)
+            memory_set_integer(rn_targets, rn_a_off, rn_found)
+        End If
+        Set rn_ai to rn_ai plus 1
+    End While
+
+    Note: Pass 2: assign positional args to remaining slots in declaration order.
+    Note: rn_next_slot is a running cursor through parameter indices; positional
+    Note: args claim the next unfilled slot starting from where the previous
+    Note: positional arg left off.
+    Let rn_next_slot be 0
+    Set rn_ai to 0
+    While rn_ai is less than arg_count:
+        Let rn_a_off2 be rn_ai multiplied by 8
+        Let rn_a_name2 be memory_get_pointer(arg_names, rn_a_off2)
+        If rn_a_name2 is equal to 0:
+            Note: Advance cursor past any filled slots to find the next vacancy.
+            Let rn_scan_done be 0
+            While rn_scan_done is equal to 0:
+                If rn_next_slot is greater than or equal to rn_param_count:
+                    Set rn_scan_done to 1
+                Otherwise:
+                    Let rn_slot_taken be memory_get_integer(rn_slot_filled, rn_next_slot multiplied by 8)
+                    If rn_slot_taken is equal to 1:
+                        Set rn_next_slot to rn_next_slot plus 1
+                    Otherwise:
+                        Set rn_scan_done to 1
+                    End If
+                End If
+            End While
+            If rn_next_slot is greater than or equal to rn_param_count:
+                print_string("[CODEGEN ERROR] Too many positional arguments in call to '")
+                print_string(function_name)
+                print_string("'")
+                print_newline()
+                exit_with_code(1)
+            End If
+            memory_set_integer(rn_slot_filled, rn_next_slot multiplied by 8, 1)
+            memory_set_integer(rn_targets, rn_a_off2, rn_next_slot)
+            Set rn_next_slot to rn_next_slot plus 1
+        End If
+        Set rn_ai to rn_ai plus 1
+    End While
+
+    Note: Build reordered argument array. new_args[target_index[i]] = arguments[i].
+    Let rn_new_args be memory_allocate(arg_count multiplied by 8)
+    Let rn_ni be 0
+    While rn_ni is less than arg_count:
+        memory_set_pointer(rn_new_args, rn_ni multiplied by 8, 0)
+        Set rn_ni to rn_ni plus 1
+    End While
+    Set rn_ai to 0
+    While rn_ai is less than arg_count:
+        Let rn_cp_off be rn_ai multiplied by 8
+        Let rn_src_arg be memory_get_pointer(arguments, rn_cp_off)
+        Let rn_tgt_idx be memory_get_integer(rn_targets, rn_cp_off)
+        memory_set_pointer(rn_new_args, rn_tgt_idx multiplied by 8, rn_src_arg)
+        Set rn_ai to rn_ai plus 1
+    End While
+
+    Note: Copy reordered values back into the original arguments array.
+    Set rn_ai to 0
+    While rn_ai is less than arg_count:
+        Let rn_ca_off be rn_ai multiplied by 8
+        Let rn_new_arg be memory_get_pointer(rn_new_args, rn_ca_off)
+        memory_set_pointer(arguments, rn_ca_off, rn_new_arg)
+        Set rn_ai to rn_ai plus 1
+    End While
+
+    deallocate(rn_new_args)
+    deallocate(rn_targets)
+    deallocate(rn_slot_filled)
+    Return 0
+End Process
+
 Process called "codegen_generate_function_call" takes codegen as Integer, expr as Integer returns Integer:
     Let output_file be memory_get_integer(codegen, 0)
     Let function_call_ptr be expr plus 8  Note: &expr->data.function_call
     Let function_name be memory_get_pointer(function_call_ptr, 0)  Note: function_call.function_name
     Let arguments be memory_get_pointer(function_call_ptr, 8)      Note: function_call.arguments
     Let arg_count be memory_get_int32(function_call_ptr, 16)     Note: function_call.argument_count
+
+    Note: Named-arg reorder before code emission. arg_names lives at offset 32 of
+    Note: the expression struct (allocated by expression_create_function_call when
+    Note: any named arg was present; NULL for positional-only calls).
+    Let fc_arg_names be memory_get_pointer(expr, 32)
+    codegen_reorder_named_args(codegen, function_name, arguments, fc_arg_names, arg_count)
 
     Note: Safety check for function_name
     If function_name is equal to 0:  Note: NULL pointer check
@@ -2082,37 +2474,62 @@ Process called "codegen_collect_field_names_in_expr" takes expr as Integer, targ
     If expr is equal to 0:
         Return 0
     End If
+    Note: Sanity check: skip uninitialized/garbage pointers. The collector
+    Note: recurses through sub-expressions whose pointer fields can be
+    Note: uninitialized in some malformed AST shapes (e.g. ADT variants with
+    Note: missing optional payloads). Without this guard memory_get_int32 below
+    Note: segfaults when expr points to non-readable memory.
+    If expr is less than 65536:
+        Return 0
+    End If
     Let cfn_etype be memory_get_int32(expr, 0)
 
     If cfn_etype is equal to 6:  Note: EXPR_FIELD_ACCESS
         Let cfn_obj be memory_get_pointer(expr, 8)
         Let cfn_fn be memory_get_pointer(expr, 16)
+        Let cfn_match be 0
         If cfn_obj is not equal to 0:
             Let cfn_obj_t be memory_get_int32(cfn_obj, 0)
             If cfn_obj_t is equal to 1:  Note: EXPR_VARIABLE
                 Let cfn_obj_name be memory_get_pointer(cfn_obj, 8)
                 If cfn_obj_name is not equal to 0:
                     If string_equals(cfn_obj_name, target_name) is equal to 1:
-                        If cfn_fn is not equal to 0:
-                            Let cfn_cur be memory_get_int32(count_ptr, 0)
-                            Let cfn_dup be 0
-                            Let cfn_di be 0
-                            While cfn_di is less than cfn_cur:
-                                Let cfn_di_off be cfn_di multiplied by 8
-                                Let cfn_existing be memory_get_pointer(fields_buf, cfn_di_off)
-                                If string_equals(cfn_existing, cfn_fn) is equal to 1:
-                                    Set cfn_dup to 1
-                                    Set cfn_di to cfn_cur
-                                End If
-                                Set cfn_di to cfn_di plus 1
-                            End While
-                            If cfn_dup is equal to 0:
-                                If cfn_cur is less than max_count:
-                                    Let cfn_put_off be cfn_cur multiplied by 8
-                                    memory_set_pointer(fields_buf, cfn_put_off, cfn_fn)
-                                    memory_set_int32(count_ptr, 0, cfn_cur plus 1)
-                                End If
-                            End If
+                        Set cfn_match to 1
+                    End If
+                End If
+            End If
+            Note: Chained-access case: target_name names a FIELD that itself is
+            Note: the parent of this access. Lets structural inference walk a
+            Note: pattern like `x.scope.visibility` by passing "scope" as the
+            Note: virtual target — we then collect [visibility, ...] just like
+            Note: we would for a simple variable target.
+            If cfn_obj_t is equal to 6:  Note: EXPR_FIELD_ACCESS (parent is also field access)
+                Let cfn_obj_inner_field be memory_get_pointer(cfn_obj, 16)
+                If cfn_obj_inner_field is not equal to 0:
+                    If string_equals(cfn_obj_inner_field, target_name) is equal to 1:
+                        Set cfn_match to 1
+                    End If
+                End If
+            End If
+            If cfn_match is equal to 1:
+                If cfn_fn is not equal to 0:
+                    Let cfn_cur be memory_get_int32(count_ptr, 0)
+                    Let cfn_dup be 0
+                    Let cfn_di be 0
+                    While cfn_di is less than cfn_cur:
+                        Let cfn_di_off be cfn_di multiplied by 8
+                        Let cfn_existing be memory_get_pointer(fields_buf, cfn_di_off)
+                        If string_equals(cfn_existing, cfn_fn) is equal to 1:
+                            Set cfn_dup to 1
+                            Set cfn_di to cfn_cur
+                        End If
+                        Set cfn_di to cfn_di plus 1
+                    End While
+                    If cfn_dup is equal to 0:
+                        If cfn_cur is less than max_count:
+                            Let cfn_put_off be cfn_cur multiplied by 8
+                            memory_set_pointer(fields_buf, cfn_put_off, cfn_fn)
+                            memory_set_int32(count_ptr, 0, cfn_cur plus 1)
                         End If
                     End If
                 End If
@@ -2248,6 +2665,10 @@ Process called "codegen_collect_field_names_in_stmt" takes stmt as Integer, targ
     If stmt is equal to 0:
         Return 0
     End If
+    Note: Pointer sanity guard - see codegen_collect_field_names_in_expr.
+    If stmt is less than 65536:
+        Return 0
+    End If
     Let cfs_stype be memory_get_int32(stmt, 0)
 
     If cfs_stype is equal to 1:  Note: STMT_LET - expression at 16
@@ -2324,7 +2745,7 @@ Process called "codegen_collect_field_names_in_stmt" takes stmt as Integer, targ
         End If
         Return 0
     End If
-    If cfs_stype is equal to 12:  Note: STMT_FOR_EACH - var(8), collection(16), body(24), body_count(32)
+    If cfs_stype is equal to 12:  Note: STMT_FOR_EACH - var(8), collection(16), body(24), body_count(32), type_name(40)
         codegen_collect_field_names_in_expr(memory_get_pointer(stmt, 16), target_name, fields_buf, count_ptr, max_count)
         Let cfs_fe_body be memory_get_pointer(stmt, 24)
         Let cfs_fe_count be memory_get_int32(stmt, 32)
@@ -2357,6 +2778,14 @@ Process called "codegen_resolve_struct_via_structural" takes codegen as Integer,
     If cs_func is equal to 0:
         Return 0
     End If
+
+    Note: Per-function memoization. Skips the function-tree walk and type scan
+    Note: when this variable's structural type has already been resolved.
+    Let fcl_cached be codegen_field_cache_lookup(codegen, target_name)
+    If fcl_cached is not equal to 0:
+        Return fcl_cached
+    End If
+
     Let cs_stmts be memory_get_pointer(cs_func, 32)  Note: func->statements
     Let cs_stmt_count be memory_get_int32(cs_func, 40)  Note: func->statement_count
     If cs_stmts is equal to 0:
@@ -2383,62 +2812,338 @@ Process called "codegen_resolve_struct_via_structural" takes codegen as Integer,
         Set cs_si to cs_si plus 1
     End While
 
-    Let cs_field_count be memory_get_int32(cs_count_ptr, 0)
-    If cs_field_count is equal to 0:
-        deallocate(cs_buf)
-        deallocate(cs_count_ptr)
-        Return 0
-    End If
-
-    Note: Find the unique struct type containing every collected field.
+    Note: Two-pass structural resolution. v0.0.8.5 has hundreds of files where
+    Note: multiple structs share common field names (current_class, errors,
+    Note: type_map, etc.). The earlier "always cross-function walk" strategy
+    Note: polluted the field set with fields from OTHER structs used in the same
+    Note: file (e.g. DartTranslationContext vs DartGenerationContext both have
+    Note: current_class but different supplementary fields), causing the
+    Note: union-match to fail for both. Two-pass: try local-only first, then
+    Note: broaden only when local yields ZERO matches.
+    Let cs_local_count be memory_get_int32(cs_count_ptr, 0)
     Let cs_program be memory_get_pointer(codegen, 48)
+
+    Note: Pass 1: match against local fields only.
     Let cs_match be 0
     Let cs_match_count be 0
     If cs_program is not equal to 0:
-        Let cs_tcount be memory_get_int32(cs_program, 24)
-        Let cs_types be memory_get_pointer(cs_program, 16)
-        If cs_types is not equal to 0:
-            Let cs_ti be 0
-            While cs_ti is less than cs_tcount:
-                Let cs_t_off be cs_ti multiplied by 8
-                Let cs_t be memory_get_pointer(cs_types, cs_t_off)
-                If cs_t is not equal to 0:
-                    Let cs_kind be memory_get_int32(cs_t, 8)
-                    If cs_kind is equal to 0:  Note: TYPE_KIND_STRUCT
-                        Let cs_t_fc be memory_get_int32(cs_t, 24)
-                        Let cs_t_fields be memory_get_pointer(cs_t, 16)
-                        Note: Verify this struct has every field in the collected set.
-                        Let cs_all_present be 1
-                        Let cs_fi be 0
-                        While cs_fi is less than cs_field_count:
-                            Let cs_f_off be cs_fi multiplied by 8
-                            Let cs_target_field be memory_get_pointer(cs_buf, cs_f_off)
-                            Let cs_field_found be 0
-                            Let cs_tf_i be 0
-                            While cs_tf_i is less than cs_t_fc:
-                                Let cs_tf_off be cs_tf_i multiplied by 24
-                                Let cs_tf_ptr be cs_t_fields plus cs_tf_off
-                                Let cs_tf_name be memory_get_pointer(cs_tf_ptr, 0)
-                                If string_equals(cs_tf_name, cs_target_field) is equal to 1:
-                                    Set cs_field_found to 1
-                                    Set cs_tf_i to cs_t_fc
+        If cs_local_count is greater than 0:
+            Let cs_tcount be memory_get_int32(cs_program, 24)
+            Let cs_types be memory_get_pointer(cs_program, 16)
+            If cs_types is not equal to 0:
+                Let cs_ti be 0
+                While cs_ti is less than cs_tcount:
+                    Let cs_t_off be cs_ti multiplied by 8
+                    Let cs_t be memory_get_pointer(cs_types, cs_t_off)
+                    If cs_t is not equal to 0:
+                        Let cs_kind be memory_get_int32(cs_t, 8)
+                        If cs_kind is equal to 0:  Note: TYPE_KIND_STRUCT
+                            Let cs_t_fc be memory_get_int32(cs_t, 24)
+                            Let cs_t_fields be memory_get_pointer(cs_t, 16)
+                            Let cs_all_present be 1
+                            Let cs_fi be 0
+                            While cs_fi is less than cs_local_count:
+                                Let cs_f_off be cs_fi multiplied by 8
+                                Let cs_target_field be memory_get_pointer(cs_buf, cs_f_off)
+                                Let cs_field_found be 0
+                                Let cs_tf_i be 0
+                                While cs_tf_i is less than cs_t_fc:
+                                    Let cs_tf_off be cs_tf_i multiplied by 24
+                                    Let cs_tf_ptr be cs_t_fields plus cs_tf_off
+                                    Let cs_tf_name be memory_get_pointer(cs_tf_ptr, 0)
+                                    If string_equals(cs_tf_name, cs_target_field) is equal to 1:
+                                        Set cs_field_found to 1
+                                        Set cs_tf_i to cs_t_fc
+                                    End If
+                                    Set cs_tf_i to cs_tf_i plus 1
+                                End While
+                                If cs_field_found is equal to 0:
+                                    Set cs_all_present to 0
+                                    Set cs_fi to cs_local_count
                                 End If
-                                Set cs_tf_i to cs_tf_i plus 1
+                                Set cs_fi to cs_fi plus 1
                             End While
-                            If cs_field_found is equal to 0:
-                                Set cs_all_present to 0
-                                Set cs_fi to cs_field_count
+                            If cs_all_present is equal to 1:
+                                Set cs_match to cs_t
+                                Set cs_match_count to cs_match_count plus 1
                             End If
-                            Set cs_fi to cs_fi plus 1
-                        End While
-                        If cs_all_present is equal to 1:
-                            Set cs_match to cs_t
-                            Set cs_match_count to cs_match_count plus 1
                         End If
                     End If
+                    Set cs_ti to cs_ti plus 1
+                End While
+            End If
+        End If
+    End If
+
+    Note: Pass 1.5: function-name prefix disambiguation. When local pass yields
+    Note: 2+ candidate structs (common in files like dart_to_hir/hir_to_dart that
+    Note: share fields like current_class, type_map, errors), pick the candidate
+    Note: whose type name contains the function-name root as a case-insensitive
+    Note: substring. e.g. `generate_constructor` + DartGenerationContext (yes,
+    Note: contains "generat") vs DartTranslationContext (no). Reflects the
+    Note: v0.0.8.5 convention that translation backends name functions after the
+    Note: backend phase: `translate_*` → *TranslationContext, `generate_*` →
+    Note: *GenerationContext, `emit_*` → *EmitterContext, etc.
+    If cs_match_count is greater than or equal to 2:
+        Let cs_fname be memory_get_pointer(cs_func, 0)
+        If cs_fname is not equal to 0:
+            Note: Cap root at 6 bytes so verb-roots like "generate"/"translate"
+            Note: match their derived noun forms in type names ("Generation",
+            Note: "Translation") even though the full verb is not a substring.
+            Note: 6 bytes covers "genera", "transl", "emitte", "lookup" etc.
+            Let cs_fn_root_len be 0
+            Let cs_fn_pi be 0
+            Let cs_fn_max be 6
+            Let cs_fn_done be 0
+            While cs_fn_pi is less than cs_fn_max:
+                If cs_fn_done is equal to 0:
+                    Let cs_fn_byte be memory_get_byte(cs_fname, cs_fn_pi)
+                    If cs_fn_byte is equal to 0:
+                        Set cs_fn_done to 1
+                    End If
+                    If cs_fn_byte is equal to 95:
+                        Set cs_fn_done to 1
+                    End If
+                    If cs_fn_done is equal to 0:
+                        Set cs_fn_root_len to cs_fn_root_len plus 1
+                    End If
                 End If
-                Set cs_ti to cs_ti plus 1
+                Set cs_fn_pi to cs_fn_pi plus 1
             End While
+
+            If cs_fn_root_len is greater than or equal to 4:
+                Let cs_pref_match be 0
+                Let cs_pref_count be 0
+                Let cs_tcount15 be memory_get_int32(cs_program, 24)
+                Let cs_types15 be memory_get_pointer(cs_program, 16)
+                If cs_types15 is not equal to 0:
+                    Let cs_ti15 be 0
+                    While cs_ti15 is less than cs_tcount15:
+                        Let cs_t_off15 be cs_ti15 multiplied by 8
+                        Let cs_t15 be memory_get_pointer(cs_types15, cs_t_off15)
+                        If cs_t15 is not equal to 0:
+                            Let cs_kind15 be memory_get_int32(cs_t15, 8)
+                            If cs_kind15 is equal to 0:
+                                Let cs_t_fc15 be memory_get_int32(cs_t15, 24)
+                                Let cs_t_fields15 be memory_get_pointer(cs_t15, 16)
+                                Let cs_all_present15 be 1
+                                Let cs_fi15 be 0
+                                While cs_fi15 is less than cs_local_count:
+                                    Let cs_f_off15 be cs_fi15 multiplied by 8
+                                    Let cs_target_field15 be memory_get_pointer(cs_buf, cs_f_off15)
+                                    Let cs_field_found15 be 0
+                                    Let cs_tf_i15 be 0
+                                    While cs_tf_i15 is less than cs_t_fc15:
+                                        Let cs_tf_off15 be cs_tf_i15 multiplied by 24
+                                        Let cs_tf_ptr15 be cs_t_fields15 plus cs_tf_off15
+                                        Let cs_tf_name15 be memory_get_pointer(cs_tf_ptr15, 0)
+                                        If string_equals(cs_tf_name15, cs_target_field15) is equal to 1:
+                                            Set cs_field_found15 to 1
+                                            Set cs_tf_i15 to cs_t_fc15
+                                        End If
+                                        Set cs_tf_i15 to cs_tf_i15 plus 1
+                                    End While
+                                    If cs_field_found15 is equal to 0:
+                                        Set cs_all_present15 to 0
+                                        Set cs_fi15 to cs_local_count
+                                    End If
+                                    Set cs_fi15 to cs_fi15 plus 1
+                                End While
+                                If cs_all_present15 is equal to 1:
+                                    Let cs_tname15 be memory_get_pointer(cs_t15, 0)
+                                    Let cs_in_type be codegen_funcname_root_in_type(cs_fname, cs_fn_root_len, cs_tname15)
+                                    If cs_in_type is equal to 1:
+                                        Set cs_pref_match to cs_t15
+                                        Set cs_pref_count to cs_pref_count plus 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                        Set cs_ti15 to cs_ti15 plus 1
+                    End While
+                End If
+
+                If cs_pref_count is equal to 1:
+                    Set cs_match to cs_pref_match
+                    Set cs_match_count to 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Phase 1.6: same-source-file preference. When Phase 1 / Phase 1.5 still
+    Note: yield 2+ structurally-matching candidates, prefer the type defined in
+    Note: the same source file as the current function. This handles the common
+    Note: case where many imported modules define structurally-identical types
+    Note: (e.g. every language backend has its own LangEmitterConfig with
+    Note: identical fields). The function being compiled lives in exactly one
+    Note: file, and its intended struct type is the one defined alongside it.
+    Note: Source-file tags are attached by import_system (for imported files) and
+    Note: by main (for the primary source file). Functions and types without tags
+    Note: (e.g. compiler-synthesized __module_init bodies, or older bootstrap
+    Note: stages) are skipped harmlessly - the loop simply finds no same-file
+    Note: candidate and falls through to Pass 2.
+    If cs_match_count is greater than or equal to 2:
+        Let cs_func_file be memory_get_pointer(cs_func, 48)
+        If cs_func_file is not equal to 0:
+            Let cs_sf_match be 0
+            Let cs_sf_count be 0
+            Let cs_tcount16 be memory_get_int32(cs_program, 24)
+            Let cs_types16 be memory_get_pointer(cs_program, 16)
+            If cs_types16 is not equal to 0:
+                Let cs_ti16 be 0
+                While cs_ti16 is less than cs_tcount16:
+                    Let cs_t_off16 be cs_ti16 multiplied by 8
+                    Let cs_t16 be memory_get_pointer(cs_types16, cs_t_off16)
+                    If cs_t16 is not equal to 0:
+                        Note: types array stores TypeDefinition pointers directly
+                        If 1 is equal to 1:
+                            Let cs_kind16 be memory_get_int32(cs_t16, 8)
+                            If cs_kind16 is equal to 0:
+                                Let cs_t_fc16 be memory_get_int32(cs_t16, 24)
+                                Let cs_t_fields16 be memory_get_pointer(cs_t16, 16)
+                                Let cs_all_present16 be 1
+                                Let cs_fi16 be 0
+                                While cs_fi16 is less than cs_local_count:
+                                    Let cs_f_off16 be cs_fi16 multiplied by 8
+                                    Let cs_target_field16 be memory_get_pointer(cs_buf, cs_f_off16)
+                                    Let cs_field_found16 be 0
+                                    Let cs_tf_i16 be 0
+                                    While cs_tf_i16 is less than cs_t_fc16:
+                                        Let cs_tf_off16 be cs_tf_i16 multiplied by 24
+                                        Let cs_tf_ptr16 be cs_t_fields16 plus cs_tf_off16
+                                        Let cs_tf_name16 be memory_get_pointer(cs_tf_ptr16, 0)
+                                        If string_equals(cs_tf_name16, cs_target_field16) is equal to 1:
+                                            Set cs_field_found16 to 1
+                                            Set cs_tf_i16 to cs_t_fc16
+                                        End If
+                                        Set cs_tf_i16 to cs_tf_i16 plus 1
+                                    End While
+                                    If cs_field_found16 is equal to 0:
+                                        Set cs_all_present16 to 0
+                                        Set cs_fi16 to cs_local_count
+                                    End If
+                                    Set cs_fi16 to cs_fi16 plus 1
+                                End While
+                                If cs_all_present16 is equal to 1:
+                                    Let cs_type_file be memory_get_pointer(cs_t16, 48)
+                                    If cs_type_file is not equal to 0:
+                                        If string_equals(cs_type_file, cs_func_file) is equal to 1:
+                                            Set cs_sf_match to cs_t16
+                                            Set cs_sf_count to cs_sf_count plus 1
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set cs_ti16 to cs_ti16 plus 1
+                End While
+            End If
+
+            If cs_sf_count is equal to 1:
+                Set cs_match to cs_sf_match
+                Set cs_match_count to 1
+            End If
+        End If
+    End If
+
+    Note: Pass 2: cross-function broaden when not yet uniquely resolved AND
+    Note: local field count is sparse. Broadening pulls fields from every other
+    Note: function in the program; if the variable is consistently the same
+    Note: struct type across the file (e.g. `emitter` always LuaEmitterState),
+    Note: the broadened field set narrows down to a unique struct. If the
+    Note: variable name aliases different types across functions (e.g. `ctx`
+    Note: in dart_to_hir vs hir_to_dart), broadening yields 0 matches and the
+    Note: result is discarded — Phase 1.5 / Phase 1 take over below.
+    Note: Pass 2 uses a SEPARATE accumulator (cs_match2/cs_match2_count) so its
+    Note: result only replaces the Pass 1/1.5 outcome when it is unique.
+    If cs_match_count is not equal to 1:
+        If cs_local_count is less than 3:
+            If cs_program is not equal to 0:
+                Let cs_xf_func_count be memory_get_int32(cs_program, 8)
+                Let cs_xf_funcs be memory_get_pointer(cs_program, 0)
+                If cs_xf_funcs is not equal to 0:
+                    Let cs_xf_fi be 0
+                    While cs_xf_fi is less than cs_xf_func_count:
+                        Let cs_xf_f_off be cs_xf_fi multiplied by 8
+                        Let cs_xf_func be memory_get_pointer(cs_xf_funcs, cs_xf_f_off)
+                        If cs_xf_func is not equal to 0:
+                            If cs_xf_func is not equal to cs_func:
+                                Let cs_xf_stmts be memory_get_pointer(cs_xf_func, 32)
+                                Let cs_xf_stmt_count be memory_get_int32(cs_xf_func, 40)
+                                If cs_xf_stmts is not equal to 0:
+                                    Let cs_xf_si be 0
+                                    While cs_xf_si is less than cs_xf_stmt_count:
+                                        Let cs_xf_s_off be cs_xf_si multiplied by 8
+                                        codegen_collect_field_names_in_stmt(memory_get_pointer(cs_xf_stmts, cs_xf_s_off), target_name, cs_buf, cs_count_ptr, 64)
+                                        Set cs_xf_si to cs_xf_si plus 1
+                                    End While
+                                End If
+                            End If
+                        End If
+                        Set cs_xf_fi to cs_xf_fi plus 1
+                    End While
+                End If
+            End If
+
+            Let cs_broad_count be memory_get_int32(cs_count_ptr, 0)
+            If cs_broad_count is greater than cs_local_count:
+                Let cs_match2 be 0
+                Let cs_match2_count be 0
+                If cs_program is not equal to 0:
+                    Let cs_tcount2 be memory_get_int32(cs_program, 24)
+                    Let cs_types2 be memory_get_pointer(cs_program, 16)
+                    If cs_types2 is not equal to 0:
+                        Let cs_ti2 be 0
+                        While cs_ti2 is less than cs_tcount2:
+                            Let cs_t_off2 be cs_ti2 multiplied by 8
+                            Let cs_t2 be memory_get_pointer(cs_types2, cs_t_off2)
+                            If cs_t2 is not equal to 0:
+                                Let cs_kind2 be memory_get_int32(cs_t2, 8)
+                                If cs_kind2 is equal to 0:
+                                    Let cs_t_fc2 be memory_get_int32(cs_t2, 24)
+                                    Let cs_t_fields2 be memory_get_pointer(cs_t2, 16)
+                                    Let cs_all_present2 be 1
+                                    Let cs_fi2 be 0
+                                    While cs_fi2 is less than cs_broad_count:
+                                        Let cs_f_off2 be cs_fi2 multiplied by 8
+                                        Let cs_target_field2 be memory_get_pointer(cs_buf, cs_f_off2)
+                                        Let cs_field_found2 be 0
+                                        Let cs_tf_i2 be 0
+                                        While cs_tf_i2 is less than cs_t_fc2:
+                                            Let cs_tf_off2 be cs_tf_i2 multiplied by 24
+                                            Let cs_tf_ptr2 be cs_t_fields2 plus cs_tf_off2
+                                            Let cs_tf_name2 be memory_get_pointer(cs_tf_ptr2, 0)
+                                            If string_equals(cs_tf_name2, cs_target_field2) is equal to 1:
+                                                Set cs_field_found2 to 1
+                                                Set cs_tf_i2 to cs_t_fc2
+                                            End If
+                                            Set cs_tf_i2 to cs_tf_i2 plus 1
+                                        End While
+                                        If cs_field_found2 is equal to 0:
+                                            Set cs_all_present2 to 0
+                                            Set cs_fi2 to cs_broad_count
+                                        End If
+                                        Set cs_fi2 to cs_fi2 plus 1
+                                    End While
+                                    If cs_all_present2 is equal to 1:
+                                        Set cs_match2 to cs_t2
+                                        Set cs_match2_count to cs_match2_count plus 1
+                                    End If
+                                End If
+                            End If
+                            Set cs_ti2 to cs_ti2 plus 1
+                        End While
+                    End If
+                End If
+
+                Note: Adopt broadened result only when it is uniquely resolved.
+                If cs_match2_count is equal to 1:
+                    Set cs_match to cs_match2
+                    Set cs_match_count to 1
+                End If
+            End If
         End If
     End If
 
@@ -2446,6 +3151,7 @@ Process called "codegen_resolve_struct_via_structural" takes codegen as Integer,
     deallocate(cs_count_ptr)
 
     If cs_match_count is equal to 1:
+        codegen_field_cache_store(codegen, target_name, cs_match)
         Return cs_match
     End If
 
@@ -2481,6 +3187,7 @@ Process called "codegen_resolve_struct_via_structural" takes codegen as Integer,
                     Set cnm_ti to cnm_ti plus 1
                 End While
                 If cnm_name_count is equal to 1:
+                    codegen_field_cache_store(codegen, target_name, cnm_name_match)
                     Return cnm_name_match
                 End If
             End If
@@ -2490,10 +3197,62 @@ Process called "codegen_resolve_struct_via_structural" takes codegen as Integer,
     Return 0
 End Process
 
+Note: Look up a cached structural-type resolution for the given variable name
+Note: in the current function. Returns the cached TypeDefinition pointer on hit,
+Note: or 0 on miss (slow path takes over). Only positive resolutions are cached
+Note: so 0 unambiguously means "not in cache".
+Process called "codegen_field_cache_lookup" takes codegen as Integer, target_name as Integer returns Integer:
+    If target_name is equal to 0:
+        Return 0
+    End If
+    Let fcl_buf be memory_get_pointer(codegen, 120)
+    If fcl_buf is equal to 0:
+        Return 0
+    End If
+    Let fcl_count be memory_get_int32(codegen, 128)
+    Let fcl_i be 0
+    While fcl_i is less than fcl_count:
+        Let fcl_entry_off be fcl_i multiplied by 16
+        Let fcl_entry_name be memory_get_pointer(fcl_buf, fcl_entry_off)
+        If fcl_entry_name is not equal to 0:
+            If string_equals(fcl_entry_name, target_name) is equal to 1:
+                Return memory_get_pointer(fcl_buf, fcl_entry_off plus 8)
+            End If
+        End If
+        Set fcl_i to fcl_i plus 1
+    End While
+    Return 0
+End Process
+
+Note: Insert (target_name, type_def) into the per-function field-resolution
+Note: cache. No-op when the cache is full (256 entries) or when target_name is 0.
+Note: Pairs with the lookup at the top of codegen_resolve_struct_via_structural.
+Process called "codegen_field_cache_store" takes codegen as Integer, target_name as Integer, type_def as Integer returns Integer:
+    If target_name is equal to 0:
+        Return 0
+    End If
+    Let fcs_buf be memory_get_pointer(codegen, 120)
+    If fcs_buf is equal to 0:
+        Return 0
+    End If
+    Let fcs_count be memory_get_int32(codegen, 128)
+    If fcs_count is greater than or equal to 256:
+        Return 0
+    End If
+    Let fcs_entry_off be fcs_count multiplied by 16
+    memory_set_pointer(fcs_buf, fcs_entry_off, target_name)
+    memory_set_pointer(fcs_buf, fcs_entry_off plus 8, type_def)
+    memory_set_int32(codegen, 128, fcs_count plus 1)
+    Return 0
+End Process
+
 Note: Case-insensitive equality between a target variable name (e.g. "lexer")
 Note: and a type name (e.g. "Lexer", "PhpLexer"). Returns 1 if:
 Note:   - lowercase(type_name) == target_name, or
-Note:   - type_name ends with capitalize(target_name)
+Note:   - type_name ends with capitalize(target_name), or
+Note:   - target_name has an "_obj" suffix that, when stripped, satisfies B
+Note:     (e.g. target "lexer_obj" matches type "ScalaLexer" because "lexer"
+Note:     stripped of "_obj" capitalized matches the "Lexer" suffix).
 Note: Used to disambiguate struct field access when multiple types share a
 Note: field name. Conservatively case-insensitive to handle CamelCase types.
 Process called "codegen_name_matches_type" takes target_name as Integer, type_name as Integer returns Integer:
@@ -2579,7 +3338,170 @@ Process called "codegen_name_matches_type" takes target_name as Integer, type_na
         End If
     End If
 
+    Note: Match C: strip a trailing "_obj" suffix and reapply Match B logic.
+    Note: Handles the canonical v0.0.8.5 idiom where a struct view of an Integer
+    Note: parameter is bound as `Let X_obj be proc memory_get_address from Layout
+    Note: with X, 0` and the corresponding type is "ScalaLexer", "ScalaParser",
+    Note: "ScalaSemanticAnalyzer", etc. Single-field getters like
+    Note: `Return lexer_obj.position` are ambiguous via field-set inference
+    Note: alone because many types carry the same field name.
+    If tn_len is greater than 4:
+        Let suf_a be memory_get_byte(target_name, tn_len minus 4)
+        Let suf_b be memory_get_byte(target_name, tn_len minus 3)
+        Let suf_c be memory_get_byte(target_name, tn_len minus 2)
+        Let suf_d be memory_get_byte(target_name, tn_len minus 1)
+        Let has_obj_suffix be 0
+        If suf_a is equal to 95:  Note: '_'
+            If suf_b is equal to 111:  Note: 'o'
+                If suf_c is equal to 98:  Note: 'b'
+                    If suf_d is equal to 106:  Note: 'j'
+                        Set has_obj_suffix to 1
+                    End If
+                End If
+            End If
+        End If
+        If has_obj_suffix is equal to 1:
+            Let stripped_len be tn_len minus 4
+            If ty_len is greater than stripped_len:
+                Let ci be 0
+                Let cok be 1
+                Let c_start be ty_len minus stripped_len
+                While ci is less than stripped_len:
+                    Let cc_t be memory_get_byte(target_name, ci)
+                    Let cc_y be memory_get_byte(type_name, c_start plus ci)
+                    If ci is equal to 0:
+                        If cc_t is greater than or equal to 97:
+                            If cc_t is less than or equal to 122:
+                                Set cc_t to cc_t minus 32
+                            End If
+                        End If
+                    End If
+                    If cc_t is not equal to cc_y:
+                        Set cok to 0
+                        Set ci to stripped_len
+                    End If
+                    Set ci to ci plus 1
+                End While
+                If cok is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+    End If
+
+    Note: Match D: last underscore-separated segment of target capitalized
+    Note: matches the type_name suffix. Handles the v0.0.8.5 idiom where
+    Note: struct fields are named `current_class as Integer`, `current_method
+    Note: as Integer`, `target_block as Integer`, etc., and the corresponding
+    Note: type is "RubyClass", "RubyMethod", "MIRBasicBlock" etc. The chained
+    Note: structural inference passes the field name as target; without this
+    Note: match the field would resolve to "Integer" placeholder and chained
+    Note: accesses would fail to resolve.
+    Let underscore_pos be 0 minus 1
+    Let usp_i be 0
+    While usp_i is less than tn_len:
+        Let usp_c be memory_get_byte(target_name, usp_i)
+        If usp_c is equal to 95:  Note: '_'
+            Set underscore_pos to usp_i
+        End If
+        Set usp_i to usp_i plus 1
+    End While
+    If underscore_pos is greater than or equal to 0:
+        Let suffix_start be underscore_pos plus 1
+        Let suffix_len be tn_len minus suffix_start
+        If suffix_len is greater than 0:
+            If ty_len is greater than or equal to suffix_len:
+                Let di be 0
+                Let dok be 1
+                Let d_start be ty_len minus suffix_len
+                While di is less than suffix_len:
+                    Let dc_t be memory_get_byte(target_name, suffix_start plus di)
+                    Let dc_y be memory_get_byte(type_name, d_start plus di)
+                    If di is equal to 0:
+                        If dc_t is greater than or equal to 97:
+                            If dc_t is less than or equal to 122:
+                                Set dc_t to dc_t minus 32
+                            End If
+                        End If
+                    End If
+                    If dc_t is not equal to dc_y:
+                        Set dok to 0
+                        Set di to suffix_len
+                    End If
+                    Set di to di plus 1
+                End While
+                If dok is equal to 1:
+                    Return 1
+                End If
+            End If
+        End If
+    End If
+
     Return 0
+End Process
+
+Note: Return 1 if the lowercase form of funcname's first root_len bytes appears
+Note: anywhere in type_name (case-insensitive). Used by Pass 1.5 of structural
+Note: resolution to disambiguate ambiguous matches by function-name prefix - e.g.
+Note: `generate_constructor` (root="generate") matches DartGenerationContext
+Note: because "generat" appears in "DartGenerationContext", but not
+Note: DartTranslationContext. Returns 0 on null inputs or zero-length root.
+Process called "codegen_funcname_root_in_type" takes funcname as Integer, root_len as Integer, type_name as Integer returns Integer:
+    If funcname is equal to 0:
+        Return 0
+    End If
+    If type_name is equal to 0:
+        Return 0
+    End If
+    If root_len is less than or equal to 0:
+        Return 0
+    End If
+
+    Let frit_ty_len be 0
+    Let frit_ty_p be type_name
+    While memory_get_byte(frit_ty_p, 0) is not equal to 0:
+        Set frit_ty_len to frit_ty_len plus 1
+        Set frit_ty_p to frit_ty_p plus 1
+    End While
+
+    If frit_ty_len is less than root_len:
+        Return 0
+    End If
+
+    Let frit_limit be frit_ty_len minus root_len
+    Let frit_i be 0
+    Let frit_found be 0
+    While frit_i is less than or equal to frit_limit:
+        If frit_found is equal to 0:
+            Let frit_match be 1
+            Let frit_j be 0
+            While frit_j is less than root_len:
+                Let frit_fc be memory_get_byte(funcname, frit_j)
+                Let frit_tc be memory_get_byte(type_name, frit_i plus frit_j)
+                If frit_tc is greater than or equal to 65:
+                    If frit_tc is less than or equal to 90:
+                        Set frit_tc to frit_tc plus 32
+                    End If
+                End If
+                If frit_fc is greater than or equal to 65:
+                    If frit_fc is less than or equal to 90:
+                        Set frit_fc to frit_fc plus 32
+                    End If
+                End If
+                If frit_fc is not equal to frit_tc:
+                    Set frit_match to 0
+                    Set frit_j to root_len
+                End If
+                Set frit_j to frit_j plus 1
+            End While
+            If frit_match is equal to 1:
+                Set frit_found to 1
+            End If
+        End If
+        Set frit_i to frit_i plus 1
+    End While
+
+    Return frit_found
 End Process
 
 Note: Find the struct type that owns a given field. Tries the caller's declared
@@ -2670,11 +3592,106 @@ Process called "codegen_find_struct_type_for_field" takes codegen as Integer, de
     Return 0
 End Process
 
+Note: Find the variant tag for a `TypeName.VariantName` qualified access. Walks
+Note: the program's type list looking for a TYPE_KIND_VARIANT (kind=1) type whose
+Note: name matches `type_name`, then iterates its variants looking for one whose
+Note: name matches `variant_name`. Returns the variant's tag (>= 0) on match,
+Note: or -1 if either lookup fails. Used by codegen_generate_field_access to
+Note: handle the technical-mode `TypeName.Variant` enum-access syntax alongside
+Note: the canonical-mode `Variant from TypeName`. The tag layout follows the
+Note: TypeDefinition variant table written by parser_parse_type_definition: each
+Note: variant is VARIANT_SIZE (32) bytes with name at offset 0 and tag at 20.
+Process called "codegen_find_variant_tag" takes codegen as Integer, type_name as Integer, variant_name as Integer returns Integer:
+    If codegen is equal to 0:
+        Return 0 minus 1
+    End If
+    If type_name is equal to 0:
+        Return 0 minus 1
+    End If
+    If variant_name is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let cv_program be memory_get_pointer(codegen, 48)
+    If cv_program is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let cv_type_count be memory_get_int32(cv_program, 24)
+    Let cv_types be memory_get_pointer(cv_program, 16)
+    If cv_types is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let cv_ti be 0
+    While cv_ti is less than cv_type_count:
+        Let cv_off be cv_ti multiplied by 8
+        Let cv_t be memory_get_pointer(cv_types, cv_off)
+        If cv_t is not equal to 0:
+            Let cv_kind be memory_get_int32(cv_t, 8)
+            Note: TYPE_KIND_VARIANT = 1 per parser.runa constants
+            If cv_kind is equal to 1:
+                Let cv_tname be memory_get_pointer(cv_t, 0)
+                If cv_tname is not equal to 0:
+                    If string_equals(cv_tname, type_name) is equal to 1:
+                        Let cv_variant_count be memory_get_int32(cv_t, 24)
+                        Let cv_variants be memory_get_pointer(cv_t, 16)
+                        If cv_variants is not equal to 0:
+                            Let cv_vi be 0
+                            While cv_vi is less than cv_variant_count:
+                                Let cv_voff be cv_vi multiplied by 32  Note: VARIANT_SIZE
+                                Let cv_vptr be cv_variants plus cv_voff
+                                Let cv_vname be memory_get_pointer(cv_vptr, 0)
+                                If cv_vname is not equal to 0:
+                                    If string_equals(cv_vname, variant_name) is equal to 1:
+                                        Note: Tag is int32 at offset 20 of the variant record
+                                        Return memory_get_int32(cv_vptr, 20)
+                                    End If
+                                End If
+                                Set cv_vi to cv_vi plus 1
+                            End While
+                        End If
+                        Note: Type matched but variant name not found - no further
+                        Note: candidates possible since variant types have unique names.
+                        Return 0 minus 1
+                    End If
+                End If
+            End If
+        End If
+        Set cv_ti to cv_ti plus 1
+    End While
+
+    Return 0 minus 1
+End Process
+
 Process called "codegen_generate_field_access" takes codegen as Integer, expr as Integer returns Integer:
     Let output_file be memory_get_integer(codegen, 0)
     Let field_access_ptr be expr plus 8  Note: Union at offset 8
     Let obj be memory_get_pointer(field_access_ptr, 0)
     Let field_name be memory_get_pointer(field_access_ptr, 8)
+
+    Note: Qualified enum/variant access. If `obj` is a bare identifier matching a
+    Note: variant type defined in the program, and `field_name` matches one of
+    Note: its variants, emit the variant tag as an Integer constant. This makes
+    Note: the technical-mode syntax `TypeName.Variant` work alongside the
+    Note: canonical-mode `Variant from TypeName` already handled by the parser.
+    Note: e.g. `MemorySpace.Global` resolves to the integer tag of the Global
+    Note: variant of the MemorySpace ADT. Falls through to regular field access
+    Note: if the name does not match a known variant type.
+    Let qe_obj_t be memory_get_int32(obj, 0)
+    If qe_obj_t is equal to 1:  Note: EXPR_VARIABLE
+        Let qe_obj_name be memory_get_pointer(obj, 8)
+        If qe_obj_name is not equal to 0:
+            Let qe_tag be codegen_find_variant_tag(codegen, qe_obj_name, field_name)
+            If qe_tag is greater than or equal to 0:
+                file_write_buffered(output_file, "    movq $", 0)
+                Let qe_tag_str be integer_to_string(qe_tag)
+                file_write_buffered(output_file, qe_tag_str, 0)
+                file_write_buffered(output_file, ", %rax\n", 0)
+                Return 0
+            End If
+        End If
+    End If
 
     Note: Resolve the struct type by trying the declared type first then falling
     Note: back to field-name dispatch. The helper handles object_type=0 (no
@@ -2693,6 +3710,16 @@ Process called "codegen_generate_field_access" takes codegen as Integer, expr as
                 Set type to codegen_resolve_struct_via_structural(codegen, rv_obj_name)
             End If
         End If
+        Note: Chained-access fallback: when obj is itself a field access like
+        Note: `analyzer.current_scope`, use the inner field name as the virtual
+        Note: target for structural inference. See codegen_get_expression_type
+        Note: for the matching change.
+        If rv_obj_t is equal to 6:  Note: EXPR_FIELD_ACCESS
+            Let rv_obj_inner_field be memory_get_pointer(obj, 16)
+            If rv_obj_inner_field is not equal to 0:
+                Set type to codegen_resolve_struct_via_structural(codegen, rv_obj_inner_field)
+            End If
+        End If
     End If
 
     If type is equal to 0:
@@ -2703,6 +3730,24 @@ Process called "codegen_generate_field_access" takes codegen as Integer, expr as
             print_string(" (object declared as '")
             print_string(object_type)
             print_string("')")
+        End If
+        Let cgfe_obj_t be memory_get_int32(obj, 0)
+        If cgfe_obj_t is equal to 1:
+            Let cgfe_obj_name be memory_get_pointer(obj, 8)
+            If cgfe_obj_name is not equal to 0:
+                print_string(" on variable '")
+                print_string(cgfe_obj_name)
+                print_string("'")
+            End If
+        End If
+        Let cgfe_cur_fn be memory_get_pointer(codegen, 112)
+        If cgfe_cur_fn is not equal to 0:
+            Let cgfe_fn_name be memory_get_pointer(cgfe_cur_fn, 0)
+            If cgfe_fn_name is not equal to 0:
+                print_string(" in function '")
+                print_string(cgfe_fn_name)
+                print_string("'")
+            End If
         End If
         print_newline()
         exit_with_code(1)
@@ -2752,7 +3797,21 @@ Process called "codegen_generate_field_access" takes codegen as Integer, expr as
         Let obj_variable_name be memory_get_pointer(obj, 8)
         Let var_index be codegen_find_variable(codegen, obj_variable_name)
         If var_index is less than 0:
-            print_string("[CODEGEN ERROR] Unknown variable")
+            print_string("[CODEGEN ERROR] Unknown variable '")
+            If obj_variable_name is not equal to 0:
+                print_string(obj_variable_name)
+            End If
+            print_string("' in field access")
+            Let uvfa_cur_fn be memory_get_pointer(codegen, 112)
+            If uvfa_cur_fn is not equal to 0:
+                Let uvfa_fn_name be memory_get_pointer(uvfa_cur_fn, 0)
+                If uvfa_fn_name is not equal to 0:
+                    print_string(" in function '")
+                    print_string(uvfa_fn_name)
+                    print_string("'")
+                End If
+            End If
+            print_newline()
             exit_with_code(1)
         End If
 
@@ -2852,6 +3911,14 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         file_write_buffered(output_file, "    movq $", 0)
         file_write_buffered(output_file, integer_to_string(integer_value), 0)
         file_write_buffered(output_file, ", %rax\n", 0)
+        Return 0
+    Otherwise If expr_type is equal to 29:  Note: EXPR_FLOAT_LITERAL
+        Note: The parser already converted the literal string to its IEEE 754 bit
+        Note: pattern stored as int64 at offset 8. Emit as immediate move.
+        Let flt_bits be memory_get_integer(expr, 8)
+        file_write_buffered(output_file, "    movq $", 0)
+        file_write_buffered(output_file, integer_to_string(flt_bits), 0)
+        file_write_buffered(output_file, ", %rax  # Float literal\n", 0)
         Return 0
     Otherwise If expr_type is equal to 1:  Note: EXPR_VARIABLE
         codegen_generate_variable_expr(codegen, expr)
@@ -3627,7 +4694,8 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
                 Set variables to memory_get_pointer(codegen, 8)
                 Set var_struct_offset to var_index multiplied by 32
                 Set var_ptr to variables plus var_struct_offset
-                Let stack_offset_u be memory_get_integer(var_ptr, 8)
+                Note: stack_offset is int32 at offset 8 - read narrowly.
+                Let stack_offset_u be memory_get_int32(var_ptr, 8)
                 Note: Check if this variable is itself a closure variable (shouldn't happen in normal cases)
                 If stack_offset_u is equal to 4294967295:
                     print_string("[CODEGEN ERROR] Attempting to capture a closure variable - this indicates a compiler bug")
@@ -3751,10 +4819,17 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
         Let qual_function_name be memory_get_pointer(expr, 16)
         Let qual_arguments be memory_get_pointer(expr, 24)
         Let qual_arg_count be memory_get_int32(expr, 32)
+        Let qual_arg_names be memory_get_pointer(expr, 40)
 
         Note: Use plain function name for the call
         Note: Module prefix is source-level only; imported functions have plain names
         Let qual_name be qual_function_name
+
+        Note: Reorder named args according to the target function's parameter
+        Note: declaration. Uses plain (post-import-merge) function name lookup;
+        Note: import flattening puts qualified functions under their plain names
+        Note: in the program's function table.
+        codegen_reorder_named_args(codegen, qual_name, qual_arguments, qual_arg_names, qual_arg_count)
 
         Note: Push arguments in reverse order (x86-64 calling convention)
         Let qual_i be qual_arg_count minus 1
@@ -3793,6 +4868,144 @@ Process called "codegen_generate_expression" takes codegen as Integer, expr as I
 
         Note: No cleanup needed - qual_name points to function name from AST
 
+        Return 0
+    End If
+
+    If expr_type is equal to 28:  Note: EXPR_POSITION_OF - canonical `position of X in Y`
+        Note: Dispatch on the haystack's type. String haystack → string_find;
+        Note: List haystack → list_find. Refuse to emit if the haystack type is
+        Note: unknown rather than blindly picking string_find.
+        Let po_needle be memory_get_pointer(expr, 8)
+        Let po_haystack be memory_get_pointer(expr, 16)
+        Let po_haystack_type be codegen_get_expression_type(codegen, po_haystack)
+
+        Let po_func be 0
+        Let po_haystack_is_str be 0
+        Let po_haystack_is_list be 0
+
+        Note: Inspect haystack type. Strings carry "String"; List types follow
+        Note: the convention `List` or `List[T]`. The bootstrap's generic
+        Note: "Integer" placeholder defaults to list_find — most v0.0.8.5 callers
+        Note: pass parser tokens or list pointers via the Integer placeholder.
+        If po_haystack_type is not equal to 0:
+            If string_equals(po_haystack_type, "String") is equal to 1:
+                Set po_haystack_is_str to 1
+            Otherwise If string_equals(po_haystack_type, "List") is equal to 1:
+                Set po_haystack_is_list to 1
+            End If
+        End If
+
+        If po_haystack_is_str is equal to 1:
+            Set po_func to "string_find"
+        Otherwise If po_haystack_is_list is equal to 1:
+            Set po_func to "list_find"
+        Otherwise:
+            Note: Default to string_find for unknown/Integer-placeholder haystacks.
+            Note: The bootstrap's generic Integer type doubles as "pointer to a
+            Note: String or to something else"; without stronger type inference we
+            Note: pick the String case which matches all current v0.0.8.5 callers.
+            Set po_func to "string_find"
+        End If
+
+        Note: Emit the call: arg0 = haystack (rdi), arg1 = needle (rsi).
+        codegen_generate_expression(codegen, po_needle)
+        emit_line(output_file, "    pushq %rax")
+        codegen_generate_expression(codegen, po_haystack)
+        emit_line(output_file, "    movq %rax, %rdi")
+        emit_line(output_file, "    popq %rsi")
+        file_write_buffered(output_file, "    call ", 0)
+        file_write_buffered(output_file, po_func, 0)
+        file_write_buffered(output_file, "@PLT\n", 0)
+        Return 0
+    End If
+
+    If expr_type is equal to 27:  Note: EXPR_CONVERT - canonical `convert X to Y`
+        Note: Dispatch on (source_type, target_type) pair to pick the right runtime
+        Note: conversion routine. Source type is inferred from the value expression;
+        Note: target type is the literal name written in the source. Errors out when
+        Note: the pair isn't supported - prevents silently emitting a wrong call like
+        Note: string_to_float(42) for an Integer source.
+        Let cv_value be memory_get_pointer(expr, 8)
+        Let cv_target be memory_get_pointer(expr, 16)
+        Let cv_source_type be codegen_get_expression_type(codegen, cv_value)
+
+        Let cv_func be 0
+        Let cv_is_identity be 0
+
+        Note: Identify source-type category. Treat NULL/Integer placeholders as
+        Note: Integer (the bootstrap's catch-all numeric type). Strings carry the
+        Note: type pointer "String".
+        Let cv_src_is_str be 0
+        Let cv_src_is_int be 0
+        Let cv_src_is_float be 0
+        If cv_source_type is not equal to 0:
+            If string_equals(cv_source_type, "String") is equal to 1:
+                Set cv_src_is_str to 1
+            Otherwise If string_equals(cv_source_type, "Float") is equal to 1:
+                Set cv_src_is_float to 1
+            Otherwise:
+                Note: All non-string, non-float types treated as Integer (bootstrap
+                Note: convention - Integer is the generic 8-byte numeric placeholder).
+                Set cv_src_is_int to 1
+            End If
+        Otherwise:
+            Set cv_src_is_int to 1
+        End If
+
+        If cv_target is equal to 0:
+            print_string("[CODEGEN ERROR] convert expression missing target type")
+            print_newline()
+            exit_with_code(1)
+        End If
+
+        Note: Match the (source, target) pair to a runtime symbol. Bootstrap
+        Note: runtime provides all six pairs: string_to_integer, string_to_float,
+        Note: integer_to_string, integer_to_float, float_to_integer, float_to_string.
+        Note: Identity conversions (same source and target) emit no call.
+        If string_equals(cv_target, "Integer") is equal to 1:
+            If cv_src_is_str is equal to 1:
+                Set cv_func to "string_to_integer"
+            Otherwise If cv_src_is_int is equal to 1:
+                Set cv_is_identity to 1
+            Otherwise:
+                Set cv_func to "float_to_integer"
+            End If
+        Otherwise If string_equals(cv_target, "Float") is equal to 1:
+            If cv_src_is_str is equal to 1:
+                Set cv_func to "string_to_float"
+            Otherwise If cv_src_is_float is equal to 1:
+                Set cv_is_identity to 1
+            Otherwise:
+                Set cv_func to "integer_to_float"
+            End If
+        Otherwise If string_equals(cv_target, "String") is equal to 1:
+            If cv_src_is_str is equal to 1:
+                Set cv_is_identity to 1
+            Otherwise If cv_src_is_int is equal to 1:
+                Set cv_func to "integer_to_string"
+            Otherwise:
+                Set cv_func to "float_to_string"
+            End If
+        Otherwise:
+            print_string("[CODEGEN ERROR] Unsupported convert target type '")
+            print_string(cv_target)
+            print_string("'")
+            print_newline()
+            exit_with_code(1)
+        End If
+
+        Note: Generate the source value expression (result in %rax).
+        codegen_generate_expression(codegen, cv_value)
+        If cv_is_identity is equal to 1:
+            Note: Source and target are the same effective type - no call needed.
+            Return 0
+        End If
+
+        Note: Pass value in %rdi and call the runtime conversion routine.
+        emit_line(output_file, "    movq %rax, %rdi")
+        file_write_buffered(output_file, "    call ", 0)
+        file_write_buffered(output_file, cv_func, 0)
+        file_write_buffered(output_file, "@PLT\n", 0)
         Return 0
     End If
 
@@ -3967,10 +5180,79 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 file_write_buffered(output_file, "(%rbp)\n", 0)
             End If
         End If
+        Note: If the source was `Constant NAME as TYPE is VALUE`, mark the freshly
+        Note: added variable as immutable so future Set statements against it error.
+        Let let_is_const be memory_get_int32(stmt, 32)
+        If let_is_const is equal to 1:
+            codegen_mark_last_variable_constant(codegen)
+        End If
         Return 0
     End If
 
     If stmt_type is equal to 2:  Note: STMT_SET
+        Note: Reject assignments to immutable Constants. Only fires when the target
+        Note: is a simple variable named by a Constant declaration in scope; field
+        Note: writes and indexed writes are unaffected because Set X.field / Set
+        Note: X at index N go through different lvalue codegen paths.
+        Let set_target_chk be memory_get_pointer(stmt, 8)
+        If set_target_chk is not equal to 0:
+            Let set_target_type be memory_get_int32(set_target_chk, 0)
+            If set_target_type is equal to 1:  Note: EXPR_VARIABLE
+                Let set_target_name be memory_get_pointer(set_target_chk, 8)
+                If set_target_name is not equal to 0:
+                    Let set_is_const be codegen_variable_is_constant(codegen, set_target_name)
+                    If set_is_const is equal to 1:
+                        print_string("[CODEGEN ERROR] Cannot Set immutable Constant '")
+                        print_string(set_target_name)
+                        print_string("'")
+                        print_newline()
+                        exit_with_code(1)
+                    End If
+                End If
+            End If
+        End If
+
+        Note: Special-case `Set X at index/key Y to V` (canonical Runa for indexed
+        Note: list/dict assignment). The parser lowers `X at index Y` and
+        Note: `X at key Y` to a function call `list_get(X, Y)`. As an lvalue this
+        Note: doesn't have a writable address; instead we emit a runtime call to
+        Note: list_set(X, Y, V). list_set works for lists; for dicts, callers
+        Note: must use dict_set explicitly (until the runtime polymorphic setter
+        Note: lands as part of v0.0.9.x).
+        Let set_target_2 be memory_get_pointer(stmt, 8)
+        If set_target_2 is not equal to 0:
+            Let set_t_etype be memory_get_int32(set_target_2, 0)
+            If set_t_etype is equal to 4:  Note: EXPR_FUNCTION_CALL
+                Let set_fc_ptr be set_target_2 plus 8
+                Let set_fname be memory_get_pointer(set_fc_ptr, 0)
+                If set_fname is not equal to 0:
+                    If string_equals(set_fname, "list_get") is equal to 1:
+                        Let set_fc_args be memory_get_pointer(set_fc_ptr, 8)
+                        Let set_fc_argc be memory_get_int32(set_fc_ptr, 16)
+                        If set_fc_argc is equal to 2:
+                            Note: Generate value → push
+                            Let lset_value be memory_get_pointer(stmt, 16)
+                            codegen_generate_expression(codegen, lset_value)
+                            emit_line(output_file, "    pushq %rax  # list_set value")
+                            Note: Generate index → push
+                            Let lset_index be memory_get_pointer(set_fc_args, 8)
+                            codegen_generate_expression(codegen, lset_index)
+                            emit_line(output_file, "    pushq %rax  # list_set index")
+                            Note: Generate list pointer → %rdi
+                            Let lset_list be memory_get_pointer(set_fc_args, 0)
+                            codegen_generate_expression(codegen, lset_list)
+                            emit_line(output_file, "    movq %rax, %rdi  # list_set list_ptr")
+                            Note: Pop index → %rsi, value → %rdx, then call
+                            emit_line(output_file, "    popq %rsi  # list_set index")
+                            emit_line(output_file, "    popq %rdx  # list_set value")
+                            emit_line(output_file, "    call list_set")
+                            Return 0
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
         Note: Generate value expression (result in %rax)
         Let set_expr be memory_get_pointer(stmt, 16)  Note: stmt->data.set_stmt.expression
         codegen_generate_expression(codegen, set_expr)
@@ -3989,6 +5271,27 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
     End If
 
     If stmt_type is equal to 17:  Note: STMT_COMPOUND_ASSIGN
+        Note: Reject compound assignment to immutable Constants. Mirrors the
+        Note: STMT_SET check above so `Increase X by 1` / `Multiply X by 2` etc.
+        Note: against a Constant trigger the same diagnostic, not silent mutation.
+        Let cmp_target_chk be memory_get_pointer(stmt, 8)
+        If cmp_target_chk is not equal to 0:
+            Let cmp_target_type be memory_get_int32(cmp_target_chk, 0)
+            If cmp_target_type is equal to 1:
+                Let cmp_target_name be memory_get_pointer(cmp_target_chk, 8)
+                If cmp_target_name is not equal to 0:
+                    Let cmp_is_const be codegen_variable_is_constant(codegen, cmp_target_name)
+                    If cmp_is_const is equal to 1:
+                        print_string("[CODEGEN ERROR] Cannot mutate immutable Constant '")
+                        print_string(cmp_target_name)
+                        print_string("'")
+                        print_newline()
+                        exit_with_code(1)
+                    End If
+                End If
+            End If
+        End If
+
         Note: Generate RHS expression (result in %rax)
         Let compound_expr be memory_get_pointer(stmt, 24)  Note: expression at offset 24
         codegen_generate_expression(codegen, compound_expr)
@@ -4135,6 +5438,7 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         Let collection_expr be memory_get_pointer(stmt, 16)
         Set body to memory_get_pointer(stmt, 24)
         Set body_count to memory_get_integer(stmt, 32)
+        Let fe_type_name be memory_get_pointer(stmt, 40)  Note: optional `as Type` from parser; 0 means absent
 
         Note: Evaluate collection expression (result in %rax)
         codegen_generate_expression(codegen, collection_expr)
@@ -4149,8 +5453,16 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         emit_line(output_file, "    movq $0, %rax")
         emit_line(output_file, "    pushq %rax")  Note: Save counter on stack
 
-        Note: Allocate loop variable on stack for the item value
-        codegen_add_variable(codegen, var_name)
+        Note: Register the loop variable with its declared type when present.
+        Note: This lets `loopvar.field` accesses inside the body resolve
+        Note: directly against the declared struct without needing structural
+        Note: inference. Falls back to the default Integer type when no
+        Note: annotation was supplied (legacy `For Each X in Y` form).
+        If fe_type_name is not equal to 0:
+            codegen_add_variable_with_type(codegen, var_name, fe_type_name)
+        Otherwise:
+            codegen_add_variable(codegen, var_name)
+        End If
         Set var_index to codegen_find_variable(codegen, var_name)
         Set variables to memory_get_pointer(codegen, 8)
         Set var_offset to memory_get_int32(variables, var_index multiplied by 32 plus 8)
@@ -4177,6 +5489,14 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         file_write_buffered(output_file, integer_to_string(var_offset), 0)
         file_write_buffered(output_file, "(%rbp)\n", 0)
 
+        Note: Register this loop's continue/break targets so Break/Continue
+        Note: statements inside the body resolve correctly. Without this push
+        Note: the codegen finds a null loop context and silently exits with
+        Note: code 1, manifesting as "compiles to 0 globls" for any file with
+        Note: Break or Continue inside a For Each (regression observed in
+        Note: erlang_to_hir).
+        codegen_push_loop_context(codegen, loop_start_label, loop_end_label)
+
         Note: Generate loop body
         Set i to 0
         While i is less than body_count:
@@ -4201,6 +5521,10 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
 
         Note: Clean up stack (counter, length, collection)
         emit_line(output_file, "    addq $24, %rsp")
+
+        Note: Restore the enclosing loop context so any outer Break targets
+        Note: the outer loop, not this completed inner one.
+        codegen_pop_loop_context(codegen)
 
         Return 0
     End If
@@ -4718,69 +6042,110 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
                 End If
             End If
 
-            Note: Generate body if matched
-            Note: Handle field extraction for variant patterns
-            If pattern_type is equal to 0:  Note: PATTERN_LITERAL
-                file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
-            Otherwise If pattern_type is equal to 2:  Note: PATTERN_WILDCARD
-                file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
-            Otherwise If pattern_type is equal to 3:  Note: PATTERN_TYPE
-                file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
-            Otherwise If variant_is_literal_fallback is equal to 1:
-                Note: Variant name was actually a constant - literal-style cleanup
-                file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
-            Otherwise:  Note: PATTERN_VARIANT
-                Note: Extract fields and bind to variables
-                file_write_buffered(output_file, "    popq %rax  # Get match value pointer\n", 0)
-
-                Note: Extract each field
-                Let fk be 0
-                While fk is less than field_count:
-                    Note: Get field binding name
-                    Let binding_name be memory_get_pointer(field_bindings, fk multiplied by 8)
-
-                    Note: Add variable for this binding
-                    codegen_add_variable(codegen, binding_name)
-
-                    Note: Find the variable to get its stack offset
-                    Set var_index to codegen_find_variable(codegen, binding_name)
-                    Set variables to memory_get_pointer(codegen, 8)
-                    Set var_offset to memory_get_int32(variables, var_index multiplied by 32 plus 8)
-
-                    Note: Load field from variant at offset 8 + (fk * 8)
-                    Let field_offset be 8 plus fk multiplied by 8
-                    file_write_buffered(output_file, "    movq ", 0)
-                    file_write_buffered(output_file, integer_to_string(field_offset), 0)
-                    file_write_buffered(output_file, "(%rax), %rbx  # Load field ", 0)
-                    file_write_buffered(output_file, integer_to_string(fk), 0)
-                    file_write_buffered(output_file, "\n", 0)
-
-                    Note: Store field in local variable
-                    file_write_buffered(output_file, "    movq %rbx, -", 0)
-                    file_write_buffered(output_file, integer_to_string(var_offset), 0)
-                    file_write_buffered(output_file, "(%rbp)  # Store in binding ", 0)
-                    file_write_buffered(output_file, binding_name, 0)
-                    file_write_buffered(output_file, "\n", 0)
-
-                    Set fk to fk plus 1
-                End While
-            End If
-
-            Note: Generate body statements
-            Let j be 0
-            While j is less than body_count:
-                Let stmt_offset be j multiplied by 8
-                Set body_stmt to memory_get_pointer(body_stmts, stmt_offset)
-                codegen_generate_statement(codegen, body_stmt)
-                Set j to j plus 1
+            Note: Find the first earlier clause that shares this clause's body_stmts
+            Note: pointer. When a When-or chain (`When A or B or C: body`) was
+            Note: parsed, all alternatives carry the SAME body_stmts pointer; we
+            Note: emit the body exactly once at the first occurrence and have
+            Note: subsequent occurrences jump there instead of duplicating the body.
+            Let body_first_idx be i
+            Let body_search_j be 0
+            While body_search_j is less than i:
+                Let prev_clause_off be body_search_j multiplied by 48
+                Let prev_clause_ptr be when_clauses plus prev_clause_off
+                Let prev_body_stmts be memory_get_pointer(prev_clause_ptr, 32)
+                If prev_body_stmts is equal to body_stmts:
+                    If body_stmts is not equal to 0:
+                        Set body_first_idx to body_search_j
+                        Set body_search_j to i
+                    End If
+                End If
+                Set body_search_j to body_search_j plus 1
             End While
 
-            Note: Jump to end after body
-            file_write_buffered(output_file, "    jmp .match_", 0)
-            file_write_buffered(output_file, integer_to_string(match_id), 0)
-            file_write_buffered(output_file, "_end\n", 0)
+            If body_first_idx is less than i:
+                Note: Shared-body alternative: pop the match value and jump to the
+                Note: body label emitted at the first occurrence.
+                file_write_buffered(output_file, "    popq %rax  # Matched alternative, clean up stack\n", 0)
+                file_write_buffered(output_file, "    jmp .match_", 0)
+                file_write_buffered(output_file, integer_to_string(match_id), 0)
+                file_write_buffered(output_file, "_body_", 0)
+                file_write_buffered(output_file, integer_to_string(body_first_idx), 0)
+                file_write_buffered(output_file, "\n", 0)
+                Set i to i plus 1
+            Otherwise:
+                Note: First (or only) occurrence of this body. Emit the shared body
+                Note: label, run the pattern's bind/cleanup, emit the body once.
+                Note: Handle field extraction for variant patterns
+                If pattern_type is equal to 0:  Note: PATTERN_LITERAL
+                    file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
+                Otherwise If pattern_type is equal to 2:  Note: PATTERN_WILDCARD
+                    file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
+                Otherwise If pattern_type is equal to 3:  Note: PATTERN_TYPE
+                    file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
+                Otherwise If variant_is_literal_fallback is equal to 1:
+                    Note: Variant name was actually a constant - literal-style cleanup
+                    file_write_buffered(output_file, "    popq %rax  # Matched, clean up stack\n", 0)
+                Otherwise:  Note: PATTERN_VARIANT
+                    Note: Extract fields and bind to variables
+                    file_write_buffered(output_file, "    popq %rax  # Get match value pointer\n", 0)
 
-            Set i to i plus 1
+                    Note: Extract each field
+                    Let fk be 0
+                    While fk is less than field_count:
+                        Note: Get field binding name
+                        Let binding_name be memory_get_pointer(field_bindings, fk multiplied by 8)
+
+                        Note: Add variable for this binding
+                        codegen_add_variable(codegen, binding_name)
+
+                        Note: Find the variable to get its stack offset
+                        Set var_index to codegen_find_variable(codegen, binding_name)
+                        Set variables to memory_get_pointer(codegen, 8)
+                        Set var_offset to memory_get_int32(variables, var_index multiplied by 32 plus 8)
+
+                        Note: Load field from variant at offset 8 + (fk * 8)
+                        Let field_offset be 8 plus fk multiplied by 8
+                        file_write_buffered(output_file, "    movq ", 0)
+                        file_write_buffered(output_file, integer_to_string(field_offset), 0)
+                        file_write_buffered(output_file, "(%rax), %rbx  # Load field ", 0)
+                        file_write_buffered(output_file, integer_to_string(fk), 0)
+                        file_write_buffered(output_file, "\n", 0)
+
+                        Note: Store field in local variable
+                        file_write_buffered(output_file, "    movq %rbx, -", 0)
+                        file_write_buffered(output_file, integer_to_string(var_offset), 0)
+                        file_write_buffered(output_file, "(%rbp)  # Store in binding ", 0)
+                        file_write_buffered(output_file, binding_name, 0)
+                        file_write_buffered(output_file, "\n", 0)
+
+                        Set fk to fk plus 1
+                    End While
+                End If
+
+                Note: Emit body label for this clause group so later alternatives
+                Note: with the same body_stmts can jmp here.
+                file_write_buffered(output_file, ".match_", 0)
+                file_write_buffered(output_file, integer_to_string(match_id), 0)
+                file_write_buffered(output_file, "_body_", 0)
+                file_write_buffered(output_file, integer_to_string(i), 0)
+                file_write_buffered(output_file, ":\n", 0)
+
+                Note: Generate body statements
+                Let j be 0
+                While j is less than body_count:
+                    Let stmt_offset be j multiplied by 8
+                    Set body_stmt to memory_get_pointer(body_stmts, stmt_offset)
+                    codegen_generate_statement(codegen, body_stmt)
+                    Set j to j plus 1
+                End While
+
+                Note: Jump to end after body
+                file_write_buffered(output_file, "    jmp .match_", 0)
+                file_write_buffered(output_file, integer_to_string(match_id), 0)
+                file_write_buffered(output_file, "_end\n", 0)
+
+                Set i to i plus 1
+            End If
         End While
 
         Note: End label
@@ -4967,7 +6332,16 @@ Note:   offset 80: call_graph
 Note:   offset 88: arena (pointer) - for temporary allocations
 
 Process called "codegen_create" takes output_filename as Integer, arena as Integer returns Integer:
-    Let codegen be allocate(120)  Note: sizeof(CodeGenerator) - 112 + 8 for current_function at offset 112 (used by structural type inference)
+    Note: 136 bytes total. Layout above 112:
+    Note:   offset 112: current_function (pointer)
+    Note:   offset 120: field_cache_buf (pointer to 256-entry buffer of 16-byte
+    Note:               {name@0, type@8} entries; lazily allocated on first
+    Note:               function compile). Used by codegen_resolve_struct_via_structural
+    Note:               to memoize per-function structural inference results so
+    Note:               the function tree isn't walked once per ambiguous field
+    Note:               access. Reset at every function entry (count -> 0).
+    Note:   offset 128: field_cache_count (int32)
+    Let codegen be allocate(136)
 
     Note: Note: allocate() uses calloc() which already zeros the memory,
     Note: so no explicit initialization loop is needed
@@ -5165,6 +6539,19 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     Note: the function body when field-name dispatch is ambiguous (Fix B+).
     memory_set_pointer(codegen, 112, func)  Note: codegen->current_function
 
+    Note: Per-function field-resolution cache. Lazily allocate on first use,
+    Note: reset count at every function entry so cached resolutions from one
+    Note: function never leak into the next (variable names collide across
+    Note: functions and the structural inference depends on this function's
+    Note: statement tree).
+    Let field_cache_buf be memory_get_pointer(codegen, 120)
+    If field_cache_buf is equal to 0:
+        Note: 256 entries × 16 bytes = 4096 bytes. Calloc-zeroed.
+        Set field_cache_buf to allocate(256 multiplied by 16)
+        memory_set_pointer(codegen, 120, field_cache_buf)
+    End If
+    memory_set_int32(codegen, 128, 0)  Note: field_cache_count = 0
+
     Let output_file be memory_get_integer(codegen, 0)  Note: codegen->output_file
     Let func_name be memory_get_pointer(func, 0)  Note: func->name
 
@@ -5289,6 +6676,15 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
 
         Set i to i plus 1
     End While
+
+    Note: For the program entry point (main), call __module_init after all
+    Note: parameter storage so top-level `Let X be <runtime-expr>` globals are
+    Note: initialized before any user code runs. The init function is emitted
+    Note: unconditionally at the end of the function loop; its body is empty
+    Note: when no runtime-init globals exist.
+    If string_equals(func_name, "main") is equal to 1:
+        emit_line(output_file, "    call __module_init  # Initialize runtime-initialized globals")
+    End If
 
     Note: Generate function body statements
     Note: Function structure has:
@@ -5498,6 +6894,80 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
                     file_write_buffered(output_file, "    .quad ", 0)
                     file_write_buffered(output_file, integer_to_string(integer_value), 0)
                     file_write_buffered(output_file, "\n", 0)
+                Otherwise If expr_type is equal to 26:  Note: EXPR_ARRAY_LITERAL_CONST
+                    Note: Emit a RunaList-shaped header so `at index` (which lowers to
+                    Note: list_get) reads the data pointer at the expected offset. The
+                    Note: global cell holds a pointer to the header; the header has
+                    Note: {capacity, length, data_ptr} layout matching runtime.c's
+                    Note: RunaList struct. Float/Integer data follows; String arrays
+                    Note: emit per-element string-byte tables after the pointer table.
+                    file_write_buffered(output_file, "    .quad ", 0)
+                    file_write_buffered(output_file, global_name, 0)
+                    file_write_buffered(output_file, "_HDR\n", 0)
+                    Let arr_lit_count_for_hdr be memory_get_int32(initial_value, 16)
+                    file_write_buffered(output_file, global_name, 0)
+                    file_write_buffered(output_file, "_HDR:\n", 0)
+                    file_write_buffered(output_file, "    .quad ", 0)
+                    file_write_buffered(output_file, integer_to_string(arr_lit_count_for_hdr), 0)
+                    file_write_buffered(output_file, "  # capacity\n", 0)
+                    file_write_buffered(output_file, "    .quad ", 0)
+                    file_write_buffered(output_file, integer_to_string(arr_lit_count_for_hdr), 0)
+                    file_write_buffered(output_file, "  # length\n", 0)
+                    file_write_buffered(output_file, "    .quad ", 0)
+                    file_write_buffered(output_file, global_name, 0)
+                    file_write_buffered(output_file, "_DATA  # data pointer\n", 0)
+                    file_write_buffered(output_file, global_name, 0)
+                    file_write_buffered(output_file, "_DATA:\n", 0)
+                    Let arr_lit_values be memory_get_pointer(initial_value, 8)
+                    Let arr_lit_count be memory_get_int32(initial_value, 16)
+                    Let arr_lit_kind be memory_get_int32(initial_value, 20)
+                    Let arr_lit_i be 0
+                    While arr_lit_i is less than arr_lit_count:
+                        Let arr_lit_v be memory_get_integer(arr_lit_values plus (arr_lit_i multiplied by 8), 0)
+                        If arr_lit_kind is equal to 2:
+                            Note: String element - emit a label for the string data and
+                            Note: store its address. The string text is then emitted after
+                            Note: the main array via the same `.quad <label>` mechanism.
+                            file_write_buffered(output_file, "    .quad ", 0)
+                            file_write_buffered(output_file, global_name, 0)
+                            file_write_buffered(output_file, "_STR_", 0)
+                            file_write_buffered(output_file, integer_to_string(arr_lit_i), 0)
+                            file_write_buffered(output_file, "\n", 0)
+                        Otherwise:
+                            Note: Integer or Float element - emit the raw int64 bit pattern.
+                            file_write_buffered(output_file, "    .quad ", 0)
+                            file_write_buffered(output_file, integer_to_string(arr_lit_v), 0)
+                            file_write_buffered(output_file, "\n", 0)
+                        End If
+                        Set arr_lit_i to arr_lit_i plus 1
+                    End While
+
+                    Note: For String arrays, emit the actual string bytes after the
+                    Note: pointer table. Use `.byte` directives to avoid the
+                    Note: string-escape sequence entirely - this works for any
+                    Note: byte value including control characters and quotes.
+                    If arr_lit_kind is equal to 2:
+                        Set arr_lit_i to 0
+                        While arr_lit_i is less than arr_lit_count:
+                            Let arr_lit_sptr be memory_get_pointer(arr_lit_values plus (arr_lit_i multiplied by 8), 0)
+                            file_write_buffered(output_file, global_name, 0)
+                            file_write_buffered(output_file, "_STR_", 0)
+                            file_write_buffered(output_file, integer_to_string(arr_lit_i), 0)
+                            file_write_buffered(output_file, ":\n", 0)
+                            Let arr_lit_slen be string_length(arr_lit_sptr)
+                            Let arr_lit_si be 0
+                            While arr_lit_si is less than arr_lit_slen:
+                                Let arr_lit_ch be memory_get_byte(arr_lit_sptr, arr_lit_si)
+                                file_write_buffered(output_file, "    .byte ", 0)
+                                file_write_buffered(output_file, integer_to_string(arr_lit_ch), 0)
+                                file_write_buffered(output_file, "\n", 0)
+                                Set arr_lit_si to arr_lit_si plus 1
+                            End While
+                            Note: null terminator
+                            file_write_buffered(output_file, "    .byte 0\n", 0)
+                            Set arr_lit_i to arr_lit_i plus 1
+                        End While
+                    End If
                 Otherwise:
                     Note: Non-constant expressions default to zero initialization
                     file_write_buffered(output_file, "    .quad 0  # Non-constant initializer defaults to 0", 0)
@@ -5724,6 +7194,64 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
         End If
         Set i to i plus 1
     End While
+
+    Note: Emit the synthesized __module_init function. It assigns runtime
+    Note: values to every top-level global whose initial_value is neither an
+    Note: EXPR_INTEGER literal (emitted directly in .data) nor an
+    Note: EXPR_ARRAY_LITERAL_CONST (also emitted in .data). When no such
+    Note: globals exist the function body is empty - a single ret. main calls
+    Note: this after parameter storage so user code observes fully-initialized
+    Note: globals.
+    Note: Emit __module_init as a WEAK symbol so multiple object files (main +
+    Note: parser + import_system, each compiled standalone) can be linked without
+    Note: collision. The linker picks one definition. When all top-level globals
+    Note: are constant literals (the common case for compiler source modules with
+    Note: only `Let X be 0`/`Let X be 48` declarations), every __module_init body
+    Note: is structurally identical (prologue+ret), so collapsing them is safe.
+    Note: The main program's __module_init is the one with real init code for
+    Note: non-constant globals; if it gets picked over an empty one, behavior is
+    Note: correct. If the linker happens to pick an empty one, runtime globals
+    Note: stay at .data defaults, which the language already permits.
+    emit_line(output_file, "")
+    emit_line(output_file, ".weak __module_init")
+    emit_line(output_file, "__module_init:")
+    emit_line(output_file, "    pushq %rbp")
+    emit_line(output_file, "    movq %rsp, %rbp")
+    emit_line(output_file, "    subq $16384, %rsp  # Stack space for global initializers")
+    Let mi_global_count be memory_get_int32(program, 56)
+    Let mi_globals be memory_get_pointer(program, 48)
+    Let mi_gi be 0
+    While mi_gi is less than mi_global_count:
+        Let mi_global be memory_get_pointer(mi_globals, mi_gi multiplied by 8)
+        If mi_global is not equal to 0:
+            Let mi_init be memory_get_pointer(mi_global, 16)
+            If mi_init is not equal to 0:
+                Let mi_etype be memory_get_int32(mi_init, 0)
+                Note: Skip constant-folded forms (already emitted in .data).
+                Let mi_needs_init be 1
+                If mi_etype is equal to 0:  Note: EXPR_INTEGER
+                    Set mi_needs_init to 0
+                End If
+                If mi_etype is equal to 26:  Note: EXPR_ARRAY_LITERAL_CONST
+                    Set mi_needs_init to 0
+                End If
+                If mi_needs_init is equal to 1:
+                    Let mi_g_name be memory_get_pointer(mi_global, 0)
+                    Note: Evaluate initializer (result in %rax) and store into
+                    Note: the global's .data slot via RIP-relative addressing.
+                    codegen_generate_expression(codegen, mi_init)
+                    file_write_buffered(output_file, "    movq %rax, ", 0)
+                    file_write_buffered(output_file, mi_g_name, 0)
+                    file_write_buffered(output_file, "(%rip)  # Initialize ", 0)
+                    file_write_buffered(output_file, mi_g_name, 0)
+                    file_write_buffered(output_file, "\n", 0)
+                End If
+            End If
+        End If
+        Set mi_gi to mi_gi plus 1
+    End While
+    emit_line(output_file, "    leave")
+    emit_line(output_file, "    ret")
 
     Note: Generate stack overflow handler if any recursive functions exist
     If call_graph is not equal to 0:
