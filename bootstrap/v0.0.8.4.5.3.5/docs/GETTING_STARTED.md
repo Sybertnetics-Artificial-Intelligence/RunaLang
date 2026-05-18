@@ -74,7 +74,7 @@ This creates the machine code object file.
 ### Step 4: Link with Runtime
 
 ```bash
-gcc /tmp/hello.o runtime/runtime.c -o hello -lm
+gcc /tmp/hello.o runtime/runtime.o -Wl,--allow-multiple-definition -o hello -lm
 ```
 
 This creates the final executable `hello`.
@@ -145,7 +145,7 @@ Executable Binary (hello)
 # Compile and run in one go
 ./build/runac test.runa /tmp/test.s && \
   as /tmp/test.s -o /tmp/test.o && \
-  gcc /tmp/test.o runtime/runtime.c -o test -lm && \
+  gcc /tmp/test.o runtime/runtime.o -Wl,--allow-multiple-definition -o test -lm && \
   ./test
 ```
 
@@ -167,7 +167,7 @@ OUTPUT=${2:-program}
 as /tmp/output.s -o /tmp/output.o || exit 1
 
 # Link
-gcc /tmp/output.o runtime/runtime.c -o "$OUTPUT" -lm || exit 1
+gcc /tmp/output.o runtime/runtime.o -Wl,--allow-multiple-definition -o "$OUTPUT" -lm || exit 1
 
 echo "Compiled successfully: $OUTPUT"
 ```
@@ -224,7 +224,7 @@ as /tmp/math_utils.s -o /tmp/math_utils.o
 as /tmp/main.s -o /tmp/main.o
 
 # Link together
-gcc /tmp/main.o /tmp/math_utils.o runtime/runtime.c -o program -lm
+gcc /tmp/main.o /tmp/math_utils.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 ./program
 ```
 
@@ -234,7 +234,7 @@ gcc /tmp/main.o /tmp/math_utils.o runtime/runtime.c -o program -lm
 # The Import statement tells the compiler to include the file
 ./build/runac main.runa /tmp/main.s
 as /tmp/main.s -o /tmp/main.o
-gcc /tmp/main.o runtime/runtime.c -o program -lm
+gcc /tmp/main.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 ./program
 ```
 
@@ -267,7 +267,7 @@ make clean && make
 # Use WSL on Windows
 wsl ./build/runac program.runa /tmp/program.s
 wsl as /tmp/program.s -o /tmp/program.o
-wsl gcc /tmp/program.o runtime/runtime.c -o program -lm
+wsl gcc /tmp/program.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 wsl ./program
 ```
 
@@ -277,8 +277,8 @@ wsl ./program
 
 **Solution:**
 ```bash
-# Make sure to link runtime.c
-gcc output.o runtime/runtime.c -o program -lm
+# Make sure to link runtime.o (the pure-Runa runtime)
+gcc output.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 #                ^^^^^^^^^^^^^^         ^^^
 #                Runtime library      Math library
 
@@ -371,7 +371,7 @@ End Process
 3. **Use GDB:**
    ```bash
    # Compile with debug info
-   gcc -g output.o runtime/runtime.c -o program -lm
+   gcc -g output.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 
    # Debug
    gdb ./program
@@ -458,7 +458,7 @@ nano program.runa
 as /tmp/program.s -o /tmp/program.o
 
 # 4. Link
-gcc /tmp/program.o runtime/runtime.c -o program -lm
+gcc /tmp/program.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 
 # 5. Run
 ./program
@@ -467,5 +467,5 @@ gcc /tmp/program.o runtime/runtime.c -o program -lm
 ### One-Liner
 
 ```bash
-./build/runac prog.runa /tmp/p.s && as /tmp/p.s -o /tmp/p.o && gcc /tmp/p.o runtime/runtime.c -o prog -lm && ./prog
+./build/runac prog.runa /tmp/p.s && as /tmp/p.s -o /tmp/p.o && gcc /tmp/p.o runtime/runtime.o -Wl,--allow-multiple-definition -o prog -lm && ./prog
 ```

@@ -722,56 +722,149 @@ Process called "process_imports_with_context" takes program as Integer, arena as
 End Process
 
 Process called "merge_imported_functions" takes main_program as Integer, import_program as Integer, arena as Integer returns Integer:
-    Note: Merge functions from imported program into main program
-    Note: Returns 0 on success, 1 on error
-    
+    Note: Merge functions from imported program into main program, skipping any
+    Note: function whose name already exists in the destination. Without the
+    Note: dedup pass, two transitive import paths to the same module (e.g.
+    Note: validation.runa importing StringCore directly AND through MemoryLayout)
+    Note: would each pull StringCore's functions into the destination, and the
+    Note: assembler would refuse the resulting .s output with "symbol already
+    Note: defined" errors. The dedup pass mirrors the behavior already present
+    Note: in merge_imported_globals.
+    Note: Returns 0 on success, 1 on error.
+
     Let import_func_count be memory_get_int32(import_program, 8)
     If import_func_count is equal to 0:
         Return 0  Note: No functions to merge
     End If
-    
+
     Let import_functions be memory_get_pointer(import_program, 0)
     If import_functions is equal to 0:
         Return 1
     End If
-    
+
     Let main_func_count be memory_get_int32(main_program, 8)
     Let main_functions be memory_get_pointer(main_program, 0)
-    
-    Note: Resize main functions array to accommodate new functions.
+
+    Note: First pass: count how many imported functions are NEW (not already
+    Note: present in main_program by name). This sizes the merged array exactly.
+    Let new_count be 0
+    Let scan_j be 0
+    While scan_j is less than import_func_count:
+        Let scan_func be memory_get_pointer(import_functions, scan_j multiplied by 8)
+        Let already_present be 0
+        If scan_func is not equal to 0:
+            Let scan_name be memory_get_pointer(scan_func, 0)  Note: func->name
+            If scan_name is not equal to 0:
+                Let scan_i be 0
+                While scan_i is less than main_func_count:
+                    Let existing_func be memory_get_pointer(main_functions, scan_i multiplied by 8)
+                    If existing_func is not equal to 0:
+                        Let existing_name be memory_get_pointer(existing_func, 0)
+                        If existing_name is not equal to 0:
+                            If string_equals(scan_name, existing_name) is equal to 1:
+                                Set already_present to 1
+                                Set scan_i to main_func_count  Note: break inner loop
+                            End If
+                        End If
+                    End If
+                    Set scan_i to scan_i plus 1
+                End While
+            End If
+        End If
+        If already_present is equal to 0:
+            Set new_count to new_count plus 1
+        End If
+        Set scan_j to scan_j plus 1
+    End While
+
+    Note: If everything was a duplicate, nothing to do.
+    If new_count is equal to 0:
+        Return 0
+    End If
+
+    Note: Resize main functions array to accommodate the new (deduplicated) entries.
     Note: Use heap allocate() not arena_allocate() - the arena grows by reallocating
     Note: its underlying buffer, which invalidates pointers from earlier arena calls.
-    Note: A later arena grow during codegen would leave main_program->functions
-    Note: dangling, causing garbage reads (manifests as memory_get_pointer crash with
-    Note: ASCII-text bytes interpreted as a pointer). The small heap leak is acceptable.
-    Let new_func_count be main_func_count plus import_func_count
+    Let new_func_count be main_func_count plus new_count
     Let new_functions be allocate(new_func_count multiplied by 8)
     If new_functions is equal to 0:
         Return 1
     End If
 
-    Note: Copy existing functions
+    Note: Copy existing functions verbatim.
     Let i be 0
     While i is less than main_func_count:
-        Let func_ptr be memory_get_pointer(main_functions, i multiplied by 8)
-        memory_set_pointer(new_functions, i multiplied by 8, func_ptr)
+        Let copy_ptr be memory_get_pointer(main_functions, i multiplied by 8)
+        memory_set_pointer(new_functions, i multiplied by 8, copy_ptr)
         Set i to i plus 1
     End While
 
-    Note: Copy imported functions
+    Note: Second pass: append imported functions that are NOT already present.
+    Note: Dedup against BOTH the original main_functions (for cross-module
+    Note: duplicates) AND the in-progress new_functions array (for duplicates
+    Note: within the import itself - some source files legitimately have two
+    Note: Process declarations with the same name, e.g. an arena-taking
+    Note: variant and a no-arena variant; only the first should reach the
+    Note: assembler since the assembler cannot distinguish overloads).
+    Let dest_index be main_func_count
     Let j be 0
     While j is less than import_func_count:
-        Set func_ptr to memory_get_pointer(import_functions, j multiplied by 8)
-        Let index be main_func_count plus j  Note: Force correct evaluation: (main_func_count + j)
-        Let offset be index multiplied by 8  Note: Then multiply the sum by 8
-        memory_set_pointer(new_functions, offset, func_ptr)
+        Let func_ptr be memory_get_pointer(import_functions, j multiplied by 8)
+        Let skip be 0
+        If func_ptr is not equal to 0:
+            Let import_name be memory_get_pointer(func_ptr, 0)
+            If import_name is not equal to 0:
+                Note: Check against original main_functions
+                Let k be 0
+                While k is less than main_func_count:
+                    Let dup_func be memory_get_pointer(main_functions, k multiplied by 8)
+                    If dup_func is not equal to 0:
+                        Let dup_name be memory_get_pointer(dup_func, 0)
+                        If dup_name is not equal to 0:
+                            If string_equals(import_name, dup_name) is equal to 1:
+                                Set skip to 1
+                                Set k to main_func_count  Note: break inner loop
+                            End If
+                        End If
+                    End If
+                    Set k to k plus 1
+                End While
+                Note: If not yet skipped, also check against already-appended
+                Note: import functions (the dest_index range above main_func_count).
+                If skip is equal to 0:
+                    Let m be main_func_count
+                    While m is less than dest_index:
+                        Let prev_func be memory_get_pointer(new_functions, m multiplied by 8)
+                        If prev_func is not equal to 0:
+                            Let prev_name be memory_get_pointer(prev_func, 0)
+                            If prev_name is not equal to 0:
+                                If string_equals(import_name, prev_name) is equal to 1:
+                                    Set skip to 1
+                                    Set m to dest_index  Note: break
+                                End If
+                            End If
+                        End If
+                        Set m to m plus 1
+                    End While
+                End If
+            End If
+        Otherwise:
+            Set skip to 1
+        End If
+        If skip is equal to 0:
+            memory_set_pointer(new_functions, dest_index multiplied by 8, func_ptr)
+            Set dest_index to dest_index plus 1
+        End If
         Set j to j plus 1
     End While
 
-    Note: Update main program
+    Note: Update main program with the deduplicated function table.
+    Note: Use dest_index rather than the precomputed new_func_count because the
+    Note: counting pass does not detect within-import duplicates, so the actual
+    Note: number of distinct functions copied may be smaller than the estimate.
     memory_set_pointer(main_program, 0, new_functions)
-    memory_set_int32(main_program, 8, new_func_count)
-    memory_set_int32(main_program, 12, new_func_count)  Note: function_capacity = function_count
+    memory_set_int32(main_program, 8, dest_index)
+    memory_set_int32(main_program, 12, dest_index)  Note: function_capacity = function_count
 
     Return 0
 End Process

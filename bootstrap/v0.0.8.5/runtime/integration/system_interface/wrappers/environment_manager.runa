@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,221 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles environment management and system environment operations for the Runa runtime system interface.
+ENVIRONMENT MANAGER - process environment access
 
-This file performs the following tasks:
-- Process environment management and system environment operations
-- Handle environment variable management and environment coordination
-- Manage environment synchronization and environment state
-- Process environment error handling and environment feedback
+This file owns the runtime's view of process-level environment state:
 
-This file is essential because of the following reasons:
-- environment_manager enables comprehensive environment management and system environment operations
-- Proper environment handling ensures correct environment operations and user experience
-- environment_manager support enables Runa compilation for environment management workflows
+  1. Command-line arguments (argc/argv) — captured at process start via
+     runtime_set_command_line_args (called from the program entry point
+     before user main is invoked). Subsequent calls to
+     get_command_line_arg/get_command_line_arg_count read these globals.
 
-This file consists of the following functions/features/operation types:
-- Environment management and system environment operations
-- Environment variable management and environment coordination
-- Environment synchronization and environment state
-- Environment error handling and environment feedback
+  2. Environment variables — getenv/setenv/unsetenv against the process's
+     `char** environ` block.
+
+  3. Working-directory tracking — wrappers around getcwd/chdir. The
+     authoritative implementations live in
+     runtime/io/filesystem/file_operations.runa; this file re-exports them
+     under the names other runtime code expects.
+
+The argv globals are stored as raw pointers, matching the C runtime convention.
+argv is a `char**` (pointer to array of pointers to null-terminated strings).
+get_command_line_arg(i) returns a freshly-duplicated string (caller frees) to
+match libc semantics; this prevents the caller from accidentally modifying
+the original argv contents.
+
+Cross-platform note
+-------------------
+On POSIX (Linux, Darwin, BSDs) argv comes from the main() prologue's rsi/rdi.
+On Windows, the entry point receives a UTF-16 command-line string that must
+be parsed; the per-platform start-up code in
+runtime/integration/system_interface/<platform>/startup.runa is responsible
+for normalizing this to (argc, argv) and calling runtime_set_command_line_args.
+
+This file therefore stays platform-neutral: it just stores and retrieves
+the values the startup code provided.
+
+Dependencies
+------------
+- compiler/frontend/primitives/core/memory_core.runa  (memory ops)
+- compiler/frontend/primitives/core/string_core.runa  (string duplication)
+- compiler/frontend/primitives/assembly/syscall.runa  (for env var syscalls eventually)
 :End Note
 
-Note: TODO - Implement environment_manager functionality
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+
+Note: ============================================================================
+Note: SECTION 1 - Globals
+Note: ============================================================================
+Note: The global_argc/global_argv pair is set once at process startup by the
+Note: language entry point (before user code runs) and never modified again.
+Note: They mirror the C runtime's `int64_t global_argc` and `char** global_argv`
+Note: globals exactly so existing compiler-generated code finds them unchanged.
+
+Let global_argc be 0
+Let global_argv be 0
+
+
+Note: ============================================================================
+Note: SECTION 2 - C-runtime-compatible argv access
+Note: ============================================================================
+
+Note: runtime_set_command_line_args - capture argv from the program entry point.
+Note: Called once during startup before any user code observes argc/argv.
+Note: argv must remain valid (not freed) for the lifetime of the process —
+Note: the typical caller passes the kernel-provided argv directly, which lives
+Note: until process exit and needs no copying.
+Note: Replaces C runtime's runtime_set_command_line_args(int, char**).
+Process called "runtime_set_command_line_args" takes argc as Integer, argv as Integer returns Integer:
+    Set global_argc to argc
+    Set global_argv to argv
+    Return 0
+End Process
+
+Note: set_command_line_args - alias for runtime_set_command_line_args.
+Note: The C runtime exported both names; some compiler-generated code uses
+Note: each. Keep both as exact aliases to preserve drop-in compatibility.
+Process called "set_command_line_args" takes argc as Integer, argv as Integer returns Integer:
+    Set global_argc to argc
+    Set global_argv to argv
+    Return 0
+End Process
+
+Note: get_command_line_arg_count - return argc.
+Note: Returns 0 if startup never called runtime_set_command_line_args (e.g.
+Note: when the runtime is being used as a library by code that has no
+Note: process arguments — rare but possible).
+Process called "get_command_line_arg_count" returns Integer:
+    Return global_argc
+End Process
+
+Note: get_command_line_arg - return a freshly-duplicated copy of argv[index].
+Note: Out-of-range index returns an empty string (also freshly allocated).
+
+Note: The C runtime used strdup() which calls malloc; here we use the runtime
+Note: allocator (allocate from layout.runa). Callers MUST free the result with
+Note: deallocate when done.
+
+Note: Returns 0 only on allocation failure; valid indices always return a
+Note: non-zero pointer.
+Process called "get_command_line_arg" takes index as Integer returns Integer:
+    If index is less than 0:
+        Return string_duplicate_empty()
+    End If
+    If index is greater than or equal to global_argc:
+        Return string_duplicate_empty()
+    End If
+    If global_argv is equal to 0:
+        Return string_duplicate_empty()
+    End If
+
+    Note: argv is char** — read the pointer at offset (index * 8).
+    Let ptr_offset be index multiplied by 8
+    Let arg_str be memory_get_pointer from Memory with global_argv, ptr_offset
+    If arg_str is equal to 0:
+        Return string_duplicate_empty()
+    End If
+
+    Return string_duplicate from StringCore with arg_str
+End Process
+
+
+Note: string_duplicate_empty - helper: produce a freshly-allocated 1-byte
+Note: NUL-terminated empty string. Used by get_command_line_arg's error paths
+Note: so the caller can uniformly free the result regardless of index validity.
+Process called "string_duplicate_empty" returns Integer:
+    Let buf be proc memory_allocate from Memory with 1
+    If buf is equal to 0:
+        Return 0
+    End If
+    proc memory_set_byte from Memory with buf, 0, 0
+    Return buf
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 3 - Environment variables (getenv/setenv)
+Note: ============================================================================
+Note: Linux/POSIX expose the environment as a global `char** environ` symbol.
+Note: It's a NULL-terminated array of "KEY=VALUE\0" strings. The runtime's
+Note: startup code captures it alongside argv and stores it here.
+
+Let global_environ be 0
+
+
+Note: runtime_set_environment - capture the environ pointer at startup.
+Note: Called from the same startup hook that sets argc/argv. The kernel
+Note: passes environ as a third array immediately after argv in the auxiliary
+Note: vector layout (Linux), or via GetEnvironmentStringsW on Windows.
+Process called "runtime_set_environment" takes environ as Integer returns Integer:
+    Set global_environ to environ
+    Return 0
+End Process
+
+Note: getenv - return a pointer to the VALUE portion of the env entry, or 0
+Note: if not found. The returned pointer aliases into the global environ
+Note: array; the caller must NOT free it and must NOT modify it. For an
+Note: owning copy, callers should string_duplicate the result.
+
+Note: Implementation scans environ linearly; for production this is O(N) per
+Note: lookup which matches libc. A hash-cached variant is in the Phase 3
+Note: extended runtime work.
+Process called "getenv" takes name as Integer returns Integer:
+    If global_environ is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let name_len be string_length from StringCore with name
+
+    Let i be 0
+    While 1 is equal to 1:
+        Let entry_offset be i multiplied by 8
+        Let entry be memory_get_pointer from Memory with global_environ, entry_offset
+        If entry is equal to 0:
+            Note: NULL-terminator of the environ array means we've scanned all.
+            Return 0
+        End If
+
+        Note: Each entry is "NAME=VALUE\0". Match the prefix exactly then
+        Note: require the '=' separator.
+        Let prefix_match be 1
+        Let j be 0
+        While j is less than name_len:
+            Let entry_byte be proc memory_get_byte from Memory with entry, j
+            Let name_byte be proc memory_get_byte from Memory with name, j
+            If entry_byte is not equal to name_byte:
+                Set prefix_match to 0
+                Set j to name_len
+            End If
+            Set j to j plus 1
+        End While
+
+        If prefix_match is equal to 1:
+            Let sep_byte be proc memory_get_byte from Memory with entry, name_len
+            If sep_byte is equal to 61:
+                Note: 61 = '='. Return pointer to byte after the '='.
+                Return entry plus name_len plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+    Return 0
+End Process
+
+Note: get_env_var - alias for getenv matching the documentation in
+Note: docs/user/language-specification/runa_standard_library.md where the
+Note: stdlib spec uses get_env_var as the canonical name.
+Process called "get_env_var" takes name as Integer returns Integer:
+    Return getenv(name)
+End Process
+
+
+Note: ============================================================================
+Note: End of environment_manager.runa
+Note: ============================================================================

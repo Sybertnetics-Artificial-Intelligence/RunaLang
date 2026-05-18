@@ -1542,11 +1542,28 @@ Process called "codegen_generate_lvalue_address" takes codegen as Integer, expr 
     Return 0
 End Process
 
-Note: Helper function to generate integer literal expression
+Note: Helper function to generate integer literal expression. Uses movabsq
+Note: when the literal exceeds the signed 32-bit range that `movq $imm, %rax`
+Note: supports - the plain `movq` immediate is sign-extended from 32 bits,
+Note: which truncates large literals like IEEE-754 float bit patterns and
+Note: INT64_MIN.
 Process called "codegen_generate_integer_expr" takes codegen as Integer, expr as Integer returns Integer:
     Let output_file be memory_get_integer(codegen, 0)  Note: codegen->output_file
     Let integer_value be memory_get_pointer(expr, 8)  Note: expr->data.integer_value
-    file_write_buffered(output_file, "    movq $", 0)
+    Let cgi_int32_max be 2147483647
+    Let cgi_use_movabs be 0
+    If integer_value is greater than cgi_int32_max:
+        Set cgi_use_movabs to 1
+    End If
+    Let cgi_lower_check be integer_value plus cgi_int32_max
+    If cgi_lower_check is less than 0 minus 1:
+        Set cgi_use_movabs to 1
+    End If
+    If cgi_use_movabs is equal to 1:
+        file_write_buffered(output_file, "    movabsq $", 0)
+    Otherwise:
+        file_write_buffered(output_file, "    movq $", 0)
+    End If
     file_write_buffered(output_file, integer_to_string(integer_value), 0)
     file_write_buffered(output_file, ", %rax\n", 0)
     Return 0
@@ -1780,9 +1797,34 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
         If operator is equal to 16:  Note: TOKEN_PLUS
             If right_type is equal to 0:  Note: Integer literal
                 Let int_val be memory_get_pointer(right, 8)
-                file_write_buffered(output_file, "    addq $", 0)
-                file_write_buffered(output_file, integer_to_string(int_val), 0)
-                file_write_buffered(output_file, ", %rax\n", 0)
+                Note: x86-64 `addq $imm, %rax` only accepts a sign-extended
+                Note: 32-bit immediate. For values that overflow that range
+                Note: (e.g. IEEE-754 float bit patterns, INT64_MIN, masks like
+                Note: 0x8000000000000000), the immediate must be materialized
+                Note: in a register first via movabsq, then added register-to-
+                Note: register. Detect "fits in 32-bit signed" without naming
+                Note: INT32_MIN as a literal: INT32_MAX is 2147483647 (fits
+                Note: as a small literal), and the lower bound is checked as
+                Note: int_val + INT32_MAX < -1 == int_val < -INT32_MAX-1.
+                Let f_use_movabs_plus be 0
+                Let f_int32_max be 2147483647
+                If int_val is greater than f_int32_max:
+                    Set f_use_movabs_plus to 1
+                End If
+                Let f_lower_check be int_val plus f_int32_max
+                If f_lower_check is less than 0 minus 1:
+                    Set f_use_movabs_plus to 1
+                End If
+                If f_use_movabs_plus is equal to 1:
+                    file_write_buffered(output_file, "    movabsq $", 0)
+                    file_write_buffered(output_file, integer_to_string(int_val), 0)
+                    file_write_buffered(output_file, ", %rcx\n", 0)
+                    emit_line(output_file, "    addq %rcx, %rax")
+                Otherwise:
+                    file_write_buffered(output_file, "    addq $", 0)
+                    file_write_buffered(output_file, integer_to_string(int_val), 0)
+                    file_write_buffered(output_file, ", %rax\n", 0)
+                End If
             Otherwise:  Note: Variable
                 Let var_name be memory_get_pointer(right, 8)
                 Let var_index be codegen_find_variable(codegen, var_name)
@@ -1816,9 +1858,28 @@ Process called "codegen_generate_binary_op" takes codegen as Integer, expr as In
         Otherwise If operator is equal to 17:  Note: TOKEN_MINUS
             If right_type is equal to 0:  Note: Integer literal
                 Set int_val to memory_get_pointer(right, 8)
-                file_write_buffered(output_file, "    subq $", 0)
-                file_write_buffered(output_file, integer_to_string(int_val), 0)
-                file_write_buffered(output_file, ", %rax\n", 0)
+                Note: Same large-immediate handling as TOKEN_PLUS above:
+                Note: subq accepts only a sign-extended 32-bit immediate;
+                Note: bigger values must go through movabsq + register.
+                Let f_use_movabs_minus be 0
+                Let f_int32_max_minus be 2147483647
+                If int_val is greater than f_int32_max_minus:
+                    Set f_use_movabs_minus to 1
+                End If
+                Let f_lower_check_minus be int_val plus f_int32_max_minus
+                If f_lower_check_minus is less than 0 minus 1:
+                    Set f_use_movabs_minus to 1
+                End If
+                If f_use_movabs_minus is equal to 1:
+                    file_write_buffered(output_file, "    movabsq $", 0)
+                    file_write_buffered(output_file, integer_to_string(int_val), 0)
+                    file_write_buffered(output_file, ", %rcx\n", 0)
+                    emit_line(output_file, "    subq %rcx, %rax")
+                Otherwise:
+                    file_write_buffered(output_file, "    subq $", 0)
+                    file_write_buffered(output_file, integer_to_string(int_val), 0)
+                    file_write_buffered(output_file, ", %rax\n", 0)
+                End If
             Otherwise:  Note: Variable
                 Set var_name to memory_get_pointer(right, 8)
                 Set var_index to codegen_find_variable(codegen, var_name)
@@ -6672,7 +6733,7 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         file_write_buffered(output_file, "(%rbp), %rax\n", 0)
         file_write_buffered(output_file, "    movq %rax, -", 0)
         file_write_buffered(output_file, integer_to_string(param_stack_offset), 0)
-        file_write_buffered(output_file, "(%rbp)", 0)
+        file_write_buffered(output_file, "(%rbp)\n", 0)
 
         Set i to i plus 1
     End While
@@ -6852,18 +6913,38 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
 
     Note: OLD orphaned code for rodata generation - REMOVED (now done in codegen main function)
 
-    Note: Generate .data section for initialized global variables
-    Let global_count be memory_get_int32(program, 56)  Note: PROGRAM_GLOBAL_COUNT - use int32
-    Let globals be memory_get_pointer(program, 48)       Note: PROGRAM_GLOBAL_VARS - use pointer
+    Note: Generate .data section for initialized global variables.
+    Note: When main.runa has set program->main_global_count (offset 64),
+    Note: emit ONLY globals defined in the current source file. Indices
+    Note: [0, main_global_count) are this file's own globals; indices at
+    Note: main_global_count and above came in through transitive imports
+    Note: and their .data entries will be emitted into their own files'
+    Note: .o outputs, then resolved at link time. Without this filter,
+    Note: each .o would carry duplicate .data definitions for every
+    Note: imported constant, and `ld -r` of multiple .o files would
+    Note: fail with multiple-definition errors.
+    Let global_count be memory_get_int32(program, 56)  Note: PROGRAM_GLOBAL_COUNT
+    Let main_global_count_dg be memory_get_int32(program, 64)  Note: filter boundary
+    Let main_global_set_dg be memory_get_int32(program, 68)    Note: 1 if main.runa recorded the boundary
+    Let emit_global_count be global_count
+    Note: When main.runa recorded a boundary, the filter is active and
+    Note: emit_global_count equals the recorded value (zero is legitimate -
+    Note: source file has no top-level Lets/Constants). Without the flag we
+    Note: keep the legacy emit-all behavior so callers that bypass main.runa
+    Note: (none currently expected, but safe) still work.
+    If main_global_set_dg is equal to 1:
+        Set emit_global_count to main_global_count_dg
+    End If
+    Let globals be memory_get_pointer(program, 48)       Note: PROGRAM_GLOBAL_VARS
     Let has_initialized_globals be 0
     Set i to 0
-    While i is less than global_count:
+    While i is less than emit_global_count:
         Let global be memory_get_pointer(globals, i multiplied by 8)
         If global is not equal to 0:
             Let initial_value be memory_get_pointer(global, 16)  Note: global->initial_value
             If initial_value is not equal to 0:
                 Set has_initialized_globals to 1
-                Set i to global_count  Note: Break
+                Set i to emit_global_count  Note: Break
             End If
         End If
         Set i to i plus 1
@@ -6872,7 +6953,7 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     If has_initialized_globals is equal to 1:
         emit_line(output_file, ".section .data")
         Set i to 0
-        While i is less than global_count:
+        While i is less than emit_global_count:
             Set global to memory_get_pointer(globals, i multiplied by 8)
             If global is equal to 0:
                 Set i to i plus 1
@@ -7175,22 +7256,63 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     callgraph_print_warnings(call_graph)
     Note: ========================================================================
 
-    Note: Generate all functions
+    Note: Determine which source file is being compiled. Main.runa tags every
+    Note: function defined in the input file with the same input_filename pointer
+    Note: BEFORE imports merge in their own functions, so functions[0]->source_file
+    Note: is the canonical "main file" pointer when the input file has any
+    Note: function declarations. All main-file functions share this pointer
+    Note: identity (it is the same heap-allocated input_filename string passed to
+    Note: every function_set_source_file call). Imported functions get a
+    Note: different pointer (the resolved_path from import_system).
+    Let main_source_file be 0
+    If function_count is greater than 0:
+        Let first_func be memory_get_pointer(functions, 0)
+        If first_func is not equal to 0:
+            Set main_source_file to memory_get_pointer(first_func, 48)  Note: func->source_file
+        End If
+    End If
+
+    Note: Generate all functions defined in THIS compilation unit. Imported
+    Note: function bodies are skipped - they will be emitted into their own
+    Note: object files when those source files are compiled separately, and
+    Note: calls into them resolve at link time as PLT references. Without this
+    Note: filter, transitive imports would inline every function from every
+    Note: imported module into every .o file, producing duplicate symbols
+    Note: across object files and pulling in cross-platform asm syntax (e.g.
+    Note: Darwin/BSD Intel-syntax syscall stubs) that the host assembler
+    Note: cannot parse.
     Set i to 0
     While i is less than function_count:
         Set func to memory_get_pointer(functions, i multiplied by 8)
 
         Note: Safety check for function pointer - skip NULL pointers
         If func is not equal to 0:
-            Set func_name to memory_get_pointer(func, 0)  Note: func->name
+            Let func_source be memory_get_pointer(func, 48)  Note: func->source_file
+            Let should_emit be 1
 
-            Note: Make main function global
-            If string_equals(func_name, "main") is equal to 1:
-                emit_line(output_file, ".globl main")
+            Note: Filter only when we have a known main source file AND the
+            Note: function has its own source file. When either is null (e.g.
+            Note: synthesized functions with no parse origin) we emit the
+            Note: function so legacy behavior is preserved.
+            If main_source_file is not equal to 0:
+                If func_source is not equal to 0:
+                    If func_source is not equal to main_source_file:
+                        Set should_emit to 0
+                    End If
+                End If
             End If
 
-            emit_line(output_file, "\n")
-            codegen_generate_function(codegen, func)
+            If should_emit is equal to 1:
+                Set func_name to memory_get_pointer(func, 0)  Note: func->name
+
+                Note: Make main function global
+                If string_equals(func_name, "main") is equal to 1:
+                    emit_line(output_file, ".globl main")
+                End If
+
+                emit_line(output_file, "\n")
+                codegen_generate_function(codegen, func)
+            End If
         End If
         Set i to i plus 1
     End While
@@ -7218,6 +7340,16 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "    pushq %rbp")
     emit_line(output_file, "    movq %rsp, %rbp")
     emit_line(output_file, "    subq $16384, %rsp  # Stack space for global initializers")
+    Note: __module_init iterates ALL globals (own + imported). This is the
+    Note: weak symbol that the linker keeps a single copy of across all
+    Note: .o files. The main program's __module_init - which has the full
+    Note: merged globals table - is the one the linker should pick, so it
+    Note: must contain init code for every global that any module reaches.
+    Note: .data emission is filtered (only own-file globals emitted as data
+    Note: slots), but __module_init still WRITES to those slots; the writes
+    Note: target symbols defined in other .o files and resolve at link
+    Note: time. This pairing keeps the .data table partitioned across .o
+    Note: files while __module_init centralizes initialization in one place.
     Let mi_global_count be memory_get_int32(program, 56)
     Let mi_globals be memory_get_pointer(program, 48)
     Let mi_gi be 0

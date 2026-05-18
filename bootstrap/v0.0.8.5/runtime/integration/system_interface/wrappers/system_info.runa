@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,464 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles system information and system introspection wrapper functionality for the Runa runtime system interface.
+SYSTEM INFO - time and system introspection
 
-This file performs the following tasks:
-- Process system information and system introspection wrapper functionality
-- Handle system information retrieval and system coordination
-- Manage system state and system synchronization
-- Process system error handling and system feedback
+This file provides:
 
-This file is essential because of the following reasons:
-- system_info enables comprehensive system information and system introspection wrapper functionality
-- Proper system information handling ensures correct system operations and user experience
-- system_info support enables Runa compilation for system information workflows
+  1. Monotonic time queries used for timing measurements:
+       get_time_us         - microseconds since arbitrary start point
+       get_time_ns         - nanoseconds since arbitrary start point
+       get_time_seconds    - seconds since arbitrary start point
 
-This file consists of the following functions/features/operation types:
-- System information and system introspection wrapper functionality
-- System information retrieval and system coordination
-- System state and system synchronization
-- System error handling and system feedback
+  2. Wall-clock time queries used for log timestamps and date arithmetic:
+       get_current_timestamp     - seconds since Unix epoch (1970-01-01 UTC)
+       get_current_timestamp_us  - microseconds since Unix epoch
+       get_current_timestamp_ns  - nanoseconds since Unix epoch
+
+  3. Process resource queries:
+       get_pid             - current process ID
+       get_ppid            - parent process ID
+       get_uid             - real user ID
+       get_gid             - real group ID
+
+  4. System introspection (Phase 3 expansion territory):
+       get_page_size       - memory page size in bytes
+       get_processor_count - number of online CPUs
+
+These wrap the platform router's syscalls and present a uniform API regardless
+of whether the underlying kernel uses clock_gettime (Linux/BSD/Darwin),
+QueryPerformanceCounter (Windows), or mach_absolute_time (Darwin fallback).
+
+Cross-platform note
+-------------------
+clock_gettime is the POSIX standard and works on Linux, *BSD, and Darwin.
+Windows uses a different path (Win32 timer APIs). The per-platform syscall.runa
+in compiler/frontend/primitives/platform/<plat>/ is expected to abstract this
+difference — Windows backends should expose a syscall_clock_gettime-equivalent
+that internally calls QueryPerformanceCounter and normalizes the result to
+timespec semantics.
+
+Where the platform router doesn't yet expose a constant (notably
+SYS_CLOCK_GETTIME), this file uses the Linux x86-64 number directly with a
+TODO comment. Adding these constants to the router and to every per-platform
+syscall.runa is tracked under Phase 3 polish work.
+
+Dependencies
+------------
+- compiler/frontend/primitives/assembly/syscall.runa (platform router)
+- compiler/frontend/primitives/core/memory_core.runa (stack buffer ops)
 :End Note
 
-Note: TODO - Implement system_info functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+
+Note: ============================================================================
+Note: SECTION 1 - Constants
+Note: ============================================================================
+
+Note: clock_gettime clock IDs (POSIX). These values are uniform across Linux,
+Note: FreeBSD, NetBSD, OpenBSD, and Darwin's clock_gettime implementation.
+Process called "CLOCK_REALTIME" returns Integer:
+    Return 0
+End Process
+
+Process called "CLOCK_MONOTONIC" returns Integer:
+    Return 1
+End Process
+
+Process called "CLOCK_PROCESS_CPUTIME_ID" returns Integer:
+    Return 2
+End Process
+
+Process called "CLOCK_THREAD_CPUTIME_ID" returns Integer:
+    Return 3
+End Process
+
+Process called "CLOCK_MONOTONIC_RAW" returns Integer:
+    Return 4
+End Process
+
+Process called "CLOCK_REALTIME_COARSE" returns Integer:
+    Return 5
+End Process
+
+Process called "CLOCK_MONOTONIC_COARSE" returns Integer:
+    Return 6
+End Process
+
+Process called "CLOCK_BOOTTIME" returns Integer:
+    Return 7
+End Process
+
+Note: SYS_CLOCK_GETTIME and SYS_SCHED_GETAFFINITY are now exposed by the
+Note: platform router (compiler/frontend/primitives/assembly/syscall.runa).
+Note: This file imports them via `from Syscall` rather than hardcoding any
+Note: platform-specific number, so the code is correct on every supported
+Note: platform without modification.
+
+Note: When porting to a new platform, ensure the new platform/syscall.runa
+Note: file in compiler/frontend/primitives/platform/<plat>/ exposes the
+Note: matching Processes (SYS_CLOCK_GETTIME, SYS_SCHED_GETAFFINITY,
+Note: SYS_GETPID, etc.) with the platform-correct syscall numbers, then add
+Note: the platform to the router's dispatcher If-chains.
+
+Note: timespec struct layout (16 bytes on x86-64 / ARM64):
+Note:   offset 0: tv_sec  (Integer, 8 bytes) - seconds
+Note:   offset 8: tv_nsec (Integer, 8 bytes) - nanoseconds (0..999_999_999)
+Note: On 32-bit platforms this is 8 bytes instead (tv_sec and tv_nsec are
+Note: 32-bit). The platform layer abstracts this — for now we assume 64-bit
+Note: target (Linux x86-64, ARM64, etc).
+Note: A timespec buffer is allocated on the syscall caller's stack frame and
+Note: passed by pointer to clock_gettime.
+
+Constant TIMESPEC_SIZE as Integer is 16
+
+
+Note: ============================================================================
+Note: SECTION 2 - Monotonic time (for timing measurements)
+Note: ============================================================================
+Note: Monotonic time is used to measure elapsed durations. Unlike wall-clock
+Note: time, it never goes backwards (no leap seconds, no manual adjustments).
+Note: Always use these functions when computing "how long did X take".
+
+Note: get_time_us - microseconds since an arbitrary start point.
+Note: Returns a 64-bit monotonic counter in microseconds. Difference between
+Note: two calls gives elapsed microseconds.
+Note: Replaces C runtime's get_time_us() which used clock_gettime(CLOCK_MONOTONIC).
+Process called "get_time_us" returns Integer:
+    Let ts_buf be proc memory_allocate from Memory with TIMESPEC_SIZE
+    If ts_buf is equal to 0:
+        Return 0
+    End If
+    Let sys_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let result be syscall_2 from Syscall with sys_num, CLOCK_MONOTONIC(), ts_buf
+    If result is less than 0:
+        proc memory_free from Memory with ts_buf
+        Return 0
+    End If
+    Let secs be memory_get_integer from Memory with ts_buf, 0
+    Let nsecs be memory_get_integer from Memory with ts_buf, 8
+    proc memory_free from Memory with ts_buf
+    Note: us = secs * 1_000_000 + nsecs / 1_000
+    Let us_secs be secs multiplied by 1000000
+    Let us_nsecs be nsecs divided by 1000
+    Return us_secs plus us_nsecs
+End Process
+
+Note: get_time_ns - nanoseconds since an arbitrary start point. Highest-
+Note: resolution monotonic counter. Use when microsecond precision is
+Note: insufficient (e.g. micro-benchmarking).
+Process called "get_time_ns" returns Integer:
+    Let ts_buf be proc memory_allocate from Memory with TIMESPEC_SIZE
+    If ts_buf is equal to 0:
+        Return 0
+    End If
+    Let sys_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let result be syscall_2 from Syscall with sys_num, CLOCK_MONOTONIC(), ts_buf
+    If result is less than 0:
+        proc memory_free from Memory with ts_buf
+        Return 0
+    End If
+    Let secs be memory_get_integer from Memory with ts_buf, 0
+    Let nsecs be memory_get_integer from Memory with ts_buf, 8
+    proc memory_free from Memory with ts_buf
+    Let ns_secs be secs multiplied by 1000000000
+    Return ns_secs plus nsecs
+End Process
+
+Note: get_time_seconds - seconds since an arbitrary start point. Coarse
+Note: resolution; use only when you don't need sub-second precision.
+Process called "get_time_seconds" returns Integer:
+    Let ts_buf be proc memory_allocate from Memory with TIMESPEC_SIZE
+    If ts_buf is equal to 0:
+        Return 0
+    End If
+    Let sys_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let result be syscall_2 from Syscall with sys_num, CLOCK_MONOTONIC(), ts_buf
+    If result is less than 0:
+        proc memory_free from Memory with ts_buf
+        Return 0
+    End If
+    Let secs be memory_get_integer from Memory with ts_buf, 0
+    proc memory_free from Memory with ts_buf
+    Return secs
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 3 - Wall-clock time (for timestamps and date arithmetic)
+Note: ============================================================================
+Note: Wall-clock time is the human-meaningful time of day. It CAN go backwards
+Note: (NTP adjustments, leap seconds, manual clock changes). Don't use it to
+Note: measure durations.
+
+Note: get_current_timestamp - seconds since Unix epoch (1970-01-01T00:00:00Z).
+Note: Replaces C runtime's get_current_timestamp() which used time(NULL).
+Process called "get_current_timestamp" returns Integer:
+    Let ts_buf be proc memory_allocate from Memory with TIMESPEC_SIZE
+    If ts_buf is equal to 0:
+        Return 0
+    End If
+    Let sys_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let result be syscall_2 from Syscall with sys_num, CLOCK_REALTIME(), ts_buf
+    If result is less than 0:
+        proc memory_free from Memory with ts_buf
+        Return 0
+    End If
+    Let secs be memory_get_integer from Memory with ts_buf, 0
+    proc memory_free from Memory with ts_buf
+    Return secs
+End Process
+
+Note: get_current_timestamp_us - microseconds since Unix epoch.
+Process called "get_current_timestamp_us" returns Integer:
+    Let ts_buf be proc memory_allocate from Memory with TIMESPEC_SIZE
+    If ts_buf is equal to 0:
+        Return 0
+    End If
+    Let sys_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let result be syscall_2 from Syscall with sys_num, CLOCK_REALTIME(), ts_buf
+    If result is less than 0:
+        proc memory_free from Memory with ts_buf
+        Return 0
+    End If
+    Let secs be memory_get_integer from Memory with ts_buf, 0
+    Let nsecs be memory_get_integer from Memory with ts_buf, 8
+    proc memory_free from Memory with ts_buf
+    Let us_secs be secs multiplied by 1000000
+    Let us_nsecs be nsecs divided by 1000
+    Return us_secs plus us_nsecs
+End Process
+
+Note: get_current_timestamp_ns - nanoseconds since Unix epoch.
+Process called "get_current_timestamp_ns" returns Integer:
+    Let ts_buf be proc memory_allocate from Memory with TIMESPEC_SIZE
+    If ts_buf is equal to 0:
+        Return 0
+    End If
+    Let sys_num be proc SYS_CLOCK_GETTIME from Syscall
+    Let result be syscall_2 from Syscall with sys_num, CLOCK_REALTIME(), ts_buf
+    If result is less than 0:
+        proc memory_free from Memory with ts_buf
+        Return 0
+    End If
+    Let secs be memory_get_integer from Memory with ts_buf, 0
+    Let nsecs be memory_get_integer from Memory with ts_buf, 8
+    proc memory_free from Memory with ts_buf
+    Let ns_secs be secs multiplied by 1000000000
+    Return ns_secs plus nsecs
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 4 - Process resource queries
+Note: ============================================================================
+Note: These map to single-syscall accessors on POSIX. Each is a thin pass-
+Note: through to the platform router. Values are stable for the lifetime of
+Note: the process (PID never changes; UID/GID change only via setuid/setgid
+Note: which we don't implement here).
+
+Process called "get_pid" returns Integer:
+    Let sys_num be proc SYS_GETPID from Syscall
+    Return syscall_0 from Syscall with sys_num
+End Process
+
+Process called "get_ppid" returns Integer:
+    Let sys_num be proc SYS_GETPPID from Syscall
+    Return syscall_0 from Syscall with sys_num
+End Process
+
+Process called "get_uid" returns Integer:
+    Let sys_num be proc SYS_GETUID from Syscall
+    Return syscall_0 from Syscall with sys_num
+End Process
+
+Process called "get_gid" returns Integer:
+    Let sys_num be proc SYS_GETGID from Syscall
+    Return syscall_0 from Syscall with sys_num
+End Process
+
+Process called "get_euid" returns Integer:
+    Let sys_num be proc SYS_GETEUID from Syscall
+    Return syscall_0 from Syscall with sys_num
+End Process
+
+Process called "get_egid" returns Integer:
+    Let sys_num be proc SYS_GETEGID from Syscall
+    Return syscall_0 from Syscall with sys_num
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 5 - System constants and introspection
+Note: ============================================================================
+
+Note: AT_PAGESZ - auxv key for page size. The Linux kernel passes an "auxiliary
+Note: vector" alongside argv/envp at process startup. Each entry is a (key,
+Note: value) pair of 64-bit integers. AT_PAGESZ is key 6 and its value is
+Note: the page size in bytes. This is the canonical, kernel-authoritative
+Note: source for page size on all POSIX platforms.
+
+Process called "AT_NULL" returns Integer:
+    Return 0
+End Process
+
+Process called "AT_PAGESZ" returns Integer:
+    Return 6
+End Process
+
+Process called "AT_NCPUS" returns Integer:
+    Note: Not standard - Linux uses AT_HWCAP/AT_PLATFORM, processor count
+    Note: comes from sched_getaffinity. AT_NCPUS placeholder for future
+    Note: platforms that expose it through auxv.
+    Return 22
+End Process
+
+Note: get_page_size - return the system memory page size in bytes.
+Note: Reads /proc/self/auxv (a binary file the kernel exposes) and scans for
+Note: the AT_PAGESZ entry. This is the kernel-authoritative answer and works
+Note: on every Linux kernel regardless of CPU architecture (x86-64 reports
+Note: 4096, Apple Silicon Darwin would report 16384, etc).
+
+Note: On non-Linux POSIX platforms (Darwin, BSD), /proc isn't available. Those
+Note: platforms should override this via a per-platform implementation that
+Note: uses sysctl HW_PAGESIZE (Darwin/BSD) or GetSystemInfo (Windows). The
+Note: per-platform override mechanism is part of the platform router (TODO).
+
+Note: Returns 4096 as a fallback if /proc/self/auxv can't be read — every
+Note: production CPU we currently support has 4096 as either the actual page
+Note: size or a safe minimum.
+Process called "get_page_size" returns Integer:
+    Note: Open /proc/self/auxv. Use SYS_OPEN with O_RDONLY (which is 0).
+    Note: We use a local null-terminated path constant rather than relying on
+    Note: imports because string literals work fine for ASCII paths.
+    Let path be "/proc/self/auxv"
+    Let sys_open_num be proc SYS_OPEN from Syscall
+    Let o_rdonly be proc O_RDONLY from Syscall
+    Let fd be syscall_3 from Syscall with sys_open_num, path, o_rdonly, 0
+    If fd is less than 0:
+        Note: /proc not mounted or file unavailable. Fall back to architecture-
+        Note: appropriate default. All Linux x86-64 / ARM64 / RISC-V / MIPS
+        Note: kernels use 4096 as default page size; only Apple Silicon and
+        Note: some configured Linux ARM64 deviate.
+        Return 4096
+    End If
+
+    Note: auxv entries are 16 bytes each (8-byte key + 8-byte value). Read
+    Note: up to 4096 bytes (256 entries) which covers all realistic auxv sizes.
+    Let buf_size be 4096
+    Let buf be proc memory_allocate from Memory with buf_size
+    If buf is equal to 0:
+        Let sys_close_num be proc SYS_CLOSE from Syscall
+        Let close_result be syscall_1 from Syscall with sys_close_num, fd
+        Return 4096
+    End If
+
+    Let sys_read_num be proc SYS_READ from Syscall
+    Let bytes_read be proc syscall_3 from Syscall with sys_read_num, fd, buf, buf_size
+    Let sys_close_num be proc SYS_CLOSE from Syscall
+    Let close_result be proc syscall_1 from Syscall with sys_close_num, fd
+
+    If bytes_read is less than 0:
+        proc memory_free from Memory with buf
+        Return 4096
+    End If
+
+    Note: Scan auxv buffer 16 bytes at a time for AT_PAGESZ.
+    Let pagesz_key be AT_PAGESZ()
+    Let null_key be AT_NULL()
+    Let offset be 0
+    Let found_value be 4096
+    While offset is less than bytes_read:
+        Let key be memory_get_integer from Memory with buf, offset
+        Let val_offset be offset plus 8
+        Let value be memory_get_integer from Memory with buf, val_offset
+        If key is equal to pagesz_key:
+            Set found_value to value
+            Set offset to bytes_read
+        End If
+        If key is equal to null_key:
+            Set offset to bytes_read
+        End If
+        Set offset to offset plus 16
+    End While
+    proc memory_free from Memory with buf
+    Return found_value
+End Process
+
+Note: get_processor_count - number of online CPUs in the calling thread's
+Note: affinity mask.
+
+Note: Uses sched_getaffinity (SYS_SCHED_GETAFFINITY = 204 on Linux x86-64).
+Note: The kernel fills a cpu_set_t buffer with a bitmask of CPUs this thread
+Note: is allowed to run on. We count the set bits to get the effective CPU
+Note: count.
+
+Note: Using affinity (vs reading /proc/cpuinfo or /sys/devices/system/cpu/online)
+Note: matters for containers and cgroups: a container limited to 2 CPUs out of
+Note: a 64-CPU host will correctly report 2, not 64.
+
+Note: cpu_set_t is 1024 bits = 128 bytes on Linux. We allocate that size and
+Note: count the set bits in the result.
+
+Note: Returns 1 if the syscall fails (safe single-threaded fallback) or
+Note: if the affinity mask is empty (shouldn't happen on a running thread but
+Note: defensive).
+Process called "get_processor_count" returns Integer:
+    Let cpu_set_size be 128
+    Let mask be proc memory_allocate from Memory with cpu_set_size
+    If mask is equal to 0:
+        Return 1
+    End If
+
+    Let sys_num be proc SYS_SCHED_GETAFFINITY from Syscall
+    Let pid be 0
+    Let result be syscall_3 from Syscall with sys_num, pid, cpu_set_size, mask
+    If result is less than 0:
+        proc memory_free from Memory with mask
+        Return 1
+    End If
+
+    Note: result is the size in bytes actually written. Count bits across the
+    Note: full mask. Each byte has 0..8 set bits; we walk it byte-by-byte and
+    Note: use the popcount sequence.
+    Let count be 0
+    Let i be 0
+    While i is less than cpu_set_size:
+        Let byte be proc memory_get_byte from Memory with mask, i
+        Note: Brian Kernighan's popcount: while byte != 0, byte &= byte-1, count++
+        Note: We don't have bit-AND or subtraction-with-mask in pure Runa here
+        Note: easily, so use the simple table lookup via per-bit shift+mod.
+        Let j be 0
+        While j is less than 8:
+            Let mask_for_bit be 1
+            Let shift_count be 0
+            While shift_count is less than j:
+                Set mask_for_bit to mask_for_bit multiplied by 2
+                Set shift_count to shift_count plus 1
+            End While
+            Let bit_val be byte divided by mask_for_bit
+            Let bit_set be bit_val modulo by 2
+            If bit_set is equal to 1:
+                Set count to count plus 1
+            End If
+            Set j to j plus 1
+        End While
+        Set i to i plus 1
+    End While
+    proc memory_free from Memory with mask
+
+    If count is equal to 0:
+        Note: Defensive: a running thread should always have at least one CPU
+        Note: in its affinity mask. If we see zero, fall back to 1 rather than
+        Note: returning a value that would break thread-pool sizing.
+        Return 1
+    End If
+    Return count
+End Process
+
+
+Note: ============================================================================
+Note: End of system_info.runa
+Note: ============================================================================

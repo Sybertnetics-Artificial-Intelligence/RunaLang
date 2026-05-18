@@ -80,8 +80,9 @@ run_test() {
         return 1
     fi
 
-    # Step 3: Link with runtime (compile runtime.c directly to ensure set functions are included)
-    if ! gcc -o "$test_output_dir/${test_name}" "$test_output_dir/${test_name}.o" "$RUNTIME_DIR/runtime.c" -no-pie -lm > "$test_output_dir/link.log" 2>&1; then
+    # Step 3: Link with the pure-Runa runtime.o (built from v0.0.8.5/runtime/ + primitives).
+    # No C source involved — the runtime is now 100% Runa.
+    if ! gcc -o "$test_output_dir/${test_name}" "$test_output_dir/${test_name}.o" "$RUNTIME_DIR/runtime.o" -no-pie -Wl,--allow-multiple-definition -lm > "$test_output_dir/link.log" 2>&1; then
         echo -e "${RED}FAILED${NC} (linking)"
         echo "FAILED: $test_name (linking error)" >> "$RESULTS_FILE"
         cat "$test_output_dir/link.log" >> "$RESULTS_FILE"

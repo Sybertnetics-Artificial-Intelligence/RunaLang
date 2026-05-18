@@ -36,6 +36,83 @@ This is a foundation primitive with NO dependencies.
 :End Note
 
 Note: ============================================================================
+Note: LOW-LEVEL LOAD/STORE INTRINSICS
+Note: ============================================================================
+Note: Raw memory access primitives implemented in inline assembly. The high-level
+Note: memory_get_*/memory_set_* helpers below compose calls to these. They are
+Note: deliberately kept in this file rather than a separate platform/ file
+Note: because they have no logical alternative on any architecture - every CPU
+Note: backend lowers them to a single load/store instruction, so the asm form
+Note: is documentation. (When ports for non-x86-64 architectures are wired,
+Note: each platform contributes its own version of this file via the build
+Note: system; until then, the x86-64 form covers Linux x86-64 builds.)
+Note: Stack-frame convention: stage1 stores parameter N at -8N(%rbp); the
+Note: function's Let-declared result variable follows at the next slot.
+
+Process called "load_byte_unsigned" takes addr as Integer returns Integer:
+    Let result be 0
+    Inline Assembly:
+        # addr at -8(%rbp), result at -16(%rbp)
+        movq -8(%rbp), %rcx
+        movzbq (%rcx), %rax
+        movq %rax, -16(%rbp)
+    End Assembly
+    Return result
+End Process
+
+Process called "load_int32_signed" takes addr as Integer returns Integer:
+    Let result be 0
+    Inline Assembly:
+        # addr at -8(%rbp), result at -16(%rbp)
+        movq -8(%rbp), %rcx
+        movslq (%rcx), %rax
+        movq %rax, -16(%rbp)
+    End Assembly
+    Return result
+End Process
+
+Process called "load_int64" takes addr as Integer returns Integer:
+    Let result be 0
+    Inline Assembly:
+        # addr at -8(%rbp), result at -16(%rbp)
+        movq -8(%rbp), %rcx
+        movq (%rcx), %rax
+        movq %rax, -16(%rbp)
+    End Assembly
+    Return result
+End Process
+
+Process called "store_byte" takes addr as Integer, value as Integer returns Integer:
+    Inline Assembly:
+        # addr at -8(%rbp), value at -16(%rbp)
+        movq -8(%rbp), %rcx
+        movq -16(%rbp), %rax
+        movb %al, (%rcx)
+    End Assembly
+    Return 0
+End Process
+
+Process called "store_int32" takes addr as Integer, value as Integer returns Integer:
+    Inline Assembly:
+        # addr at -8(%rbp), value at -16(%rbp)
+        movq -8(%rbp), %rcx
+        movq -16(%rbp), %rax
+        movl %eax, (%rcx)
+    End Assembly
+    Return 0
+End Process
+
+Process called "store_int64" takes addr as Integer, value as Integer returns Integer:
+    Inline Assembly:
+        # addr at -8(%rbp), value at -16(%rbp)
+        movq -8(%rbp), %rcx
+        movq -16(%rbp), %rax
+        movq %rax, (%rcx)
+    End Assembly
+    Return 0
+End Process
+
+Note: ============================================================================
 Note: Memory Read Operations
 Note: ============================================================================
 
@@ -48,6 +125,58 @@ Process called "memory_get_byte" takes ptr as Integer, offset as Integer returns
     Let address be ptr plus offset
     Let result be proc load_byte_unsigned with address
     Return result
+End Process
+
+Process called "memory_get_int8" takes ptr as Integer, offset as Integer returns Integer:
+    Note: Read a signed 8-bit integer from memory at ptr + offset, sign-extended
+    Note: to 64-bit. Composes from memory_get_byte and applies sign-extension
+    Note: if the byte value is >= 128 (top bit set).
+    Let unsigned_byte be proc memory_get_byte with ptr, offset
+    Let bit7_mask be 128
+    If unsigned_byte is greater than or equal to bit7_mask:
+        Return unsigned_byte minus 256
+    End If
+    Return unsigned_byte
+End Process
+
+Process called "memory_set_int8" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    Note: Write the low 8 bits of value to memory at ptr + offset.
+    Note: Negative values are stored two's-complement; the store_byte path
+    Note: truncates everything above the bottom 8 bits, so positive and
+    Note: negative inputs both produce the correct byte pattern.
+    Let address be ptr plus offset
+    Let dummy be proc store_byte with address, value
+    Return 0
+End Process
+
+Process called "memory_get_qword" takes ptr as Integer, offset as Integer returns Integer:
+    Note: Quad-word alias for memory_get_int64. "qword" is x86 terminology;
+    Note: some callers (especially low-level memory marshallers) reach for this
+    Note: name.
+    Return proc memory_get_int64 with ptr, offset
+End Process
+
+Process called "memory_get_int16" takes ptr as Integer, offset as Integer returns Integer:
+    Note: Read a signed 16-bit integer from memory at ptr + offset, sign-extended
+    Note: to 64-bit. Used by half-precision float (Float16) and 80-bit float
+    Note: (Float80) bit-pattern access in softfloat.runa, and by serializers
+    Note: that read network/file headers carrying 16-bit fields.
+    Note: Composed from two byte reads (little-endian) so it works without a
+    Note: platform-specific load_int16 intrinsic. The sign-extension step
+    Note: replicates bit 15 across the upper 48 bits when the value is negative.
+    Let address be ptr plus offset
+    Let lo be proc load_byte_unsigned with address
+    Let hi_addr be address plus 1
+    Let hi be proc load_byte_unsigned with hi_addr
+    Let hi_shifted be hi multiplied by 256
+    Let value be lo plus hi_shifted
+    Note: sign-extend: if bit 15 (0x8000) is set, value is negative.
+    Let sign_bit be hi multiplied by 256
+    Let bit15_mask be 32768  Note: 0x8000
+    If value is greater than or equal to bit15_mask:
+        Return value minus 65536  Note: subtract 2^16 to sign-extend
+    End If
+    Return value
 End Process
 
 Process called "memory_get_int32" takes ptr as Integer, offset as Integer returns Integer:
@@ -96,6 +225,28 @@ Process called "memory_set_byte" takes ptr as Integer, offset as Integer, value 
 
     Let address be ptr plus offset
     Let dummy be proc store_byte with address, value
+    Return 0
+End Process
+
+Process called "memory_set_int16" takes ptr as Integer, offset as Integer, value as Integer returns Integer:
+    Note: Write a 16-bit integer to memory at ptr + offset (little-endian).
+    Note: Only the low 16 bits of value are written. Returns 0.
+    Note: Composed from two byte writes since there is no platform-specific
+    Note: 16-bit store intrinsic in this layer. Negative values are stored
+    Note: two's-complement: the low byte is value & 0xFF, the high byte is
+    Note: (value >> 8) & 0xFF, both done with arithmetic that ignores
+    Note: bits above 16.
+    Let address be ptr plus offset
+    Let lo_mask be 255  Note: 0x00FF
+    Let lo_byte_offset_zero be 0
+    Let lo_byte be value
+    Note: extract low byte: value mod 256 handles both positive and negative
+    Note: by virtue of x86 movb truncation - we pass the full Integer to
+    Note: store_byte which only uses the bottom 8 bits.
+    Let dummy_lo be proc store_byte with address, lo_byte
+    Let hi_addr be address plus 1
+    Let hi_byte be value divided by 256
+    Let dummy_hi be proc store_byte with hi_addr, hi_byte
     Return 0
 End Process
 

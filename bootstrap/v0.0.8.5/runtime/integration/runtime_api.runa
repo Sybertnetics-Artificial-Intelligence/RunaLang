@@ -1,0 +1,611 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+RUNTIME API - C-RUNTIME ABI COMPATIBILITY LAYER
+
+This file is the ABI bridge between Runa primitives and the symbol names
+the legacy C runtime (runtime.c) exposed. The previous v0.0.8.4.5.3.5
+runtime.o exported ~78 symbols under specific names (list_append, dict_set,
+ascii_value_of, etc). Stage1 binaries link against those names.
+
+The migration from C to Runa kept the primitive implementations under
+their preferred Runa names (list_push, Dictionary.set, etc) so the
+primitive layer can evolve without ABI churn. This file is the stable
+re-export layer that maps:
+
+    legacy_c_name  ->  primitive_module.canonical_name
+
+Symbols whose names already match the primitive (e.g. allocate, memory_copy,
+string_compare) do NOT appear here; they are exported directly by their
+primitive files and require no wrapper.
+
+Symbols that ONLY differ in naming convention appear as thin one-line
+wrappers. The wrappers compile to a single jump and have zero runtime
+overhead beyond a call/ret pair.
+
+Symbols that have no direct primitive equivalent (integer_to_float,
+float_to_integer, string_to_float, ascii_value_of, is_alpha, is_digit,
+is_whitespace, memory_pointer_to_string, memory_get_substring,
+memory_get_pointer_at_index, memory_set_pointer_at_index,
+memory_realloc, memory_reallocate, memory_allocate, reallocate,
+call_function_pointer_2args) are implemented here using inline assembly
+or by composing existing primitives. This keeps the integration layer
+self-contained and avoids polluting the primitive files with names that
+exist solely for ABI compatibility.
+
+Layout:
+
+  Section 1  - Collection name aliases (lists, dicts, sets)
+  Section 2  - String name aliases and missing primitives
+  Section 3  - Memory aliases and indexed-pointer helpers
+  Section 4  - Character classification helpers
+  Section 5  - Float / integer conversion primitives
+  Section 6  - Function-pointer invocation bridge
+  Section 7  - Heap allocator aliases (reallocate family)
+:End Note
+
+Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as SetMod
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/memory/layout.runa" as Heap
+
+Note:
+============================================================================
+SECTION 1 - COLLECTION NAME ALIASES
+============================================================================
+The C runtime used flat prefixed names (list_append, dict_set, set_union).
+The Runa primitives use module-scoped names (List.push, Dictionary.set,
+SetMod.union). Each alias here is a single delegating call.
+:End Note
+
+Process called "list_append" takes list_ptr as Integer, value as Integer returns Integer:
+    Return List.list_push(list_ptr, value)
+End Process
+
+Process called "list_find" takes list_ptr as Integer, value as Integer returns Integer:
+    Return List.list_index_of(list_ptr, value)
+End Process
+
+Process called "dict_create" returns Integer:
+    Return Dictionary.create()
+End Process
+
+Process called "dict_destroy" takes dict_ptr as Integer returns Integer:
+    Return Dictionary.destroy(dict_ptr)
+End Process
+
+Process called "dict_set" takes dict_ptr as Integer, key as Integer, value as Integer returns Integer:
+    Return Dictionary.set(dict_ptr, key, value)
+End Process
+
+Process called "dict_get" takes dict_ptr as Integer, key as Integer returns Integer:
+    Return Dictionary.get(dict_ptr, key)
+End Process
+
+Process called "dict_has" takes dict_ptr as Integer, key as Integer returns Integer:
+    Return Dictionary.contains(dict_ptr, key)
+End Process
+
+Process called "dict_remove" takes dict_ptr as Integer, key as Integer returns Integer:
+    Return Dictionary.remove(dict_ptr, key)
+End Process
+
+Process called "dict_size" takes dict_ptr as Integer returns Integer:
+    Return Dictionary.size(dict_ptr)
+End Process
+
+Process called "dict_keys" takes dict_ptr as Integer returns Integer:
+    Return Dictionary.keys(dict_ptr)
+End Process
+
+Process called "dict_values" takes dict_ptr as Integer returns Integer:
+    Return Dictionary.values(dict_ptr)
+End Process
+
+Process called "set_union" takes set1_ptr as Integer, set2_ptr as Integer returns Integer:
+    Return SetMod.union(set1_ptr, set2_ptr)
+End Process
+
+Process called "set_intersection" takes set1_ptr as Integer, set2_ptr as Integer returns Integer:
+    Return SetMod.intersection(set1_ptr, set2_ptr)
+End Process
+
+Process called "set_to_list" takes set_ptr as Integer returns Integer:
+    Return SetMod.to_list(set_ptr)
+End Process
+
+Note:
+============================================================================
+SECTION 2 - STRING NAME ALIASES AND MISSING PRIMITIVES
+============================================================================
+string_find: aliased to string_index_of.
+ascii_value_of: legacy name for "the byte at this index, or 0 on
+out-of-bounds" - implemented directly here since no primitive matches.
+:End Note
+
+Process called "string_find" takes haystack as Integer, needle as Integer returns Integer:
+    Return StringPrim.string_index_of(haystack, needle)
+End Process
+
+Process called "ascii_value_of" takes str as Integer, index as Integer returns Integer:
+    If str is equal to 0:
+        Return 0
+    End If
+    If index is less than 0:
+        Return 0
+    End If
+    Let str_len be StringCore.string_length(str)
+    If index is greater than or equal to str_len:
+        Return 0
+    End If
+    Return Memory.memory_get_byte(str, index)
+End Process
+
+Note:
+============================================================================
+SECTION 3 - MEMORY ALIASES AND INDEXED-POINTER HELPERS
+============================================================================
+The C runtime had an array-style API (memory_*_pointer_at_index) which
+operates on a base pointer interpreted as an array of pointers. The
+Runa primitives only expose byte-offset variants. These wrappers
+multiply the index by 8 (sizeof pointer on x86-64) and delegate.
+
+memory_pointer_to_string: in C this was a pointer cast. In Runa it is
+also a no-op cast because strings and pointers share the same Integer
+representation.
+
+memory_get_substring: allocates a new buffer of length+1 bytes, copies
+the requested range, and null-terminates. Distinct from string_substring
+which operates on string objects; this variant takes a raw byte pointer.
+:End Note
+
+Process called "memory_get_pointer_at_index" takes base as Integer, index as Integer returns Integer:
+    Let byte_offset be index multiplied by 8
+    Return Memory.memory_get_pointer(base, byte_offset)
+End Process
+
+Process called "memory_set_pointer_at_index" takes base as Integer, index as Integer, value as Integer returns Integer:
+    Let byte_offset be index multiplied by 8
+    Return Memory.memory_set_pointer(base, byte_offset, value)
+End Process
+
+Process called "memory_pointer_to_string" takes ptr as Integer returns Integer:
+    Return ptr
+End Process
+
+Process called "memory_get_substring" takes str as Integer, start as Integer, length as Integer returns Integer:
+    If str is equal to 0:
+        Return 0
+    End If
+    If length is less than 0:
+        Return 0
+    End If
+    Let buf_size be length plus 1
+    Let buf be Heap.allocate(buf_size)
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let copy_result be Memory.memory_copy(buf, str plus start, length)
+    Let zero_result be Memory.memory_set_byte(buf, length, 0)
+    Return buf
+End Process
+
+Note:
+============================================================================
+SECTION 4 - CHARACTER CLASSIFICATION HELPERS
+============================================================================
+ASCII-only classification used by lexers. Returns 1 if the input byte
+satisfies the predicate, 0 otherwise. Non-ASCII bytes (>= 128) are
+rejected by is_alpha and is_digit; is_whitespace accepts only the four
+canonical ASCII whitespace bytes (space, tab, newline, carriage return).
+:End Note
+
+Process called "is_alpha" takes ch as Integer returns Integer:
+    If ch is greater than or equal to 65:
+        If ch is less than or equal to 90:
+            Return 1
+        End If
+    End If
+    If ch is greater than or equal to 97:
+        If ch is less than or equal to 122:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_digit" takes ch as Integer returns Integer:
+    If ch is greater than or equal to 48:
+        If ch is less than or equal to 57:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Process called "is_whitespace" takes ch as Integer returns Integer:
+    If ch is equal to 32:
+        Return 1
+    End If
+    If ch is equal to 9:
+        Return 1
+    End If
+    If ch is equal to 10:
+        Return 1
+    End If
+    If ch is equal to 13:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Note:
+============================================================================
+SECTION 5 - FLOAT / INTEGER CONVERSION PRIMITIVES
+============================================================================
+These functions cross the integer/float boundary using SSE2 conversion
+instructions:
+  - cvtsi2sd  signed int64 -> binary64
+  - cvttsd2si binary64 -> signed int64 (truncated toward zero)
+
+The Runa convention is to represent IEEE-754 binary64 as an Integer
+bit-pattern. So each function takes/returns Integer values whose bits
+are reinterpreted at the SSE2 boundary.
+
+string_to_float parses a decimal string into an IEEE-754 binary64 bit
+pattern. The implementation handles:
+  - optional leading sign
+  - integer part (decimal digits)
+  - optional fractional part after '.'
+  - optional exponent suffix 'e' or 'E' followed by signed integer
+  - leading/trailing whitespace is NOT stripped (caller's responsibility)
+
+The parser uses double-precision arithmetic for the mantissa scaling
+and applies the exponent via repeated multiplication. Accuracy is
+within 1 ULP for inputs that fit within float64 dynamic range; very
+small or very large magnitudes (subnormal or near-overflow) may differ
+by 1-2 ULPs from a fully-correct Grisu/Ryu implementation, which is
+acceptable for compiler-internal use where these conversions come from
+source-level literals already bounded by float64's range.
+:End Note
+
+Process called "integer_to_float" takes n as Integer returns Integer:
+    Let result_bits be 0
+    Inline Assembly:
+        # n is at -8(%rbp), result_bits is at -16(%rbp).
+        movq -8(%rbp), %rax
+        cvtsi2sdq %rax, %xmm0
+        movq %xmm0, -16(%rbp)
+    End Assembly
+    Return result_bits
+End Process
+
+Process called "float_to_integer" takes float_bits as Integer returns Integer:
+    Let result be 0
+    Inline Assembly:
+        # float_bits is at -8(%rbp), result is at -16(%rbp).
+        movq -8(%rbp), %xmm0
+        cvttsd2siq %xmm0, %rax
+        movq %rax, -16(%rbp)
+    End Assembly
+    Return result
+End Process
+
+Note:
+float_multiply_bits is an internal helper used by string_to_float to
+scale the parsed mantissa by powers of ten. It takes two IEEE-754
+binary64 values as Integer bit-patterns and returns their product as
+an Integer bit-pattern. Implemented via SSE2 mulsd.
+:End Note
+
+Process called "float_multiply_bits" takes a_bits as Integer, b_bits as Integer returns Integer:
+    Let result_bits be 0
+    Inline Assembly:
+        # a_bits at -8(%rbp), b_bits at -16(%rbp), result_bits at -24(%rbp).
+        movq -8(%rbp), %xmm0
+        movq -16(%rbp), %xmm1
+        mulsd %xmm1, %xmm0
+        movq %xmm0, -24(%rbp)
+    End Assembly
+    Return result_bits
+End Process
+
+Process called "string_to_float" takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+
+    Let str_len be StringCore.string_length(s)
+    If str_len is equal to 0:
+        Return 0
+    End If
+
+    Let pos be 0
+    Let sign be 1
+    Let first_byte be Memory.memory_get_byte(s, 0)
+
+    If first_byte is equal to 45:
+        Set sign to -1
+        Set pos to 1
+    End If
+    If first_byte is equal to 43:
+        Set pos to 1
+    End If
+
+    Note: Accumulate integer part into an integer mantissa to preserve
+    Note: precision; convert to float at the end via integer_to_float.
+    Let integer_mantissa be 0
+    Let fraction_digits be 0
+    Let saw_dot be 0
+
+    While pos is less than str_len:
+        Let ch be Memory.memory_get_byte(s, pos)
+        If ch is equal to 46:
+            If saw_dot is not equal to 0:
+                Note: second dot - bail out and use what we have
+                Set pos to str_len
+            Otherwise:
+                Set saw_dot to 1
+                Set pos to pos plus 1
+            End If
+        Otherwise:
+            If ch is equal to 101:
+                Set pos to str_len
+            Otherwise:
+                If ch is equal to 69:
+                    Set pos to str_len
+                Otherwise:
+                    If ch is greater than or equal to 48:
+                        If ch is less than or equal to 57:
+                            Let digit be ch minus 48
+                            Set integer_mantissa to integer_mantissa multiplied by 10
+                            Set integer_mantissa to integer_mantissa plus digit
+                            If saw_dot is equal to 1:
+                                Set fraction_digits to fraction_digits plus 1
+                            End If
+                            Set pos to pos plus 1
+                        Otherwise:
+                            Note: non-digit, non-dot, non-exponent - stop
+                            Set pos to str_len
+                        End If
+                    Otherwise:
+                        Set pos to str_len
+                    End If
+                End If
+            End If
+        End If
+    End While
+
+    Note: Parse optional exponent. pos may have stopped at 'e' or 'E';
+    Note: rescan from the original buffer to find it.
+    Let exp_pos be 0
+    Let exp_value be 0
+    Let exp_sign be 1
+    Let exp_scan be 0
+    While exp_scan is less than str_len:
+        Let exp_ch be Memory.memory_get_byte(s, exp_scan)
+        If exp_ch is equal to 101:
+            Set exp_pos to exp_scan plus 1
+            Set exp_scan to str_len
+        Otherwise:
+            If exp_ch is equal to 69:
+                Set exp_pos to exp_scan plus 1
+                Set exp_scan to str_len
+            Otherwise:
+                Set exp_scan to exp_scan plus 1
+            End If
+        End If
+    End While
+
+    If exp_pos is not equal to 0:
+        If exp_pos is less than str_len:
+            Let exp_first be Memory.memory_get_byte(s, exp_pos)
+            If exp_first is equal to 45:
+                Set exp_sign to -1
+                Set exp_pos to exp_pos plus 1
+            End If
+            If exp_first is equal to 43:
+                Set exp_pos to exp_pos plus 1
+            End If
+        End If
+        While exp_pos is less than str_len:
+            Let ed be Memory.memory_get_byte(s, exp_pos)
+            If ed is greater than or equal to 48:
+                If ed is less than or equal to 57:
+                    Set exp_value to exp_value multiplied by 10
+                    Set exp_value to exp_value plus (ed minus 48)
+                    Set exp_pos to exp_pos plus 1
+                Otherwise:
+                    Set exp_pos to str_len
+                End If
+            Otherwise:
+                Set exp_pos to str_len
+            End If
+        End While
+    End If
+
+    Let total_exp be exp_value multiplied by exp_sign
+    Set total_exp to total_exp minus fraction_digits
+
+    Let mantissa_with_sign be integer_mantissa multiplied by sign
+    Let mantissa_float_bits be integer_to_float(mantissa_with_sign)
+
+    Note: Apply 10^total_exp via repeated multiplication by ten_bits.
+    Note: 10.0 in IEEE-754 binary64 is 0x4024000000000000.
+    Let ten_bits be 4621819117588971520
+    Let one_over_ten_bits be 4585833956506886266
+
+    Let scratch be Heap.allocate(40)
+    If scratch is equal to 0:
+        Return mantissa_float_bits
+    End If
+
+    Note: scratch slots: 0=mantissa, 1=multiplier, 2=result, 3=scratch_a, 4=scratch_b
+    Let result_offset be 16
+    Let mantissa_offset be 0
+    Let mult_offset be 8
+
+    Let _set_m be Memory.memory_set_integer(scratch, mantissa_offset, mantissa_float_bits)
+
+    If total_exp is greater than 0:
+        Let _set_t be Memory.memory_set_integer(scratch, mult_offset, ten_bits)
+    Otherwise:
+        Let _set_o be Memory.memory_set_integer(scratch, mult_offset, one_over_ten_bits)
+    End If
+
+    Let iter_count be total_exp
+    If iter_count is less than 0:
+        Set iter_count to 0 minus iter_count
+    End If
+
+    Let result_bits be mantissa_float_bits
+    Let i be 0
+    While i is less than iter_count:
+        Let mantissa_now be Memory.memory_get_integer(scratch, mantissa_offset)
+        Let mult_now be Memory.memory_get_integer(scratch, mult_offset)
+        Let product be float_multiply_bits(mantissa_now, mult_now)
+        Let _store be Memory.memory_set_integer(scratch, mantissa_offset, product)
+        Set result_bits to product
+        Set i to i plus 1
+    End While
+
+    Let _free be Heap.deallocate(scratch)
+    Return result_bits
+End Process
+
+Note:
+============================================================================
+SECTION 6 - FUNCTION-POINTER INVOCATION BRIDGE
+============================================================================
+call_function_pointer_2args invokes a C-ABI function pointer that takes
+two integer arguments and returns an integer. Used by hashtable.runa for
+caller-supplied hash / equality callbacks.
+
+The implementation uses inline assembly to set up the System V AMD64
+calling convention (rdi=arg1, rsi=arg2) and CALL through the function
+pointer. The compiler-generated prologue/epilogue handles stack
+alignment; the inline block only does the call.
+:End Note
+
+Process called "call_function_pointer_2args" takes fn as Integer, arg1 as Integer, arg2 as Integer returns Integer:
+    Let result be 0
+    Inline Assembly:
+        # fn at -8(%rbp), arg1 at -16(%rbp), arg2 at -24(%rbp),
+        # result at -32(%rbp). Load System V argument registers
+        # directly from the locals, then indirect-call the function
+        # pointer in r11 (a scratch register that the callee may
+        # clobber freely).
+        movq -16(%rbp), %rdi
+        movq -24(%rbp), %rsi
+        movq -8(%rbp), %r11
+        callq *%r11
+        movq %rax, -32(%rbp)
+    End Assembly
+    Return result
+End Process
+
+Note:
+============================================================================
+SECTION 7 - HEAP ALLOCATOR ALIASES (REALLOCATE FAMILY)
+============================================================================
+The C runtime exposed several spellings of the same operation:
+  - allocate(size)                       canonical
+  - deallocate(ptr)                      canonical
+  - reallocate(ptr, old_size, new_size)  grows-with-zeroing variant
+  - memory_realloc(ptr, new_size)        thin libc realloc
+  - memory_reallocate(ptr, new_size)     alias of memory_realloc
+  - memory_allocate(size)                alias of allocate
+
+The Runa primitive layer (compiler/frontend/primitives/memory/layout.runa)
+already exports allocate and deallocate under those exact names. The
+remaining names are re-exported from here.
+
+reallocate is the only one that does extra work: when growing a buffer
+it zero-fills the newly added bytes. This matches the legacy C
+behavior and is required by callers (containers.o uses it to grow
+arrays of pointers, which must read as nullptr in newly-allocated
+slots).
+:End Note
+
+Process called "memory_allocate" takes size as Integer returns Integer:
+    Return Heap.allocate(size)
+End Process
+
+Process called "memory_realloc" takes ptr as Integer, new_size as Integer returns Integer:
+    If ptr is equal to 0:
+        Return Heap.allocate(new_size)
+    End If
+    If new_size is equal to 0:
+        Let _free be Heap.deallocate(ptr)
+        Return 0
+    End If
+    Let new_ptr be Heap.allocate(new_size)
+    If new_ptr is equal to 0:
+        Return 0
+    End If
+    Note: We do not know the old size at this entry point, so we copy
+    Note: new_size bytes; the caller is responsible for ensuring the
+    Note: old allocation was at least new_size bytes if shrinking or
+    Note: the source range is valid if growing. For the growing-with-
+    Note: zero-fill variant, use reallocate(ptr, old_size, new_size).
+    Let _copy be Memory.memory_copy(new_ptr, ptr, new_size)
+    Let _free be Heap.deallocate(ptr)
+    Return new_ptr
+End Process
+
+Process called "memory_reallocate" takes ptr as Integer, new_size as Integer returns Integer:
+    Return memory_realloc(ptr, new_size)
+End Process
+
+Process called "reallocate" takes ptr as Integer, old_size as Integer, new_size as Integer returns Integer:
+    If ptr is equal to 0:
+        Let fresh be Heap.allocate(new_size)
+        If fresh is equal to 0:
+            Return 0
+        End If
+        Note: allocate guarantees zero-filled memory, so no extra
+        Note: zeroing is needed for the entire fresh buffer.
+        Return fresh
+    End If
+    If new_size is equal to 0:
+        Let _free be Heap.deallocate(ptr)
+        Return 0
+    End If
+    Let new_ptr be Heap.allocate(new_size)
+    If new_ptr is equal to 0:
+        Return 0
+    End If
+    Let bytes_to_copy be old_size
+    If new_size is less than old_size:
+        Set bytes_to_copy to new_size
+    End If
+    Let _copy be Memory.memory_copy(new_ptr, ptr, bytes_to_copy)
+    If new_size is greater than old_size:
+        Let zero_start be new_ptr plus old_size
+        Let zero_len be new_size minus old_size
+        Let i be 0
+        While i is less than zero_len:
+            Let _zb be Memory.memory_set_byte(zero_start, i, 0)
+            Set i to i plus 1
+        End While
+    End If
+    Let _release be Heap.deallocate(ptr)
+    Return new_ptr
+End Process

@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,464 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles syscall management and system call orchestration for the Runa runtime system interface.
+SYSCALL MANAGER — runtime-side wrapper
 
-This file performs the following tasks:
-- Process syscall management and system call orchestration
-- Handle syscall coordination and syscall management
-- Manage syscall synchronization and syscall state management
-- Process syscall error handling and syscall feedback
+This file is the RUNTIME's interface to the OS syscall layer. The actual
+syscall instruction is issued by compiler/frontend/primitives/assembly/syscall.runa
+(platform router) which delegates to per-platform implementations in
+compiler/frontend/primitives/platform/<plat>/syscall.runa. Those primitive
+files use Runa's `Inline Assembly:` feature to embed the syscall instruction
+directly.
 
-This file is essential because of the following reasons:
-- syscall_manager enables comprehensive syscall management and system call orchestration
-- Proper syscall management ensures correct system call coordination and user experience
-- syscall_manager support enables Runa compilation for syscall management workflows
+This file's job is THREE-FOLD:
 
-This file consists of the following functions/features/operation types:
-- Syscall management and system call orchestration
-- Syscall coordination and syscall management
-- Syscall synchronization and syscall state management
-- Syscall error handling and syscall feedback
+  1. EXPORT C-runtime-compatible entry points so user code and compiler-
+     generated code can call familiar names (system_call, exit_with_code).
+     This lets us drop in runtime.o and replace runtime.c without any
+     calling-code changes.
+
+  2. PROVIDE error translation. Linux returns negative errno values from
+     syscalls; this layer offers helpers to detect failure (errno_check)
+     and translate to typed Runa errors (errno_to_error_code).
+
+  3. PROVIDE convenience for retry-on-EINTR loops. Many syscalls are
+     interruptible by signals; the canonical pattern is to retry on EINTR.
+     This layer offers retry-wrapped variants for read/write/wait.
+
+Architecture
+------------
+
+  runtime/integration/system_interface/syscall_manager.runa  (this file)
+                            |
+                            v
+  compiler/frontend/primitives/assembly/syscall.runa         (platform router)
+                            |
+                            v
+  compiler/frontend/primitives/platform/<plat>/syscall.runa  (inline asm)
+                            |
+                            v
+                       syscall instruction
+
+What this file does NOT do
+--------------------------
+- Does NOT duplicate the syscall implementation. The platform-specific
+  primitives are the single source of truth for issuing syscalls.
+- Does NOT define syscall numbers, flags, or constants. Those live in the
+  platform-specific files.
+- Does NOT implement file/socket/process operations directly. Those are in:
+    runtime/io/filesystem/file_operations.runa
+    runtime/io/network/...
+    runtime/integration/system_interface/wrappers/process_manager.runa
+  This file provides the lowest-level dispatch and exit primitives only.
+
+Dependencies
+------------
+- compiler/frontend/primitives/assembly/syscall.runa
 :End Note
 
-Note: TODO - Implement syscall_manager functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+
+Note: ============================================================================
+Note: SECTION 1 — C-runtime-compatible entry points (the symbols runtime.o exports)
+Note: ============================================================================
+
+Note: system_call - generic syscall dispatcher.
+
+Note: This is the C-runtime-compatible entry point. Stage1's compiler-generated
+Note: code calls `system_call(num, a1, a2, a3, a4, a5, a6)` directly when it
+Note: needs raw kernel access (rare; most code uses higher-level wrappers).
+Note: Replaces the legacy `system_call` from v0.0.8.4.5.3.5/runtime/runtime.c
+Note: which was a C variadic stub forwarding to the syscall instruction.
+
+Note: The result is the kernel's return value: negative values indicate -errno,
+Note: non-negative values are success (fd, byte count, pid, etc. depending on
+Note: which syscall was invoked).
+Process called "system_call" takes num as Integer, a1 as Integer, a2 as Integer, a3 as Integer, a4 as Integer, a5 as Integer, a6 as Integer returns Integer:
+    Return syscall_6 from Syscall with num, a1, a2, a3, a4, a5, a6
+End Process
+
+Note: exit_with_code - terminate the process with the given exit code.
+
+Note: Uses SYS_EXIT_GROUP which terminates every thread in the process. The
+Note: per-thread SYS_EXIT alternative is wrong for libc-style exit() semantics;
+Note: we always want the entire process to exit. The platform router resolves
+Note: SYS_EXIT_GROUP to the correct syscall number for the current target
+Note: (e.g. 231 on Linux x86-64, different on Darwin/BSD/Windows/etc.) — never
+Note: hardcode the number here, the router is the single source of truth and
+Note: this code stays valid across all 18+ supported platform/architecture
+Note: combinations.
+
+Note: This function does not return. The caller's stack is abandoned; finalizers
+Note: registered via Runa's panic/recover machinery are NOT run here. For
+Note: graceful shutdown that runs finalizers, use the higher-level
+Note: services/error_handling/shutdown.runa entry point.
+Process called "exit_with_code" takes code as Integer returns Integer:
+    Let exit_group_num be proc SYS_EXIT_GROUP from Syscall
+    Let dummy be syscall_1 from Syscall with exit_group_num, code
+    Note: Defensive infinite loop in case the kernel returns (it should not).
+    Note: Ensures we never return to the caller even on a kernel/platform
+    Note: that doesn't honor exit_group for some reason.
+    While 1 is equal to 1:
+        Set dummy to syscall_1 from Syscall with exit_group_num, code
+    End While
+    Return 0
+End Process
+
+Note: exit - alias for exit_with_code, matching libc's exit().
+Process called "exit" takes code as Integer returns Integer:
+    Return exit_with_code(code)
+End Process
+
+Note: _exit - alias for exit_with_code, matching libc's _exit() (no atexit handlers).
+Note: Runa does not currently run atexit handlers from exit() either, so the
+Note: distinction is purely historical / for source compatibility.
+Process called "_exit" takes code as Integer returns Integer:
+    Return exit_with_code(code)
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 2 — Errno detection and translation
+Note: ============================================================================
+Note: Linux syscall convention: negative return values in [-4095, -1] indicate
+Note: errno = -result. Any value >= 0 is success. (4095 = MAX_ERRNO; values more
+Note: negative than -4095 are valid pointers/handles, not errors.)
+
+
+Note: errno_check - returns 1 if the result represents an error, 0 otherwise.
+Note: Use after any syscall to determine success/failure before consuming result.
+Process called "errno_check" takes result as Integer returns Integer:
+    If result is less than 0:
+        If result is greater than 0 minus 4096:
+            Return 1
+        End If
+    End If
+    Return 0
+End Process
+
+Note: errno_value - extract the positive errno from a failed syscall result.
+Note: Returns 0 if the result was not an error (caller should check first).
+Process called "errno_value" takes result as Integer returns Integer:
+    If errno_check(result) is equal to 1:
+        Return 0 minus result
+    End If
+    Return 0
+End Process
+
+Note: Named errno constants. These are the standard Linux errno values from
+Note: /usr/include/asm-generic/errno-base.h and errno.h. Provided as Process
+Note: returning Integer to be consistent with the platform/<plat>/syscall.runa
+Note: convention.
+
+Process called "EPERM" returns Integer:
+    Return 1
+End Process
+
+Process called "ENOENT" returns Integer:
+    Return 2
+End Process
+
+Process called "ESRCH" returns Integer:
+    Return 3
+End Process
+
+Process called "EINTR" returns Integer:
+    Return 4
+End Process
+
+Process called "EIO" returns Integer:
+    Return 5
+End Process
+
+Process called "ENXIO" returns Integer:
+    Return 6
+End Process
+
+Process called "E2BIG" returns Integer:
+    Return 7
+End Process
+
+Process called "ENOEXEC" returns Integer:
+    Return 8
+End Process
+
+Process called "EBADF" returns Integer:
+    Return 9
+End Process
+
+Process called "ECHILD" returns Integer:
+    Return 10
+End Process
+
+Process called "EAGAIN" returns Integer:
+    Return 11
+End Process
+
+Process called "EWOULDBLOCK" returns Integer:
+    Note: Linux: EWOULDBLOCK is an alias for EAGAIN.
+    Return 11
+End Process
+
+Process called "ENOMEM" returns Integer:
+    Return 12
+End Process
+
+Process called "EACCES" returns Integer:
+    Return 13
+End Process
+
+Process called "EFAULT" returns Integer:
+    Return 14
+End Process
+
+Process called "ENOTBLK" returns Integer:
+    Return 15
+End Process
+
+Process called "EBUSY" returns Integer:
+    Return 16
+End Process
+
+Process called "EEXIST" returns Integer:
+    Return 17
+End Process
+
+Process called "EXDEV" returns Integer:
+    Return 18
+End Process
+
+Process called "ENODEV" returns Integer:
+    Return 19
+End Process
+
+Process called "ENOTDIR" returns Integer:
+    Return 20
+End Process
+
+Process called "EISDIR" returns Integer:
+    Return 21
+End Process
+
+Process called "EINVAL" returns Integer:
+    Return 22
+End Process
+
+Process called "ENFILE" returns Integer:
+    Return 23
+End Process
+
+Process called "EMFILE" returns Integer:
+    Return 24
+End Process
+
+Process called "ENOTTY" returns Integer:
+    Return 25
+End Process
+
+Process called "ETXTBSY" returns Integer:
+    Return 26
+End Process
+
+Process called "EFBIG" returns Integer:
+    Return 27
+End Process
+
+Process called "ENOSPC" returns Integer:
+    Return 28
+End Process
+
+Process called "ESPIPE" returns Integer:
+    Return 29
+End Process
+
+Process called "EROFS" returns Integer:
+    Return 30
+End Process
+
+Process called "EMLINK" returns Integer:
+    Return 31
+End Process
+
+Process called "EPIPE" returns Integer:
+    Return 32
+End Process
+
+Process called "EDOM" returns Integer:
+    Return 33
+End Process
+
+Process called "ERANGE" returns Integer:
+    Return 34
+End Process
+
+Process called "EDEADLK" returns Integer:
+    Return 35
+End Process
+
+Process called "ENAMETOOLONG" returns Integer:
+    Return 36
+End Process
+
+Process called "ENOLCK" returns Integer:
+    Return 37
+End Process
+
+Process called "ENOSYS" returns Integer:
+    Return 38
+End Process
+
+Process called "ENOTEMPTY" returns Integer:
+    Return 39
+End Process
+
+Process called "ELOOP" returns Integer:
+    Return 40
+End Process
+
+Process called "ECONNREFUSED" returns Integer:
+    Return 111
+End Process
+
+Process called "ETIMEDOUT" returns Integer:
+    Return 110
+End Process
+
+Process called "EADDRINUSE" returns Integer:
+    Return 98
+End Process
+
+Process called "EADDRNOTAVAIL" returns Integer:
+    Return 99
+End Process
+
+Process called "ENETUNREACH" returns Integer:
+    Return 101
+End Process
+
+Process called "ECONNRESET" returns Integer:
+    Return 104
+End Process
+
+Process called "EALREADY" returns Integer:
+    Return 114
+End Process
+
+Process called "EINPROGRESS" returns Integer:
+    Return 115
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 3 — EINTR retry helpers
+Note: ============================================================================
+Note: Slow syscalls (read, write, wait, accept, connect, poll, etc.) can be
+Note: interrupted by signals, returning -EINTR. The canonical pattern is to
+Note: retry. These wrappers do that automatically. Use them in preference to
+Note: direct syscall calls when the syscall is interruptible and you don't
+Note: have signal-driven cancellation logic.
+
+Note: read_retry - read into buffer, retrying on EINTR.
+Note: Returns the same values as raw read: bytes read (>=0), or -errno (other than -EINTR).
+Process called "read_retry" takes fd as Integer, buf as Integer, count as Integer returns Integer:
+    While 1 is equal to 1:
+        Let result be syscall_read from Syscall with fd, buf, count
+        If result is greater than or equal to 0:
+            Return result
+        End If
+        If result is not equal to 0 minus 4:
+            Note: -EINTR = -4. Anything else, return the error.
+            Return result
+        End If
+    End While
+    Return 0
+End Process
+
+Note: write_retry - write from buffer, retrying on EINTR.
+Note: Note: a SHORT WRITE (result < count without an error) is not retried
+Note: here; callers should loop on partial writes themselves. EINTR with zero
+Note: bytes written IS retried because no progress was made.
+Process called "write_retry" takes fd as Integer, buf as Integer, count as Integer returns Integer:
+    While 1 is equal to 1:
+        Let result be syscall_write from Syscall with fd, buf, count
+        If result is greater than or equal to 0:
+            Return result
+        End If
+        If result is not equal to 0 minus 4:
+            Return result
+        End If
+    End While
+    Return 0
+End Process
+
+Note: write_full - write exactly count bytes, looping until all are written
+Note: or a non-EINTR error occurs. Returns count on success, or -errno on error.
+Process called "write_full" takes fd as Integer, buf as Integer, count as Integer returns Integer:
+    Let total be 0
+    While total is less than count:
+        Let remaining be count minus total
+        Let cur_buf be buf plus total
+        Let result be write_retry(fd, cur_buf, remaining)
+        If result is less than 0:
+            Return result
+        End If
+        If result is equal to 0:
+            Note: write() returning 0 on a regular fd is unusual but possible
+            Note: on some kernels for zero-length writes. Treat as completion
+            Note: to avoid infinite loop.
+            Return total
+        End If
+        Set total to total plus result
+    End While
+    Return total
+End Process
+
+Note: read_full - read exactly count bytes, looping until all are read or EOF
+Note: or a non-EINTR error. Returns count on full read, less-than-count if EOF
+Note: reached before count bytes, or -errno on error.
+Process called "read_full" takes fd as Integer, buf as Integer, count as Integer returns Integer:
+    Let total be 0
+    While total is less than count:
+        Let remaining be count minus total
+        Let cur_buf be buf plus total
+        Let result be read_retry(fd, cur_buf, remaining)
+        If result is less than 0:
+            Return result
+        End If
+        If result is equal to 0:
+            Note: EOF reached before getting full count. Return partial.
+            Return total
+        End If
+        Set total to total plus result
+    End While
+    Return total
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 4 — Helper / introspection
+Note: ============================================================================
+
+Note: syscall_is_supported - check whether the running kernel supports the given
+Note: syscall number. Used by feature-detection paths in higher-level wrappers
+Note: (e.g. preferring statx() over fstat() when available).
+
+Note: Implementation: invoke the syscall with invalid arguments; if the kernel
+Note: returns -ENOSYS (-38) the syscall is not implemented. Any other error (or
+Note: success) indicates the syscall exists. This is the standard libc pattern.
+
+Note: WARNING: this MAY have side effects depending on the syscall — only use
+Note: for syscalls that are safe to call with invalid args (which is most of
+Note: them, since invalid-arg detection happens before any state change).
+Process called "syscall_is_supported" takes num as Integer returns Integer:
+    Let result be syscall_0 from Syscall with num
+    Let errno be errno_value(result)
+    If errno is equal to ENOSYS():
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: End of syscall_manager.runa
+Note: ============================================================================

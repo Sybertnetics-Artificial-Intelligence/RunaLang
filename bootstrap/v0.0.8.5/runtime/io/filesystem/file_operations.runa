@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,610 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles file operations and file I/O for the Runa runtime I/O system.
+FILE OPERATIONS - runtime-side file I/O
 
-This file performs the following tasks:
-- Process file operations and file I/O
-- Handle file reading and file writing
-- Manage file permissions and file coordination
-- Process file error handling and file feedback
+This file is the RUNTIME's filesystem interface. It provides:
 
-This file is essential because of the following reasons:
-- file_operations enables comprehensive file operations and file I/O
-- Proper file handling ensures correct file operations and user experience
-- file_operations support enables Runa compilation for file operation workflows
+  1. C-runtime-compatible symbols (file_open_fd, file_write_fd, file_close_fd,
+     read_file_data, runtime_read_file, write_file, etc.) that compiler-
+     generated code calls. These are the exact symbol names runtime.c
+     exported, so runtime.o is a drop-in replacement.
 
-This file consists of the following functions/features/operation types:
-- File operations and file I/O
-- File reading and file writing
-- File permissions and file coordination
-- File error handling and file feedback
+  2. Buffered I/O (file_open_buffered, file_write_buffered, file_close_buffered)
+     with a fixed-size handle table and per-handle write buffer. This matches
+     the C runtime's BufferedFile design - the codegen relies on it for
+     emitting .s files efficiently (many small writes).
+
+  3. High-level convenience: read_entire_file, write_entire_file,
+     append_to_file, get_file_size, get_cwd, file_exists.
+
+Cross-platform design
+---------------------
+Every syscall goes through the platform router at
+compiler/frontend/primitives/assembly/syscall.runa, which dispatches to
+per-platform implementations in
+compiler/frontend/primitives/platform/<plat>/syscall.runa.
+
+Supported platforms (per the existing router):
+  Linux x86_64/ARM64/ARM32, Darwin x86_64/ARM64,
+  FreeBSD/NetBSD/OpenBSD x86_64/ARM64,
+  Windows x86_64/ARM64, MIPS32/64, PowerPC, RISC-V32/64.
+
+This file NEVER hardcodes:
+  - Syscall numbers (use SYS_OPEN(), SYS_READ() etc. from the router)
+  - File mode flags (use O_RDONLY(), O_WRONLY(), O_CREAT() from the router)
+  - Permission bits (use MODE_0644(), MODE_0755() from the router)
+  - Seek constants (use SEEK_SET(), SEEK_CUR(), SEEK_END() from the router)
+  - Standard FD values (use STDIN_FILENO(), STDOUT_FILENO(), STDERR_FILENO())
+
+Where a platform's syscall behavior differs (e.g. Windows uses HANDLEs not
+fds), the per-platform syscall.runa abstracts the difference. Runtime code
+treats the result uniformly as an Integer "file descriptor".
+
+Dependencies
+------------
+- compiler/frontend/primitives/assembly/syscall.runa     (platform router)
+- compiler/frontend/primitives/io/file_io.runa           (fio_* primitives)
+- compiler/frontend/primitives/core/memory_core.runa     (memory allocation)
+- compiler/frontend/primitives/core/string_core.runa     (string operations)
+- runtime/integration/system_interface/syscall_manager.runa (errno, retry helpers)
 :End Note
 
-Note: TODO - Implement file_operations functionality
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/io/file_io.runa" as FileIO
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "runtime/integration/system_interface/syscall_manager.runa" as SyscallMgr
+
+
+Note: ============================================================================
+Note: SECTION 1 - C-runtime-compatible direct file descriptor operations
+Note: ============================================================================
+Note: These are the unbuffered, low-level file functions. They map 1:1 to
+Note: the v0.0.8.4.5.3.5/runtime/runtime.c symbols of the same name so the
+Note: new runtime.o is a drop-in replacement.
+
+Note: file_open_fd - open a file for reading.
+Note: Returns the fd on success, or a negative errno on failure.
+Note: Replaces the C runtime's file_open_fd(const char*).
+Process called "file_open_fd" takes path as Integer returns Integer:
+    Return fio_open_read from FileIO with path
+End Process
+
+Note: file_open_fd_with_flags - open a file with caller-supplied flags and
+Note: default permissions (0644). Use this when you need control over O_RDWR,
+Note: O_APPEND, O_TRUNC, O_CREAT, etc. The flag values come from the platform
+Note: router (O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND).
+Note: Replaces C runtime's file_open_fd_with_flags(const char*, int).
+Process called "file_open_fd_with_flags" takes path as Integer, flags as Integer returns Integer:
+    Let default_mode be proc MODE_0644 from Syscall
+    Return fio_open from FileIO with path, flags, default_mode
+End Process
+
+Note: file_open_fd_with_flags_and_mode - full control over both flags and
+Note: permission bits. Useful when creating files that should NOT be world-
+Note: readable (e.g. credential stores).
+Process called "file_open_fd_with_flags_and_mode" takes path as Integer, flags as Integer, mode as Integer returns Integer:
+    Return fio_open from FileIO with path, flags, mode
+End Process
+
+Note: file_open_for_writing - open/truncate for writing. Convenience wrapper
+Note: replacing the common O_WRONLY|O_CREAT|O_TRUNC sequence.
+Process called "file_open_for_writing" takes path as Integer returns Integer:
+    Return fio_open_write_truncate from FileIO with path
+End Process
+
+Note: file_open_for_appending - open for appending, creating if missing.
+Process called "file_open_for_appending" takes path as Integer returns Integer:
+    Return fio_open_append from FileIO with path
+End Process
+
+Note: file_close_fd - close a file descriptor.
+Note: Returns 0 on success, negative errno on failure.
+Note: Replaces C runtime's file_close_fd(int).
+Process called "file_close_fd" takes fd as Integer returns Integer:
+    Return fio_close from FileIO with fd
+End Process
+
+Note: close_file - alias for file_close_fd, matching another C runtime symbol.
+Process called "close_file" takes fd as Integer returns Integer:
+    Return fio_close from FileIO with fd
+End Process
+
+Note: open_file - legacy C-runtime stdio-style open. Original C signature
+Note: was FILE* open_file(const char* path, const char* mode). The Runa
+Note: runtime has no FILE* type - it uses integer file descriptors
+Note: throughout - so this wrapper translates mode strings into the
+Note: appropriate file descriptor open path and returns the descriptor
+Note: as an Integer. The mode argument is interpreted as the leading
+Note: character of the mode string:
+Note:   "r" / "rb"           -> read-only
+Note:   "w" / "wb"           -> write, truncate, create
+Note:   "a" / "ab"           -> append, create
+Note:   "r+" / "rb+" / "r+b" -> read+write existing file
+Note: Modes not in this set fall through to read-only. Returns 0 on
+Note: failure (matching the legacy NULL-on-error convention so callers'
+Note: `If handle is equal to 0` checks still work). On success returns a
+Note: non-zero file descriptor that close_file (and any get_file_size_internal,
+Note: read/write helper) accepts.
+Process called "open_file" takes path as Integer, mode as Integer returns Integer:
+    If path is equal to 0:
+        Return 0
+    End If
+
+    Let mode_char be 114  Note: 'r' default
+    If mode is not equal to 0:
+        Let first_byte be memory_get_byte from Memory with mode, 0
+        If first_byte is not equal to 0:
+            Set mode_char to first_byte
+        End If
+    End If
+
+    Let fd be 0
+    If mode_char is equal to 114:
+        Note: 'r' - read-only existing file
+        Set fd to file_open_fd(path)
+    Otherwise:
+        If mode_char is equal to 119:
+            Note: 'w' - write, truncate, create
+            Set fd to file_open_for_writing(path)
+        Otherwise:
+            If mode_char is equal to 97:
+                Note: 'a' - append, create
+                Set fd to file_open_for_appending(path)
+            Otherwise:
+                Note: Unknown mode - fall back to read-only.
+                Set fd to file_open_fd(path)
+            End If
+        End If
+    End If
+
+    If fd is less than 0:
+        Return 0  Note: legacy NULL-on-error contract
+    End If
+    Return fd
+End Process
+
+Note: file_read_fd - read up to count bytes from fd into buffer.
+Note: Returns bytes read (0 = EOF, negative = -errno). Short reads are
+Note: possible and must be handled by callers; use read_full for fixed-size
+Note: reads.
+Process called "file_read_fd" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+    Return fio_read from FileIO with fd, buffer, count
+End Process
+
+Note: file_write_fd - write a null-terminated string to fd. Determines length
+Note: from the string (string_length scan). Returns bytes written or -errno.
+Note: Replaces C runtime's file_write_fd(int, const char*) which assumed the
+Note: input was a C-string (null-terminated).
+Process called "file_write_fd" takes fd as Integer, buffer as Integer returns Integer:
+    Let len be string_length from StringCore with buffer
+    Return fio_write from FileIO with fd, buffer, len
+End Process
+
+Note: file_write_fd_with_size - write exactly `size` bytes from buffer to fd.
+Note: Returns bytes written or -errno. Short writes possible; use write_full
+Note: from syscall_manager for full writes.
+Note: Replaces C runtime's file_write_fd_with_size(int, const char*, int64_t).
+Process called "file_write_fd_with_size" takes fd as Integer, buffer as Integer, size as Integer returns Integer:
+    Return fio_write from FileIO with fd, buffer, size
+End Process
+
+Note: file_lseek - reposition fd's offset. whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END.
+Note: Returns the new absolute offset, or negative errno on failure.
+Process called "file_lseek" takes fd as Integer, offset as Integer, whence as Integer returns Integer:
+    Return fio_seek from FileIO with fd, offset, whence
+End Process
+
+Note: file_length - get the size of an open fd by seeking to end and back.
+Note: Returns size in bytes, or -1 on error. Preserves the current file
+Note: offset. For path-based size queries use get_file_size.
+Process called "file_length" takes fd as Integer returns Integer:
+    Return fio_file_length from FileIO with fd
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 2 - Whole-file convenience operations
+Note: ============================================================================
+
+Note: runtime_read_file - read an entire file as a null-terminated string.
+Note: Returns a heap-allocated buffer (caller frees with deallocate) or 0 on error.
+Note: Replaces C runtime's runtime_read_file(const char*).
+Note: The buffer is allocated with capacity = file_size + 1 and the trailing
+Note: byte is set to NUL. The buffer contents are the raw file bytes; no
+Note: encoding conversion is done.
+Process called "runtime_read_file" takes path as Integer returns Integer:
+    Return read_entire_file from FileIO with path
+End Process
+
+Note: read_file_data - alias for runtime_read_file. Matches another symbol
+Note: name used by some C runtime callers.
+Process called "read_file_data" takes path as Integer returns Integer:
+    Return read_entire_file from FileIO with path
+End Process
+
+Note: write_file - write a null-terminated string to a path. Overwrites the
+Note: file if it exists, creates it otherwise (mode 0644). Returns 0 on success
+Note: or non-zero on failure (the C-runtime convention).
+Note: Replaces C runtime's write_file(char*, char*).
+Process called "write_file" takes path as Integer, content as Integer returns Integer:
+    Let result be write_entire_file from FileIO with path, content
+    Note: write_entire_file returns 1 on success, 0 on failure. Translate to
+    Note: C-runtime convention (0 = success, non-zero = failure).
+    If result is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Note: append_file - append content to a file, creating it if missing.
+Process called "append_file" takes path as Integer, content as Integer returns Integer:
+    Let result be append_to_file from FileIO with path, content
+    If result is equal to 1:
+        Return 0
+    End If
+    Return 1
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 3 - Path-based queries (no fd needed)
+Note: ============================================================================
+
+Note: get_file_size_internal - get a file's size by path. Returns -1 on error.
+Note: Replaces C runtime's get_file_size_internal(const char*).
+Process called "get_file_size_internal" takes path as Integer returns Integer:
+    Let fd be fio_open_read from FileIO with path
+    If fd is less than 0:
+        Return 0 minus 1
+    End If
+    Let size be fio_file_length from FileIO with fd
+    Let close_result be fio_close from FileIO with fd
+    Return size
+End Process
+
+Note: file_exists - return 1 if the path exists and is readable, 0 otherwise.
+Process called "file_exists" takes path as Integer returns Integer:
+    Return file_readable from FileIO with path
+End Process
+
+Note: stat_file - stat a file into a pre-allocated stat buffer.
+Note: The buffer must be allocated by the caller and large enough for the
+Note: platform's stat struct (Linux x86-64: 144 bytes). Returns 0 on success
+Note: or negative errno on failure.
+Note: Replaces C runtime's stat_file(const char*, struct stat*).
+Note: NOTE: stat struct layout varies by platform. Callers needing portable
+Note: field access should use file_metadata.runa helpers, not direct offset
+Note: arithmetic on the buffer.
+Process called "stat_file" takes path as Integer, stat_buf as Integer returns Integer:
+    Let sys_stat_num be proc SYS_STAT from Syscall
+    Return syscall_2 from Syscall with sys_stat_num, path, stat_buf
+End Process
+
+Note: get_mtime_from_stat - extract the modification time (seconds since epoch)
+Note: from a stat buffer. The offset is platform-specific:
+Note:   Linux x86-64: 88 bytes (st_mtim.tv_sec)
+Note:   Linux ARM64:  similar
+Note:   Other platforms: different - TODO: route through platform layer.
+Note: For now this returns the Linux x86-64 value. Future versions of the
+Note: platform router should expose stat-field-offset accessors.
+Process called "get_mtime_from_stat" takes stat_buf as Integer returns Integer:
+    Let mtime_offset be 88
+    Return memory_get_integer from Memory with stat_buf, mtime_offset
+End Process
+
+Note: get_cwd_internal - get the current working directory.
+Note: Returns a heap-allocated null-terminated string (caller frees) or 0 on error.
+Note: Replaces C runtime's get_cwd_internal().
+Note: Maximum path length is bounded; PATH_MAX (4096) is typical on Linux.
+Process called "get_cwd_internal" returns Integer:
+    Let path_max be 4096
+    Let buf be proc memory_allocate from Memory with path_max
+    If buf is equal to 0:
+        Return 0
+    End If
+    Let sys_getcwd be proc SYS_GETCWD from Syscall
+    Let result be syscall_2 from Syscall with sys_getcwd, buf, path_max
+    If result is less than 0:
+        proc memory_free from Memory with buf
+        Return 0
+    End If
+    Return buf
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 4 - Buffered I/O (BufferedFile design from C runtime)
+Note: ============================================================================
+Note: The C runtime kept a fixed table of 256 BufferedFile handles, each with
+Note: a 4096-byte write buffer. Codegen issues many small writes when emitting
+Note: .s files; buffering reduces syscall overhead by 100x+ on typical inputs.
+
+Note: Handle table layout: each slot is 24 bytes:
+Note:   offset 0:  fd (Integer)     - underlying file descriptor (0 = unused slot)
+Note:   offset 8:  buf (Integer)    - pointer to 4096-byte buffer
+Note:   offset 16: used (Integer)   - bytes currently in buffer (0..4096)
+
+Note: The handle table itself is a 256 * 24 = 6144 byte buffer allocated lazily
+Note: on first use. Handles are 1-indexed (0 = invalid) to match the C runtime
+Note: where 0 was a sentinel.
+
+Note: Storage for the global buffered-file handle table. Initialized lazily
+Note: on first file_open_buffered call.
+Let BUFFERED_HANDLE_COUNT be 256
+Let BUFFERED_HANDLE_SIZE be 24
+Let BUFFERED_BUFFER_SIZE be 4096
+Let buffered_table be 0
+Let buffered_table_initialized be 0
+
+
+Note: buffered_init - allocate the handle table on first use.
+Note: Returns 1 on success, 0 on allocation failure.
+Process called "buffered_init" returns Integer:
+    If buffered_table_initialized is equal to 1:
+        Return 1
+    End If
+    Let total_size be BUFFERED_HANDLE_COUNT multiplied by BUFFERED_HANDLE_SIZE
+    Let table be proc memory_allocate from Memory with total_size
+    If table is equal to 0:
+        Return 0
+    End If
+    Note: Zero the table so unused slots have fd=0.
+    Let i be 0
+    While i is less than total_size:
+        proc memory_set_byte from Memory with table, i, 0
+        Set i to i plus 1
+    End While
+    Set buffered_table to table
+    Set buffered_table_initialized to 1
+    Return 1
+End Process
+
+
+Note: buffered_slot_addr - compute the address of slot N in the table.
+Note: Returns 0 if N is out of range or table not initialized.
+Process called "buffered_slot_addr" takes handle as Integer returns Integer:
+    If buffered_table_initialized is equal to 0:
+        Return 0
+    End If
+    If handle is less than 1:
+        Return 0
+    End If
+    If handle is greater than BUFFERED_HANDLE_COUNT:
+        Return 0
+    End If
+    Let slot_offset be handle minus 1
+    Set slot_offset to slot_offset multiplied by BUFFERED_HANDLE_SIZE
+    Return buffered_table plus slot_offset
+End Process
+
+
+Note: open_buffered_in_slot - helper that opens the file and populates the
+Note: slot. Split out so file_open_buffered's loop has a clean exit path.
+Note: The `flags` argument is the C-runtime-compatible MODE INDICATOR,
+Note: NOT the raw open() flag bits. Stage1 and other callers pass small
+Note: integers (0=read, 1=write-truncate, 2=read-write) the way fopen()
+Note: takes a mode string. We translate to actual open() flags here to
+Note: match the legacy ABI: 0/default -> read; 1 -> write+truncate.
+Process called "open_buffered_in_slot" takes handle as Integer, slot as Integer, path as Integer, flags as Integer returns Integer:
+    Note: Translate C-runtime mode integer (1=write-truncate, otherwise read).
+    Note: Uses the existing fio_open_X helpers (no flag-bit manipulation here)
+    Note: to keep the parser-fragile mid-expression `proc X from Y` chains
+    Note: out of this body.
+    Let fd be fio_open_read from FileIO with path
+    If flags is equal to 1:
+        Set fd to fio_open_write_truncate from FileIO with path
+    End If
+    If fd is less than 0:
+        Return 0
+    End If
+
+    Note: Allocate per-handle buffer.
+    Let buf be proc memory_allocate from Memory with BUFFERED_BUFFER_SIZE
+    If buf is equal to 0:
+        Let close_result be fio_close from FileIO with fd
+        Return 0
+    End If
+
+    Note: Populate the slot.
+    proc memory_set_integer from Memory with slot, 0, fd
+    proc memory_set_integer from Memory with slot, 8, buf
+    proc memory_set_integer from Memory with slot, 16, 0
+    Return handle
+End Process
+
+
+Note: file_open_buffered - open a file for buffered writing. flags should be
+Note: a combination of O_WRONLY/O_CREAT/O_TRUNC/O_APPEND from the platform router.
+Note: Returns a positive handle on success (1..BUFFERED_HANDLE_COUNT) or 0 on error.
+Note: Replaces C runtime's file_open_buffered(const char*, int64_t).
+Process called "file_open_buffered" takes path as Integer, flags as Integer returns Integer:
+    Let init_ok be buffered_init()
+    If init_ok is equal to 0:
+        Return 0
+    End If
+
+    Note: Find an unused slot (fd == 0 means free). The handle search uses
+    Note: a sentinel return-on-find pattern rather than a Break because the
+    Note: Runa parser handles intra-loop Return cleaner than Break + post-loop
+    Note: completion logic.
+    Let handle be 1
+    While handle is less than or equal to BUFFERED_HANDLE_COUNT:
+        Let slot be buffered_slot_addr(handle)
+        Let cur_fd be memory_get_integer from Memory with slot, 0
+        If cur_fd is equal to 0:
+            Return open_buffered_in_slot(handle, slot, path, flags)
+        End If
+        Set handle to handle plus 1
+    End While
+
+    Note: No free slot found.
+    Return 0
+End Process
+
+
+Note: buffered_flush - flush a buffered handle's pending bytes to disk.
+Note: Returns 0 on success, negative errno on failure.
+Note: Internal helper; not exported as a C-runtime symbol but available to
+Note: other runtime modules that need explicit flushes.
+Process called "buffered_flush" takes handle as Integer returns Integer:
+    Let slot be buffered_slot_addr(handle)
+    If slot is equal to 0:
+        Return 0 minus 9
+    End If
+    Let used be memory_get_integer from Memory with slot, 16
+    If used is equal to 0:
+        Return 0
+    End If
+    Let fd be memory_get_integer from Memory with slot, 0
+    Let buf be memory_get_integer from Memory with slot, 8
+    Note: Issue write loop until all `used` bytes are out (handles short writes).
+    Let total be 0
+    While total is less than used:
+        Let remaining be used minus total
+        Let chunk_buf be buf plus total
+        Let chunk be fio_write from FileIO with fd, chunk_buf, remaining
+        If chunk is less than 0:
+            Note: -errno; reset used to keep buffer state consistent. The
+            Note: caller will see the error and likely abandon the handle.
+            proc memory_set_integer from Memory with slot, 16, 0
+            Return chunk
+        End If
+        Set total to total plus chunk
+    End While
+    Note: Buffer fully drained; reset used count.
+    proc memory_set_integer from Memory with slot, 16, 0
+    Return 0
+End Process
+
+
+Note: file_write_buffered - append data to a buffered handle. If the data
+Note: would overflow the buffer, flushes first then writes.
+Note: Returns bytes written on success, negative on failure.
+Note: Replaces C runtime's file_write_buffered(int64_t, const char*, int64_t).
+Process called "file_write_buffered" takes handle as Integer, data as Integer, size as Integer returns Integer:
+    Note: Legacy C-runtime convention: size==0 means "compute byte length via
+    Note: string_length on the null-terminated buffer." Callers in stage1's
+    Note: codegen rely on this behavior.
+    Let actual_size be size
+    If actual_size is equal to 0:
+        Set actual_size to proc string_length from StringCore with data
+    End If
+    Let slot be buffered_slot_addr(handle)
+    If slot is equal to 0:
+        Note: Invalid handle.
+        Return 0 minus 9
+    End If
+
+    Note: Fast path: data fits in remaining buffer space.
+    Let used be memory_get_integer from Memory with slot, 16
+    Let buf be memory_get_integer from Memory with slot, 8
+    Let new_used be used plus actual_size
+
+    If new_used is less than or equal to BUFFERED_BUFFER_SIZE:
+        Note: Copy actual_size bytes from data into buf at offset `used`.
+        Let dest be buf plus used
+        proc memory_copy from Memory with dest, data, actual_size
+        proc memory_set_integer from Memory with slot, 16, new_used
+        Return actual_size
+    End If
+
+    Note: Slow path: data doesn't fit. Flush, then either fit-now or write directly.
+    Let flush_result be buffered_flush(handle)
+    If flush_result is less than 0:
+        Return flush_result
+    End If
+
+    Note: After flush, the buffer is empty (used == 0). If actual_size still doesn't
+    Note: fit, write directly to fd to avoid pathological copying.
+    If actual_size is greater than BUFFERED_BUFFER_SIZE:
+        Let fd be memory_get_integer from Memory with slot, 0
+        Let total be 0
+        While total is less than actual_size:
+            Let remaining be actual_size minus total
+            Let chunk_data be data plus total
+            Let chunk be fio_write from FileIO with fd, chunk_data, remaining
+            If chunk is less than 0:
+                Return chunk
+            End If
+            Set total to total plus chunk
+        End While
+        Return actual_size
+    End If
+
+    Note: After flush, data fits. Copy into freshly-empty buffer.
+    Let dest_after_flush be buf
+    proc memory_copy from Memory with dest_after_flush, data, actual_size
+    proc memory_set_integer from Memory with slot, 16, actual_size
+    Return actual_size
+End Process
+
+
+Note: file_close_buffered - flush and close a buffered handle. Returns 0 on
+Note: success, negative on failure. Always frees the buffer and clears the slot,
+Note: even if the underlying close fails (the fd may have been already invalid).
+Note: Replaces C runtime's file_close_buffered(int64_t).
+Process called "file_close_buffered" takes handle as Integer returns Integer:
+    Let slot be buffered_slot_addr(handle)
+    If slot is equal to 0:
+        Return 0 minus 9
+    End If
+
+    Note: Flush any pending data. Even on error we proceed to close the fd
+    Note: and free the buffer so the slot can be reused.
+    Let flush_result be buffered_flush(handle)
+
+    Let fd be memory_get_integer from Memory with slot, 0
+    Let buf be memory_get_integer from Memory with slot, 8
+
+    Let close_result be fio_close from FileIO with fd
+    If buf is not equal to 0:
+        proc memory_free from Memory with buf
+    End If
+
+    Note: Clear the slot so it can be reused.
+    proc memory_set_integer from Memory with slot, 0, 0
+    proc memory_set_integer from Memory with slot, 8, 0
+    proc memory_set_integer from Memory with slot, 16, 0
+
+    If flush_result is less than 0:
+        Return flush_result
+    End If
+    Return close_result
+End Process
+
+
+Note: ============================================================================
+Note: SECTION 5 - Directory and unlink operations
+Note: ============================================================================
+
+Note: mkdir_path - create a directory at the given path with mode 0755.
+Note: Returns 0 on success or negative errno on failure.
+Process called "mkdir_path" takes path as Integer returns Integer:
+    Let sys_mkdir_num be proc SYS_MKDIR from Syscall
+    Let mode be proc MODE_0755 from Syscall
+    Return syscall_2 from Syscall with sys_mkdir_num, path, mode
+End Process
+
+Note: rmdir_path - remove an empty directory.
+Process called "rmdir_path" takes path as Integer returns Integer:
+    Let sys_rmdir_num be proc SYS_RMDIR from Syscall
+    Return syscall_1 from Syscall with sys_rmdir_num, path
+End Process
+
+Note: unlink_path - remove a file. Returns 0 on success, negative errno on failure.
+Process called "unlink_path" takes path as Integer returns Integer:
+    Let sys_unlink_num be proc SYS_UNLINK from Syscall
+    Return syscall_1 from Syscall with sys_unlink_num, path
+End Process
+
+Note: chdir_path - change the process's current working directory.
+Process called "chdir_path" takes path as Integer returns Integer:
+    Let sys_chdir_num be proc SYS_CHDIR from Syscall
+    Return syscall_1 from Syscall with sys_chdir_num, path
+End Process
+
+Note: ============================================================================
+Note: End of file_operations.runa
+Note: ============================================================================

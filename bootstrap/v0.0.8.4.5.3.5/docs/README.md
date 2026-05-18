@@ -104,7 +104,7 @@ Linker (executable binary)
 - **Lexer** (`lexer.runa`) - Tokenizes source code, handles multi-word keywords
 - **Parser** (`parser.runa`) - Builds Abstract Syntax Tree (AST)
 - **Code Generator** (`codegen.runa`) - Generates x86-64 assembly
-- **Runtime** (`runtime.c`) - Minimal C runtime for syscalls (being replaced)
+- **Runtime** (`runtime.o`) - Pure-Runa runtime (compiled from `v0.0.8.5/runtime/` and `v0.0.8.5/compiler/frontend/primitives/`). Zero C source — the legacy C runtime is fully escaped as of v0.0.8.5.
 
 **Collection Runtime:**
 - **Lists** (`runtime_list.runa`) - Dynamic arrays with resize support
@@ -188,7 +188,7 @@ v0.0.8.4/
 │   └── string_utils.runa       # String operations
 │
 ├── runtime/
-│   └── runtime.c               # C runtime (syscalls, memory, collections)
+│   └── runtime.o               # Pure-Runa runtime (built from v0.0.8.5 sources, zero C)
 │
 ├── build/
 │   └── runac                   # Compiled Runa compiler (executable)
@@ -297,7 +297,7 @@ v0.0.8.4/
 
 # Assemble and link
 as /tmp/program.s -o /tmp/program.o
-gcc /tmp/program.o runtime/runtime.c -o program -lm
+gcc /tmp/program.o runtime/runtime.o -Wl,--allow-multiple-definition -o program -lm
 
 # Run
 ./program
