@@ -1408,32 +1408,81 @@ End Process
 
 Process called "memory_safe_move" takes dest as Integer, src as Integer, size as Integer returns Integer:
     @Reasoning:
-        Historic API for "move with overlap support". Today the
-        underlying MemoryCore.memory_copy is a forward bytewise copy,
-        which is correct only when dest <= src OR src+size <= dest. This
-        function preserves the API entry point with the same range checks
-        as memory_safe_copy and dispatches to the same underlying copy.
-        Genuine overlap-safe move (memmove-style) requires a backward
-        loop when dest > src AND src+size > dest, which is not yet
-        implemented in MemoryCore. Callers needing true overlap safety
-        must avoid overlapping regions until that primitive is added.
+        Overlap-safe byte move with full memmove semantics. Unlike
+        memory_safe_copy (which always copies forward and is only correct
+        for non-overlapping regions or for the dest <= src case), this
+        entrypoint guarantees the destination region holds the original
+        contents of the source region after the call, regardless of how
+        the two regions overlap. The direction of the underlying byte
+        copy is chosen at runtime from the relative position of dest and
+        src: forward when there is no forward-overlap hazard, backward
+        when copying forward would overwrite source bytes before they
+        are read. This is the standard C memmove contract, restated in
+        terms of Runa primitives.
     @End Reasoning
 
     @Implementation:
         Steps:
-            1. memory_check_pointer_range on dest.
-            2. memory_check_pointer_range on src.
-            3. proc memory_copy from MemoryCore with dest, src, size.
-            4. Return 1.
+            1. memory_check_pointer_range on dest. Reject malformed
+               (null, non-positive size, address-space wraparound).
+            2. memory_check_pointer_range on src. Same.
+            3. Same-pointer fast path: if dest equals src, the move is a
+               no-op. Return 1 without invoking any byte primitive.
+            4. Compute src_end = src + size and choose direction:
+                   - Forward copy is safe when dest <= src OR
+                     src_end <= dest. The first condition covers either
+                     no overlap (dest+size <= src so dest < src) or the
+                     backward-overlap case (dest < src AND dest+size >
+                     src), in which forward iteration reads each source
+                     byte BEFORE the destination write reaches it. The
+                     second condition covers the no-overlap case where
+                     dest is past the end of the source region.
+                   - Forward copy is UNSAFE when dest > src AND
+                     src_end > dest. This is the forward-overlap case:
+                     a forward loop would write into the source region
+                     before it has finished reading from it. In that
+                     case we dispatch to memory_copy_backward, which
+                     iterates from index size-1 down to 0 so each
+                     source byte is read before its slot is overwritten.
+            5. Return 1 on success.
 
-        Bug fix: rewrote both same-file range-check calls from `from
-        MemoryCore` to the canonical no-module form.
+        memory_copy_backward lives in compiler/frontend/primitives/core/
+        memory_core.runa alongside memory_copy. Both primitives accept
+        identical (dest, src, length) parameters; the only difference is
+        the iteration direction.
+
+        Bug fix history: this Process previously delegated unconditionally
+        to MemoryCore.memory_copy and documented the resulting failure
+        mode (forward-overlap regions would silently corrupt data) as
+        the caller's responsibility. The 2026-05-18 fix adds the
+        backward-copy primitive and the direction-selection logic so the
+        documented memmove contract is now actually upheld by the
+        implementation. The same-file range-check calls keep the
+        canonical no-module form they were rewritten to in the earlier
+        migration pass.
     @End Implementation
 
+    @Performance_Hints:
+        Same total byte-traffic cost as memory_safe_copy in the no-
+        overlap case (one forward loop). In the forward-overlap case the
+        backward loop has identical work count but worse hardware
+        prefetcher behavior on most architectures; this is the
+        unavoidable cost of correctness. Callers who know their regions
+        do not overlap should prefer memory_safe_copy to keep the
+        prefetcher-friendly forward access pattern.
+    @End Performance_Hints
+
     @Security_Scope:
-        Pointer-range validation is performed before any bytes move.
-        Overlap correctness is the caller's responsibility today; see
-        @Reasoning for the contract.
+        Pointer-range validation is performed on BOTH dest and src
+        before any byte moves, so either the move completes correctly
+        or it does not start - there is no partial-move state visible
+        to the caller. The direction selection is purely a function of
+        the two pointer values and the size, none of which can be
+        mutated mid-call, so an attacker cannot induce a wrong-direction
+        copy by racing with the function body. The same-pointer fast
+        path returns success without performing any read or write,
+        which is the correct behavior for a self-move and prevents
+        spurious memory traffic.
     @End Security_Scope
 
     Note: Validate destination (same-file call)
@@ -1448,8 +1497,33 @@ Process called "memory_safe_move" takes dest as Integer, src as Integer, size as
         Return 0
     End If
 
-    Note: Perform move (delegates to memory_copy; see @Reasoning for overlap contract)
-    Let dummy be proc memory_copy from MemoryCore with dest, src, size
+    Note: Same-pointer fast path. A self-move is a no-op; skip all byte work.
+    If dest is equal to src:
+        Return 1
+    End If
+
+    Note: Choose copy direction based on overlap relationship.
+    Note: Forward copy is safe when dest <= src (covers no-overlap and
+    Note: backward-overlap) or when src + size <= dest (covers no-overlap
+    Note: where dest is past the end of the source region).
+    Note: The forward-overlap case (dest > src AND src + size > dest)
+    Note: requires a backward copy to preserve source bytes that would
+    Note: otherwise be overwritten before they are read.
+    Let src_end be src plus size
+    If dest is less than src:
+        Note: dest is before src in memory - forward copy is safe.
+        Let dummy be proc memory_copy from MemoryCore with dest, src, size
+        Return 1
+    End If
+
+    If src_end is less than or equal to dest:
+        Note: src region ends at or before dest - no overlap, forward copy is safe.
+        Let dummy be proc memory_copy from MemoryCore with dest, src, size
+        Return 1
+    End If
+
+    Note: dest > src AND src + size > dest: forward overlap. Must copy backward.
+    Let dummy be proc memory_copy_backward from MemoryCore with dest, src, size
 
     Return 1
 End Process

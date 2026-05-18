@@ -26,19 +26,19 @@ The bootstrap parser currently recognizes and parses the following top-level ann
 - @Performance_Hints ... @End Performance_Hints
 - @Progress ... @End Progress
 - @Feedback ... @End Feedback
-- @Translation_Note ... @End_Translation_Note
-- @Error_Handling ... @End_Error_Handling
+- @Translation_Note ... @End Translation_Note
+- @Error_Handling ... @End Error_Handling
 
 Specified but not yet routed by the bootstrap parser as top-level blocks (reserved and recognized by the lexer, but not consumed as annotation blocks yet):
 
-- @Task, @End_Task
-- @Requirements, @End_Requirements
-- @Verify, @End_Verify
-- @Request, @End_Request
-- @Context, @End_Context
-- @Collaboration, @End_Collaboration
-- @Iteration, @End_Iteration
-- @Clarification, @End_Clarification
+- @Task, @End Task
+- @Requirements, @End Requirements
+- @Verify, @End Verify
+- @Request, @End Request
+- @Context, @End Context
+- @Collaboration, @End Collaboration
+- @Iteration, @End Iteration
+- @Clarification, @End Clarification
 
 These remain part of the language specification and are supported in the annotation type system; parser routing will be enabled in a subsequent bootstrap update. Until then, keep these blocks in code for forward-compatibility, or place their content inside parsed blocks (e.g., within @Implementation) if immediate parsing is required.
 
@@ -211,7 +211,7 @@ Example (ideal structure):
     latency_budget_ms: 50
     memory_limit_mb: 256
     reliability_target: "99.9%"
-@End_Context
+@End Context
 ```
 
 or
@@ -223,7 +223,7 @@ or
     memory_constraints: "max_512MB"
     user_base: "mobile_users"
     criticality: "high"
-@End_Context
+@End Context
 ```
 
 ### 4. Task and Specification Annotations
@@ -245,7 +245,7 @@ Example (ideal structure):
     inputs: ["capacity:Int", "loader:Function"]
     outputs: ["get/put interface", "eviction policy"]
     acceptance: ["O(1) ops", ">=95% hit-rate on Zipf(1.2)"]
-@End_Task
+@End Task
 ```
 
 or
@@ -265,7 +265,7 @@ or
     frameworks: ["OpenCV", "TensorFlow Lite"]
     priority: "Performance over accuracy"
     deadline: "2 weeks"
-@End_Task
+@End Task
 ```
 
 #### @Requirements Block
@@ -284,7 +284,7 @@ Example (ideal structure):
     functional: ["persist user session", "rotate keys"]
     non_functional: ["p95<50ms", "error_rate<0.1%"]
     constraints: ["FIPS140-2", "EU-only data"]
-@End_Requirements
+@End Requirements
 ```
 
 or
@@ -308,7 +308,7 @@ or
         "Must work offline",
         "Compatible with Android/iOS"
     ]
-@End_Requirements
+@End Requirements
 ```
 
 ### 5. Verification and Quality Annotations
@@ -328,7 +328,7 @@ Example (ideal structure):
 @Verify:
     Assert cache_size is less than or equal to capacity
     Assert ttl is greater than 0
-@End_Verify
+@End Verify
 ```
 
 or
@@ -340,7 +340,7 @@ or
     Assert all items in result satisfy validation_criteria
     Assert response_time is less than 100 # milliseconds
     Assert memory_usage is less than 50_000_000 # bytes
-@End_Verify
+@End Verify
 
 Process called "ProcessUserData" that takes user_input:
     # Implementation with automatic verification
@@ -604,7 +604,7 @@ Example (ideal structure):
     target_languages: ["Python", "Rust"]
     platform_specific: { "Python": "use asyncio" }
     performance_considerations: { "Rust": "prefer iterators over indexing" }
-@End_Translation_Note
+@End Translation_Note
 ```
 
 or
@@ -631,7 +631,7 @@ or
         "Java": "Requires Java 8+ for CompletableFuture",
         "C++": "Requires C++11+ for std::async"
     }
-@End_Translation_Note
+@End Translation_Note
 ```
 
 ### 10. Error Handling and Recovery Annotations
@@ -651,7 +651,7 @@ Example (ideal structure):
     expected_errors: [ { "type": "NetworkTimeout", "recovery": "retry" } ]
     fallback_behavior: "return_cached_result"
     user_notification: "user_friendly_messages"
-@End_Error_Handling
+@End Error_Handling
 ```
 
 or
@@ -677,7 +677,7 @@ or
     error_reporting: "detailed_logging"
     monitoring_alerts: "critical_errors_only"
     user_notification: "user_friendly_messages"
-@End_Error_Handling
+@End Error_Handling
 ```
 
 ## Advanced Communication Patterns
@@ -703,7 +703,7 @@ Example (ideal structure):
     current_focus: "profile allocations"
     success_criteria: ["peak RSS < 200MB"]
     next_iteration_plan: "switch to arena allocator"
-@End_Iteration
+@End Iteration
 ```
 
 or
@@ -723,7 +723,7 @@ or
         "Accuracy > 95%"
     ]
     next_iteration_plan: "Add comprehensive error handling and edge case coverage"
-@End_Iteration
+@End Iteration
 ```
 
 ## Protocol Implementation Guidelines
@@ -760,7 +760,7 @@ or
     constraints: ["Secure", "Fast", "User-friendly"]
     target_language: "Python"
     deadline: "3 days"
-@End_Task
+@End Task
 
 @Reasoning:
     Using JWT tokens for stateless authentication because:
@@ -790,7 +790,7 @@ or
         "Refresh tokens expire in 30 days",
         "Secure password storage"
     ]
-@End_Requirements
+@End Requirements
 
 # Implementation Example
 @Implementation:
@@ -799,7 +799,7 @@ or
             Assert email is not None
             Assert password is not None
             Assert email contains "@"
-        @End_Verify
+        @End Verify
         
         Let user be find_user_by_email with email as email
         If user is None:
