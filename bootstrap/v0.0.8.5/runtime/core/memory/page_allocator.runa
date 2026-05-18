@@ -1,0 +1,313 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements RAW PAGE ALLOCATION for the Runa runtime memory system.
+
+PAGE ALLOCATION - Direct mmap/munmap Page Allocator
+- Process raw anonymous-page allocation via the platform mmap syscall
+- Process raw page deallocation via the platform munmap syscall
+- Process page-allocator-based reallocation (allocate-copy-free composition)
+
+This file is essential because of the following reasons:
+- Raw page allocation is the substrate that the higher tiers (arena,
+  chained arena, owned heap) build on. They use it to acquire large
+  multi-page buffers without paying the malloc/free overhead.
+- A page-granular allocator must exist somewhere in the runtime; this is
+  the canonical home for the raw mmap/munmap wrappers callers will use
+  when they want to manage their own pages rather than go through the
+  owned-heap registry.
+- Centralising the prot/flag composition in one place prevents callers
+  from hardcoding x86_64-Linux-specific magic numbers (PROT_READ=1,
+  MAP_PRIVATE=2 etc.) - the Syscall module supplies the platform-correct
+  values, and this module composes them once.
+
+This file consists of the following functions/features/operation types:
+- page_allocate (size) - allocate anonymous private pages
+- page_free (ptr, size) - munmap the pages
+- page_reallocate (ptr, old, new) - resize via allocate-copy-free
+
+Migration history:
+- 2026-05-18: Moved from compiler/internal/memory_utils.runa into the runtime
+  tree per the CEO-ratified "memory management lives in runtime/core/memory/"
+  ruling. The pre-migration source defined local PROT_READ/PROT_WRITE and
+  MAP_PRIVATE/MAP_ANONYMOUS constants that hardcoded x86_64-Linux magic
+  numbers (1, 2, 2, 32). The move replaces those locals with calls to the
+  Syscall module's platform-aware accessors, fixing a latent
+  cross-platform-correctness defect where the constants would be silently
+  wrong on every non-Linux-x86_64 target. The Processes are also renamed
+  from syscall_malloc/syscall_free/syscall_realloc to page_allocate/
+  page_free/page_reallocate so the names describe what the functions do
+  (page allocation) rather than what they imitate (malloc).
+
+Dependencies:
+- Imports compiler/frontend/primitives/assembly/syscall.runa for the
+  platform-correct mmap/munmap entrypoints and the PROT_* / MAP_* value
+  accessors.
+- Imports compiler/frontend/primitives/core/memory_core.runa for the
+  memory_copy primitive used by page_reallocate.
+:End Note
+
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Note:
+============================================================================
+Page Allocator Constants
+============================================================================
+:End Note
+
+Note:
+ANON_FD is the file descriptor passed to mmap for anonymous mappings. POSIX
+mmap requires this to be -1 on platforms that observe the fd argument for
+MAP_ANONYMOUS, and ignores it on the others. -1 is the portable choice.
+:End Note
+
+Constant ANON_FD as Integer is 0 minus 1
+
+Constant ANON_OFFSET as Integer is 0
+
+Note:
+============================================================================
+Raw Page Allocation
+============================================================================
+:End Note
+
+Process called "page_allocate" takes size as Integer returns Integer:
+    @Reasoning:
+        Allocate a contiguous region of anonymous private pages via mmap.
+        Returns the base address of the mapping on success, 0 on failure.
+        The caller chooses the size; the kernel rounds it up to the next
+        page boundary internally and the caller is responsible for
+        remembering the size they requested (because munmap needs it).
+        This is the lowest-level allocator the runtime exposes; everything
+        else (arena, chained arena, owned heap) is implemented on top of it.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Read the platform-correct PROT_READ and PROT_WRITE flags
+               from the Syscall module and combine them with OR (encoded
+               as addition because the bit patterns are disjoint on every
+               supported platform).
+            2. Read the platform-correct MAP_PRIVATE and MAP_ANONYMOUS
+               flags and combine them the same way.
+            3. Call syscall_mmap with addr=0 (kernel picks the address),
+               length=size, the composed prot and flags, fd=-1, offset=0.
+            4. mmap returns the mapped address on success or a negative
+               error code on failure. Translate negative -> 0 so callers
+               see the simple "zero means failure" convention used
+               throughout the runtime.
+
+        Migration note (2026-05-18): the pre-migration source hardcoded
+            Let prot_flags be PROT_READ plus PROT_WRITE  Note: 1 + 2 = 3
+            Let map_flags be MAP_PRIVATE plus MAP_ANONYMOUS  Note: 2 + 32 = 34
+        with the right-hand-side comments revealing that the local
+        constants were x86_64-Linux-specific. The values are different on
+        macOS (MAP_ANONYMOUS=0x1000=4096) and other platforms. The new
+        body queries Syscall for the correct platform values at runtime.
+    @End Implementation
+
+    @Performance_Hints:
+        One mmap syscall - hundreds of cycles minimum (kernel transition,
+        VMA setup, possible TLB invalidation). Not suitable for small
+        allocations; use TIER 2 arena or TIER 3 owned-heap for those.
+        Suitable for allocations >= one page (4KB on most platforms).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Anonymous mmap mappings are zero-filled by the kernel on first
+        access, so this function never returns memory containing another
+        process's data. The MAP_PRIVATE flag ensures writes do not leak
+        to a backing file. The PROT_READ | PROT_WRITE choice means the
+        returned pages are NOT executable - callers wanting executable
+        pages must call mmap directly with PROT_EXEC; we deliberately do
+        not expose an "executable page" entrypoint here because the
+        W^X discipline says read/write and execute should be requested
+        explicitly, not by default.
+    @End Security_Scope
+
+    Let prot_flags be proc PROT_READ from Syscall plus proc PROT_WRITE from Syscall
+    Let map_flags be proc MAP_PRIVATE from Syscall plus proc MAP_ANONYMOUS from Syscall
+
+    Let ptr be proc syscall_mmap from Syscall with 0, size, prot_flags, map_flags, ANON_FD, ANON_OFFSET
+
+    Note: mmap returns a negative error code on failure
+    If ptr is less than 0:
+        Return 0
+    End If
+
+    Return ptr
+End Process
+
+Note:
+============================================================================
+Raw Page Deallocation
+============================================================================
+:End Note
+
+Process called "page_free" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Unmap a region previously mapped by page_allocate. mmap on every
+        supported platform requires the caller to remember the original
+        size and pass it to munmap; the kernel has no way to look up the
+        size from the address alone (it only knows the VMA, which may
+        cover more than one original mapping after merging). Hence the
+        size parameter is mandatory and must match what was passed to
+        page_allocate.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: ptr == 0 -> reject (return 0). munmap on a
+               null pointer is implementation-defined on some kernels
+               and we want a deterministic refusal.
+            2. Size guard: size <= 0 -> reject. munmap with a zero or
+               negative length is invalid and the kernel will return
+               EINVAL; we catch it earlier so the failure mode is
+               consistent.
+            3. Call syscall_munmap(ptr, size). Negative result means the
+               syscall failed (EINVAL most commonly: the address range
+               does not correspond to a live mapping).
+            4. Return 1 on success, 0 on failure.
+    @End Implementation
+
+    @Performance_Hints:
+        One munmap syscall plus a TLB shootdown for any pages that were
+        actually touched. For very large mappings, the TLB shootdown
+        dominates and can take milliseconds on busy systems.
+    @End Performance_Hints
+
+    @Security_Scope:
+        munmap on the wrong address range can free a different mapping
+        than the caller intended, exposing the slot to immediate reuse
+        by a subsequent allocation. The size argument is the principal
+        defence against this - passing the correct size ensures the
+        kernel only unmaps the originally allocated extent. Callers
+        must therefore record sizes alongside pointers when they call
+        page_allocate.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Let result be proc syscall_munmap from Syscall with ptr, size
+
+    If result is less than 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note:
+============================================================================
+Raw Page Reallocation
+============================================================================
+:End Note
+
+Process called "page_reallocate" takes ptr as Integer, old_size as Integer, new_size as Integer returns Integer:
+    @Reasoning:
+        Resize a previously page-allocated buffer. The implementation is
+        the allocate-copy-free composition because mmap does not provide
+        an in-place resize entrypoint on every supported platform (Linux
+        has mremap, Darwin does not). The behaviour is deliberately
+        symmetric with the C realloc convention: ptr == 0 means
+        "allocate fresh", new_size == 0 means "free the buffer".
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. ptr == 0: caller has no existing buffer, delegate to
+               page_allocate(new_size) and return its result.
+            2. new_size == 0: caller wants to free the buffer, delegate
+               to page_free(ptr, old_size) and return 0 (the "freed"
+               canonical zero pointer).
+            3. Allocate the new buffer with page_allocate(new_size).
+               On failure return 0; the old buffer is left intact (this
+               matches the realloc convention - failure does NOT
+               invalidate the original pointer).
+            4. Choose copy_size = min(old_size, new_size). On shrink,
+               we copy only new_size bytes; on grow, we copy all of
+               old_size and the remainder of new_buffer is zero-filled
+               by mmap.
+            5. memory_copy(new_ptr, ptr, copy_size).
+            6. page_free(ptr, old_size) to release the original.
+            7. Return new_ptr.
+
+        Migration note (2026-05-18): the pre-migration source called
+            Return proc syscall_malloc from Syscall with new_size
+        which was wrong - syscall_malloc is the same-file Process being
+        defined, not a Syscall member. The qualified form resolved only
+        because of import flattening in stage-1; the canonical form is
+        the same-file self-call (`proc page_allocate with new_size`) and
+        the migration rewrites it that way.
+    @End Implementation
+
+    @Performance_Hints:
+        Two mmap syscalls plus one memory_copy plus one munmap. For
+        very large resizes, the memory_copy dominates; on Linux a future
+        optimisation could call mremap directly when the caller can
+        tolerate address changes (MREMAP_MAYMOVE) - but mremap is not
+        portable, so the portable composition lives here.
+    @End Performance_Hints
+
+    @Security_Scope:
+        On shrink, the bytes between new_size and old_size are discarded
+        by the munmap and the kernel reclaims their physical backing.
+        Callers who want to ensure sensitive data is wiped before unmap
+        must memory_zero the tail before calling page_reallocate; the
+        function itself does not zero on shrink to avoid imposing the
+        cost on callers that do not need it.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Note: No existing buffer - delegate to a fresh allocation
+        Return proc page_allocate with new_size
+    End If
+
+    If new_size is equal to 0:
+        Note: Resize to zero is equivalent to free
+        Let dummy be proc page_free with ptr, old_size
+        Return 0
+    End If
+
+    Note: Allocate the new region
+    Let new_ptr be proc page_allocate with new_size
+
+    If new_ptr is equal to 0:
+        Note: Allocation failed - leave original buffer intact per realloc convention
+        Return 0
+    End If
+
+    Note: Copy the minimum of old_size and new_size bytes
+    Let copy_size be old_size
+    If new_size is less than old_size:
+        Set copy_size to new_size
+    End If
+
+    Let dummy be proc memory_copy from MemoryCore with new_ptr, ptr, copy_size
+
+    Note: Free the old region
+    Set dummy to proc page_free with ptr, old_size
+
+    Return new_ptr
+End Process

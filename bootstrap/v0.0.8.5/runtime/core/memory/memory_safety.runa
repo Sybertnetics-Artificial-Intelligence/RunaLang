@@ -49,16 +49,28 @@ Migration history:
   every Process during the same migration pass.
 
 Dependencies:
-- Imports compiler/internal/memory_utils.runa for the kernel-space pointer
-  validation helper, the allocate/deallocate facade, and the allocate_aligned
-  helper used by memory_safe_alloc.
+- Imports compiler/frontend/primitives/memory/layout.runa for the canonical
+  TIER-3 owned-heap allocate/deallocate entrypoints used by
+  memory_bounds_create/destroy and memory_safe_alloc/free.
+- Imports runtime/core/memory/owned_heap_wrappers.runa for the
+  allocate_aligned helper used by memory_safe_alloc when a non-default
+  alignment is requested.
 - Imports compiler/frontend/primitives/core/memory_core.runa for raw memory
   qword/integer/pointer read and write primitives.
 - Imports compiler/frontend/primitives/core/pointer_primitive.runa for
   primitive null and alignment pointer queries.
+
+Note on the historical MemoryUtils dependency: prior to the 2026-05-18
+memory_utils migration, this file imported compiler/internal/memory_utils.runa
+for validate_pointer (now inlined into this file), allocate/deallocate (which
+were actually defined in layout.runa and reached through transitive import
+flattening), and allocate_aligned (now in owned_heap_wrappers.runa). The
+migration removed the MemoryUtils import entirely and pointed each consumer
+at its real upstream.
 :End Note
 
-Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/frontend/primitives/memory/layout.runa" as MemoryLayout
+Import "runtime/core/memory/owned_heap_wrappers.runa" as OwnedHeapWrappers
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/core/pointer_primitive.runa" as PointerPrimitive
 
@@ -200,7 +212,7 @@ Process called "memory_bounds_create" takes base_ptr as Integer, size as Integer
         Return 0
     End If
 
-    Let bounds be proc allocate from MemoryUtils with 40  Note: MemoryBounds is 40 bytes
+    Let bounds be proc allocate from MemoryLayout with 40  Note: MemoryBounds is 40 bytes
     If bounds is equal to 0:
         Return 0
     End If
@@ -258,7 +270,7 @@ Process called "memory_bounds_destroy" takes bounds as Integer returns Nothing:
     Note: Invalidate bounds before freeing (defense in depth)
     Let dummy be proc memory_set_integer from MemoryCore with bounds, 24, 0
 
-    Set dummy to proc deallocate from MemoryUtils with bounds
+    Set dummy to proc deallocate from MemoryLayout with bounds
     Return
 End Process
 
@@ -614,12 +626,106 @@ Process called "memory_check_null_dereference" takes ptr as Integer returns Inte
     Return 1  Note: Safe - pointer is not null
 End Process
 
+Note:
+============================================================================
+User-Space / Kernel-Space Pointer Validation
+============================================================================
+
+The kernel-space boundary value used below is the canonical x86_64
+non-canonical-address split point. On x86_64 Linux, user space lives in
+the lower half of the virtual address range (below 0x800000000000) and
+kernel space lives in the upper half. A pointer at or above the boundary
+is by construction never a legitimate user-space pointer.
+
+For platforms with different canonical splits (aarch64 with 48-bit VA,
+RISC-V Sv39/Sv48, etc.) the same predicate still rejects all kernel
+addresses correctly because those platforms also place user space in the
+lower half - the constant chosen here is the *smallest* possible kernel
+boundary across all supported platforms, so any address at or above it
+is guaranteed to be invalid for user-space dereference on every target.
+:End Note
+
+Constant USERSPACE_BOUNDARY_X86_64 as Integer is 140737488355328  Note: 0x800000000000
+
+Process called "validate_pointer" takes ptr as Integer returns Integer:
+    @Reasoning:
+        Lightweight pointer plausibility predicate: reject NULL and reject
+        addresses that fall in the kernel-space half of the canonical
+        x86_64 virtual address layout. This is intentionally weaker than
+        memory_validate_pointer (which adds an alignment check on top);
+        it exists as the address-space-range primitive that
+        memory_validate_pointer delegates to. Lives in this file (the
+        runtime memory-safety module) because address-space validation
+        is a memory-safety concern and the runtime is the canonical
+        home for memory infrastructure per the CEO ruling on the
+        compiler/internal/memory_utils migration.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard. ptr == 0 is the universal "no pointer" sentinel;
+               reject.
+            2. Kernel-space rejection. Compare ptr against the canonical
+               USERSPACE_BOUNDARY_X86_64 constant (0x800000000000); any
+               value at or above is in the upper half of the 64-bit
+               address space and is not a legitimate user-space pointer.
+            3. Return 1 if both checks pass.
+
+        Migration note (2026-05-18): this Process was moved verbatim from
+        compiler/internal/memory_utils.runa where it carried the original
+        body of the validate_pointer wrapper. The pre-migration source had
+        memory_safety.memory_validate_pointer (in this same file) delegating
+        to MemoryUtils.validate_pointer, which then delegated back here
+        through the same import chain - a circular naming relationship
+        that resolved through stage-1 import flattening. The migration
+        breaks that loop by collapsing the real implementation into this
+        file directly; the memory_validate_pointer wrapper now calls
+        validate_pointer locally (no module clause) and the MemoryUtils
+        dependency disappears.
+
+        The constant value (0x800000000000 = 140737488355328) is the
+        canonical x86_64 user/kernel-space split point. The boundary is
+        higher on platforms with larger virtual address spaces, but using
+        the lowest supported boundary is the safest portable rejection
+        criterion: a pointer at or above this value is *never* a valid
+        user-space pointer on any target Runa supports.
+    @End Implementation
+
+    @Performance_Hints:
+        Two integer comparisons. Constant time. Inlinable. The branch
+        predictor will favour the success path heavily because all
+        legitimate user-space pointers pass both checks.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Rejecting addresses at or above the kernel-space boundary is a
+        defence-in-depth check: legitimate Runa code should never produce
+        such an address (pointers come from mmap and brk, which the
+        kernel keeps below the boundary), and an address in that range
+        almost certainly indicates either pointer arithmetic gone wrong
+        or an adversarial input. The check does not need to be foolproof
+        in a hostile environment - other defences (registry liveness,
+        bounds checks) cover ranges the address-space check alone cannot.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if pointer is in user space (< 0x800000000000 on x86_64)
+    If ptr is greater than or equal to USERSPACE_BOUNDARY_X86_64:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
 Process called "memory_validate_pointer" takes ptr as Integer returns Integer:
     @Reasoning:
         The fully-qualified pointer-validity predicate exposed to external
         callers. Composes null-check, default-alignment check, and the
-        user-space-only kernel-space exclusion provided by
-        MemoryUtils.validate_pointer. Returning 1 here is the strongest
+        user-space-only kernel-space exclusion provided by the same-file
+        validate_pointer primitive. Returning 1 here is the strongest
         signal this module gives that a raw pointer can be dereferenced
         safely with respect to address-space validity (it does not check
         liveness in the allocation registry; that is layout.runa's job).
@@ -631,22 +737,33 @@ Process called "memory_validate_pointer" takes ptr as Integer returns Integer:
             2. Alignment check: pointer_is_aligned with
                MEMORY_ALIGNMENT_DEFAULT (8). Non-8-aligned pointers cannot
                legally point at qword-sized objects.
-            3. Delegate to MemoryUtils.validate_pointer for the
-               kernel-space and large-value exclusions.
+            3. Delegate to the same-file validate_pointer for the
+               kernel-space and NULL exclusions.
 
-        Bug fix: the pre-migration source contained
+        Bug fix (2026-05-17): the pre-migration source contained
             Return proc MemoryUtils.validate_pointer with ptr
         which uses the wrong call syntax (dot-form invocation rather than
-        the canonical `from`-form). The migration rewrote it to
+        the canonical `from`-form). The 2026-05-17 memory_safety migration
+        rewrote it to the canonical from-form.
+
+        Bug fix (2026-05-18): the memory_utils migration moved the actual
+        validate_pointer implementation into this same file (above), so the
+        delegation no longer needs to cross a module boundary. The call
+        was rewritten from
             Return proc validate_pointer from MemoryUtils with ptr
-        which is what every other Runa caller of MemoryUtils.validate_pointer
-        in the codebase uses, and what the parser actually expects.
+        to the same-file form
+            Return proc validate_pointer with ptr
+        This breaks the circular naming relationship that existed when
+        compiler/internal/memory_utils.runa hosted validate_pointer and
+        this file delegated to it (which transitively re-imported this
+        file's memory_validate_pointer through the import chain).
     @End Implementation
 
     @Performance_Hints:
         Three short tests; fast-fails on the cheapest comparison (null)
-        first. Inlinable in principle. The MemoryUtils.validate_pointer
-        delegation does range checks that are themselves O(1).
+        first. Inlinable in principle. The same-file validate_pointer
+        delegation does range checks that are themselves O(1) and may be
+        inlined further by the optimiser.
     @End Performance_Hints
 
     @Security_Scope:
@@ -669,8 +786,8 @@ Process called "memory_validate_pointer" takes ptr as Integer returns Integer:
         Return 0
     End If
 
-    Note: Check if pointer is in valid user space (canonical `from`-form)
-    Return proc validate_pointer from MemoryUtils with ptr
+    Note: Check if pointer is in valid user space (same-file call, no module clause)
+    Return proc validate_pointer with ptr
 End Process
 
 Process called "memory_check_alignment" takes ptr as Integer, alignment as Integer returns Integer:
@@ -1072,20 +1189,25 @@ Process called "memory_safe_alloc" takes size as Integer, alignment as Integer r
             1. Reject non-positive size with 0 return.
             2. Compute safe_size = size + 16 (8 for canary + 8 for guard).
             3. Allocate safe_size bytes. If alignment > 1, route through
-               MemoryUtils.allocate_aligned, otherwise through the
-               regular allocate facade.
+               OwnedHeapWrappers.allocate_aligned (which understands the
+               over-allocate-and-back-pointer aligned-allocation protocol),
+               otherwise through the canonical MemoryLayout.allocate.
             4. If allocation fails, return 0.
             5. Compute data_ptr = ptr + 8 (skip the canary slot).
             6. Install canary at data_ptr-8 via memory_set_canary.
             7. Install guard at data_ptr+size via memory_set_guard.
             8. Return data_ptr (the address callers will read/write).
 
-        Bug fix: rewrote
+        Bug fix (2026-05-17): rewrote
             Set ptr to proc MemoryUtils.allocate_aligned with safe_size, alignment
-        to the canonical
-            Set ptr to proc allocate_aligned from MemoryUtils with safe_size, alignment
-        and rewrote the same-file canary/guard install calls from
-        `from MemoryCore` to the canonical no-module form.
+        to the canonical from-form, and rewrote the same-file canary/guard
+        install calls from `from MemoryCore` to the canonical no-module form.
+
+        Bug fix (2026-05-18): the memory_utils migration relocated
+        allocate_aligned from compiler/internal/memory_utils.runa to
+        runtime/core/memory/owned_heap_wrappers.runa and pointed
+        allocate/deallocate at their actual home (layout.runa). The call
+        sites in this Process were updated to use the canonical homes.
     @End Implementation
 
     @Performance_Hints:
@@ -1112,9 +1234,9 @@ Process called "memory_safe_alloc" takes size as Integer, alignment as Integer r
 
     Let ptr be 0
     If alignment is greater than 1:
-        Set ptr to proc allocate_aligned from MemoryUtils with safe_size, alignment
+        Set ptr to proc allocate_aligned from OwnedHeapWrappers with safe_size, alignment
     Otherwise:
-        Set ptr to proc allocate from MemoryUtils with safe_size
+        Set ptr to proc allocate from MemoryLayout with safe_size
     End If
 
     If ptr is equal to 0:
@@ -1149,14 +1271,18 @@ Process called "memory_safe_free" takes ptr as Integer returns Integer:
                misaligned / kernel-space.
             3. Compute alloc_ptr = ptr - 8 (the address allocate
                originally returned).
-            4. proc deallocate from MemoryUtils with alloc_ptr.
+            4. proc deallocate from MemoryLayout with alloc_ptr.
             5. Return 1.
 
-        Bug fix: rewrote
+        Bug fix (2026-05-17): rewrote
             Let is_valid be proc memory_validate_pointer from MemoryCore with ptr
-        to the canonical same-file form
-            Let is_valid be proc memory_validate_pointer with ptr
-        memory_validate_pointer is defined in THIS file.
+        to the canonical same-file form. memory_validate_pointer is defined
+        in THIS file.
+
+        Bug fix (2026-05-18): the memory_utils migration repointed the
+        deallocate call from `from MemoryUtils` (which transitively
+        resolved to layout.runa) to `from MemoryLayout` directly, matching
+        the actual canonical location of the deallocator.
     @End Implementation
 
     @Security_Scope:
@@ -1182,7 +1308,7 @@ Process called "memory_safe_free" takes ptr as Integer returns Integer:
     Let alloc_ptr be ptr minus 8
 
     Note: Free the memory
-    Let dummy be proc deallocate from MemoryUtils with alloc_ptr
+    Let dummy be proc deallocate from MemoryLayout with alloc_ptr
     Return 1
 End Process
 

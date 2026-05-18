@@ -1,0 +1,386 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements TIER 3 (Owned Heap) higher-level allocation wrappers
+for the Runa runtime memory system.
+
+OWNED HEAP WRAPPERS - Composable Helpers Over MemoryLayout.allocate
+- Process zero-initialized owned-heap allocations
+- Process strictly-aligned owned-heap allocations (with back-pointer header)
+- Process owned-heap deallocation for back-pointer aligned allocations
+- Provide a registry-aware size query for live owned-heap allocations
+
+This file is essential because of the following reasons:
+- Zero-initialized allocation is the natural shape for structure-shaped data
+  that must start blank; rolling it into the core allocator would force every
+  caller to pay the memset cost even when they immediately overwrite, so we
+  expose it as a composable wrapper.
+- Aligned allocation supports buffer alignment for executable formats,
+  cache-line packing, and SIMD-friendly buffers. The MemoryLayout.allocate
+  contract only guarantees 8-byte alignment; this wrapper synthesises stronger
+  alignment by over-allocating and storing a back-pointer header.
+- The registry-aware size query is the correct way to ask "how big is the
+  user data behind this pointer?" - layout.runa's header carries a total_size
+  (header plus user) so the user portion is only obtainable through the
+  registry. This wrapper hides that detail from callers.
+
+This file consists of the following functions/features/operation types:
+- allocate_zeroed (size) - allocate then memory_zero
+- allocate_aligned (size, alignment) - allocate with back-pointer header
+- deallocate_aligned (ptr) - free back-pointer aligned allocation
+- owned_heap_get_size (ptr) - registry-aware user-data size lookup
+
+Migration history:
+- 2026-05-18: Moved from compiler/internal/memory_utils.runa into the runtime
+  tree per the CEO-ratified "memory management lives in runtime/core/memory/"
+  ruling. The internal call to align_pointer_up (which was a duplicate of the
+  canonical PointerPrimitive.pointer_align_up) was rewritten to use the
+  canonical primitive directly during the move. The owned_heap_get_size
+  function (formerly get_allocation_size) was rewritten from a fictitious
+  size-header read to a registry-lookup against MemoryLayout's allocation
+  registry, fixing a latent silent bug that the migration plan flagged.
+
+Dependencies:
+- Imports compiler/frontend/primitives/memory/layout.runa for the canonical
+  TIER-3 allocate/deallocate entrypoints and the registry_lookup helper used
+  by owned_heap_get_size.
+- Imports compiler/frontend/primitives/core/memory_core.runa for memory_zero
+  (zeroed allocation) and memory_set_pointer / memory_get_pointer /
+  memory_get_int64 (back-pointer header writes and registry reads).
+- Imports compiler/frontend/primitives/core/pointer_primitive.runa for the
+  canonical pointer_align_up used during aligned allocation.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as MemoryLayout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/pointer_primitive.runa" as PointerPrimitive
+
+Note:
+============================================================================
+Owned-Heap Wrapper Constants
+============================================================================
+:End Note
+
+Note:
+ALIGNED_HEADER_SIZE is the number of bytes reserved immediately before the
+returned aligned pointer to store the original raw pointer that
+MemoryLayout.allocate handed back. deallocate_aligned reads this slot to
+recover the raw pointer and then calls the canonical deallocator.
+:End Note
+
+Constant ALIGNED_HEADER_SIZE as Integer is 8
+
+Note:
+LAYOUT_HEADER_SIZE is the size of the MemoryLayout owned-heap allocation
+header that precedes every user data pointer. owned_heap_get_size walks
+backwards through this offset to read the allocation ID stored at offset 0.
+The value must match layout.runa's `header_size = 32` constant.
+:End Note
+
+Constant LAYOUT_HEADER_SIZE as Integer is 32
+
+Note:
+LAYOUT_REGISTRY_SIZE_OFFSET is the field offset of the recorded user size
+within a registry entry (RegistryEntry layout, 56 bytes total, size at
+offset 32 per layout.runa's documented entry structure).
+:End Note
+
+Constant LAYOUT_REGISTRY_SIZE_OFFSET as Integer is 32
+
+Note:
+============================================================================
+Zero-Initialized Allocation
+============================================================================
+:End Note
+
+Process called "allocate_zeroed" takes size as Integer returns Integer:
+    @Reasoning:
+        Allocate a TIER-3 owned-heap block and zero its user region before
+        handing it back. Many callers want freshly zeroed memory for
+        structure-shaped data (so that uninitialized field reads return 0
+        deterministically) but pay the memset cost only when they actually
+        want it; the un-zeroed path remains available via
+        MemoryLayout.allocate. Returning 0 on either the allocate or the
+        zero failure path keeps a simple ABI: callers test for zero, no
+        secondary error channel is needed.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Call MemoryLayout.allocate(size) to obtain a user pointer
+               sitting behind the registry-tracked owned-heap header.
+            2. If allocate returned 0, propagate the failure unchanged.
+            3. Call MemoryCore.memory_zero(ptr, size) to clear exactly the
+               size bytes of user region the caller asked for. Note that
+               the allocator may have rounded up internally to 16 bytes
+               for free-list metadata reuse, but we deliberately zero only
+               the caller-visible size so that any allocator-private bytes
+               beyond size remain in whatever state allocate left them.
+            4. Return the user pointer.
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocation plus one memory_zero pass. memory_zero is
+        word-vectorised internally; the dominant cost is the allocate call,
+        not the zero. Use MemoryLayout.allocate directly when the caller
+        will overwrite the buffer immediately and the zero is wasted work.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Zeroing the user region before returning prevents the new owner
+        from observing stale heap contents from the previous allocation
+        that reused this slot via the free-list path. This is a
+        defence-in-depth measure - the allocator's free-list reuse path
+        does not zero on free, so without this wrapper a caller asking for
+        zeroed memory could inadvertently leak the previous owner's data.
+    @End Security_Scope
+
+    Let ptr be proc allocate from MemoryLayout with size
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero exactly the caller-requested size (not the allocator's rounded-up size)
+    Let dummy be proc memory_zero from MemoryCore with ptr, size
+
+    Return ptr
+End Process
+
+Note:
+============================================================================
+Aligned Allocation (Stronger Than Default 8-Byte Alignment)
+============================================================================
+:End Note
+
+Process called "allocate_aligned" takes size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Synthesise an owned-heap allocation whose returned pointer is aligned
+        to an arbitrary power-of-two alignment stronger than the allocator's
+        default. The technique is the standard over-allocate-and-align-up
+        idiom: ask for (alignment-1) extra padding plus 8 bytes for a
+        back-pointer header, align the user-visible pointer up inside that
+        oversized block, and stash the original raw pointer in the 8 bytes
+        immediately before the aligned pointer so deallocate_aligned can
+        recover it.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Compute the total allocation size:
+                 extra_size = alignment - 1   (padding budget)
+                 total_size = size + extra_size + ALIGNED_HEADER_SIZE
+               The ALIGNED_HEADER_SIZE term reserves the 8 bytes that will
+               hold the back-pointer header.
+            2. Call MemoryLayout.allocate(total_size) for the raw pointer.
+               Failure propagates as 0.
+            3. Compute the candidate user pointer = raw_ptr + ALIGNED_HEADER_SIZE.
+               This is the first byte past the reserved header.
+            4. Round that candidate up to the requested alignment using the
+               canonical PointerPrimitive.pointer_align_up. The padding
+               budget reserved at step 1 guarantees the rounded pointer
+               still lies inside the allocated block.
+            5. Write the original raw pointer into the 8 bytes immediately
+               preceding the aligned pointer (header_ptr = aligned_ptr - 8).
+               deallocate_aligned reads this back.
+            6. Return the aligned user pointer.
+
+        Migration note (2026-05-18): the pre-migration source called a local
+        align_pointer_up Process that was a literal duplicate of
+        PointerPrimitive.pointer_align_up. The move into runtime rewrites
+        the call to use the canonical primitive directly, eliminating the
+        duplicate.
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocation (the dominant cost) plus a single
+        pointer-arithmetic round-up plus one pointer write. The padding
+        overhead is at most alignment-1 bytes of wasted user region, which
+        is the unavoidable cost of aligning over an allocator that returns
+        8-byte-aligned pointers. For alignment values that the allocator
+        already provides (alignment <= 8), prefer MemoryLayout.allocate
+        directly to avoid the +8 header overhead.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The back-pointer stored at aligned_ptr - 8 is private state used
+        by deallocate_aligned. Callers who write into the byte region they
+        receive must not write past size bytes in the negative direction;
+        doing so would corrupt the back-pointer and cause deallocate_aligned
+        to free an arbitrary address. The 8-byte gap is reserved for this
+        purpose and is not part of the caller's usable size budget.
+    @End Security_Scope
+
+    Note: Reserve padding for alignment + 8 bytes for back-pointer header
+    Let extra_size be alignment minus 1
+    Let total_size be size plus extra_size plus ALIGNED_HEADER_SIZE
+
+    Let raw_ptr be proc allocate from MemoryLayout with total_size
+
+    If raw_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Compute aligned user pointer (first candidate past the header gap)
+    Let ptr_plus_header be raw_ptr plus ALIGNED_HEADER_SIZE
+    Let aligned_ptr be proc pointer_align_up from PointerPrimitive with ptr_plus_header, alignment
+
+    Note: Store original raw pointer in the 8 bytes immediately before aligned_ptr
+    Let header_ptr be aligned_ptr minus ALIGNED_HEADER_SIZE
+    Let dummy be proc memory_set_pointer from MemoryCore with header_ptr, 0, raw_ptr
+
+    Return aligned_ptr
+End Process
+
+Process called "deallocate_aligned" takes ptr as Integer returns Integer:
+    @Reasoning:
+        Free a buffer that was returned by allocate_aligned. The user pointer
+        does not point at the start of the underlying owned-heap allocation,
+        so we cannot pass it directly to MemoryLayout.deallocate; we first
+        recover the original raw pointer from the 8-byte back-pointer header
+        stored immediately before the user pointer.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on ptr == 0 (idempotent free).
+            2. Compute header_ptr = ptr - ALIGNED_HEADER_SIZE.
+            3. Read the raw pointer from offset 0 of the header slot
+               (the value that allocate_aligned wrote at step 5).
+            4. Call MemoryLayout.deallocate(raw_ptr) to release the
+               underlying allocation, including the over-allocated padding
+               and the back-pointer header.
+            5. Return 1 on completion. We deliberately do not propagate
+               MemoryLayout.deallocate's return value because the canonical
+               deallocator returns 1 on success and 0 on argument error
+               (ptr == 0), and we have already checked ptr above.
+    @End Implementation
+
+    @Security_Scope:
+        Step 3 implicitly trusts that the 8 bytes before ptr contain the
+        back-pointer that allocate_aligned wrote. Calling this function on
+        any other pointer (one obtained from MemoryLayout.allocate
+        directly, or a stack pointer, or a heap pointer from a different
+        allocator) reads arbitrary memory and then attempts to free that
+        arbitrary address. The contract is therefore: only call this with
+        a pointer that allocate_aligned returned, and only call it once.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Recover original raw pointer from back-pointer header
+    Let header_ptr be ptr minus ALIGNED_HEADER_SIZE
+    Let original_ptr be proc memory_get_pointer from MemoryCore with header_ptr, 0
+
+    Note: Free the original pointer through the canonical owned-heap deallocator
+    Let dummy be proc deallocate from MemoryLayout with original_ptr
+    Return 1
+End Process
+
+Note:
+============================================================================
+Registry-Aware User-Data Size Query
+============================================================================
+:End Note
+
+Process called "owned_heap_get_size" takes ptr as Integer returns Integer:
+    @Reasoning:
+        Answer the question "how many bytes did the caller ask for when
+        this user pointer was allocated?" for a pointer that was returned
+        by MemoryLayout.allocate. The answer cannot be read directly from
+        the in-memory header because layout.runa records total_size (header
+        plus user region) there, not user_size; the user-requested size is
+        only available from the registry entry inserted at allocation time.
+
+        This Process replaces the pre-migration get_allocation_size, which
+        assumed a `[size:8][user data]` header layout that MemoryLayout
+        does NOT actually use. The pre-migration version read garbage from
+        whatever byte happened to be 8 bytes before the user pointer (in
+        the real layout, that location contains the third quadword of the
+        header, namely total_size, not user size - and for back-pointer
+        aligned allocations it contains the back-pointer itself, which is
+        not a size at all). The fix is to consult the registry.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on ptr == 0.
+            2. Compute header_ptr = ptr - LAYOUT_HEADER_SIZE. layout.runa
+               places its 32-byte owned-heap header immediately before the
+               user pointer it returns.
+            3. Read alloc_id from offset 0 of the header (the first qword
+               written by MemoryLayout.allocate at line 718/786).
+            4. Look up the registry entry for that alloc_id via
+               MemoryLayout.registry_lookup. Failed lookup (returned 0)
+               means the pointer was either never registered, has already
+               been removed (deallocated and the slot recycled), or did
+               not originate from MemoryLayout.allocate. Return 0 in all
+               those cases.
+            5. Read the user size from offset LAYOUT_REGISTRY_SIZE_OFFSET
+               (32) of the registry entry. layout.runa documents the
+               registry entry layout: offset 32 holds size (allocation size
+               in bytes).
+            6. Return that size.
+
+        Migration note (2026-05-18): this implementation is a from-scratch
+        replacement of the pre-migration body, which read
+            size = memory_get_integer(ptr - 8, 0)
+        on the assumption of a wrong header layout. The new body walks the
+        registry instead, which is the canonical source of truth for size
+        information in the owned-heap subsystem.
+    @End Implementation
+
+    @Performance_Hints:
+        Two memory reads (header alloc_id, registry size field) plus one
+        linear-probe hash lookup. Constant time on average; worst case
+        bounded by registry_capacity probes during lookup if the registry
+        is heavily loaded. Callers who need this in a hot path should
+        cache the result rather than re-querying.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The function reads 8 bytes at ptr - 32. If the caller passes a
+        pointer that did NOT come from MemoryLayout.allocate (a stack
+        pointer, an arena pointer, a pointer offset into the middle of an
+        allocation), that read will return whatever bytes happen to live
+        32 bytes before ptr, then registry_lookup will be called with that
+        garbage value as alloc_id. The lookup is bounded (linear probe
+        through the hash table) and side-effect-free, so the worst outcome
+        is a 0 return - which is the right "I don't know" answer. The
+        function therefore cannot crash on a bad pointer, only return 0.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Read alloc_id from the owned-heap header
+    Let header_ptr be ptr minus LAYOUT_HEADER_SIZE
+    Let alloc_id be proc memory_get_int64 from MemoryCore with header_ptr, 0
+
+    Note: Look up the registry entry for this allocation
+    Let entry_ptr be proc registry_lookup from MemoryLayout with alloc_id
+    If entry_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Read user-data size from the registry entry (offset 32 = size field)
+    Let user_size be proc memory_get_int64 from MemoryCore with entry_ptr, LAYOUT_REGISTRY_SIZE_OFFSET
+    Return user_size
+End Process
