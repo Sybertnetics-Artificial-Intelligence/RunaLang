@@ -1,0 +1,688 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements SIZE-CLASS MEMORY POOLS for the Runa runtime memory
+system. Pools are a separate concern from arenas: they sit alongside the
+chained arena at TIER 3 (OWNED) and provide O(1) allocation and deallocation
+for FIXED, FREQUENTLY-USED small allocation sizes.
+
+SIZE-CLASS MEMORY POOLS - O(1) Fixed-Size Bulk Allocation
+- Process fixed-size allocations from a pre-batched free list per size class
+- Handle 6 size classes (8, 16, 32, 64, 128, 256 bytes) with separate free lists
+- Maintain per-batch tracking lists so destroy can free every batch cleanly
+- Operate as instance-based pools (no globals) per the MEMORY_ARCHITECTURE.md
+  TIER 3 ownership model
+
+This file is essential because of the following reasons:
+- Size-class pools serve the small-allocation hot path with constant-time
+  allocate/deallocate, which arena bump allocators cannot match for workloads
+  that need explicit per-allocation lifetime control.
+- Pools reduce fragmentation for frequently-recycled small objects by keeping
+  same-size blocks together in dedicated batches.
+- Free-list maintenance means the cost of allocate and deallocate is a single
+  pointer-update each, independent of pool size and total memory in use.
+
+This file consists of the following functions/features/operation types:
+- Size-class index calculation (pool_get_size_class_index)
+- Block-size lookup by class index (pool_get_size_for_class)
+- Pool lifecycle (pool_create, pool_destroy)
+- Batch allocation for empty free lists (pool_allocate_block_batch)
+- Allocate / deallocate (pool_allocate, pool_deallocate)
+- Statistics access (pool_get_statistics)
+
+Migration note: these primitives were previously part of
+`compiler/internal/arena_utils.runa`. They have been moved to this dedicated
+file because pools are conceptually distinct from arenas — they serve
+different lifetimes (per-allocation vs operation-scoped) and use different
+internal data structures (free lists vs bump pointers). No callers existed
+at the time of migration (the pool primitives were defined-but-unreferenced),
+so the move is name-preserving: every Process keeps its `pool_*` name.
+
+Dependencies:
+- Imports compiler/internal/memory_utils.runa for owned-heap allocate/deallocate
+- Imports compiler/frontend/primitives/core/memory_core.runa for raw memory r/w
+:End Note
+
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+
+Note:
+============================================================================
+Pool Constants
+============================================================================
+:End Note
+
+Constant POOL_SIZE_CLASS_COUNT as Integer is 6
+Constant POOL_SIZE_8 as Integer is 8
+Constant POOL_SIZE_16 as Integer is 16
+Constant POOL_SIZE_32 as Integer is 32
+Constant POOL_SIZE_64 as Integer is 64
+Constant POOL_SIZE_128 as Integer is 128
+Constant POOL_SIZE_256 as Integer is 256
+Constant POOL_BLOCK_COUNT as Integer is 64
+
+Note:
+============================================================================
+MemoryPool Structure Definition
+============================================================================
+
+MemoryPool instance layout (336 bytes = 6 pool entries * 56 bytes each):
+
+  Per-pool-entry (56 bytes):
+    Offset  0: free_list        Pointer to first free block in linked free list
+    Offset  8: total_blocks     Total blocks ever allocated for this size class
+    Offset 16: free_blocks      Number of blocks currently on the free list
+    Offset 24: block_size       Block size in bytes for this class
+    Offset 32: allocations      Lifetime allocations served from this class
+    Offset 40: deallocations    Lifetime deallocations returned to this class
+    Offset 48: batches_list     Head of batch-tracking list (for cleanup)
+
+The pool is instance-based per MEMORY_ARCHITECTURE.md TIER 3 OWNED semantics.
+Caller creates the pool via pool_create, retains the returned pointer for the
+pool's lifetime, and calls pool_destroy when the pool is no longer needed.
+No global state.
+
+Free-list block layout:
+  Each block in a free list is prefixed with an 8-byte "next" pointer slot.
+  pool_allocate returns the pointer 8 bytes past the block header; the header
+  is reused as the next-pointer slot when the block is on the free list.
+
+Batches:
+  Blocks are allocated 64 at a time (POOL_BLOCK_COUNT) into a single
+  contiguous batch buffer. A separate 16-byte batch-tracking node records
+  the batch pointer plus a next-batch-node pointer; nodes are chained from
+  the pool entry's batches_list. Destroy walks this list to free every
+  batch cleanly with zero leaks.
+:End Note
+
+Process called "pool_get_size_class_index" takes size as Integer returns Integer:
+    @Reasoning:
+        Maps a requested allocation size to a pool size class (0..5). Sizes
+        that exceed POOL_SIZE_256 cannot be served by any class and the
+        caller must fall back to a different allocator (typically arena or
+        owned heap). Returning -1 signals this fallback condition rather
+        than rounding up indefinitely.
+    @End Reasoning
+
+    @Implementation:
+        A cascade of inclusive upper-bound comparisons: size <= 8 maps to
+        class 0, size <= 16 maps to class 1, etc., up to size <= 256 for
+        class 5. Anything larger returns -1.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). Average-case 3 comparisons due to the cascade structure;
+        worst-case 6 for the largest fit-in-pool size.
+    @End Performance_Hints
+
+    If size is less than or equal to POOL_SIZE_8:
+        Return 0
+    Otherwise If size is less than or equal to POOL_SIZE_16:
+        Return 1
+    Otherwise If size is less than or equal to POOL_SIZE_32:
+        Return 2
+    Otherwise If size is less than or equal to POOL_SIZE_64:
+        Return 3
+    Otherwise If size is less than or equal to POOL_SIZE_128:
+        Return 4
+    Otherwise If size is less than or equal to POOL_SIZE_256:
+        Return 5
+    End If
+
+    Return negative 1
+End Process
+
+Process called "pool_get_size_for_class" takes class_index as Integer returns Integer:
+    @Reasoning:
+        Inverse of pool_get_size_class_index. Returns the actual block size
+        backing each class index. Used during pool initialization to write
+        block_size into each pool entry.
+    @End Reasoning
+
+    @Implementation:
+        A direct lookup by index 0..5; out-of-range indices return 0 so
+        callers can detect the error condition.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). Average-case 3 comparisons due to cascade structure.
+    @End Performance_Hints
+
+    If class_index is equal to 0:
+        Return POOL_SIZE_8
+    Otherwise If class_index is equal to 1:
+        Return POOL_SIZE_16
+    Otherwise If class_index is equal to 2:
+        Return POOL_SIZE_32
+    Otherwise If class_index is equal to 3:
+        Return POOL_SIZE_64
+    Otherwise If class_index is equal to 4:
+        Return POOL_SIZE_128
+    Otherwise If class_index is equal to 5:
+        Return POOL_SIZE_256
+    End If
+
+    Return 0
+End Process
+
+Process called "pool_create" returns Integer:
+    @Reasoning:
+        Creates an instance-based MemoryPool with all 6 size classes
+        initialized to empty free lists. The instance model lets multiple
+        pools coexist (per-thread, per-subsystem) without any global state.
+        Allocation of actual block batches is deferred to the first call
+        into pool_allocate for a given class — pools start empty and only
+        allocate memory on demand.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Allocate the 336-byte pool structure on the owned heap.
+            2. For each class_index in 0..5:
+                 - Compute pool_entry_ptr = pool + class_index * 56.
+                 - Look up block_size via pool_get_size_for_class.
+                 - Zero the free_list, total_blocks, free_blocks,
+                   allocations, deallocations, and batches_list fields.
+                 - Write block_size into the entry's block_size field.
+            3. Return the pool pointer (or 0 on allocation failure).
+    @End Implementation
+
+    @Performance_Hints:
+        Single owned-heap allocation plus 6*7 = 42 memory writes. Performed
+        once per pool lifetime.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Pool ownership transfers to the caller; caller must invoke
+        pool_destroy on cleanup. No global pool registration occurs.
+    @End Security_Scope
+
+    Note: Allocate pool structure (6 classes * 56 bytes per entry = 336 bytes)
+    Let pool_struct_size be 336
+    Let pool be proc allocate from MemoryUtils with pool_struct_size
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Note: Initialize each pool size class
+    Let class_index be 0
+    While class_index is less than POOL_SIZE_CLASS_COUNT:
+        Let pool_entry_offset be class_index multiplied by 56
+        Let pool_entry_ptr be pool plus pool_entry_offset
+
+        Note: Get block size for this class
+        Let block_size be proc pool_get_size_for_class with class_index
+
+        Note: Initialize pool entry fields
+        Let dummy1 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 0, 0             Note: free_list = null
+        Let dummy2 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 8, 0             Note: total_blocks = 0
+        Let dummy3 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 16, 0            Note: free_blocks = 0
+        Let dummy4 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 24, block_size   Note: block_size
+        Let dummy5 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 32, 0            Note: allocations = 0
+        Let dummy6 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 40, 0            Note: deallocations = 0
+        Let dummy7 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 48, 0            Note: batches_list = null
+
+        Set class_index to class_index plus 1
+    End While
+
+    Return pool
+End Process
+
+Process called "pool_allocate_block_batch" takes pool as Integer, class_index as Integer returns Integer:
+    @Reasoning:
+        When a pool entry's free list is empty, this routine allocates a
+        contiguous batch of 64 blocks, threads them into a free list, and
+        records the batch in the entry's batches_list so destroy can free it
+        cleanly. Batch allocation amortizes the per-block allocate cost
+        across 64 blocks.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL pool guard and class_index range check [0, POOL_SIZE_CLASS_COUNT).
+            2. Compute pool_entry_ptr.
+            3. Read block_size; compute actual_block_size = block_size + 8
+               (room for the 8-byte next pointer prefix).
+            4. Allocate the batch buffer: actual_block_size * POOL_BLOCK_COUNT.
+            5. Allocate a 16-byte batch-tracking node.
+            6. If either allocation fails, free what was allocated and return 0.
+            7. Initialize the batch node (batch_ptr, next=null), then prepend
+               it onto pool_entry.batches_list.
+            8. Thread the 64 blocks into a free list by writing each block's
+               next pointer to point at the next block in the batch.
+            9. Prepend the new batch to the existing free list (set the last
+               block's next to the old free list head, set the entry's
+               free_list to the first block of the batch).
+            10. Update total_blocks += POOL_BLOCK_COUNT and
+                free_blocks += POOL_BLOCK_COUNT.
+            11. Return POOL_BLOCK_COUNT.
+    @End Implementation
+
+    @Performance_Hints:
+        One large owned-heap allocation (block batch), one small node
+        allocation, and O(POOL_BLOCK_COUNT) memory writes to thread the
+        free list. Amortizes the per-block cost across 64 subsequent
+        pool_allocate calls.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Batch-tracking ensures destroy can find every batch. If batch
+        tracking were omitted, batches allocated after pool_create would
+        leak on destroy. The 16-byte node cost per 64-block batch is the
+        price of correct cleanup.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    If class_index is less than 0:
+        Return 0
+    End If
+
+    If class_index is greater than or equal to POOL_SIZE_CLASS_COUNT:
+        Return 0
+    End If
+
+    Note: Get pool entry
+    Let pool_entry_offset be class_index multiplied by 56
+    Let pool_entry_ptr be pool plus pool_entry_offset
+
+    Note: Get block size for this class
+    Let block_size be proc memory_get_integer from MemoryCore with pool_entry_ptr, 24
+
+    Note: Add 8 bytes for next pointer in free list
+    Let actual_block_size be block_size plus 8
+
+    Note: Allocate batch of blocks
+    Let batch_size be actual_block_size multiplied by POOL_BLOCK_COUNT
+    Let batch_ptr be proc allocate from MemoryUtils with batch_size
+
+    If batch_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate batch tracking node (16 bytes: batch_ptr + next)
+    Let batch_node_size be 16
+    Let batch_node be proc allocate from MemoryUtils with batch_node_size
+
+    If batch_node is equal to 0:
+        Let dummy_free_batch be proc deallocate from MemoryUtils with batch_ptr
+        Return 0
+    End If
+
+    Note: Initialize batch tracking node
+    Let dummy_bn1 be proc memory_set_integer from MemoryCore with batch_node, 0, batch_ptr  Note: batch_ptr
+    Let dummy_bn2 be proc memory_set_integer from MemoryCore with batch_node, 8, 0          Note: next = null
+
+    Note: Add batch node to batches_list (prepend)
+    Let old_batches_list be proc memory_get_integer from MemoryCore with pool_entry_ptr, 48
+    Let dummy_bn3 be proc memory_set_integer from MemoryCore with batch_node, 8, old_batches_list
+    Let dummy_bn4 be proc memory_set_integer from MemoryCore with pool_entry_ptr, 48, batch_node
+
+    Note: Initialize free list by linking all blocks
+    Let i be 0
+    While i is less than POOL_BLOCK_COUNT:
+        Let block_offset be i multiplied by actual_block_size
+        Let block_ptr be batch_ptr plus block_offset
+
+        Note: Calculate next block pointer
+        Let next_block_ptr be 0
+        Let next_i be i plus 1
+        If next_i is less than POOL_BLOCK_COUNT:
+            Let next_block_offset be next_i multiplied by actual_block_size
+            Set next_block_ptr to batch_ptr plus next_block_offset
+        End If
+
+        Note: Set next pointer in block (first 8 bytes)
+        Let dummy_next be proc memory_set_integer from MemoryCore with block_ptr, 0, next_block_ptr
+
+        Set i to i plus 1
+    End While
+
+    Note: Update pool entry to add new blocks to free list (prepend batch)
+    Let old_free_list be proc memory_get_integer from MemoryCore with pool_entry_ptr, 0
+    Let dummy_set_free be proc memory_set_integer from MemoryCore with pool_entry_ptr, 0, batch_ptr
+
+    Note: Link old free list to end of new blocks
+    If old_free_list is not equal to 0:
+        Note: Find last block in new batch
+        Let last_block_offset be POOL_BLOCK_COUNT minus 1
+        Set last_block_offset to last_block_offset multiplied by actual_block_size
+        Let last_block_ptr be batch_ptr plus last_block_offset
+
+        Note: Link to old free list
+        Let dummy_link be proc memory_set_integer from MemoryCore with last_block_ptr, 0, old_free_list
+    End If
+
+    Note: Update statistics
+    Let old_total_blocks be proc memory_get_integer from MemoryCore with pool_entry_ptr, 8
+    Let new_total_blocks be old_total_blocks plus POOL_BLOCK_COUNT
+    Let dummy_total be proc memory_set_integer from MemoryCore with pool_entry_ptr, 8, new_total_blocks
+
+    Let old_free_blocks be proc memory_get_integer from MemoryCore with pool_entry_ptr, 16
+    Let new_free_blocks be old_free_blocks plus POOL_BLOCK_COUNT
+    Let dummy_free be proc memory_set_integer from MemoryCore with pool_entry_ptr, 16, new_free_blocks
+
+    Return POOL_BLOCK_COUNT
+End Process
+
+Process called "pool_allocate" takes pool as Integer, size as Integer returns Integer:
+    @Reasoning:
+        The primary entry point for pool allocation. Maps the requested size
+        to a class, ensures the free list has at least one block (triggering
+        a batch allocation if it is empty), pops the head of the free list,
+        and returns a pointer to the usable memory (past the 8-byte next-pointer
+        prefix). Returns 0 if the size exceeds any pool class; the caller is
+        expected to fall back to another allocator in that case.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL pool guard.
+            2. class_index = pool_get_size_class_index(size). If -1, return 0.
+            3. Compute pool_entry_ptr.
+            4. Read free_blocks. If 0, call pool_allocate_block_batch.
+               If batch returns 0, return 0 (allocation failed at runtime).
+            5. Read free_list_head. Return 0 if NULL (defense in depth;
+               should not happen after a successful batch).
+            6. Read free_list_head.next (the new head after popping).
+            7. Write the new head into pool_entry.free_list.
+            8. Decrement free_blocks; increment allocations.
+            9. Return free_list_head + 8 (skip the 8-byte next-pointer prefix).
+    @End Implementation
+
+    @Performance_Hints:
+        Hot path: 4 memory reads + 3 memory writes, all O(1). When the free
+        list is empty the cost spikes to one batch allocation amortized over
+        64 subsequent allocations.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Returns a pointer into pool-owned memory. The pointer is valid until
+        the caller passes it back to pool_deallocate or the pool is destroyed.
+        Callers must not retain pointers past pool destruction.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if size fits in any pool class
+    Let class_index be proc pool_get_size_class_index with size
+
+    If class_index is less than 0:
+        Note: Size too large for pooling - caller must fall back
+        Return 0
+    End If
+
+    Note: Get pool entry for this size class
+    Let pool_entry_offset be class_index multiplied by 56
+    Let pool_entry_ptr be pool plus pool_entry_offset
+
+    Note: Check if free blocks available
+    Let free_blocks be proc memory_get_integer from MemoryCore with pool_entry_ptr, 16
+
+    If free_blocks is equal to 0:
+        Note: No free blocks, allocate new batch
+        Let batch_count be proc pool_allocate_block_batch with pool, class_index
+
+        If batch_count is equal to 0:
+            Note: Failed to allocate batch
+            Return 0
+        End If
+
+        Note: Reload free_blocks after batch allocation
+        Set free_blocks to proc memory_get_integer from MemoryCore with pool_entry_ptr, 16
+    End If
+
+    Note: Get first block from free list
+    Let free_list_head be proc memory_get_integer from MemoryCore with pool_entry_ptr, 0
+
+    If free_list_head is equal to 0:
+        Note: Free list is empty (should not happen after batch allocation)
+        Return 0
+    End If
+
+    Note: Read next pointer from block (first 8 bytes)
+    Let next_free_block be proc memory_get_integer from MemoryCore with free_list_head, 0
+
+    Note: Update free list head to next block
+    Let dummy_update_head be proc memory_set_integer from MemoryCore with pool_entry_ptr, 0, next_free_block
+
+    Note: Update statistics
+    Let new_free_blocks be free_blocks minus 1
+    Let dummy_free_count be proc memory_set_integer from MemoryCore with pool_entry_ptr, 16, new_free_blocks
+
+    Let allocations be proc memory_get_integer from MemoryCore with pool_entry_ptr, 32
+    Let new_allocations be allocations plus 1
+    Let dummy_alloc_count be proc memory_set_integer from MemoryCore with pool_entry_ptr, 32, new_allocations
+
+    Note: Return pointer to usable memory (skip 8-byte header)
+    Let usable_ptr be free_list_head plus 8
+
+    Return usable_ptr
+End Process
+
+Process called "pool_deallocate" takes pool as Integer, ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Returns a previously-allocated block to its pool's free list. Pushes
+        the block at the head of the free list so subsequent allocations
+        reuse it (LIFO discipline keeps recently-touched memory hot in cache).
+        The size parameter is required so we can identify which class the
+        block belongs to without storing per-block class metadata.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL pool/ptr guard.
+            2. class_index = pool_get_size_class_index(size); return 0 if -1.
+            3. Compute pool_entry_ptr and the block_header_ptr (= ptr - 8).
+            4. Read the current free_list head.
+            5. Write block_header_ptr.next = current head.
+            6. Write pool_entry.free_list = block_header_ptr.
+            7. Increment free_blocks, increment deallocations.
+            8. Return 1.
+    @End Implementation
+
+    @Performance_Hints:
+        Hot path: 3 memory reads + 3 memory writes, all O(1). LIFO push at
+        the head of the free list.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The pointer must have come from a prior pool_allocate against the
+        same pool with the same size; passing a foreign pointer corrupts
+        the free list. The class_index resolution is done by size, so the
+        size argument must match what was passed to allocate. There is no
+        runtime check against this constraint — it is a caller responsibility.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if size fits in any pool class
+    Let class_index be proc pool_get_size_class_index with size
+
+    If class_index is less than 0:
+        Note: Size doesn't match any pool class - cannot deallocate
+        Return 0
+    End If
+
+    Note: Get pool entry for this size class
+    Let pool_entry_offset be class_index multiplied by 56
+    Let pool_entry_ptr be pool plus pool_entry_offset
+
+    Note: Get block header pointer (subtract 8 bytes for next-pointer prefix)
+    Let block_header_ptr be ptr minus 8
+
+    Note: Get current free list head
+    Let free_list_head be proc memory_get_integer from MemoryCore with pool_entry_ptr, 0
+
+    Note: Set next pointer in returned block to current head
+    Let dummy_next be proc memory_set_integer from MemoryCore with block_header_ptr, 0, free_list_head
+
+    Note: Update free list head to returned block
+    Let dummy_head be proc memory_set_integer from MemoryCore with pool_entry_ptr, 0, block_header_ptr
+
+    Note: Update statistics
+    Let free_blocks be proc memory_get_integer from MemoryCore with pool_entry_ptr, 16
+    Let new_free_blocks be free_blocks plus 1
+    Let dummy_free_count be proc memory_set_integer from MemoryCore with pool_entry_ptr, 16, new_free_blocks
+
+    Let deallocations be proc memory_get_integer from MemoryCore with pool_entry_ptr, 40
+    Let new_deallocations be deallocations plus 1
+    Let dummy_dealloc_count be proc memory_set_integer from MemoryCore with pool_entry_ptr, 40, new_deallocations
+
+    Return 1
+End Process
+
+Process called "pool_get_statistics" takes pool as Integer, class_index as Integer returns Integer:
+    @Reasoning:
+        Returns a pointer to the pool entry for the requested class. Every
+        diagnostic counter lives inside that 56-byte entry, so callers get
+        all statistics through one pointer rather than seven separate
+        getters. The returned pointer aliases the internal pool entry;
+        callers must not mutate it and must not retain it past pool_destroy.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL pool guard and class_index range check.
+            2. Compute pool_entry_ptr = pool + class_index * 56.
+            3. Return pool_entry_ptr.
+        Callers read the same fields documented in this file's header
+        (free_list, total_blocks, free_blocks, block_size, allocations,
+        deallocations, batches_list) via memory_get_integer.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). Pure pointer arithmetic.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The returned pointer is internal to the pool. Treat it as read-only
+        and do not free it. It becomes invalid after pool_destroy.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    If class_index is less than 0:
+        Return 0
+    End If
+
+    If class_index is greater than or equal to POOL_SIZE_CLASS_COUNT:
+        Return 0
+    End If
+
+    Note: Return pointer to pool entry (contains all statistics)
+    Let pool_entry_offset be class_index multiplied by 56
+    Let pool_entry_ptr be pool plus pool_entry_offset
+
+    Return pool_entry_ptr
+End Process
+
+Process called "pool_destroy" takes pool as Integer returns Integer:
+    @Reasoning:
+        Tears down the pool with zero memory leaks. The critical correctness
+        property here is that EVERY batch ever allocated must be freed, not
+        just the ones referenced from free lists. That is why each batch is
+        recorded in batches_list on creation — destroy walks that list per
+        class and frees every batch buffer and tracking node before freeing
+        the pool structure itself.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL pool guard.
+            2. For each class_index in 0..POOL_SIZE_CLASS_COUNT:
+                 - Compute pool_entry_ptr.
+                 - Read batches_list from offset 48.
+                 - Walk the batch-tracking list:
+                     - Read batch_ptr (offset 0) and next_batch_node (offset 8).
+                     - Free batch_ptr (if non-null) via MemoryUtils.deallocate.
+                     - Free the tracking node itself.
+                     - Advance to next_batch_node.
+            3. Free the pool structure itself.
+            4. Return 1.
+    @End Implementation
+
+    @Performance_Hints:
+        O(total_batch_count) across all classes. Each batch is freed exactly
+        once. Cost is dominated by the underlying allocator's per-free cost.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Invalidates EVERY pointer ever returned from this pool. Callers must
+        not retain or use such pointers after destroy. This is non-negotiable
+        because the underlying batch memory is returned to the heap.
+    @End Security_Scope
+
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Note: Walk through all 6 size classes and free their batches
+    Let class_index be 0
+    While class_index is less than POOL_SIZE_CLASS_COUNT:
+        Let pool_entry_offset be class_index multiplied by 56
+        Let pool_entry_ptr be pool plus pool_entry_offset
+
+        Note: Get batches_list for this size class
+        Let batches_list be proc memory_get_integer from MemoryCore with pool_entry_ptr, 48
+
+        Note: Walk through batches_list and free all batches
+        Let current_batch_node be batches_list
+        While current_batch_node is not equal to 0:
+            Note: Get batch pointer and next node
+            Let batch_ptr be proc memory_get_integer from MemoryCore with current_batch_node, 0
+            Let next_batch_node be proc memory_get_integer from MemoryCore with current_batch_node, 8
+
+            Note: Free the actual batch memory
+            If batch_ptr is not equal to 0:
+                Let dummy_free_batch be proc deallocate from MemoryUtils with batch_ptr
+            End If
+
+            Note: Free the batch tracking node
+            Let dummy_free_node be proc deallocate from MemoryUtils with current_batch_node
+
+            Note: Move to next batch node
+            Set current_batch_node to next_batch_node
+        End While
+
+        Set class_index to class_index plus 1
+    End While
+
+    Note: Free the pool structure itself
+    Let dummy_free_pool be proc deallocate from MemoryUtils with pool
+
+    Return 1
+End Process
+
+Note:
+============================================================================
+END OF SIZE-CLASS MEMORY POOL IMPLEMENTATION
+============================================================================
+:End Note

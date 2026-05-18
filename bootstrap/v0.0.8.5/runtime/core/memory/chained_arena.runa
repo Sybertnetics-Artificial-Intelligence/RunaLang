@@ -1,0 +1,2142 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements the CHAINED ARENA variant of TIER 2 arena allocation
+for the Runa runtime memory system.
+
+CHAINED ARENA - Fast Bulk, O(1) Cleanup, Unbounded Growth via Block Chain
+- Process bulk temporary allocations with single-operation lifetime
+- Handle arena creation, allocation, and destruction across a chain of blocks
+- Grow capacity by allocating additional blocks rather than relocating data
+- Preserve pointer stability across grow events (existing allocations stay valid)
+- Track per-arena peak usage for diagnostics and fragmentation analysis
+- Maintain integrity invariants suitable for online validation and leak checks
+
+This file is essential because of the following reasons:
+- Chained-block arenas enable fast bulk temporary allocations (~10ns vs ~100ns heap)
+  while permitting capacity expansion without invalidating existing pointers.
+- Proper chained handling ensures O(1) bulk cleanup for thousands of allocations
+  even when total usage outgrows the initial reservation.
+- Chained arenas support compiler-grade workflows where allocations are heavy
+  and pointer stability is required across grow events (parsing, IR construction,
+  symbol-table assembly, batch translation passes).
+- Deterministic memory management for operation-scoped data with predictable
+  amortized cost per allocation and zero individual-free overhead.
+
+This file consists of the following functions/features/operation types:
+- Chained arena creation and destruction (chained_arena_create, chained_arena_destroy)
+- Chained arena allocation (chained_arena_allocate - bump allocator with chained growth)
+- Chained arena reset, clear, clone, and capacity-recovery operations
+- Chained arena query operations (size, capacity, usage, peak, allocation count)
+- Chained arena performance operations (stats, profile, optimize, benchmark)
+- Chained arena debugging operations (validate, dump, trace, leak check, verify)
+
+This file complements `runtime/core/memory/arena.runa` (the simple single-buffer
+arena). The two arenas are SEPARATE TYPES with disjoint name spaces:
+- `Arena` (in arena.runa) is a single-buffer doubling arena that COPIES data on
+  growth. Suitable for small bounded workloads where pointer instability is OK.
+- `ChainedArena` (in this file) is a multi-block arena that CHAINS blocks on
+  growth. Suitable for large workloads where pointer stability is required.
+
+Dependencies:
+- Imports compiler/internal/memory_utils.runa for tier-3 owned-heap allocate/deallocate
+- Imports compiler/internal/memory_safety.runa for pointer validation
+- Imports compiler/internal/debug_utils.runa for diagnostic helpers
+- Imports compiler/frontend/primitives/core/memory_core.runa for raw memory r/w
+- Imports compiler/frontend/primitives/core/bitwise_core.runa for alignment checks
+- Imports compiler/frontend/primitives/core/syscall_core.runa for benchmark timing
+:End Note
+
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/internal/memory_safety.runa" as MemorySafety
+Import "compiler/internal/debug_utils.runa" as DebugUtils
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as BitwiseCore
+Import "compiler/frontend/primitives/core/syscall_core.runa" as Syscall
+
+Note:
+============================================================================
+ChainedArena Structure Definitions
+============================================================================
+:End Note
+
+Note:
+ChainedArena structure layout (88 bytes, 11 qwords):
+  Offset  0: memory_block        Pointer to current active block's memory
+  Offset  8: current_pos         Bump pointer position within the current block
+  Offset 16: size                Logical size of the current block
+  Offset 24: capacity            Physical capacity of the current block
+  Offset 32: alignment           Default alignment requirement (power of 2)
+  Offset 40: first_block         Head of the ArenaBlock chain
+  Offset 48: current_block       Tail (active) of the ArenaBlock chain
+  Offset 56: is_active           1 if the arena is live, 0 if destroyed
+  Offset 64: allocation_count    Lifetime allocation count
+  Offset 72: total_allocated     Sum of allocation sizes across all blocks
+  Offset 80: peak_usage          Maximum observed usage (sum-of-used) across lifetime
+
+The 80-byte offset for peak_usage is new in this migration. Prior to the move
+out of compiler/internal/arena_utils.runa, three readers (peak getter, stats
+reset, validate) claimed to read peak_usage but actually read total_allocated
+at offset 72. The struct has been extended to a true 88-byte layout with a
+dedicated peak_usage cell at offset 80 that is updated by chained_arena_allocate
+after every successful bump.
+:End Note
+
+Type called "ChainedArena":
+    memory_block as Integer        Note: Pointer to current active memory block
+    current_pos as Integer         Note: Current bump position in active block
+    size as Integer                Note: Size of current block
+    capacity as Integer            Note: Capacity of current block
+    alignment as Integer           Note: Memory alignment requirement
+    first_block as Integer         Note: Pointer to first ArenaBlock in chain
+    current_block as Integer       Note: Pointer to current (tail) ArenaBlock
+    is_active as Integer           Note: 1 if arena is active, 0 if destroyed
+    allocation_count as Integer    Note: Number of allocations made
+    total_allocated as Integer     Note: Total bytes allocated across all blocks
+    peak_usage as Integer          Note: Peak observed usage across lifetime
+End Type
+
+Type called "ArenaBlock":
+    memory as Integer              Note: Pointer to memory in this block
+    size as Integer                Note: Size of this block
+    used as Integer                Note: Bytes used in this block
+    next as Integer                Note: Pointer to next block in chain
+End Type
+
+Type called "ArenaAllocation":
+    arena as Integer               Note: Pointer to parent ChainedArena
+    memory_ptr as Integer          Note: Pointer to allocated memory
+    size as Integer                Note: Size of allocation
+    alignment as Integer           Note: Alignment of allocation
+    is_freed as Integer            Note: 1 if allocation is freed
+    next as Integer                Note: Pointer to next allocation record
+End Type
+
+Type called "ArenaStats":
+    total_allocations as Integer   Note: Total number of allocations
+    total_bytes as Integer         Note: Total bytes allocated
+    peak_usage as Integer          Note: Peak memory usage
+    fragmentation as Integer       Note: Memory fragmentation percentage
+    allocation_time as Integer     Note: Time spent on allocations
+    deallocation_time as Integer   Note: Time spent on deallocations
+End Type
+
+Note:
+============================================================================
+ChainedArena Constants
+============================================================================
+:End Note
+
+Constant ARENA_DEFAULT_SIZE as Integer is 65536
+Constant ARENA_MIN_SIZE as Integer is 4096
+Constant ARENA_MAX_SIZE as Integer is 1073741824
+Constant ARENA_ALIGNMENT as Integer is 8
+Constant ARENA_GROWTH_FACTOR as Integer is 2
+Constant ARENA_SHRINK_THRESHOLD as Integer is 4
+
+Constant ARENA_ALLOCATION_SUCCESS as Integer is 0
+Constant ARENA_ALLOCATION_FAILED as Integer is -1
+Constant ARENA_ALLOCATION_OVERFLOW as Integer is -2
+Constant ARENA_ALLOCATION_INVALID as Integer is -3
+
+Constant ARENA_STRUCT_SIZE as Integer is 88
+Constant ARENA_BLOCK_NODE_SIZE as Integer is 32
+
+Note:
+============================================================================
+ChainedArena Creation and Destruction
+============================================================================
+:End Note
+
+Process called "chained_arena_create" takes initial_size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Goal: produce a fully-initialized ChainedArena with one bootstrap block ready
+        for bump allocation, returning 0 on any sub-allocation failure rather than
+        leaking partial state. The chained design defers growth cost until exhaustion,
+        so initial sizing only needs to cover the expected steady-state footprint;
+        anything beyond will trigger a new block link in chained_arena_allocate.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Clamp initial_size into [ARENA_MIN_SIZE, ARENA_MAX_SIZE].
+            2. Clamp alignment up to ARENA_ALIGNMENT if a smaller value was passed.
+            3. Allocate the 88-byte ChainedArena header on the owned heap.
+            4. Allocate the 32-byte ArenaBlock node for the first block.
+            5. Allocate the actual data buffer of size_to_use bytes for that block.
+            6. Initialize the block node fields (memory, size, used=0, next=null).
+            7. Initialize all 11 header fields including the new peak_usage=0.
+            8. On any allocation failure, deallocate previously allocated parts
+               in reverse order and return 0 so no leak survives the failure path.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is two owned-heap allocations plus one large data buffer, totalling
+        roughly one call into the underlying allocator per stage. Subsequent
+        bump allocations against the returned arena are O(1) until the block
+        fills, at which point chained_arena_allocate links a new block with cost
+        amortized geometrically (block size doubles by ARENA_GROWTH_FACTOR).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Does not accept any caller-controlled pointer. Validates incoming size
+        and alignment to keep the arena within bounded resource use. The created
+        arena holds owned memory only; no shared or borrowed regions are linked.
+    @End Security_Scope
+
+    Note: Validate size
+    Let size_to_use be initial_size
+    If size_to_use is less than ARENA_MIN_SIZE:
+        Set size_to_use to ARENA_MIN_SIZE
+    End If
+    If size_to_use is greater than ARENA_MAX_SIZE:
+        Set size_to_use to ARENA_MAX_SIZE
+    End If
+
+    Note: Validate alignment (must be at least default arena alignment)
+    Let alignment_to_use be alignment
+    If alignment_to_use is less than ARENA_ALIGNMENT:
+        Set alignment_to_use to ARENA_ALIGNMENT
+    End If
+
+    Note: Allocate ChainedArena structure (88 bytes: 11 qwords)
+    Let arena_ptr be proc allocate from MemoryUtils with ARENA_STRUCT_SIZE
+    If arena_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate first ArenaBlock node (32 bytes: 4 qwords)
+    Let first_block_node be proc allocate from MemoryUtils with ARENA_BLOCK_NODE_SIZE
+    If first_block_node is equal to 0:
+        Let dealloc_result be proc deallocate from MemoryUtils with arena_ptr
+        Return 0
+    End If
+
+    Note: Allocate memory for first block
+    Let memory_block be proc allocate from MemoryUtils with size_to_use
+    If memory_block is equal to 0:
+        Let dealloc1 be proc deallocate from MemoryUtils with arena_ptr
+        Let dealloc2 be proc deallocate from MemoryUtils with first_block_node
+        Return 0
+    End If
+
+    Note: Initialize ArenaBlock node
+    Let dummy1 be proc memory_set_integer from MemoryCore with first_block_node, 0, memory_block  Note: memory
+    Let dummy2 be proc memory_set_integer from MemoryCore with first_block_node, 8, size_to_use   Note: size
+    Let dummy3 be proc memory_set_integer from MemoryCore with first_block_node, 16, 0            Note: used = 0
+    Let dummy4 be proc memory_set_integer from MemoryCore with first_block_node, 24, 0            Note: next = null
+
+    Note: Initialize ChainedArena structure fields
+    Let dummy5 be proc memory_set_integer from MemoryCore with arena_ptr, 0, memory_block         Note: memory_block (current)
+    Let dummy6 be proc memory_set_integer from MemoryCore with arena_ptr, 8, 0                    Note: current_pos = 0
+    Let dummy7 be proc memory_set_integer from MemoryCore with arena_ptr, 16, size_to_use         Note: size (current)
+    Let dummy8 be proc memory_set_integer from MemoryCore with arena_ptr, 24, size_to_use         Note: capacity (current)
+    Let dummy9 be proc memory_set_integer from MemoryCore with arena_ptr, 32, alignment_to_use    Note: alignment
+    Let dummy10 be proc memory_set_integer from MemoryCore with arena_ptr, 40, first_block_node   Note: first_block
+    Let dummy11 be proc memory_set_integer from MemoryCore with arena_ptr, 48, first_block_node   Note: current_block
+    Let dummy12 be proc memory_set_integer from MemoryCore with arena_ptr, 56, 1                  Note: is_active = true
+    Let dummy13 be proc memory_set_integer from MemoryCore with arena_ptr, 64, 0                  Note: allocation_count = 0
+    Let dummy14 be proc memory_set_integer from MemoryCore with arena_ptr, 72, 0                  Note: total_allocated = 0
+    Let dummy15 be proc memory_set_integer from MemoryCore with arena_ptr, 80, 0                  Note: peak_usage = 0
+
+    Return arena_ptr
+End Process
+
+Process called "chained_arena_destroy" takes arena as Integer returns Nothing:
+    @Reasoning:
+        Destroying a chained arena must walk the entire block chain because each
+        block holds its own data buffer allocated from the owned heap. Failing to
+        walk would leak every block beyond the first. Marking the arena inactive
+        before the walk lets concurrent diagnostics observe the in-flight teardown
+        without racing on freed memory.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Validate the arena pointer via memory_safety to reject obviously
+               corrupted pointers without crashing.
+            3. Set is_active=0 to mark the arena as dying.
+            4. Walk the block chain from first_block:
+                 a. Read next pointer FIRST (before freeing the current node).
+                 b. Free the block's data buffer if non-null.
+                 c. Free the block node itself.
+                 d. Advance.
+            5. Free the ChainedArena header.
+    @End Implementation
+
+    @Performance_Hints:
+        O(N) in the number of chained blocks. Each block contributes two owned-heap
+        free calls plus one node free. The header free is a final fixed-cost call.
+        Total cost scales linearly with block count, not allocation count, which
+        is the key efficiency property of arena destruction.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller-controlled pointer is validated via memory_validate_pointer before
+        dereference. After destruction, all data pointers handed out previously
+        from the arena become invalid; callers must not retain them.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return
+    End If
+
+    Note: Validate arena pointer
+    Let is_valid be proc memory_validate_pointer from MemorySafety with arena
+    If is_valid is equal to 0:
+        Return
+    End If
+
+    Note: Mark arena as inactive
+    Let dummy1 be proc memory_set_integer from MemoryCore with arena, 56, 0  Note: is_active = false
+
+    Note: Get first block in chain
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+
+    Note: Walk through block chain and free each block
+    While current_block is not equal to 0:
+        Note: Get memory pointer from this block
+        Let block_memory be proc memory_get_integer from MemoryCore with current_block, 0
+
+        Note: Get next block before freeing current
+        Let next_block be proc memory_get_integer from MemoryCore with current_block, 24
+
+        Note: Free the memory in this block
+        If block_memory is not equal to 0:
+            Let dealloc1 be proc deallocate from MemoryUtils with block_memory
+        End If
+
+        Note: Free the block node itself
+        Let dealloc2 be proc deallocate from MemoryUtils with current_block
+
+        Note: Move to next block
+        Set current_block to next_block
+    End While
+
+    Note: Free arena structure itself
+    Let dealloc3 be proc deallocate from MemoryUtils with arena
+
+    Return
+End Process
+
+Process called "chained_arena_reset" takes arena as Integer returns Integer:
+    @Reasoning:
+        Reset returns the arena to a fresh state while reclaiming all blocks
+        beyond the first. This is the canonical pattern for reusing a long-lived
+        arena across distinct operations: keep the bootstrap block (probably hot
+        in cache), free anything we grew into, zero the bootstrap buffer for
+        security, and clear allocation counters.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard and is_active check.
+            2. Read first_block. If null, nothing to reset.
+            3. Walk the chain starting at first_block.next and free each block
+               (both buffer and node).
+            4. Terminate first_block's next pointer at 0 and reset its used=0.
+            5. Re-point the arena's current_block to first_block, reset
+               memory_block, size, capacity to first_block's values.
+            6. Zero the first_block buffer (security hygiene; prevents data
+               leakage to later allocations).
+            7. Reset current_pos, allocation_count, total_allocated, peak_usage.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is O(N) in trailing block count for the free walk, plus one
+        memory_zero of the bootstrap buffer. Subsequent allocations are again
+        O(1) bumps within the bootstrap block until growth is needed.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Memory zeroing is intentional: stale data from the previous use of the
+        arena could leak into the next operation if a caller reads beyond the
+        explicitly written portion of a returned allocation.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if arena is active
+    Let is_active be proc memory_get_integer from MemoryCore with arena, 56
+    If is_active is equal to 0:
+        Return 0
+    End If
+
+    Note: Get first block and current block
+    Let first_block_node be proc memory_get_integer from MemoryCore with arena, 40
+    Let current_block_node be proc memory_get_integer from MemoryCore with arena, 48
+
+    Note: If there are additional blocks beyond first, free them
+    If first_block_node is not equal to 0:
+        Note: Get the second block in chain (first.next)
+        Let second_block be proc memory_get_integer from MemoryCore with first_block_node, 24
+
+        Note: Walk through chain starting from second block and free all
+        Let block_to_free be second_block
+        While block_to_free is not equal to 0:
+            Let block_memory be proc memory_get_integer from MemoryCore with block_to_free, 0
+            Let next_block be proc memory_get_integer from MemoryCore with block_to_free, 24
+
+            Note: Free the memory in this block
+            If block_memory is not equal to 0:
+                Let dealloc1 be proc deallocate from MemoryUtils with block_memory
+            End If
+
+            Note: Free the block node itself
+            Let dealloc2 be proc deallocate from MemoryUtils with block_to_free
+
+            Set block_to_free to next_block
+        End While
+
+        Note: Terminate first block's chain (set next to null)
+        Let dummy_term be proc memory_set_integer from MemoryCore with first_block_node, 24, 0
+
+        Note: Reset first block's used field to 0
+        Let dummy_used be proc memory_set_integer from MemoryCore with first_block_node, 16, 0
+
+        Note: Get first block's memory and size
+        Let first_memory be proc memory_get_integer from MemoryCore with first_block_node, 0
+        Let first_size be proc memory_get_integer from MemoryCore with first_block_node, 8
+
+        Note: Update arena to use first block as current
+        Let dummy1 be proc memory_set_integer from MemoryCore with arena, 0, first_memory
+        Let dummy2 be proc memory_set_integer from MemoryCore with arena, 16, first_size
+        Let dummy3 be proc memory_set_integer from MemoryCore with arena, 24, first_size
+        Let dummy4 be proc memory_set_integer from MemoryCore with arena, 48, first_block_node
+
+        Note: Zero first block's memory for security
+        Let dummy5 be proc memory_zero from MemoryCore with first_memory, first_size
+    End If
+
+    Note: Reset current position to 0
+    Let dummy6 be proc memory_set_integer from MemoryCore with arena, 8, 0
+
+    Note: Reset allocation count
+    Let dummy7 be proc memory_set_integer from MemoryCore with arena, 64, 0
+
+    Note: Reset total allocated
+    Let dummy8 be proc memory_set_integer from MemoryCore with arena, 72, 0
+
+    Note: Reset peak usage
+    Let dummy9 be proc memory_set_integer from MemoryCore with arena, 80, 0
+
+    Return 1
+End Process
+
+Process called "chained_arena_clear" takes arena as Integer returns Integer:
+    @Reasoning:
+        Clear is the soft cousin of reset: it returns positions to zero on every
+        block in the chain without freeing the trailing blocks. Use this when the
+        caller will immediately reuse the full chained capacity (avoids the cost
+        of re-linking blocks on the next growth cycle). Unlike reset, clear does
+        not zero memory; callers must overwrite before reading.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard and is_active check.
+            2. Walk every block in the chain, setting block.used=0.
+            3. Re-point the arena's current to first_block (same as reset).
+            4. Reset current_pos, allocation_count, total_allocated, peak_usage.
+            5. Memory is NOT zeroed (key difference from reset).
+    @End Implementation
+
+    @Performance_Hints:
+        O(N) in block count for the walk; no syscalls; no deallocations. Roughly
+        an order of magnitude cheaper than reset for arenas with many trailing
+        blocks, at the cost of retaining their physical memory.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Unlike reset, clear leaves prior data in the arena buffers. Subsequent
+        allocations will return memory that contains stale bytes until written.
+        Use reset (not clear) when subsequent code may read uninitialized cells.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if arena is active
+    Let is_active be proc memory_get_integer from MemoryCore with arena, 56
+    If is_active is equal to 0:
+        Return 0
+    End If
+
+    Note: Reset all blocks' used fields to 0
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While current_block is not equal to 0:
+        Let dummy_reset be proc memory_set_integer from MemoryCore with current_block, 16, 0  Note: used = 0
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Note: Get first block as current
+    Let first_block_node be proc memory_get_integer from MemoryCore with arena, 40
+    If first_block_node is not equal to 0:
+        Let first_memory be proc memory_get_integer from MemoryCore with first_block_node, 0
+        Let first_size be proc memory_get_integer from MemoryCore with first_block_node, 8
+
+        Note: Update arena to use first block as current
+        Let dummy1 be proc memory_set_integer from MemoryCore with arena, 0, first_memory
+        Let dummy2 be proc memory_set_integer from MemoryCore with arena, 16, first_size
+        Let dummy3 be proc memory_set_integer from MemoryCore with arena, 24, first_size
+        Let dummy4 be proc memory_set_integer from MemoryCore with arena, 48, first_block_node
+    End If
+
+    Note: Reset current position to 0
+    Let dummy5 be proc memory_set_integer from MemoryCore with arena, 8, 0
+
+    Note: Reset allocation count
+    Let dummy6 be proc memory_set_integer from MemoryCore with arena, 64, 0
+
+    Note: Reset total allocated
+    Let dummy7 be proc memory_set_integer from MemoryCore with arena, 72, 0
+
+    Note: Reset peak usage
+    Let dummy8 be proc memory_set_integer from MemoryCore with arena, 80, 0
+
+    Return 1
+End Process
+
+Process called "chained_arena_clone" takes source_arena as Integer returns Integer:
+    @Reasoning:
+        Cloning produces a structurally-equivalent arena with byte-identical data
+        in every block up to each block's used count. The clone owns its own
+        buffers; mutating one arena does not affect the other. Useful for
+        snapshotting compilation state or for parallel exploration where each
+        branch needs its own copy of a shared starting context.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read source's first_block size and alignment; use these to
+               bootstrap a new arena via chained_arena_create.
+            3. Walk source blocks and destination blocks in lockstep:
+                 a. Copy memory[0..used] from src to dst.
+                 b. Set dst block's used to match src.
+                 c. If src.next exists, allocate a matching ArenaBlock node
+                    plus data buffer in the destination, link it in, advance.
+                 d. On any allocation failure, destroy the half-built clone
+                    and return 0.
+            4. Update the clone's current_block, memory_block, current_pos,
+               size, capacity to mirror the source's last-active state.
+            5. Copy allocation_count, total_allocated, peak_usage.
+    @End Implementation
+
+    @Performance_Hints:
+        O(total_used_bytes) for the memory copies plus O(block_count) header
+        operations. The clone is strictly heavier than the source's original
+        allocation cost (you pay for both allocate and copy), so use sparingly
+        and prefer snapshot+restore patterns where possible.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Source pointer is treated as caller-supplied and not validated beyond
+        NULL check; caller is responsible for passing a live arena. Failure
+        paths free all partially-allocated clone state to avoid leaks.
+    @End Security_Scope
+
+    If source_arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Get source arena properties from first block
+    Let src_first_block be proc memory_get_integer from MemoryCore with source_arena, 40
+    If src_first_block is equal to 0:
+        Return 0
+    End If
+
+    Let first_block_size be proc memory_get_integer from MemoryCore with src_first_block, 8
+    Let alignment be proc memory_get_integer from MemoryCore with source_arena, 32
+
+    Note: Create new arena with same first block size
+    Let new_arena be proc chained_arena_create with first_block_size, alignment
+    If new_arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Clone all blocks in the chain
+    Let src_block be src_first_block
+    Let dst_block be proc memory_get_integer from MemoryCore with new_arena, 40  Note: new first_block
+    Let last_dst_block be dst_block
+
+    While src_block is not equal to 0:
+        Note: Get source block info
+        Let src_memory be proc memory_get_integer from MemoryCore with src_block, 0
+        Let src_size be proc memory_get_integer from MemoryCore with src_block, 8
+        Let src_used be proc memory_get_integer from MemoryCore with src_block, 16
+        Let src_next be proc memory_get_integer from MemoryCore with src_block, 24
+
+        Note: Get destination block memory
+        Let dst_memory be proc memory_get_integer from MemoryCore with dst_block, 0
+
+        Note: Copy memory contents up to used amount
+        If src_used is greater than 0:
+            Let copy_result be proc memory_copy from MemoryCore with dst_memory, src_memory, src_used
+        End If
+
+        Note: Set destination block's used field
+        Let dummy_used be proc memory_set_integer from MemoryCore with dst_block, 16, src_used
+
+        Note: If source has next block, create corresponding block in destination
+        If src_next is not equal to 0:
+            Note: Get next block size
+            Let next_src_size be proc memory_get_integer from MemoryCore with src_next, 8
+
+            Note: Allocate new ArenaBlock node
+            Let new_dst_block be proc allocate from MemoryUtils with ARENA_BLOCK_NODE_SIZE
+            If new_dst_block is equal to 0:
+                Note: Failed to allocate - cleanup and return 0
+                Let destroy_result be proc chained_arena_destroy with new_arena
+                Return 0
+            End If
+
+            Note: Allocate memory for new block
+            Let new_dst_memory be proc allocate from MemoryUtils with next_src_size
+            If new_dst_memory is equal to 0:
+                Let dealloc_node be proc deallocate from MemoryUtils with new_dst_block
+                Set destroy_result to proc chained_arena_destroy with new_arena
+                Return 0
+            End If
+
+            Note: Initialize new destination block
+            Let dummy1 be proc memory_set_integer from MemoryCore with new_dst_block, 0, new_dst_memory  Note: memory
+            Let dummy2 be proc memory_set_integer from MemoryCore with new_dst_block, 8, next_src_size   Note: size
+            Let dummy3 be proc memory_set_integer from MemoryCore with new_dst_block, 16, 0               Note: used = 0
+            Let dummy4 be proc memory_set_integer from MemoryCore with new_dst_block, 24, 0               Note: next = null
+
+            Note: Link to previous destination block
+            Let dummy5 be proc memory_set_integer from MemoryCore with dst_block, 24, new_dst_block
+
+            Note: Advance to next blocks
+            Set src_block to src_next
+            Set dst_block to new_dst_block
+            Set last_dst_block to new_dst_block
+        Otherwise:
+            Note: No more source blocks
+            Set src_block to 0
+        End If
+    End While
+
+    Note: Update new arena's current_block to point to last block
+    Let dummy6 be proc memory_set_integer from MemoryCore with new_arena, 48, last_dst_block
+
+    Note: Get final memory block and position from last destination block
+    Let final_memory be proc memory_get_integer from MemoryCore with last_dst_block, 0
+    Let final_size be proc memory_get_integer from MemoryCore with last_dst_block, 8
+    Let final_used be proc memory_get_integer from MemoryCore with last_dst_block, 16
+
+    Note: Update new arena's current state
+    Let dummy7 be proc memory_set_integer from MemoryCore with new_arena, 0, final_memory   Note: memory_block
+    Let dummy8 be proc memory_set_integer from MemoryCore with new_arena, 8, final_used     Note: current_pos
+    Let dummy9 be proc memory_set_integer from MemoryCore with new_arena, 16, final_size    Note: size
+    Let dummy10 be proc memory_set_integer from MemoryCore with new_arena, 24, final_size   Note: capacity
+
+    Note: Copy allocation count and total allocated
+    Let allocation_count be proc memory_get_integer from MemoryCore with source_arena, 64
+    Let dummy11 be proc memory_set_integer from MemoryCore with new_arena, 64, allocation_count
+
+    Let total_allocated be proc memory_get_integer from MemoryCore with source_arena, 72
+    Let dummy12 be proc memory_set_integer from MemoryCore with new_arena, 72, total_allocated
+
+    Note: Copy peak usage
+    Let peak_usage be proc memory_get_integer from MemoryCore with source_arena, 80
+    Let dummy13 be proc memory_set_integer from MemoryCore with new_arena, 80, peak_usage
+
+    Return new_arena
+End Process
+
+Note:
+============================================================================
+ChainedArena Allocation Operations
+============================================================================
+:End Note
+
+Process called "chained_arena_allocate" takes arena as Integer, size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        This is the hot path. Every chained-arena allocation site in the compiler
+        runs through here, so the implementation must be tight: a single aligned
+        bump on the fast path, with growth deferred to a slow path that doubles
+        the block size and links a new ArenaBlock when the current block fills.
+        Pointer stability is non-negotiable: prior allocations remain at their
+        original addresses across grow events because we never relocate buffers.
+    @End Reasoning
+
+    @Implementation:
+        Fast path (current block has room):
+            1. NULL/zero-size guard.
+            2. is_active check.
+            3. Read current_pos and current memory_block.
+            4. Align current_pos up to `alignment` (when alignment > 1).
+            5. Compute new_pos = aligned_pos + size.
+            6. If new_pos <= capacity: take the slot, update current_pos,
+               increment allocation_count, increase total_allocated, update
+               peak_usage if the new sum-of-used exceeds the recorded peak.
+            7. Return memory_block + aligned_pos.
+
+        Slow path (current block too small):
+            1. Commit current_pos into current_block.used so block accounting
+               reflects what was actually consumed.
+            2. Compute new_block_size = max(capacity * 2, size + alignment).
+               Clamp to ARENA_MAX_SIZE.
+            3. Allocate a new ArenaBlock node and its data buffer.
+            4. On either allocation failure, free what was reserved and return 0
+               without mutating the arena state.
+            5. Initialize new block node (memory, size, used=0, next=null).
+            6. Link current_block.next = new_block, then switch arena's view to
+               the new block as current_block, with current_pos=0,
+               size=new_block_size, capacity=new_block_size.
+            7. Fall through to the fast-path bump using the new block.
+
+        Peak tracking:
+            After every successful bump, compute the arena's current total
+            usage by summing committed block.used across the chain plus the
+            new current_pos. If this exceeds the stored peak_usage at offset
+            80, write the new peak. This costs an O(block_count) chain walk
+            per allocation, which is acceptable because chains stay short
+            (geometric growth keeps log-many blocks even at extreme sizes).
+    @End Implementation
+
+    @Performance_Hints:
+        Fast path: O(1) plus the peak-tracking chain walk, dominated by the
+        memory_get_integer / memory_set_integer pair on the arena header.
+        Slow path: O(1) per grow (two allocate calls plus pointer updates).
+        Peak tracking can be omitted by callers that do not need diagnostics,
+        but is always-on here because the cost is amortized into roughly the
+        same order as the allocation itself for short chains.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller-supplied size and alignment are validated. Negative or absurd
+        sizes are rejected. The allocation never returns a pointer outside
+        the arena's allocated capacity, so callers cannot accidentally read
+        or write past the arena's owned memory range.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    If size is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if arena is active
+    Let is_active be proc memory_get_integer from MemoryCore with arena, 56
+    If is_active is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current position and memory block
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Let memory_block be proc memory_get_integer from MemoryCore with arena, 0
+
+    Note: Align current position if needed
+    Let aligned_pos be current_pos
+    If alignment is greater than 1:
+        Let mask be alignment minus 1
+        Let offset be current_pos bitwise and mask
+        If offset is not equal to 0:
+            Let padding be alignment minus offset
+            Set aligned_pos to current_pos plus padding
+        End If
+    End If
+
+    Note: Calculate new position after allocation
+    Let new_pos be aligned_pos plus size
+
+    Note: Check if we have enough space in current block
+    Let capacity be proc memory_get_integer from MemoryCore with arena, 24
+    If new_pos is greater than capacity:
+        Note: SLOW PATH: Current block is full, allocate new block
+
+        Note: Update current block's used field before allocating new block
+        Let current_block_node be proc memory_get_integer from MemoryCore with arena, 48
+        If current_block_node is not equal to 0:
+            Let dummy_update_used be proc memory_set_integer from MemoryCore with current_block_node, 16, current_pos
+        End If
+
+        Note: Calculate new block size (double previous size or fit allocation, whichever larger)
+        Let new_block_size be capacity multiplied by 2
+        Let size_needed be size plus alignment  Note: Add alignment for padding
+        If new_block_size is less than size_needed:
+            Set new_block_size to size_needed
+        End If
+
+        Note: Cap at ARENA_MAX_SIZE
+        If new_block_size is greater than ARENA_MAX_SIZE:
+            Set new_block_size to ARENA_MAX_SIZE
+        End If
+
+        Note: Allocate new ArenaBlock node
+        Let new_block_node be proc allocate from MemoryUtils with ARENA_BLOCK_NODE_SIZE
+        If new_block_node is equal to 0:
+            Return 0  Note: Failed to allocate block node
+        End If
+
+        Note: Allocate memory for new block
+        Let new_memory_block be proc allocate from MemoryUtils with new_block_size
+        If new_memory_block is equal to 0:
+            Let dealloc_node be proc deallocate from MemoryUtils with new_block_node
+            Return 0  Note: Failed to allocate new block memory
+        End If
+
+        Note: Initialize new ArenaBlock node
+        Let dummy1 be proc memory_set_integer from MemoryCore with new_block_node, 0, new_memory_block  Note: memory
+        Let dummy2 be proc memory_set_integer from MemoryCore with new_block_node, 8, new_block_size    Note: size
+        Let dummy3 be proc memory_set_integer from MemoryCore with new_block_node, 16, 0                Note: used = 0
+        Let dummy4 be proc memory_set_integer from MemoryCore with new_block_node, 24, 0                Note: next = null
+
+        Note: Link new block to current block's next pointer
+        If current_block_node is not equal to 0:
+            Let dummy5 be proc memory_set_integer from MemoryCore with current_block_node, 24, new_block_node
+        End If
+
+        Note: Update arena to use new block as current
+        Let dummy6 be proc memory_set_integer from MemoryCore with arena, 0, new_memory_block    Note: memory_block
+        Let dummy7 be proc memory_set_integer from MemoryCore with arena, 8, 0                   Note: current_pos = 0
+        Let dummy8 be proc memory_set_integer from MemoryCore with arena, 16, new_block_size     Note: size
+        Let dummy9 be proc memory_set_integer from MemoryCore with arena, 24, new_block_size     Note: capacity
+        Let dummy10 be proc memory_set_integer from MemoryCore with arena, 48, new_block_node    Note: current_block
+
+        Note: Recalculate positions for new block
+        Set current_pos to 0
+        Set memory_block to new_memory_block
+        Set aligned_pos to 0
+        Set new_pos to size
+        Set capacity to new_block_size
+
+        Note: Verify new block has space (always true after growing within ARENA_MAX_SIZE)
+        If new_pos is greater than capacity:
+            Return 0  Note: Allocation too large even for new block
+        End If
+    End If
+
+    Note: Calculate pointer to allocated memory
+    Let alloc_ptr be memory_block plus aligned_pos
+
+    Note: Update current position
+    Let dummy11 be proc memory_set_integer from MemoryCore with arena, 8, new_pos
+
+    Note: Increment allocation count
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Let new_count be allocation_count plus 1
+    Let dummy12 be proc memory_set_integer from MemoryCore with arena, 64, new_count
+
+    Note: Update total allocated bytes across all blocks
+    Let total_allocated be proc memory_get_integer from MemoryCore with arena, 72
+    Let new_total be total_allocated plus size
+    Let dummy13 be proc memory_set_integer from MemoryCore with arena, 72, new_total
+
+    Note: Update peak usage if current total usage exceeds stored peak.
+    Note: Current total usage = sum of committed block.used + arena.current_pos.
+    Let total_used be 0
+    Let walk_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While walk_block is not equal to 0:
+        Let walk_used be proc memory_get_integer from MemoryCore with walk_block, 16
+        Set total_used to total_used plus walk_used
+        Set walk_block to proc memory_get_integer from MemoryCore with walk_block, 24
+    End While
+    Set total_used to total_used plus new_pos
+
+    Let stored_peak be proc memory_get_integer from MemoryCore with arena, 80
+    If total_used is greater than stored_peak:
+        Let dummy14 be proc memory_set_integer from MemoryCore with arena, 80, total_used
+    End If
+
+    Return alloc_ptr
+End Process
+
+Process called "chained_arena_allocate_aligned" takes arena as Integer, size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Public alias preserved for callers that want to spell the alignment
+        argument explicitly at the call site for readability. Functionally
+        identical to chained_arena_allocate, kept as a separate entry point
+        because removing it would silently break downstream callers that
+        spell their intent through the API name.
+    @End Reasoning
+
+    @Implementation:
+        Forwards directly to chained_arena_allocate with the supplied
+        alignment. No additional work is done; the underlying allocator
+        already aligns when alignment > 1.
+    @End Implementation
+
+    Note: Direct alias for chained_arena_allocate with explicit alignment
+    Let result be proc chained_arena_allocate with arena, size, alignment
+    Return result
+End Process
+
+Process called "chained_arena_allocate_zeroed" takes arena as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Many use cases require zero-initialized memory: stack frames in IR
+        builders, freshly-created struct instances, lookup tables. Doing the
+        bump and the zero in one entry point lets the caller skip a separate
+        memory_zero call and keeps the zero region tight to the allocation.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Read the arena's default alignment from offset 32 (falls back
+               to ARENA_ALIGNMENT if the arena pointer is null, which lets
+               this call propagate the null cleanly to chained_arena_allocate).
+            2. Bump-allocate `size` bytes at the arena's default alignment.
+            3. If allocation succeeded, zero the returned region.
+            4. Return the pointer (or 0 on allocation failure).
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is one chained_arena_allocate plus a memory_zero proportional to
+        `size`. For large zero regions, prefer chained_arena_allocate +
+        memset-by-page if the allocator backs onto a freshly-mapped page that
+        is guaranteed zero by the OS, but for the general case this is the
+        right primitive.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Zeroing guarantees no stale data leaks from a previous arena occupant
+        into the newly-handed-out region.
+    @End Security_Scope
+
+    Note: Get arena alignment
+    Let alignment be ARENA_ALIGNMENT
+    If arena is not equal to 0:
+        Set alignment to proc memory_get_integer from MemoryCore with arena, 32
+    End If
+
+    Note: Allocate memory
+    Let alloc_ptr be proc chained_arena_allocate with arena, size, alignment
+    If alloc_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero the allocated memory
+    Let dummy be proc memory_zero from MemoryCore with alloc_ptr, size
+
+    Return alloc_ptr
+End Process
+
+Process called "chained_arena_allocate_array" takes arena as Integer, element_size as Integer, count as Integer returns Integer:
+    @Reasoning:
+        Array allocations want alignment derived from element_size so individual
+        elements sit on natural boundaries. Clamping the alignment to 16 keeps
+        SIMD-aligned arrays accurate while preventing absurd alignment requests
+        for oversized element types from leaking into the underlying allocator.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Compute total_size = element_size * count.
+            2. Set alignment = element_size, clamped to 16.
+            3. Bump-allocate at that alignment via chained_arena_allocate.
+            4. Return whatever the bump allocator returned (0 on failure).
+    @End Implementation
+
+    @Performance_Hints:
+        Single chained_arena_allocate call. Alignment to element size avoids
+        unaligned reads/writes on the resulting array, which on x86_64 is a
+        soft performance issue for scalars but a hard requirement for SIMD.
+    @End Performance_Hints
+
+    Note: Calculate total size
+    Let total_size be element_size multiplied by count
+
+    Note: Use element size as alignment (up to 16 bytes)
+    Let alignment be element_size
+    If alignment is greater than 16:
+        Set alignment to 16
+    End If
+
+    Note: Allocate array memory
+    Let result be proc chained_arena_allocate with arena, total_size, alignment
+    Return result
+End Process
+
+Process called "chained_arena_allocate_string" takes arena as Integer, length as Integer returns Integer:
+    @Reasoning:
+        Strings carry an implicit null-terminator byte; this entry point folds
+        the +1 into the allocation so callers cannot forget it. Strings use
+        byte-alignment because they are sequences of bytes; any larger alignment
+        would waste arena space for no benefit.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Compute buffer_size = length + 1 (room for null terminator).
+            2. Bump-allocate buffer_size bytes at alignment=1.
+            3. Return the pointer.
+    @End Implementation
+
+    @Security_Scope:
+        The returned buffer is uninitialized; callers must write the string
+        bytes AND the null terminator. The +1 byte is included specifically
+        so that callers terminating with index `length` are in-bounds.
+    @End Security_Scope
+
+    Note: Add 1 for null terminator
+    Let buffer_size be length plus 1
+
+    Note: Strings use 1-byte alignment
+    Let result be proc chained_arena_allocate with arena, buffer_size, 1
+    Return result
+End Process
+
+Process called "chained_arena_allocate_struct" takes arena as Integer, struct_size as Integer returns Integer:
+    @Reasoning:
+        Struct allocations are aligned to 8 bytes because the runtime memory
+        layout assumes 8-byte field granularity for the Integer type that backs
+        every field-bearing position in a Runa struct. Aligning at 8 ensures
+        that subsequent memory_get_integer / memory_set_integer calls against
+        the returned pointer are aligned.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Set alignment = 8 (matches the runtime's Integer-field rule).
+            2. Bump-allocate struct_size bytes at alignment=8.
+            3. Return the pointer.
+    @End Implementation
+
+    Note: Structures use 8-byte alignment
+    Let alignment be 8
+
+    Let result be proc chained_arena_allocate with arena, struct_size, alignment
+    Return result
+End Process
+
+Note:
+============================================================================
+ChainedArena Memory Management
+============================================================================
+:End Note
+
+Process called "chained_arena_compact" takes arena as Integer returns Integer:
+    @Reasoning:
+        For a bump-allocator with chained blocks, fragmentation cannot occur in
+        the traditional sense: allocations are linearly arranged inside each
+        block and individual frees do not exist. The "compact" operation is
+        therefore a no-op preserved for API symmetry with allocators that do
+        need explicit compaction. Returning success documents that the arena's
+        internal state already satisfies the contract that compact would
+        otherwise enforce.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Return 1. No mutation occurs because the arena is already in
+               its most compact state.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). No memory traffic.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Bump allocators with chained blocks do not fragment.
+    Note: Allocations are contiguous within each block.
+    Note: Compaction is unnecessary and would be harmful (would move pointers).
+    Return 1
+End Process
+
+Note:
+============================================================================
+ChainedArena Query Operations
+============================================================================
+:End Note
+
+Process called "chained_arena_get_size" takes arena as Integer returns Integer:
+    @Reasoning:
+        Total size reports the SUM of every block's nominal size in the chain.
+        Diagnostics frequently want this number to reason about how much
+        memory the arena has reserved versus how much it is actively using.
+    @End Reasoning
+
+    @Implementation:
+        Walk the chain from first_block and accumulate each block's size
+        field at offset 8. Return the sum. NULL arena returns 0.
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count). Chain walks are cheap because chains stay short.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Sum sizes of all blocks in chain
+    Let total_size be 0
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While current_block is not equal to 0:
+        Let block_size be proc memory_get_integer from MemoryCore with current_block, 8
+        Set total_size to total_size plus block_size
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Return total_size
+End Process
+
+Process called "chained_arena_get_capacity" takes arena as Integer returns Integer:
+    @Reasoning:
+        For chained-block bump allocators, each block's capacity equals its
+        size: there is no header overhead inside the block. Total capacity
+        therefore equals total size. This entry point is kept distinct from
+        chained_arena_get_size for API symmetry with allocators that
+        distinguish the two.
+    @End Reasoning
+
+    @Implementation:
+        Walk the chain and sum block.size at offset 8 (same as get_size).
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count).
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: For chained blocks, capacity per block equals size per block.
+    Let total_capacity be 0
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While current_block is not equal to 0:
+        Let block_size be proc memory_get_integer from MemoryCore with current_block, 8
+        Set total_capacity to total_capacity plus block_size
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Return total_capacity
+End Process
+
+Process called "chained_arena_get_usage" takes arena as Integer returns Integer:
+    @Reasoning:
+        Usage reports the bytes that have been handed out across all blocks,
+        including the partial bytes in the active block (which may not yet
+        be reflected in the block's committed `used` field). Computing it
+        requires summing committed used across the chain and then adding
+        the active block's bump pointer.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Walk the chain and sum block.used at offset 16.
+            2. Add arena.current_pos at offset 8 (uncommitted bump position).
+            3. Return the total.
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count). Used by chained_arena_allocate to update peak usage
+        on the hot path.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Sum used bytes from all blocks in chain
+    Let total_used be 0
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While current_block is not equal to 0:
+        Let block_used be proc memory_get_integer from MemoryCore with current_block, 16
+        Set total_used to total_used plus block_used
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Note: Add current block's bump position (may not yet be committed to block.used)
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Set total_used to total_used plus current_pos
+
+    Return total_used
+End Process
+
+Process called "chained_arena_get_peak_usage" takes arena as Integer returns Integer:
+    @Reasoning:
+        Returns the maximum aggregate usage observed across the arena's
+        lifetime. The peak is maintained by chained_arena_allocate on each
+        successful bump (see its @Implementation block). This value persists
+        across reset_stats unless explicitly cleared.
+    @End Reasoning
+
+    @Implementation:
+        Read the qword at offset 80 of the arena structure. Returns 0 for a
+        null arena. The qword is updated by chained_arena_allocate (after
+        each successful bump) and zeroed by chained_arena_reset and
+        chained_arena_reset_stats.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1) memory read.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with arena, 80
+    Return peak_usage
+End Process
+
+Process called "chained_arena_get_fragmentation" takes arena as Integer returns Integer:
+    @Reasoning:
+        Bump allocators allocate linearly within each block, so by definition
+        there are no holes between allocations within a block. Fragmentation
+        is therefore always zero. This entry point is preserved for callers
+        that interrogate generic allocator metrics without needing to know
+        the specific allocator strategy.
+    @End Reasoning
+
+    @Implementation:
+        Always returns 0 for non-null arenas, 0 for null arenas.
+    @End Implementation
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Bump allocators allocate linearly - no fragmentation.
+    Return 0
+End Process
+
+Process called "chained_arena_get_allocation_count" takes arena as Integer returns Integer:
+    @Reasoning:
+        Tracks the lifetime number of successful allocations against the
+        arena. Useful for benchmarking and load characterization.
+    @End Reasoning
+
+    @Implementation:
+        Read the qword at offset 64 of the arena structure.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1) memory read.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Return allocation_count
+End Process
+
+Process called "chained_arena_is_full" takes arena as Integer returns Integer:
+    @Reasoning:
+        Reports whether the CURRENT block has been exhausted. In a chained
+        arena with automatic growth, the arena as a whole is never "full"
+        unless ARENA_MAX_SIZE is reached for the next-block size, but the
+        current block can be exhausted and force a slow-path grow on the
+        next allocation. Callers may use this to pre-emptively decide
+        whether to flush or batch upcoming work.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL arena returns 1 (treat null as fully unusable).
+            2. Read current_pos at offset 8.
+            3. Read capacity at offset 24.
+            4. Return 1 if current_pos >= capacity, else 0.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1) (two memory reads, one comparison).
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 1
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Let capacity be proc memory_get_integer from MemoryCore with arena, 24
+
+    If current_pos is greater than or equal to capacity:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "chained_arena_has_space" takes arena as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Reports whether an allocation of the requested size can succeed.
+        With chained growth, any size up to ARENA_MAX_SIZE per block can
+        be served by linking a new block, so the answer is yes for any
+        reasonable input. Sizes exceeding ARENA_MAX_SIZE cannot be served
+        even by a fresh block and return false.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL arena returns 0.
+            2. Zero-size queries return 1 (trivially yes).
+            3. Sizes exceeding ARENA_MAX_SIZE return 0.
+            4. Otherwise return 1.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1).
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    If size is equal to 0:
+        Return 1
+    End If
+
+    Note: Check if allocation would exceed maximum arena block size
+    If size is greater than ARENA_MAX_SIZE:
+        Return 0
+    End If
+
+    Note: With automatic growth via chained blocks, arena can always accommodate
+    Note: allocations up to ARENA_MAX_SIZE per block.
+    Return 1
+End Process
+
+Note:
+============================================================================
+ChainedArena Performance Operations
+============================================================================
+:End Note
+
+Process called "chained_arena_get_stats" takes arena as Integer returns Integer:
+    @Reasoning:
+        Bundles every diagnostic counter into a single 72-byte stats structure
+        for callers that want a snapshot without making nine separate getter
+        calls. The structure is allocated on the owned heap; callers own it
+        and must free it (or accept the leak if used inside an outer arena).
+    @End Reasoning
+
+    @Implementation:
+        Stats structure layout (72 bytes):
+            offset  0: total_size       - sum of block sizes
+            offset  8: total_capacity   - sum of block capacities (= sizes here)
+            offset 16: current_usage    - sum of block.used + arena.current_pos
+            offset 24: peak_usage       - arena.peak_usage at offset 80
+            offset 32: allocation_count - arena.allocation_count
+            offset 40: total_allocated  - arena.total_allocated
+            offset 48: total_freed      - always 0 (no individual frees)
+            offset 56: fragmentation    - always 0 (bump allocator)
+            offset 64: block_count      - number of blocks in chain
+
+        Walk the chain once to compute total_size, total_capacity,
+        current_usage (committed portion), and block_count. Add the
+        uncommitted current_pos. Read the remaining counters from the
+        arena header. Allocate the stats buffer via MemoryUtils.allocate
+        and write the fields.
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count) for the chain walk, plus one owned-heap allocation.
+        Callers that poll this frequently should consider caching the result
+        and bumping a dirty flag in the arena.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Returned buffer is owned by the caller. No internal arena pointer
+        is leaked through the stats structure.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let stats_size be 72
+    Let stats_ptr be proc allocate from MemoryUtils with stats_size
+
+    If stats_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Sum sizes, capacities, and usage across all blocks
+    Let total_size be 0
+    Let total_capacity be 0
+    Let total_usage be 0
+    Let block_count be 0
+
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While current_block is not equal to 0:
+        Let block_size be proc memory_get_integer from MemoryCore with current_block, 8
+        Let block_used be proc memory_get_integer from MemoryCore with current_block, 16
+
+        Set total_size to total_size plus block_size
+        Set total_capacity to total_capacity plus block_size  Note: capacity = size in chained design
+        Set total_usage to total_usage plus block_used
+        Set block_count to block_count plus 1
+
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Note: Add current position from arena (current block's uncommitted usage)
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Set total_usage to total_usage plus current_pos
+
+    Note: Set stats fields
+    Let dummy1 be proc memory_set_integer from MemoryCore with stats_ptr, 0, total_size
+    Let dummy2 be proc memory_set_integer from MemoryCore with stats_ptr, 8, total_capacity
+    Let dummy3 be proc memory_set_integer from MemoryCore with stats_ptr, 16, total_usage
+
+    Note: Read peak_usage from new offset 80
+    Let peak_usage be proc memory_get_integer from MemoryCore with arena, 80
+    Let dummy4 be proc memory_set_integer from MemoryCore with stats_ptr, 24, peak_usage
+
+    Note: Get allocation count
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Let dummy5 be proc memory_set_integer from MemoryCore with stats_ptr, 32, allocation_count
+
+    Note: Get total allocated from arena field
+    Let total_allocated be proc memory_get_integer from MemoryCore with arena, 72
+    Let dummy6 be proc memory_set_integer from MemoryCore with stats_ptr, 40, total_allocated
+
+    Note: Total freed is 0 for bump allocator (no individual frees)
+    Let dummy7 be proc memory_set_integer from MemoryCore with stats_ptr, 48, 0
+
+    Note: Fragmentation is 0 for bump allocator
+    Let dummy8 be proc memory_set_integer from MemoryCore with stats_ptr, 56, 0
+
+    Note: Set block count
+    Let dummy9 be proc memory_set_integer from MemoryCore with stats_ptr, 64, block_count
+
+    Return stats_ptr
+End Process
+
+Process called "chained_arena_reset_stats" takes arena as Integer returns Nothing:
+    @Reasoning:
+        Allows callers to zero the diagnostic counters (allocation_count,
+        peak_usage) without disturbing the arena's structural state. Used
+        when benchmarking distinct phases against the same arena and the
+        caller wants per-phase counters rather than lifetime counters.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Write 0 to offset 64 (allocation_count).
+            3. Write 0 to offset 80 (peak_usage).
+            4. Leave structural fields (memory_block, current_pos, size,
+               capacity, alignment, first/current_block, is_active) untouched.
+            5. total_allocated at offset 72 is also left untouched because it
+               is a structural-lifetime counter, not a phase counter.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). Two memory writes.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return
+    End If
+
+    Note: Reset allocation count to 0
+    Let dummy1 be proc memory_set_integer from MemoryCore with arena, 64, 0
+
+    Note: Reset peak usage to 0 (offset 80, the new dedicated peak field)
+    Let dummy2 be proc memory_set_integer from MemoryCore with arena, 80, 0
+
+    Note: Structural fields and total_allocated (offset 72) remain intact.
+
+    Return
+End Process
+
+Process called "chained_arena_profile" takes arena as Integer returns Integer:
+    @Reasoning:
+        Produces a derived-metrics report distinct from get_stats: rather than
+        returning raw counters, profile computes percentages and ratios that
+        diagnose allocation patterns (utilization, average size, efficiency,
+        waste, rate, per-block utilization). Useful for capacity planning and
+        for spotting workloads that should switch to a different allocator.
+    @End Reasoning
+
+    @Implementation:
+        Profile structure layout (56 bytes):
+            offset  0: utilization_percentage     (0..100)
+            offset  8: average_allocation_size    (total_usage / allocation_count)
+            offset 16: allocation_efficiency      (100 for bump - no overhead)
+            offset 24: memory_waste               (total_capacity - total_usage)
+            offset 32: allocation_rate            (count, as simple metric)
+            offset 40: block_count                (number of chained blocks)
+            offset 48: average_block_utilization  (utilization / block_count)
+
+        Implementation walks the chain once, then computes each metric with
+        division-by-zero guards (utilization=0 if capacity=0, etc.).
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count). One owned-heap allocation.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let profile_size be 56
+    Let profile_ptr be proc allocate from MemoryUtils with profile_size
+
+    If profile_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Sum across all blocks
+    Let total_capacity be 0
+    Let total_usage be 0
+    Let block_count be 0
+
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+    While current_block is not equal to 0:
+        Let block_size be proc memory_get_integer from MemoryCore with current_block, 8
+        Let block_used be proc memory_get_integer from MemoryCore with current_block, 16
+
+        Set total_capacity to total_capacity plus block_size
+        Set total_usage to total_usage plus block_used
+        Set block_count to block_count plus 1
+
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Note: Add current position
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Set total_usage to total_usage plus current_pos
+
+    Note: Calculate utilization percentage
+    Let utilization be 0
+    If total_capacity is greater than 0:
+        Let hundred be 100
+        Let numerator be total_usage multiplied by hundred
+        Set utilization to numerator divided by total_capacity
+    End If
+
+    Let dummy1 be proc memory_set_integer from MemoryCore with profile_ptr, 0, utilization
+
+    Note: Calculate average allocation size
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Let average_size be 0
+    If allocation_count is greater than 0:
+        Set average_size to total_usage divided by allocation_count
+    End If
+
+    Let dummy2 be proc memory_set_integer from MemoryCore with profile_ptr, 8, average_size
+
+    Note: Allocation efficiency: 100% for bump allocator (no per-allocation overhead)
+    Let hundred be 100
+    Let dummy3 be proc memory_set_integer from MemoryCore with profile_ptr, 16, hundred
+
+    Note: Calculate memory waste (unused capacity)
+    Let waste be total_capacity minus total_usage
+    Let dummy4 be proc memory_set_integer from MemoryCore with profile_ptr, 24, waste
+
+    Note: Allocation rate is allocation count (simple metric)
+    Let dummy5 be proc memory_set_integer from MemoryCore with profile_ptr, 32, allocation_count
+
+    Note: Block count
+    Let dummy6 be proc memory_set_integer from MemoryCore with profile_ptr, 40, block_count
+
+    Note: Average block utilization
+    Let avg_block_util be 0
+    If block_count is greater than 0:
+        Set avg_block_util to utilization divided by block_count
+    End If
+    Let dummy7 be proc memory_set_integer from MemoryCore with profile_ptr, 48, avg_block_util
+
+    Return profile_ptr
+End Process
+
+Process called "chained_arena_optimize" takes arena as Integer returns Integer:
+    @Reasoning:
+        Long-running arenas may have grown trailing blocks that became unused
+        after a reset-without-clear pattern, or after later allocations
+        retreated to a smaller working set. Optimize walks the chain, finds
+        the last block with any data, and frees every block beyond it. This
+        is the only routine in the chained arena that can shrink the chain
+        without losing live data.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Walk the chain. For each block:
+                 - If block.used > 0, mark as last_used.
+                 - If the block IS the current block AND current_pos > 0,
+                   also mark as last_used (uncommitted data still live).
+            3. If a last_used block was identified:
+                 - Free every block after it (data buffer + node).
+                 - Terminate last_used.next at 0.
+                 - Re-point arena.current_block to last_used, and update
+                   arena.memory_block, size, capacity to match.
+            4. Return 1 in all success paths.
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count). Performs deallocations only on trailing unused blocks,
+        so cost scales with what is being freed, not what is being kept.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Pointers handed out from blocks that get freed become invalid. Caller
+        is responsible for not retaining them; the arena cannot detect such
+        retention. The optimize call should follow a clear/reset cycle that
+        the caller knows is safe.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Walk through block chain and find last used block
+    Let last_used_block be 0
+    Let current_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
+
+    While current_block is not equal to 0:
+        Let block_used be proc memory_get_integer from MemoryCore with current_block, 16
+        Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+        Let current_arena_block be proc memory_get_integer from MemoryCore with arena, 48
+
+        Note: Check if this block has any data
+        If block_used is greater than 0:
+            Set last_used_block to current_block
+        Otherwise If current_block is equal to current_arena_block:
+            Note: Current block - check current_pos
+            If current_pos is greater than 0:
+                Set last_used_block to current_block
+            End If
+        End If
+
+        Set current_block to proc memory_get_integer from MemoryCore with current_block, 24  Note: next
+    End While
+
+    Note: If we found a last used block, free all blocks after it
+    If last_used_block is not equal to 0:
+        Let next_block be proc memory_get_integer from MemoryCore with last_used_block, 24
+
+        Note: Terminate chain at last used block
+        Let dummy1 be proc memory_set_integer from MemoryCore with last_used_block, 24, 0
+
+        Note: Free all blocks after last used
+        While next_block is not equal to 0:
+            Let block_memory be proc memory_get_integer from MemoryCore with next_block, 0
+            Let following_block be proc memory_get_integer from MemoryCore with next_block, 24
+
+            Note: Free block memory
+            If block_memory is not equal to 0:
+                Let dealloc1 be proc deallocate from MemoryUtils with block_memory
+            End If
+
+            Note: Free block node
+            Let dealloc2 be proc deallocate from MemoryUtils with next_block
+
+            Set next_block to following_block
+        End While
+
+        Note: Update arena to use last_used_block as current
+        Let last_memory be proc memory_get_integer from MemoryCore with last_used_block, 0
+        Let last_size be proc memory_get_integer from MemoryCore with last_used_block, 8
+        Let last_used be proc memory_get_integer from MemoryCore with last_used_block, 16
+
+        Let dummy2 be proc memory_set_integer from MemoryCore with arena, 0, last_memory
+        Let dummy3 be proc memory_set_integer from MemoryCore with arena, 8, last_used
+        Let dummy4 be proc memory_set_integer from MemoryCore with arena, 16, last_size
+        Let dummy5 be proc memory_set_integer from MemoryCore with arena, 24, last_size
+        Let dummy6 be proc memory_set_integer from MemoryCore with arena, 48, last_used_block
+
+        Return 1
+    End If
+
+    Note: No unused blocks to remove
+    Return 1
+End Process
+
+Process called "chained_arena_benchmark" takes arena as Integer, iterations as Integer returns Integer:
+    @Reasoning:
+        Measures real allocation throughput against the arena to support
+        capacity planning and regression-testing. Uses CLOCK_MONOTONIC for
+        nanosecond-resolution timing across the benchmark window.
+    @End Reasoning
+
+    @Implementation:
+        Benchmark results layout (32 bytes):
+            offset  0: allocations_per_second
+            offset  8: average_allocation_time_ns
+            offset 16: total_time_ns
+            offset 24: iterations_completed
+
+        Steps:
+            1. NULL/zero-iter guards.
+            2. Allocate the 32-byte results buffer and a 16-byte timespec.
+            3. Read CLOCK_MONOTONIC start time via syscall_2(clock_gettime).
+            4. Run `iterations` 64-byte arena allocations.
+            5. Read end time.
+            6. Compute total, average, throughput.
+            7. Call chained_arena_reset on the arena to drop the benchmark
+               allocations so the arena is reusable for real work.
+            8. Free the timespec, return the results buffer.
+    @End Implementation
+
+    @Performance_Hints:
+        Benchmarks invoke syscall_2 twice (start + end). Their cost dominates
+        for tiny iteration counts; for large iteration counts the bump-allocator
+        cost dominates. Pick iterations >= 100000 for stable measurements.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The arena is reset at the end, so allocation pointers handed out
+        during the benchmark become invalid. Do not retain them beyond
+        this call.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    If iterations is less than 1:
+        Return 0
+    End If
+
+    Let results_size be 32
+    Let results_ptr be proc allocate from MemoryUtils with results_size
+
+    If results_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get start timestamp via clock_gettime(CLOCK_MONOTONIC)
+    Let CLOCK_MONOTONIC be 1
+    Let timespec_size be 16
+    Let timespec_ptr be proc allocate from MemoryUtils with timespec_size
+
+    Let syscall_num be 228
+    Let dummy1 be proc syscall_2 from Syscall with syscall_num, CLOCK_MONOTONIC, timespec_ptr
+
+    Let start_sec be proc memory_get_integer from MemoryCore with timespec_ptr, 0
+    Let start_nsec be proc memory_get_integer from MemoryCore with timespec_ptr, 8
+    Let billion be 1000000000
+    Let start_time be start_sec multiplied by billion
+    Set start_time to start_time plus start_nsec
+
+    Note: Perform benchmark iterations
+    Let test_size be 64
+    Let i be 0
+    While i is less than iterations:
+        Let alloc_ptr be proc chained_arena_allocate with arena, test_size, 8
+        Set i to i plus 1
+    End While
+
+    Note: Get end timestamp
+    Let dummy2 be proc syscall_2 from Syscall with syscall_num, CLOCK_MONOTONIC, timespec_ptr
+
+    Let end_sec be proc memory_get_integer from MemoryCore with timespec_ptr, 0
+    Let end_nsec be proc memory_get_integer from MemoryCore with timespec_ptr, 8
+    Let end_time be end_sec multiplied by billion
+    Set end_time to end_time plus end_nsec
+
+    Note: Calculate results
+    Let total_time be end_time minus start_time
+    Let dummy3 be proc memory_set_integer from MemoryCore with results_ptr, 16, total_time
+
+    Let average_time be 0
+    If iterations is greater than 0:
+        Set average_time to total_time divided by iterations
+    End If
+    Let dummy4 be proc memory_set_integer from MemoryCore with results_ptr, 8, average_time
+
+    Note: Calculate allocations per second
+    Let allocs_per_sec be 0
+    If total_time is greater than 0:
+        Let iterations_times_billion be iterations multiplied by billion
+        Set allocs_per_sec to iterations_times_billion divided by total_time
+    End If
+    Let dummy5 be proc memory_set_integer from MemoryCore with results_ptr, 0, allocs_per_sec
+
+    Let dummy6 be proc memory_set_integer from MemoryCore with results_ptr, 24, iterations
+
+    Note: Reset arena after benchmark
+    Let dummy7 be proc chained_arena_reset with arena
+
+    Note: Free timespec
+    Let dummy8 be proc deallocate from MemoryUtils with timespec_ptr
+
+    Return results_ptr
+End Process
+
+Note:
+============================================================================
+ChainedArena Debugging Operations
+============================================================================
+:End Note
+
+Process called "chained_arena_validate" takes arena as Integer returns Integer:
+    @Reasoning:
+        Validates the arena's invariants in a way callable from any context,
+        including diagnostic paths and the periodic integrity sweeps that run
+        in long-lived compilations. Detects pointer corruption, out-of-range
+        counters, and the most common forms of arena tampering.
+    @End Reasoning
+
+    @Implementation:
+        Checked invariants:
+            - arena pointer != 0
+            - memory_block != 0
+            - 0 <= current_pos <= capacity
+            - size <= capacity
+            - allocation_count >= 0
+            - peak_usage (at offset 80) <= total_capacity (via chain walk)
+        Returns 1 if all hold, 0 if any fail.
+
+        The peak check is bounded by total_capacity (sum of all blocks) so
+        that historically-large peaks remain valid after blocks are freed.
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count) due to the chain walk for capacity sum. Cheap enough
+        to call before every batch operation in debug builds.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Returning 0 rather than asserting allows the caller to take a
+        safe path (e.g., refuse the operation, log, recover) without
+        crashing the process on a corrupted arena.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: Check memory block is not equal to 0
+    Let memory_block be proc memory_get_integer from MemoryCore with arena, 0
+    If memory_block is equal to 0:
+        Return 0
+    End If
+
+    Note: Check current position is within bounds
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Let capacity be proc memory_get_integer from MemoryCore with arena, 24
+
+    If current_pos is less than 0:
+        Return 0
+    End If
+
+    If current_pos is greater than capacity:
+        Return 0
+    End If
+
+    Note: Check size is within capacity
+    Let size be proc memory_get_integer from MemoryCore with arena, 16
+    If size is greater than capacity:
+        Return 0
+    End If
+
+    Note: Check allocation count is non-negative
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    If allocation_count is less than 0:
+        Return 0
+    End If
+
+    Note: Compute total capacity by walking chain
+    Let total_capacity be 0
+    Let walk_block be proc memory_get_integer from MemoryCore with arena, 40
+    While walk_block is not equal to 0:
+        Let walk_size be proc memory_get_integer from MemoryCore with walk_block, 8
+        Set total_capacity to total_capacity plus walk_size
+        Set walk_block to proc memory_get_integer from MemoryCore with walk_block, 24
+    End While
+
+    Note: Peak usage (offset 80) must not exceed historical total capacity
+    Let peak_usage be proc memory_get_integer from MemoryCore with arena, 80
+    If peak_usage is greater than total_capacity:
+        Return 0
+    End If
+
+    Note: All validation checks passed
+    Return 1
+End Process
+
+Process called "chained_arena_dump" takes arena as Integer returns Integer:
+    @Reasoning:
+        Produces a fixed-layout debug snapshot of the arena's current state.
+        Used by debugging tools that print arena diagnostics; the fixed
+        layout means consumers can rely on byte offsets without referring
+        to source code.
+    @End Reasoning
+
+    @Implementation:
+        Dump structure layout (64 bytes):
+            offset  0: memory_block_ptr
+            offset  8: current_position
+            offset 16: size
+            offset 24: capacity
+            offset 32: allocation_count
+            offset 40: peak_usage      (NEW: now reads from offset 80, not 72)
+            offset 48: is_valid        (result of chained_arena_validate)
+            offset 56: utilization_percent (current_pos * 100 / capacity)
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count) for the embedded validate call. One owned-heap allocation.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let dump_size be 64
+    Let dump_ptr be proc allocate from MemoryUtils with dump_size
+
+    If dump_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy arena state into dump structure
+    Let memory_block be proc memory_get_integer from MemoryCore with arena, 0
+    Let dummy1 be proc memory_set_integer from MemoryCore with dump_ptr, 0, memory_block
+
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Let dummy2 be proc memory_set_integer from MemoryCore with dump_ptr, 8, current_pos
+
+    Let size be proc memory_get_integer from MemoryCore with arena, 16
+    Let dummy3 be proc memory_set_integer from MemoryCore with dump_ptr, 16, size
+
+    Let capacity be proc memory_get_integer from MemoryCore with arena, 24
+    Let dummy4 be proc memory_set_integer from MemoryCore with dump_ptr, 24, capacity
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Let dummy5 be proc memory_set_integer from MemoryCore with dump_ptr, 32, allocation_count
+
+    Note: Peak usage from new offset 80
+    Let peak_usage be proc memory_get_integer from MemoryCore with arena, 80
+    Let dummy6 be proc memory_set_integer from MemoryCore with dump_ptr, 40, peak_usage
+
+    Note: Validate arena
+    Let is_valid be proc chained_arena_validate with arena
+    Let dummy7 be proc memory_set_integer from MemoryCore with dump_ptr, 48, is_valid
+
+    Note: Calculate utilization percentage
+    Let utilization be 0
+    If capacity is greater than 0:
+        Let hundred be 100
+        Let numerator be current_pos multiplied by hundred
+        Set utilization to numerator divided by capacity
+    End If
+    Let dummy8 be proc memory_set_integer from MemoryCore with dump_ptr, 56, utilization
+
+    Return dump_ptr
+End Process
+
+Process called "chained_arena_trace" takes arena as Integer returns Integer:
+    @Reasoning:
+        Returns aggregate allocation-history metrics. The bump allocator does
+        not retain per-allocation records, so the trace reports counts and
+        averages rather than per-allocation entries. For a per-allocation
+        trace, instrument the call sites externally.
+    @End Reasoning
+
+    @Implementation:
+        Trace structure layout (48 bytes):
+            offset  0: total_allocations
+            offset  8: total_bytes_allocated (= arena.current_pos as proxy)
+            offset 16: current_allocations  (= total_allocations, no frees)
+            offset 24: largest_allocation   (= average, no per-size tracking)
+            offset 32: smallest_allocation  (= average, no per-size tracking)
+            offset 40: average_allocation_size
+
+        For bump allocators, individual allocation sizes are not retained,
+        so largest/smallest are reported as the average — explicitly noted
+        as an approximation rather than an exact figure.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). One owned-heap allocation.
+    @End Performance_Hints
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let trace_size be 48
+    Let trace_ptr be proc allocate from MemoryUtils with trace_size
+
+    If trace_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Get allocation count
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Let dummy1 be proc memory_set_integer from MemoryCore with trace_ptr, 0, allocation_count
+
+    Note: Get total bytes allocated (current position is a usable proxy)
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Let dummy2 be proc memory_set_integer from MemoryCore with trace_ptr, 8, current_pos
+
+    Note: Current allocations is allocation count (no individual frees in bump allocator)
+    Let dummy3 be proc memory_set_integer from MemoryCore with trace_ptr, 16, allocation_count
+
+    Note: Calculate average allocation size
+    Let average_size be 0
+    If allocation_count is greater than 0:
+        Set average_size to current_pos divided by allocation_count
+    End If
+
+    Note: For bump allocator, individual allocation sizes are not retained.
+    Note: Report average as the approximation for largest/smallest.
+    Let dummy4 be proc memory_set_integer from MemoryCore with trace_ptr, 24, average_size
+    Let dummy5 be proc memory_set_integer from MemoryCore with trace_ptr, 32, average_size
+    Let dummy6 be proc memory_set_integer from MemoryCore with trace_ptr, 40, average_size
+
+    Return trace_ptr
+End Process
+
+Process called "chained_arena_check_leaks" takes arena as Integer returns Integer:
+    @Reasoning:
+        Bump allocators do not have per-allocation frees, so the conventional
+        notion of a leak does not apply. The closest analogue is: was the
+        arena destroyed without being reset, leaving its allocations
+        committed at the time of destruction? This routine reports the
+        allocation count as a leak count when the arena still holds live
+        allocations.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read allocation_count and current_pos.
+            3. If both are non-zero, return allocation_count as the
+               potential-leak figure.
+            4. Otherwise return 0 (no live allocations to leak).
+    @End Implementation
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+
+    Note: If there are allocations and current position is not zero, potential leak
+    If allocation_count is greater than 0:
+        If current_pos is greater than 0:
+            Note: Return allocation count as the number of potential leaks.
+            Return allocation_count
+        End If
+    End If
+
+    Note: No leaks detected
+    Return 0
+End Process
+
+Process called "chained_arena_verify" takes arena as Integer returns Integer:
+    @Reasoning:
+        Stronger than validate: in addition to the bounds and counter checks,
+        verify also examines pointer alignment to detect corruption that
+        validate cannot see (e.g., a memory_block pointer that has been
+        clobbered into a non-8-byte-aligned value points at corrupted state
+        even if the numeric checks pass).
+    @End Reasoning
+
+    @Implementation:
+        Checked invariants beyond validate:
+            - current_pos <= size
+            - size <= capacity
+            - peak_usage >= current_pos
+            - peak_usage <= capacity
+            - memory_block aligned to 8 bytes (low 3 bits zero)
+        Returns 1 only if validate AND every additional check pass.
+    @End Implementation
+
+    @Performance_Hints:
+        O(block_count) (validate dominates). Slightly heavier than validate
+        due to the alignment check.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Misaligned memory_block is treated as corruption. Reporting it as
+        invalid lets callers refuse to operate on the arena rather than
+        risk a hard fault later.
+    @End Security_Scope
+
+    If arena is equal to 0:
+        Return 0
+    End If
+
+    Note: First, validate basic arena structure
+    Let is_valid be proc chained_arena_validate with arena
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Check for memory corruption by verifying key invariants
+    Let memory_block be proc memory_get_integer from MemoryCore with arena, 0
+    Let current_pos be proc memory_get_integer from MemoryCore with arena, 8
+    Let size be proc memory_get_integer from MemoryCore with arena, 16
+    Let capacity be proc memory_get_integer from MemoryCore with arena, 24
+
+    Note: Verify current_pos <= size <= capacity
+    If current_pos is greater than size:
+        Return 0
+    End If
+
+    If size is greater than capacity:
+        Return 0
+    End If
+
+    Note: Verify allocation count makes sense
+    Let allocation_count be proc memory_get_integer from MemoryCore with arena, 64
+    If allocation_count is less than 0:
+        Return 0
+    End If
+
+    Note: Verify peak usage (offset 80) is consistent with current state
+    Let peak_usage be proc memory_get_integer from MemoryCore with arena, 80
+    If peak_usage is less than current_pos:
+        Return 0
+    End If
+
+    If peak_usage is greater than capacity:
+        Return 0
+    End If
+
+    Note: Check memory block alignment (should be 8-byte aligned for x86_64)
+    Let alignment_mask be 7
+    Let offset be proc bitwise_and from BitwiseCore with memory_block, alignment_mask
+    If offset is not equal to 0:
+        Note: Memory block is not aligned - potential corruption
+        Return 0
+    End If
+
+    Note: All verification checks passed
+    Return 1
+End Process
+
+Note:
+============================================================================
+END OF CHAINED ARENA IMPLEMENTATION
+============================================================================
+
+Architecture summary:
+- Multi-block chained arena (vs. simple single-buffer arena.runa).
+- O(1) bump allocation on the fast path; O(1) per geometric grow on slow path.
+- Pointer stability: existing allocations remain valid across grow events.
+- Peak usage tracked at offset 80 in the 88-byte ChainedArena header.
+- Pool primitives moved to runtime/core/memory/pool.runa.
+============================================================================
+:End Note
