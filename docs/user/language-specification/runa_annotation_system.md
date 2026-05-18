@@ -14,18 +14,18 @@ Runa’s annotation system encodes developer and architect intent for AI systems
 
 The bootstrap parser currently recognizes and parses the following top-level annotation blocks:
 
-- @Reasoning ... @End_Reasoning
-- @Implementation ... @End_Implementation
-- @Uncertainty ... @End_Uncertainty
-- @Request_Clarification ... @End_Request_Clarification
-- @KnowledgeReference ... @End_KnowledgeReference
-- @TestCases ... @End_TestCases
-- @Resource_Constraints ... @End_Resource_Constraints
-- @Security_Scope ... @End_Security_Scope
-- @Execution_Model ... @End_Execution_Model
-- @Performance_Hints ... @End_Performance_Hints
-- @Progress ... @End_Progress
-- @Feedback ... @End_Feedback
+- @Reasoning ... @End Reasoning
+- @Implementation ... @End Implementation
+- @Uncertainty ... @End Uncertainty
+- @Request_Clarification ... @End Request_Clarification
+- @KnowledgeReference ... @End KnowledgeReference
+- @TestCases ... @End TestCases
+- @Resource_Constraints ... @End Resource_Constraints
+- @Security_Scope ... @End Security_Scope
+- @Execution_Model ... @End Execution_Model
+- @Performance_Hints ... @End Performance_Hints
+- @Progress ... @End Progress
+- @Feedback ... @End Feedback
 - @Translation_Note ... @End_Translation_Note
 - @Error_Handling ... @End_Error_Handling
 
@@ -99,7 +99,7 @@ Example (ideal structure):
     Options considered: cache, batch, rewrite
     Decision: cache because hit-rate > 0.9, memory budget 256MB
     Risks: staleness; Mitigation: ttl=60s, background refresh
-@End_Reasoning
+@End Reasoning
 ```
 
 or
@@ -111,7 +111,7 @@ or
     2. The partial ordering of the data suggests good pivot selection
     3. The implementation is simpler and requires less additional memory
     4. Average case performance is O(n log n) which meets our requirements
-@End_Reasoning
+@End Reasoning
 ```
 
 **Purpose**: Improves code maintainability by documenting the reasoning behind implementation decisions.
@@ -136,7 +136,7 @@ Example (ideal structure):
         2. Compute scale preserving aspect ratio
         3. Apply bilinear filter; clamp to bounds
         4. Return new buffer with metadata updated
-@End_Implementation
+@End Implementation
 ```
 
 **Purpose**: Bridges the gap between high-level algorithmic thinking and concrete implementation details.
@@ -179,7 +179,7 @@ Example (ideal structure):
     reference_id: "doi:10.1145/321105.321114"
     version: "canonical"
     relevance: "Optimal pathfinding with admissible heuristics"
-@End_KnowledgeReference
+@End KnowledgeReference
 ```
 
 or
@@ -191,7 +191,7 @@ or
     version: "as of 2023-10"
     relevant_sections: ["3.1 Scaled Dot-Product Attention", "3.2 Multi-Head Attention"]
     implementation_notes: "Using standard transformer but with modified positional encoding"
-@End_KnowledgeReference
+@End KnowledgeReference
 ```
 
 #### @Context Block
@@ -364,7 +364,7 @@ Example (ideal structure):
         { "name": "hit", "input": ["k"], "prepare": "put(""k"",1)", "expected_output": 1 },
         { "name": "miss", "input": ["z"], "expected_output": null }
     ]
-@End_TestCases
+@End TestCases
 ```
 
 or
@@ -400,7 +400,7 @@ or
             "load_pattern": "gradual_increase"
         }
     ]
-@End_TestCases
+@End TestCases
 ```
 
 ### 6. Resource and Security Annotations
@@ -420,7 +420,7 @@ Example (ideal structure):
     memory_limit: "256MB"
     cpu_limit: "2 cores"
     execution_timeout: "30 seconds"
-@End_Resource_Constraints
+@End Resource_Constraints
 ```
 or
 
@@ -434,7 +434,7 @@ or
     optimize_for: "memory"  # or "speed", "battery", "accuracy"
     max_iterations: 10000
     cache_size: "64MB"
-@End_Resource_Constraints
+@End Resource_Constraints
 ```
 
 #### @Security_Scope Block
@@ -453,7 +453,7 @@ Example (ideal structure):
     forbidden: ["net.access"]
     sandbox_level: "strict"
     audit_logging: "detailed"
-@End_Security_Scope
+@End Security_Scope
 ```
 
 or
@@ -477,7 +477,7 @@ or
     encryption_required: true
     audit_logging: "detailed"
     privilege_level: "user"
-@End_Security_Scope
+@End Security_Scope
 ```
 
 ### 7. Execution and Performance Annotations
@@ -497,7 +497,7 @@ Example (ideal structure):
     mode: "batch"
     concurrency: "parallel"
     parallelism_level: 4
-@End_Execution_Model
+@End Execution_Model
 ```
 
 or
@@ -512,7 +512,7 @@ or
     retry_policy: "exponential_backoff"
     error_recovery: "graceful_degradation"
     monitoring: "detailed"
-@End_Execution_Model
+@End Execution_Model
 ```
 
 #### @Performance_Hints Block
@@ -530,7 +530,7 @@ Example (ideal structure):
     cache_strategy: "aggressive"
     vectorization: "enabled"
     parallel_threshold: 1000
-@End_Performance_Hints
+@End Performance_Hints
 ```
 
 or
@@ -545,7 +545,7 @@ or
     prefetch_enabled: true
     compression: "enabled"
     hot_path_optimization: ["search", "sort", "filter"]
-@End_Performance_Hints
+@End Performance_Hints
 ```
 
 ### 8. Communication Flow Annotations
@@ -566,7 +566,7 @@ Example (ideal structure):
     current_milestone: "API complete"
     next_milestone: "Benchmarking"
     blockers: ["missing fixtures"]
-@End_Progress
+@End Progress
 ```
 
 or
@@ -584,7 +584,7 @@ or
         "performance_baseline": "85ms average response time"
     }
     confidence_level: 0.9
-@End_Progress
+@End Progress
 ```
 
 ### 9. Translation and Target-Specific Annotations
@@ -768,14 +768,14 @@ or
     2. No server-side session storage required
     3. Industry standard with good library support
     4. Includes expiration and claims
-@End_Reasoning
+@End Reasoning
 
 @Security_Scope:
     capabilities: ["crypto.hash", "crypto.jwt", "database.read", "database.write"]
     forbidden: ["file.system", "network.external"]
     encryption_required: true
     audit_logging: "enabled"
-@End_Security_Scope
+@End Security_Scope
 
 @Requirements:
     functional: [
@@ -814,7 +814,7 @@ or
         
         Let token be generate_jwt_token with user_id as user.id
         Return AuthResult.success with token as token
-@End_Implementation
+@End Implementation
 
 @Progress:
     completion_percentage: 90
@@ -825,7 +825,7 @@ or
         "integration_tests_passing": 3,
         "performance_benchmark": "Average 150ms authentication time"
     }
-@End_Progress
+@End Progress
 
 
 ```

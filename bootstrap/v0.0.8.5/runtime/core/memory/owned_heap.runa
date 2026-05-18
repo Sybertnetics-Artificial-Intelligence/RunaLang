@@ -1,0 +1,2326 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements the DESCRIPTOR-HEAP variant of the Runa runtime memory
+system: a per-heap-descriptor bump allocator backed by an mmap region, with a
+metadata struct (OwnedHeap) describing one independent heap instance.
+
+OWNED HEAP (Per-Descriptor) - Bump Allocator With Owner-Scoped Lifetime
+- Process bump allocations against a self-contained mmap-backed buffer
+- Handle per-descriptor heap creation, destruction, reset, clear, and clone
+- Manage resize, grow, shrink, compact (no-op for bump allocators), and merge
+- Provide query operations for size, capacity, usage, peak, allocation count
+- Provide performance instrumentation (stats, profile, optimize, benchmark)
+- Provide debugging surface (validate, dump, trace, leak check, verify)
+
+This file is essential because of the following reasons:
+- The per-descriptor heap fills the gap between the single-buffer Arena
+  (runtime/core/memory/arena.runa) and the global owned-heap free-list allocator
+  in compiler/frontend/primitives/memory/layout.runa: it provides multiple
+  independent bump arenas each with its own mmap region, lifetime, owner field,
+  and statistics surface. Useful for plugin sandboxing, per-pass compilation
+  heaps, per-thread scratch areas, and any future workload that wants O(1)
+  bulk-free with named ownership.
+- The 34 Processes form a coherent per-descriptor API surface independent of
+  the registry-tracked global owned-heap subsystem. Callers that want a heap
+  they can destroy at a known point in time without scanning a global registry
+  use this engine.
+- Bump-allocator semantics under the "owned heap" label is documented honestly
+  here in the @Reasoning blocks: the user-visible allocate function returns a
+  pointer that is invalidated only when the descriptor itself is reset, cleared,
+  destroyed, or resized. There is no per-allocation free. This is the same
+  shape as the Arena in arena.runa, but with a richer per-instance metadata
+  surface and an explicit owner field that lets a parent subsystem reclaim its
+  child heaps deterministically.
+
+This file consists of the following functions/features/operation types:
+- Descriptor lifecycle: create, destroy, reset, clear, clone
+- Allocation: allocate, allocate_aligned, allocate_zeroed, allocate_array,
+  allocate_string, allocate_struct
+- Memory management: resize, grow, shrink, compact (no-op), merge
+- Query: get_size, get_capacity, get_usage, get_peak_usage, get_fragmentation,
+  get_allocation_count, is_full, has_space, descriptor_get_size
+- Performance: get_stats, reset_stats, profile, optimize, benchmark
+- Debugging: validate, dump, trace, check_leaks, verify
+
+Migration history:
+- 2026-05-18: Moved from compiler/internal/owned_utils.runa into the runtime
+  tree per the CEO-ratified "memory management lives in runtime/core/memory/"
+  ruling. Three unused imports (MemorySafety, DebugUtils, Collections) were
+  stripped during the move. A broken import path
+  (compiler/frontend/primitives/core/syscall_core.runa, which does not exist
+  on disk) was repointed at the canonical compiler/frontend/primitives/assembly/
+  syscall.runa as used by arena.runa. The mmap/munmap calls were rewritten from
+  raw syscall_6/syscall_2 with hardcoded Linux syscall numbers to use the
+  cross-platform syscall_mmap/syscall_munmap abstractions exposed by the
+  syscall module. The mremap call retains its raw form because no abstracted
+  wrapper exists; it remains Linux-specific and is documented as such on the
+  resize Process. The owned_heap_get_size Process was renamed to
+  owned_heap_descriptor_get_size to avoid name collision with the new
+  registry-aware owned_heap_get_size in runtime/core/memory/owned_heap_wrappers.runa
+  (different signature, different semantics, both retained). Zero external
+  callers existed for any of the 34 Processes so the rename is safe.
+
+  Pre-migration the file also served as an import-alias re-exporter for
+  allocate/deallocate via transitive resolution through MemoryUtils to Layout.
+  That role has been retired: all 26 caller files now import MemoryLayout
+  directly, eliminating the alias indirection.
+
+Dependencies:
+- Imports compiler/frontend/primitives/memory/layout.runa for the canonical
+  TIER-3 owned-heap allocate/deallocate used to allocate descriptor structs
+  and ancillary diagnostic blobs.
+- Imports compiler/frontend/primitives/core/memory_core.runa for raw memory
+  qword reads, writes, copies, zeroing, and byte writes.
+- Imports compiler/frontend/primitives/core/bitwise_core.runa for power-of-two
+  alignment arithmetic.
+- Imports compiler/frontend/primitives/assembly/syscall.runa for mmap, munmap,
+  the raw mremap dispatch, and clock_gettime in benchmark.
+:End Note
+
+Import "compiler/frontend/primitives/memory/layout.runa" as MemoryLayout
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/bitwise_core.runa" as BitwiseCore
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+
+Note:
+============================================================================
+OwnedHeap Structure Definitions
+============================================================================
+:End Note
+
+Note:
+OwnedHeap structure layout (80 bytes, 10 qwords):
+  Offset  0: memory_block        Pointer to mmap-backed data buffer
+  Offset  8: current_pos         Bump pointer position within the data buffer
+  Offset 16: size                Logical size of the data buffer in bytes
+  Offset 24: capacity            Physical (mmap-reserved) capacity in bytes
+  Offset 32: alignment           Default alignment for allocate (power of 2)
+  Offset 40: owner               Opaque owner-pointer field (caller-defined)
+  Offset 48: is_owned            1 if descriptor owns its memory_block, else 0
+  Offset 56: allocation_count    Lifetime count of allocate calls that succeeded
+  Offset 64: peak_usage          Max current_pos observed across descriptor lifetime
+  Offset 72: reserved            Padding qword to keep 16-byte struct alignment
+
+Allocations against this descriptor are pointer-bump increments: current_pos
+moves forward by the (alignment-padded) size, and the returned pointer is
+memory_block + aligned_pos. There is NO per-allocation header. Individual
+free is not supported - the descriptor as a whole is the unit of free.
+
+Note that size and capacity coincide today (size is set to capacity at create
+and after resize). The two fields are retained as distinct slots to allow
+future logical-vs-physical distinction (e.g., a descriptor that has reserved
+more pages than it has committed) without breaking the on-disk layout.
+:End Note
+
+Type called "OwnedHeap":
+    memory_block as Integer    Note: Pointer to allocated memory block
+    current_pos as Integer     Note: Current bump pointer position
+    size as Integer            Note: Logical size of buffer
+    capacity as Integer        Note: Physical mmap-reserved capacity
+    alignment as Integer       Note: Default alignment (power of 2)
+    owner as Integer           Note: Opaque owner reference
+    is_owned as Integer        Note: 1 if descriptor owns memory_block, else 0
+    allocation_count as Integer Note: Lifetime successful-allocate count
+    peak_usage as Integer      Note: Max current_pos observed
+End Type
+
+Note:
+OwnedAllocation structure layout (56 bytes, 7 qwords):
+  Offset  0: heap            Pointer to parent OwnedHeap descriptor
+  Offset  8: memory_ptr      Pointer to the allocation
+  Offset 16: size            Size of the allocation in bytes
+  Offset 24: alignment       Alignment used for this allocation
+  Offset 32: owner           Opaque owner reference for this allocation
+  Offset 40: is_freed        1 if individually freed (reserved for future)
+  Offset 48: next            Pointer to next OwnedAllocation in a chain
+
+This Type is declared for forward compatibility with a per-allocation tracking
+list that the migration plan flagged as an unrealised design intent. Today no
+allocate path instantiates this struct; the structure shape is reserved so
+that a future per-allocation registry can be bolted on without breaking the
+existing descriptor layout.
+:End Note
+
+Type called "OwnedAllocation":
+    heap as Integer            Note: Parent OwnedHeap descriptor
+    memory_ptr as Integer      Note: Allocation address
+    size as Integer            Note: Allocation size in bytes
+    alignment as Integer       Note: Allocation alignment
+    owner as Integer           Note: Opaque per-allocation owner
+    is_freed as Integer        Note: Reserved for per-allocation free
+    next as Integer            Note: Forward link for allocation chain
+End Type
+
+Note:
+OwnedHeapStats structure layout (48 bytes, 6 qwords):
+  Offset  0: total_allocations  Lifetime allocate-call count
+  Offset  8: total_bytes        Current allocated-bytes count (current_pos)
+  Offset 16: peak_usage         Peak bytes-in-use observed
+  Offset 24: fragmentation      Always 0 for a bump allocator
+  Offset 32: allocation_time    Reserved future field (currently 0)
+  Offset 40: deallocation_time  Reserved future field (currently 0)
+
+Returned by owned_heap_get_stats. The returned pointer is itself an owned-heap
+allocation that the caller must release via MemoryLayout.deallocate when done.
+:End Note
+
+Type called "OwnedHeapStats":
+    total_allocations as Integer Note: Lifetime allocate count
+    total_bytes as Integer       Note: Current allocated bytes
+    peak_usage as Integer        Note: Peak bytes-in-use
+    fragmentation as Integer     Note: 0 for bump allocators
+    allocation_time as Integer   Note: Reserved (0)
+    deallocation_time as Integer Note: Reserved (0)
+End Type
+
+Note:
+============================================================================
+OwnedHeap Constants
+============================================================================
+:End Note
+
+Constant OWNED_HEAP_DEFAULT_SIZE as Integer is 131072       Note: 128KB default
+Constant OWNED_HEAP_MIN_SIZE as Integer is 8192             Note: 8KB minimum
+Constant OWNED_HEAP_MAX_SIZE as Integer is 2147483648       Note: 2GB maximum
+Constant OWNED_HEAP_ALIGNMENT as Integer is 16              Note: default 16-byte align
+Constant OWNED_HEAP_GROWTH_FACTOR as Integer is 2           Note: doubling growth
+Constant OWNED_HEAP_SHRINK_THRESHOLD as Integer is 4        Note: shrink at 1/4 usage
+
+Constant OWNED_ALLOCATION_SUCCESS as Integer is 0
+Constant OWNED_ALLOCATION_FAILED as Integer is -1
+Constant OWNED_ALLOCATION_OVERFLOW as Integer is -2
+Constant OWNED_ALLOCATION_INVALID as Integer is -3
+
+Note:
+OWNED_HEAP_STRUCT_SIZE is the on-disk size of the OwnedHeap descriptor in
+bytes. The compiler currently lays out the 9-field Type as 9 qwords (72
+bytes), but the historical descriptor used a fixed 80-byte allocation because
+the initial design reserved a padding qword for future expansion. We retain
+the 80-byte allocation to keep the on-disk shape stable across the migration
+and to leave room for the future per-allocation chain head pointer.
+:End Note
+
+Constant OWNED_HEAP_STRUCT_SIZE as Integer is 80
+
+Note:
+PROT_READ_WRITE is the mmap protection mask used by descriptor heaps:
+PROT_READ (0x1) | PROT_WRITE (0x2) = 0x3. MAP_PRIVATE_ANON is the mmap flags
+mask: MAP_PRIVATE (0x2) | MAP_ANONYMOUS (0x20) = 0x22 (34 decimal). These
+match the constants used by runtime/core/memory/arena.runa so that the two
+allocators have identical platform behaviour.
+:End Note
+
+Constant PROT_READ_WRITE as Integer is 3
+Constant MAP_PRIVATE_ANON as Integer is 34
+
+Note:
+SYSCALL_MREMAP is the Linux syscall number for mremap. There is no
+cross-platform wrapper for mremap in the syscall module (unlike mmap/munmap),
+so resize calls the raw syscall_4 dispatch with this number. On non-Linux
+platforms owned_heap_resize will fail at runtime; this is documented on the
+resize Process @Security_Scope and is the same limitation that the
+pre-migration source had.
+:End Note
+
+Constant SYSCALL_MREMAP as Integer is 25
+Constant MREMAP_MAYMOVE as Integer is 1
+
+Note:
+MMAP_ERROR_THRESHOLD is the high-address threshold used to detect mmap and
+mremap failure. The syscall ABI on Linux returns a negative errno in the
+range -1 .. -4095 on failure, which appears as a very large unsigned address
+in the top of the virtual memory space. Any address above (0 - 4096) is
+interpreted as an error code. This same threshold convention is used by
+arena.runa and matches the kernel mmap ABI documented in <bits/mman-linux.h>.
+:End Note
+
+Constant MMAP_ERROR_THRESHOLD as Integer is -4096
+
+Note:
+CLOCK_MONOTONIC is the POSIX clock id used by the benchmark Process for
+high-resolution timing. SYSCALL_CLOCK_GETTIME is the Linux syscall number;
+the chained_arena benchmark uses the same raw syscall pattern with the same
+constants, so this is the established convention. The 16-byte timespec layout
+(sec at offset 0, nsec at offset 8) is also identical to that file.
+:End Note
+
+Constant CLOCK_MONOTONIC as Integer is 1
+Constant SYSCALL_CLOCK_GETTIME as Integer is 228
+Constant TIMESPEC_SIZE as Integer is 16
+Constant NANOSECONDS_PER_SECOND as Integer is 1000000000
+
+Note:
+============================================================================
+OwnedHeap Creation and Destruction
+============================================================================
+:End Note
+
+Process called "owned_heap_create" takes initial_size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Create a fresh descriptor heap with its own mmap-backed data buffer.
+        Returns 0 on any sub-allocation failure rather than leaking a half-
+        initialized descriptor. The descriptor is small (80 bytes) and lives
+        in the global owned heap; the data buffer is mmap'd directly so that
+        a large heap does not pollute the owned-heap free list with a huge
+        single allocation. mmap also gives the kernel control over physical
+        page commit, which keeps the resident set small until the heap is
+        actually used.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Clamp initial_size up to OWNED_HEAP_MIN_SIZE if too small.
+               No upper clamp here: an oversized request will fail at the
+               mmap syscall, which propagates as 0 below.
+            2. Clamp alignment up to 8 if a smaller value was passed. A
+               descriptor heap always returns at least 8-byte aligned
+               pointers.
+            3. Allocate the 80-byte OwnedHeap descriptor from the global
+               owned heap. Failure returns 0.
+            4. mmap a fresh PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS
+               region of use_size bytes via the cross-platform
+               Syscall.syscall_mmap wrapper. fd=-1, offset=0, addr_hint=0.
+            5. If mmap returned an error (address greater than the negative
+               error threshold), deallocate the descriptor and return 0.
+            6. Initialize all 9 fields of the descriptor:
+                 memory_block      = mmap_result
+                 current_pos       = 0
+                 size              = use_size
+                 capacity          = use_size
+                 alignment         = use_alignment
+                 owner             = 0 (caller may set later)
+                 is_owned          = 1 (descriptor owns the mmap region)
+                 allocation_count  = 0
+                 peak_usage        = 0
+            7. Return the descriptor pointer.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is one owned-heap allocation (descriptor) plus one mmap syscall.
+        The mmap is the dominant cost (~1-10 microseconds depending on
+        contention and zero-page recycling in the kernel); the descriptor
+        allocation is sub-microsecond. Subsequent allocate calls against the
+        returned heap are O(1) pointer-bump.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Does not accept any caller-controlled pointer. Validates incoming
+        size and alignment. The mmap region is fresh kernel-zeroed memory so
+        no stale data is exposed to the caller. The descriptor's owner field
+        is set to 0; if a parent subsystem needs ownership tracking it must
+        write the owner field after create returns.
+    @End Security_Scope
+
+    Note: Validate initial_size
+    Let use_size be initial_size
+    If use_size is less than OWNED_HEAP_MIN_SIZE:
+        Set use_size to OWNED_HEAP_MIN_SIZE
+    End If
+
+    Note: Validate alignment - must be at least 8 bytes
+    Let use_alignment be alignment
+    If use_alignment is less than 8:
+        Set use_alignment to 8
+    End If
+
+    Note: Allocate OwnedHeap descriptor (80 bytes)
+    Let heap_ptr be proc allocate from MemoryLayout with OWNED_HEAP_STRUCT_SIZE
+
+    If heap_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Allocate mmap-backed data buffer via cross-platform wrapper
+    Let addr_hint be 0
+    Let fd be 0 minus 1
+    Let mmap_offset be 0
+    Let memory_block be proc syscall_mmap from Syscall with addr_hint, use_size, PROT_READ_WRITE, MAP_PRIVATE_ANON, fd, mmap_offset
+
+    Note: Check for mmap failure - any address above the error threshold is an errno return
+    If memory_block is greater than MMAP_ERROR_THRESHOLD:
+        Let dummy1 be proc deallocate from MemoryLayout with heap_ptr
+        Return 0
+    End If
+
+    Note: Initialize OwnedHeap descriptor fields
+    Let dummy2 be proc memory_set_integer from MemoryCore with heap_ptr, 0, memory_block     Note: memory_block
+    Let dummy3 be proc memory_set_integer from MemoryCore with heap_ptr, 8, 0                Note: current_pos = 0
+    Let dummy4 be proc memory_set_integer from MemoryCore with heap_ptr, 16, use_size        Note: size
+    Let dummy5 be proc memory_set_integer from MemoryCore with heap_ptr, 24, use_size        Note: capacity
+    Let dummy6 be proc memory_set_integer from MemoryCore with heap_ptr, 32, use_alignment   Note: alignment
+    Let dummy7 be proc memory_set_integer from MemoryCore with heap_ptr, 40, 0               Note: owner = 0
+    Let dummy8 be proc memory_set_integer from MemoryCore with heap_ptr, 48, 1               Note: is_owned = true
+    Let dummy9 be proc memory_set_integer from MemoryCore with heap_ptr, 56, 0               Note: allocation_count = 0
+    Let dummy10 be proc memory_set_integer from MemoryCore with heap_ptr, 64, 0              Note: peak_usage = 0
+
+    Return heap_ptr
+End Process
+
+Process called "owned_heap_destroy" takes heap as Integer returns Nothing:
+    @Reasoning:
+        Tear down a descriptor heap. The mmap region must be returned to the
+        kernel via munmap (the owned-heap deallocator cannot release an mmap
+        region because it never tracked it), and the descriptor must be
+        released to the owned heap so its 80 bytes are reusable. NULL is
+        accepted as a no-op for idempotent cleanup paths.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return immediately on heap == 0.
+            2. Read memory_block (offset 0) and capacity (offset 24).
+            3. If memory_block is non-zero, munmap the mmap region using the
+               cross-platform Syscall.syscall_munmap wrapper. capacity is the
+               size that was mmap'd at create or resize time.
+            4. Release the descriptor itself through MemoryLayout.deallocate.
+
+        Note: this Process does not propagate the munmap return value because
+        munmap failure on a valid address pair indicates kernel-level state
+        corruption that the caller cannot meaningfully recover from.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is one munmap syscall (~1 microsecond) plus one owned-heap free.
+        Munmap dominates. After destroy, any pointer previously returned by
+        allocate against this heap is invalid and must not be dereferenced.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller is responsible for ensuring no live pointers into memory_block
+        remain. The function unmaps memory_block from the process address
+        space; subsequent reads through stale pointers will fault. Validates
+        memory_block != 0 before unmap to avoid passing a null address to
+        munmap, which the kernel would reject as EINVAL on most platforms.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return
+    End If
+
+    Note: Read memory_block and capacity for unmap
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    Note: Unmap the data buffer if it was mapped
+    If memory_block is not equal to 0:
+        Let dummy1 be proc syscall_munmap from Syscall with memory_block, capacity
+    End If
+
+    Note: Free the descriptor itself
+    Let dummy2 be proc deallocate from MemoryLayout with heap
+
+    Return
+End Process
+
+Process called "owned_heap_reset" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return the descriptor to a fresh state without releasing the mmap
+        region. After reset, the heap behaves as if it were just created:
+        allocation_count and peak_usage are both 0, and the bump pointer is
+        at 0. This is the canonical "reuse this heap for a new pass" entry
+        point - the data buffer stays warm in the cache and the mmap region
+        stays committed. Pointers previously returned from this heap are
+        invalidated by reset (the underlying bytes are not zeroed, but the
+        bump pointer no longer reserves them, so future allocates will reuse
+        the same addresses).
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on heap == 0.
+            2. Set current_pos (offset 8) to 0.
+            3. Set allocation_count (offset 56) to 0.
+            4. Set peak_usage (offset 64) to 0.
+            5. Return 1 to indicate success.
+
+        Note: reset deliberately does NOT zero the underlying data buffer.
+        Use owned_heap_clear for that. The non-zeroing behaviour is what
+        gives reset its O(1) cost regardless of how much was allocated.
+    @End Implementation
+
+    @Performance_Hints:
+        Three qword stores. O(1) regardless of how much memory was allocated
+        against the descriptor before reset. This is the fastest reuse path.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The underlying data buffer is NOT zeroed. If a security-sensitive
+        workload reused this heap and wrote secrets into its allocations, a
+        subsequent allocator on the same heap will see those secrets unless
+        the caller uses owned_heap_clear (which zeroes) or writes over the
+        allocation before reading from it. For cryptographic key material or
+        similar high-value data, use owned_heap_clear instead.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Note: Reset bump pointer
+    Let dummy1 be proc memory_set_integer from MemoryCore with heap, 8, 0
+
+    Note: Reset allocation count
+    Let dummy2 be proc memory_set_integer from MemoryCore with heap, 56, 0
+
+    Note: Reset peak usage
+    Let dummy3 be proc memory_set_integer from MemoryCore with heap, 64, 0
+
+    Return 1
+End Process
+
+Process called "owned_heap_clear" takes heap as Integer returns Integer:
+    @Reasoning:
+        Zero out the data buffer and reset the bump pointer. Unlike reset,
+        clear pays the cost of zeroing the entire size-byte buffer; in
+        exchange it guarantees that subsequent allocate calls return memory
+        whose initial contents are all zero. Useful when the descriptor was
+        previously used for secret data or when the caller wants
+        deterministic-zero initial state for the next pass without paying
+        per-allocation zero costs.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on heap == 0.
+            2. Read memory_block (offset 0) and size (offset 16).
+            3. Call memory_zero(memory_block, size) to clear the data buffer.
+            4. Reset current_pos (offset 8) to 0. Allocation count and peak
+               usage are NOT reset by clear - only by reset/reset_stats. This
+               preserves the lifetime-counter semantics: clear is "wipe the
+               bytes," reset is "wipe the bookkeeping."
+            5. Return 1.
+
+        Migration note (2026-05-18): the pre-migration source documented
+        "Does not free heap memory, just resets position" which obscured
+        what makes clear different from reset. The behavioural difference -
+        clear zeroes the data buffer, reset does not - is now explicit.
+    @End Implementation
+
+    @Performance_Hints:
+        O(size) due to the full-buffer memory_zero. For large heaps this is
+        much more expensive than reset. Prefer reset whenever the caller is
+        okay with stale data in unreferenced regions of the buffer.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Zeroing the buffer is a defence-in-depth measure that prevents stale
+        data from a previous owner leaking into subsequent allocators. Use
+        this entry point when the heap previously held sensitive data.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero out data buffer
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+    Let size be proc memory_get_integer from MemoryCore with heap, 16
+
+    Let dummy1 be proc memory_zero from MemoryCore with memory_block, size
+
+    Note: Reset bump pointer (allocation_count and peak_usage preserved by design)
+    Let dummy2 be proc memory_set_integer from MemoryCore with heap, 8, 0
+
+    Return 1
+End Process
+
+Process called "owned_heap_clone" takes source_heap as Integer returns Integer:
+    @Reasoning:
+        Produce an independent copy of an existing descriptor heap. The
+        clone has its own mmap region (created by owned_heap_create) of the
+        same size and alignment, and the live byte range (0 .. current_pos)
+        of the source buffer is copied byte-for-byte into the clone's
+        buffer. After clone returns, mutating either heap has no effect on
+        the other. The bookkeeping fields (current_pos, allocation_count,
+        peak_usage) are copied from source so that any pointer arithmetic
+        based on heap state remains consistent.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on source_heap == 0.
+            2. Read source's size (offset 16) and alignment (offset 32).
+            3. Create a new heap with the same size and alignment via
+               owned_heap_create. Failure propagates as 0.
+            4. Read source's memory_block (offset 0), clone's memory_block
+               (offset 0), and source's current_pos (offset 8). The
+               current_pos value is also the count of bytes that contain
+               live data.
+            5. memory_copy(dst_block, src_block, current_pos) duplicates the
+               live byte range. Bytes beyond current_pos are left as
+               kernel-zeroed (the clone's mmap region is fresh).
+            6. Set clone's current_pos to source's current_pos.
+            7. Set clone's allocation_count from source's allocation_count
+               (offset 56).
+            8. Set clone's peak_usage from source's peak_usage (offset 64).
+            9. Return clone pointer.
+
+        Note: the clone shares no memory with the source. Pointers handed
+        out previously by allocate against source point into source's
+        memory_block, not the clone's. The clone is a fresh address-space
+        with the same logical contents at the same offsets.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is owned_heap_create (one descriptor allocate plus one mmap)
+        plus one memory_copy of current_pos bytes. The mmap is the dominant
+        cost for small live data; memory_copy dominates for large live data.
+        Either way O(current_pos) plus a fixed mmap cost.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The clone observes whatever bytes the source had in its live region.
+        If the source was used for secret data, the clone inherits those
+        secrets. Caller is responsible for not cloning into a less-trusted
+        context. Bytes beyond current_pos are kernel-zeroed in the clone
+        regardless of source contents.
+    @End Security_Scope
+
+    If source_heap is equal to 0:
+        Return 0
+    End If
+
+    Note: Read source size and alignment
+    Let size be proc memory_get_integer from MemoryCore with source_heap, 16
+    Let alignment be proc memory_get_integer from MemoryCore with source_heap, 32
+
+    Note: Create new heap with matching dimensions
+    Let new_heap be proc owned_heap_create with size, alignment
+
+    If new_heap is equal to 0:
+        Return 0
+    End If
+
+    Note: Copy live byte range
+    Let src_block be proc memory_get_integer from MemoryCore with source_heap, 0
+    Let dst_block be proc memory_get_integer from MemoryCore with new_heap, 0
+    Let current_pos be proc memory_get_integer from MemoryCore with source_heap, 8
+
+    Let dummy1 be proc memory_copy from MemoryCore with dst_block, src_block, current_pos
+
+    Note: Mirror bookkeeping fields
+    Let dummy2 be proc memory_set_integer from MemoryCore with new_heap, 8, current_pos
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with source_heap, 56
+    Let dummy3 be proc memory_set_integer from MemoryCore with new_heap, 56, allocation_count
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with source_heap, 64
+    Let dummy4 be proc memory_set_integer from MemoryCore with new_heap, 64, peak_usage
+
+    Return new_heap
+End Process
+
+Note:
+============================================================================
+OwnedHeap Allocation Operations
+============================================================================
+:End Note
+
+Process called "owned_heap_allocate" takes heap as Integer, size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Allocate size bytes from the descriptor heap with the requested
+        alignment, using pointer-bump. This is the core allocator entry point;
+        all other allocate_* Processes call into this one with derived
+        size/alignment arguments. The bump pointer is advanced past the
+        allocation; there is no individual free path - the entire heap is
+        freed at descriptor destroy/reset/clear time.
+
+        Bump-allocator-under-owned-name (semantic clarification): despite
+        the "owned heap" label, this Process implements arena semantics, not
+        Tier-3 owned-heap semantics. There is no per-allocation header, no
+        free list, no registry tracking, and no individual free. The
+        distinction matters because callers who want true Tier-3 owned
+        memory (with individual free, registry tracking, generation-based
+        use-after-free detection) must use MemoryLayout.allocate directly,
+        not this Process. The "owned" qualifier here refers only to the
+        owner field on the descriptor (which a parent subsystem may set to
+        identify the heap's owner) - it does NOT promise per-allocation
+        free.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on heap == 0.
+            2. Zero-size guard: return 0 on size == 0 (zero-byte allocations
+               are not meaningful for a bump allocator; returning a non-null
+               pointer for them would create aliasing risk).
+            3. Read current_pos (offset 8) and memory_block (offset 0).
+            4. Align current_pos UP to the requested alignment if alignment
+               > 1. Uses bitwise_and to find the misalignment then adds the
+               complement: aligned_pos = current_pos + ((alignment - (current_pos & (alignment-1))) & (alignment-1))
+               implemented in the simpler explicit form: if offset != 0,
+               aligned_pos = current_pos + (alignment - offset).
+            5. Read capacity (offset 24). Check aligned_pos + size <= capacity.
+               If not, return 0 (allocation would overflow the descriptor).
+            6. Compute alloc_ptr = memory_block + aligned_pos.
+            7. Store the new bump pointer (aligned_pos + size) into
+               current_pos.
+            8. Increment allocation_count (offset 56) by 1.
+            9. If new bump pointer exceeds peak_usage (offset 64), update
+               peak_usage so it tracks the lifetime maximum.
+           10. Return alloc_ptr.
+
+        Note: this Process does not grow the descriptor on overflow. Callers
+        who want auto-growth must build a wrapper that calls
+        owned_heap_resize or owned_heap_grow when allocate returns 0.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1) on the success path: a constant number of memory_get/set ops
+        plus a single bitwise_and. No syscalls, no branches into the kernel,
+        no cross-cache-line walks. The dominant cost is the memory_get and
+        memory_set primitives themselves.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Does not zero the returned memory; the caller observes whatever
+        bytes were left in the buffer from a previous allocator. For
+        zeroed allocations use owned_heap_allocate_zeroed. The returned
+        pointer lies within memory_block .. memory_block + capacity, so
+        out-of-bounds writes are impossible up to the allocation size;
+        writes BEYOND the returned size may corrupt subsequent allocations
+        (the bump allocator does not enforce per-allocation bounds).
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    If size is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+
+    Note: Align current_pos up to the requested alignment
+    Let aligned_pos be current_pos
+    If alignment is greater than 1:
+        Let mask be alignment minus 1
+        Let offset be proc bitwise_and from BitwiseCore with current_pos, mask
+        If offset is not equal to 0:
+            Let padding be alignment minus offset
+            Set aligned_pos to current_pos plus padding
+        End If
+    End If
+
+    Note: Bounds check
+    Let new_pos be aligned_pos plus size
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+    If new_pos is greater than capacity:
+        Return 0
+    End If
+
+    Note: Compute and record the allocation
+    Let alloc_ptr be memory_block plus aligned_pos
+    Let dummy1 be proc memory_set_integer from MemoryCore with heap, 8, new_pos
+
+    Note: Update allocation count
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Let new_count be allocation_count plus 1
+    Let dummy2 be proc memory_set_integer from MemoryCore with heap, 56, new_count
+
+    Note: Update peak usage if exceeded
+    Let peak_usage be proc memory_get_integer from MemoryCore with heap, 64
+    If new_pos is greater than peak_usage:
+        Let dummy3 be proc memory_set_integer from MemoryCore with heap, 64, new_pos
+    End If
+
+    Return alloc_ptr
+End Process
+
+Process called "owned_heap_allocate_aligned" takes heap as Integer, size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Convenience entry point that forwards directly to owned_heap_allocate.
+        Retained as a named Process because callers documenting alignment-
+        sensitive allocations (cache-line packing, SIMD-friendly buffers)
+        find the explicit name clearer than passing an alignment argument
+        through the generic allocate.
+    @End Reasoning
+
+    @Implementation:
+        Forwards directly: returns owned_heap_allocate(heap, size, alignment).
+        No additional logic - alignment is already handled by allocate itself.
+    @End Implementation
+
+    @Performance_Hints:
+        Identical to owned_heap_allocate. The wrapper imposes one extra
+        call frame, which a sufficiently capable inliner will collapse.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Inherits the security properties of owned_heap_allocate. Returned
+        memory is not zeroed.
+    @End Security_Scope
+
+    Let result be proc owned_heap_allocate with heap, size, alignment
+    Return result
+End Process
+
+Process called "owned_heap_allocate_zeroed" takes heap as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Allocate size bytes from the descriptor heap and zero them before
+        return. Uses the heap's default 8-byte alignment for the underlying
+        allocate. Convenience for callers who want structure-shaped memory
+        whose uninitialized field reads return 0 deterministically; pay the
+        memset cost in exchange for not having to set every field.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Forward to owned_heap_allocate with alignment = 8.
+            2. If allocate returned 0, propagate the failure.
+            3. memory_zero(result, size).
+            4. Return result.
+    @End Implementation
+
+    @Performance_Hints:
+        O(size) for the zeroing pass plus the O(1) cost of allocate. For
+        small allocations the call overhead dominates; for large
+        allocations the memory_zero pass dominates.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The zero pass prevents stale data from a previous allocator in the
+        same buffer slot from leaking to the caller. Use this entry point
+        when the descriptor heap is reused across security domains.
+    @End Security_Scope
+
+    Let default_alignment be 8
+    Let result be proc owned_heap_allocate with heap, size, default_alignment
+
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let dummy be proc memory_zero from MemoryCore with result, size
+
+    Return result
+End Process
+
+Process called "owned_heap_allocate_array" takes heap as Integer, element_size as Integer, count as Integer returns Integer:
+    @Reasoning:
+        Allocate a contiguous array of count elements each of element_size
+        bytes. The total size is element_size * count; alignment defaults to
+        8 bytes which is sufficient for most primitive element types. For
+        wider alignment (16-byte for SIMD, 32-byte for AVX), use
+        owned_heap_allocate_aligned with the desired alignment and an
+        explicit total size.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Compute total_size = element_size * count. No overflow check
+               here - the underlying allocate will catch overflow via the
+               capacity test (a negative or absurdly large total_size will
+               not fit in the descriptor).
+            2. Forward to owned_heap_allocate with alignment = 8.
+    @End Implementation
+
+    @Performance_Hints:
+        Identical to owned_heap_allocate plus one multiplication. The
+        returned memory is uninitialized; if zero-initialized array
+        elements are required, use owned_heap_allocate_zeroed with the same
+        total_size.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller is responsible for not exceeding the array bounds when
+        writing element data. The descriptor heap does not track per-
+        element bounds.
+    @End Security_Scope
+
+    Let total_size be element_size multiplied by count
+    Let alignment be 8
+
+    Let result be proc owned_heap_allocate with heap, total_size, alignment
+    Return result
+End Process
+
+Process called "owned_heap_allocate_string" takes heap as Integer, length as Integer returns Integer:
+    @Reasoning:
+        Allocate a C-style null-terminated string buffer with capacity
+        length + 1 bytes. The trailing byte is written as 0 so the buffer
+        is a valid empty string until the caller fills the prefix. Strings
+        are allocated with alignment = 1 because byte addressing of strings
+        is the canonical use case and any tighter alignment wastes space.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. buffer_size = length + 1 (room for trailing NUL).
+            2. allocate with alignment = 1.
+            3. If allocate succeeded, write a 0 byte at offset length so the
+               buffer is a valid C string ("\0" at minimum).
+            4. Return the buffer pointer.
+
+        Note: this Process does NOT copy any source string into the buffer.
+        Callers who want a duplicate of an existing C string must memcpy
+        the source after allocate returns.
+    @End Implementation
+
+    @Performance_Hints:
+        owned_heap_allocate cost plus one byte write. The NUL write is the
+        cheapest possible side-effect; cost is dominated by the underlying
+        allocate.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Returned buffer holds whatever bytes the descriptor's data buffer
+        had at the allocation offset (except the trailing NUL). Callers
+        reading the buffer as a string before filling it will observe stale
+        data up to the first 0 byte (or up to length, whichever is closer).
+        Use owned_heap_allocate_zeroed if a fully-zeroed buffer is needed.
+    @End Security_Scope
+
+    Let buffer_size be length plus 1
+    Let alignment be 1
+
+    Let result be proc owned_heap_allocate with heap, buffer_size, alignment
+
+    If result is not equal to 0:
+        Let null_offset be length
+        Let dummy be proc memory_set_byte from MemoryCore with result, null_offset, 0
+    End If
+
+    Return result
+End Process
+
+Process called "owned_heap_allocate_struct" takes heap as Integer, struct_size as Integer returns Integer:
+    @Reasoning:
+        Convenience entry point for structure allocations: forwards to
+        allocate with alignment = 16 which matches the platform ABI
+        requirement for structs containing 16-byte-aligned members
+        (long double, __m128, etc.) and over-aligns lighter structs at
+        most by 15 bytes of padding per allocation.
+    @End Reasoning
+
+    @Implementation:
+        Forwards: returns owned_heap_allocate(heap, struct_size, 16).
+    @End Implementation
+
+    @Performance_Hints:
+        Same as owned_heap_allocate at alignment 16. The 16-byte alignment
+        may waste up to 15 bytes per allocation on smaller structs; for
+        dense packing of small structs prefer owned_heap_allocate with a
+        smaller alignment.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Inherits the security properties of owned_heap_allocate. Returned
+        memory is not zeroed.
+    @End Security_Scope
+
+    Let alignment be 16
+
+    Let result be proc owned_heap_allocate with heap, struct_size, alignment
+    Return result
+End Process
+
+Note:
+============================================================================
+OwnedHeap Memory Management
+============================================================================
+:End Note
+
+Process called "owned_heap_resize" takes heap as Integer, new_size as Integer returns Integer:
+    @Reasoning:
+        Resize the descriptor's mmap region to new_size bytes via mremap.
+        Allows the kernel to relocate the mapping if needed (MREMAP_MAYMOVE),
+        which preserves the existing live byte range at the new address
+        without an explicit copy. The descriptor's memory_block, size, and
+        capacity are updated to reflect the new mapping. Existing pointers
+        handed out by allocate are INVALIDATED if the kernel relocates the
+        mapping; callers must not retain pointers across resize unless they
+        verified the address did not change.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read current_pos (offset 8). If new_size < current_pos, the
+               live data range would be truncated; return 0 to refuse the
+               shrink rather than silently lose data.
+            3. Read current memory_block (offset 0) and capacity (offset 24).
+            4. Issue raw syscall_4 with SYSCALL_MREMAP, passing
+               (memory_block, capacity, new_size, MREMAP_MAYMOVE). No
+               cross-platform wrapper exists for mremap so the raw dispatch
+               is the only path.
+            5. Check the return value against MMAP_ERROR_THRESHOLD - if the
+               syscall failed, return 0 and leave the descriptor unchanged.
+            6. Update memory_block (offset 0) to the new address.
+            7. Update capacity (offset 24) and size (offset 16) to new_size.
+               The two fields remain coupled today; future logical/physical
+               split would only update capacity here.
+            8. Return 1 on success.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is one mremap syscall, which is significantly faster than
+        the equivalent munmap + mmap + memcpy sequence because the kernel
+        can either extend the mapping in place (~1 microsecond) or move it
+        via page-table edits (proportional to the page count of the live
+        range, no actual byte copies).
+    @End Performance_Hints
+
+    @Security_Scope:
+        mremap is Linux-specific. On non-Linux platforms (Darwin, FreeBSD,
+        Windows via WSL2 with limitations) this syscall will fail with
+        ENOSYS or equivalent, and resize will return 0. The descriptor's
+        existing mapping is preserved on failure. Pointers handed out
+        before resize are invalidated if the kernel relocated the mapping
+        even though resize itself returned successfully - callers must not
+        retain pointers across resize.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    If new_size is less than current_pos:
+        Return 0
+    End If
+
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    Note: mremap is Linux-specific; no cross-platform wrapper exists
+    Let new_addr be proc syscall_4 from Syscall with SYSCALL_MREMAP, memory_block, capacity, new_size, MREMAP_MAYMOVE
+
+    If new_addr is greater than MMAP_ERROR_THRESHOLD:
+        Return 0
+    End If
+
+    Let dummy1 be proc memory_set_integer from MemoryCore with heap, 0, new_addr
+    Let dummy2 be proc memory_set_integer from MemoryCore with heap, 24, new_size
+    Let dummy3 be proc memory_set_integer from MemoryCore with heap, 16, new_size
+
+    Return 1
+End Process
+
+Process called "owned_heap_grow" takes heap as Integer, growth_size as Integer returns Integer:
+    @Reasoning:
+        Grow the descriptor's capacity by exactly growth_size bytes (not by
+        a multiplicative factor). For doubling-style growth callers should
+        pass capacity directly (which doubles current capacity). The simple
+        additive form is provided because some callers want bounded growth
+        with predictable memory usage.
+    @End Reasoning
+
+    @Implementation:
+        Reads current capacity (offset 24), computes new_capacity =
+        capacity + growth_size, and forwards to owned_heap_resize. The
+        resize call performs the actual mremap.
+    @End Implementation
+
+    @Performance_Hints:
+        Same as owned_heap_resize. If exponential growth is needed (to
+        amortize the resize cost across many small grows), call grow with
+        growth_size = current capacity to double.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Inherits Linux-only restriction from owned_heap_resize. Pointers
+        previously returned by allocate are invalidated if the kernel
+        relocates the mapping during grow.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+    Let new_capacity be capacity plus growth_size
+
+    Let result be proc owned_heap_resize with heap, new_capacity
+    Return result
+End Process
+
+Process called "owned_heap_shrink" takes heap as Integer returns Integer:
+    @Reasoning:
+        Shrink the descriptor's mmap region down to current_pos plus a
+        small headroom buffer. The headroom (1024 bytes) gives the next
+        few allocations room to succeed before another grow becomes
+        necessary, amortising the cost of repeated shrink/grow cycles in
+        steady-state workloads. Used by owned_heap_optimize when the heap
+        is below the shrink threshold.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read current_pos (offset 8).
+            3. new_size = current_pos + 1024 (the headroom constant).
+            4. Forward to owned_heap_resize. The resize will refuse if
+               new_size < current_pos, but here new_size > current_pos by
+               construction so the resize is well-defined.
+    @End Implementation
+
+    @Performance_Hints:
+        Same as owned_heap_resize. Useful at the end of a workload phase
+        to release unused mmap pages back to the kernel; the kernel
+        decommits the freed pages on the spot, reducing the process's RSS.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Inherits Linux-only restriction from owned_heap_resize. The
+        shrunken region's high-address pages are released to the kernel;
+        any data the descriptor held in those pages is lost.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+
+    Let headroom be 1024
+    Let new_size be current_pos plus headroom
+
+    Let result be proc owned_heap_resize with heap, new_size
+    Return result
+End Process
+
+Process called "owned_heap_compact" takes heap as Integer returns Integer:
+    @Reasoning:
+        Bump allocators do not fragment because every allocation is laid
+        out contiguously from offset 0 forward. There are no gaps to
+        compact away. This Process is therefore a definitional no-op on
+        success, retained in the API only for interface uniformity with
+        allocators that DO fragment (free-list, slab, buddy). Callers who
+        compact-then-validate as a periodic maintenance hook may continue
+        to call it on this allocator; the 1 return value indicates that
+        the (vacuous) compaction succeeded.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on heap == 0.
+            2. Return 1 indicating success (vacuous compaction).
+
+        This is an intentional no-op, not a placeholder. The annotation
+        documents why the Process body is short: there is nothing to do.
+        Removing this Process would force every caller writing a generic
+        allocator-maintenance hook to special-case bump allocators.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). A single null check and a return; no memory operations.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Does not read or modify the descriptor beyond the null check.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Note: Bump allocators are inherently non-fragmenting - compaction is vacuous.
+    Return 1
+End Process
+
+Process called "owned_heap_merge" takes heap1 as Integer, heap2 as Integer returns Integer:
+    @Reasoning:
+        Build a fresh descriptor heap whose data buffer holds the
+        concatenation of heap1's and heap2's live byte ranges. The
+        resulting heap is independent of both sources (they remain valid
+        and unchanged). The new heap's capacity is heap1.size + heap2.size,
+        its current_pos is heap1.current_pos + heap2.current_pos, its
+        allocation_count is the sum of the two sources' counts, and its
+        alignment is inherited from heap1. peak_usage is left at 0 in the
+        merged heap because the merge operation itself does not have a
+        meaningful "peak observed during merge."
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Reject NULL inputs on either side.
+            2. Read size1 (offset 16 of heap1), size2 (offset 16 of heap2),
+               and total_size = size1 + size2.
+            3. Read alignment from heap1 (offset 32). Inherit only from
+               heap1 because alignment requirements are caller-defined and
+               we cannot reconcile a conflict; documenting heap1 as the
+               authority avoids surprise.
+            4. Create the merged heap via owned_heap_create(total_size,
+               alignment). Failure propagates as 0.
+            5. Read source data block pointers (heap1 offset 0, heap2
+               offset 0) and the merged block pointer.
+            6. Read live ranges: pos1 = heap1.current_pos, pos2 =
+               heap2.current_pos.
+            7. memory_copy(merged_block, heap1_block, pos1) copies the
+               first heap's live bytes to the start of the merged buffer.
+            8. dest_ptr = merged_block + pos1.
+               memory_copy(dest_ptr, heap2_block, pos2) appends the second
+               heap's live bytes.
+            9. Update the merged heap's current_pos to pos1 + pos2.
+           10. Read both sources' allocation_count (offset 56), sum them,
+               and write the total into the merged heap.
+           11. Return the merged heap pointer.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is owned_heap_create (one descriptor allocate plus one mmap)
+        plus two memory_copies. Linear in total_size. For very large
+        merges the two memory_copies dominate; for small merges the
+        mmap dominates.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The merged heap contains a verbatim copy of heap1's and heap2's
+        live data; if either source held sensitive data, the merged heap
+        inherits it. Caller is responsible for not exposing the merged
+        heap across a trust boundary that the sources did not cross.
+    @End Security_Scope
+
+    If heap1 is equal to 0:
+        Return 0
+    End If
+
+    If heap2 is equal to 0:
+        Return 0
+    End If
+
+    Let size1 be proc memory_get_integer from MemoryCore with heap1, 16
+    Let size2 be proc memory_get_integer from MemoryCore with heap2, 16
+    Let total_size be size1 plus size2
+
+    Let alignment be proc memory_get_integer from MemoryCore with heap1, 32
+
+    Let merged_heap be proc owned_heap_create with total_size, alignment
+
+    If merged_heap is equal to 0:
+        Return 0
+    End If
+
+    Let block1 be proc memory_get_integer from MemoryCore with heap1, 0
+    Let block2 be proc memory_get_integer from MemoryCore with heap2, 0
+    Let merged_block be proc memory_get_integer from MemoryCore with merged_heap, 0
+
+    Let pos1 be proc memory_get_integer from MemoryCore with heap1, 8
+    Let pos2 be proc memory_get_integer from MemoryCore with heap2, 8
+
+    Let dummy1 be proc memory_copy from MemoryCore with merged_block, block1, pos1
+
+    Let dest_offset be pos1
+    Let dest_ptr be merged_block plus dest_offset
+    Let dummy2 be proc memory_copy from MemoryCore with dest_ptr, block2, pos2
+
+    Let new_pos be pos1 plus pos2
+    Let dummy3 be proc memory_set_integer from MemoryCore with merged_heap, 8, new_pos
+
+    Let count1 be proc memory_get_integer from MemoryCore with heap1, 56
+    Let count2 be proc memory_get_integer from MemoryCore with heap2, 56
+    Let total_count be count1 plus count2
+    Let dummy4 be proc memory_set_integer from MemoryCore with merged_heap, 56, total_count
+
+    Return merged_heap
+End Process
+
+Note:
+============================================================================
+OwnedHeap Query Operations
+============================================================================
+:End Note
+
+Process called "owned_heap_descriptor_get_size" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return the logical size (in bytes) of the descriptor's data buffer
+        - that is, the value of the size field at descriptor offset 16.
+        Renamed during migration from owned_heap_get_size to avoid a name
+        collision with runtime/core/memory/owned_heap_wrappers.runa's
+        owned_heap_get_size (which takes a user-pointer and consults the
+        registry, an entirely different signature and semantics). Both
+        Processes coexist; this one queries a heap descriptor, the wrapper
+        version queries a single allocation's recorded size.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on heap == 0.
+            2. Read size from offset 16.
+            3. Return the value.
+
+        Pre-migration name: owned_heap_get_size. Zero external callers used
+        the old name, so the rename has no caller-side impact.
+    @End Implementation
+
+    @Performance_Hints:
+        One qword read. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata, not the data buffer. Safe on
+        any descriptor that is not actively being destroyed by another
+        thread.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let size be proc memory_get_integer from MemoryCore with heap, 16
+    Return size
+End Process
+
+Process called "owned_heap_get_capacity" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return the physical capacity (in bytes) of the descriptor's data
+        buffer - that is, the value of the capacity field at offset 24. In
+        the current design size and capacity always coincide; the fields
+        are retained as distinct slots to allow future logical-vs-physical
+        distinction.
+    @End Reasoning
+
+    @Implementation:
+        NULL guard, then read offset 24 and return it.
+    @End Implementation
+
+    @Performance_Hints:
+        One qword read. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+    Return capacity
+End Process
+
+Process called "owned_heap_get_usage" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return the current bump pointer position (offset 8) which is also
+        the number of bytes currently allocated against the heap. Useful
+        for diagnostics, watermark monitoring, and the optimize/shrink
+        decision logic in owned_heap_optimize.
+    @End Reasoning
+
+    @Implementation:
+        NULL guard, then read offset 8 and return it.
+    @End Implementation
+
+    @Performance_Hints:
+        One qword read. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Return current_pos
+End Process
+
+Process called "owned_heap_get_peak_usage" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return the lifetime maximum of current_pos (offset 64). This is the
+        canonical "high water mark" metric for capacity planning: how big
+        did the heap need to get during this descriptor's lifetime? The
+        value persists across reset_stats only if the application sets it
+        again after reset; reset_stats deliberately retains the previous
+        peak as a baseline (see owned_heap_reset_stats).
+    @End Reasoning
+
+    @Implementation:
+        NULL guard, then read offset 64 and return it.
+    @End Implementation
+
+    @Performance_Hints:
+        One qword read. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with heap, 64
+    Return peak_usage
+End Process
+
+Process called "owned_heap_get_fragmentation" takes heap as Integer returns Integer:
+    @Reasoning:
+        Bump allocators do not fragment - every allocation is contiguous
+        from offset 0 forward. The fragmentation metric is therefore always
+        0 by construction. This Process is retained in the API for parity
+        with allocators that DO fragment, so a generic
+        "compute-allocator-fragmentation" caller can poll all allocators
+        uniformly. A non-zero return would be a contract violation.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0 on heap == 0 (matches the "no
+               fragmentation" semantics by happy accident; a null heap
+               trivially has no gaps).
+            2. Return 0 (the genuine no-fragmentation answer for any
+               live bump allocator).
+
+        The Return 0 here is the correct computed value, not a placeholder.
+        See @Reasoning for the proof.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1). One null check, one return.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads no descriptor state.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Note: Bump allocators have no fragmentation by construction.
+    Return 0
+End Process
+
+Process called "owned_heap_get_allocation_count" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return the lifetime count of successful allocate calls (offset 56).
+        Reset by reset and reset_stats. Useful for diagnostics and average-
+        allocation-size calculations in owned_heap_profile.
+    @End Reasoning
+
+    @Implementation:
+        NULL guard, then read offset 56 and return it.
+    @End Implementation
+
+    @Performance_Hints:
+        One qword read. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Return allocation_count
+End Process
+
+Process called "owned_heap_is_full" takes heap as Integer returns Integer:
+    @Reasoning:
+        Return 1 if the heap has zero free bytes - that is, if current_pos
+        >= capacity. A null heap is conservatively reported as full (the
+        caller cannot allocate from it) which is more useful than the
+        contrary "empty heap" interpretation for the common pattern of
+        "allocate if not full".
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 1 (full).
+            2. Read current_pos (offset 8) and capacity (offset 24).
+            3. If current_pos >= capacity, return 1. Otherwise return 0.
+
+        The >= rather than == is deliberate: if current_pos somehow exceeds
+        capacity (which would be a bug in allocate), we still report full
+        rather than falsely report space available.
+    @End Implementation
+
+    @Performance_Hints:
+        Two qword reads, one comparison. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 1
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    If current_pos is greater than or equal to capacity:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Process called "owned_heap_has_space" takes heap as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Return 1 if the heap can accommodate an allocation of size bytes
+        WITHOUT considering alignment padding. The omission of alignment is
+        deliberate: this is a fast pre-check, not a guarantee, so the
+        caller can use it to short-circuit obviously-too-large requests
+        without paying for the bitwise-alignment arithmetic. The actual
+        allocate call still performs the exact bounds check with alignment.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return 0.
+            2. Zero-size check: zero bytes always fits, return 1.
+            3. Compute space_remaining = capacity - current_pos.
+            4. If space_remaining >= size, return 1. Otherwise return 0.
+    @End Implementation
+
+    @Performance_Hints:
+        Two qword reads, one subtraction, one comparison. O(1). Use this
+        for fast pre-checks; the underlying allocate will still re-check
+        bounds with alignment padding.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata. Reports a conservative answer
+        if alignment padding would push the allocation past capacity:
+        has_space may return 1 in a case where allocate would later
+        return 0. Callers must treat has_space as a hint, not a guarantee.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    If size is equal to 0:
+        Return 1
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    Let space_remaining be capacity minus current_pos
+
+    If space_remaining is greater than or equal to size:
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+Note:
+============================================================================
+OwnedHeap Performance Operations
+============================================================================
+:End Note
+
+Process called "owned_heap_get_stats" takes heap as Integer returns Integer:
+    @Reasoning:
+        Allocate and populate a 48-byte OwnedHeapStats blob with current
+        statistics from the heap descriptor. The blob is itself an
+        allocation from the global owned heap; the caller is responsible
+        for releasing it with MemoryLayout.deallocate when done. Returns a
+        pointer rather than a stack-copied struct because the v0.0.8.5
+        bootstrap compiler does not yet support struct-by-value returns;
+        the stats Type is documented in the file header for the day that
+        support lands.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Allocate 48 bytes via MemoryLayout.allocate. Failure
+               propagates as 0.
+            3. Read allocation_count (offset 56) and write to stats offset
+               0 (total_allocations).
+            4. Read current_pos (offset 8) and write to stats offset 8
+               (total_bytes).
+            5. Read peak_usage (offset 64) and write to stats offset 16
+               (peak_usage).
+            6. Write 0 to stats offset 24 (fragmentation - always 0 for
+               bump allocator, see owned_heap_get_fragmentation).
+            7. Write 0 to stats offsets 32 and 40 (allocation_time and
+               deallocation_time - reserved future fields, currently
+               always 0).
+            8. Return the stats pointer.
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocate plus a constant number of memory_get/set
+        ops. The allocate is the dominant cost. For polling-style stats
+        consumption consider building a caller-side stats buffer and
+        re-using it via direct memory_get reads against the descriptor
+        rather than calling get_stats repeatedly.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The returned blob is heap-allocated; callers MUST release it via
+        MemoryLayout.deallocate to avoid leaking. The blob holds copies of
+        descriptor metadata fields and reveals nothing about the heap's
+        data buffer contents.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let stats_size be 48
+    Let stats_ptr be proc allocate from MemoryLayout with stats_size
+
+    If stats_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Let dummy1 be proc memory_set_integer from MemoryCore with stats_ptr, 0, allocation_count
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let dummy2 be proc memory_set_integer from MemoryCore with stats_ptr, 8, current_pos
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with heap, 64
+    Let dummy3 be proc memory_set_integer from MemoryCore with stats_ptr, 16, peak_usage
+
+    Note: Fragmentation is 0 by construction for bump allocators
+    Let dummy4 be proc memory_set_integer from MemoryCore with stats_ptr, 24, 0
+
+    Note: allocation_time and deallocation_time reserved for future use
+    Let dummy5 be proc memory_set_integer from MemoryCore with stats_ptr, 32, 0
+    Let dummy6 be proc memory_set_integer from MemoryCore with stats_ptr, 40, 0
+
+    Return stats_ptr
+End Process
+
+Process called "owned_heap_reset_stats" takes heap as Integer returns Nothing:
+    @Reasoning:
+        Reset the lifetime allocation counter to 0 and reset peak_usage to
+        the current usage. The peak-reset-to-current pattern preserves the
+        meaningful invariant peak_usage >= current_pos: after reset_stats
+        completes, future allocations will only push peak_usage higher.
+        This is different from owned_heap_reset which zeroes both counters
+        AND zeroes current_pos; reset_stats is for "I want fresh
+        statistics but my heap is mid-workload."
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: return.
+            2. Write 0 to offset 56 (allocation_count).
+            3. Read current_pos (offset 8) and write that value to
+               offset 64 (peak_usage). Setting peak_usage to current_pos
+               (rather than 0) means future calls to get_peak_usage will
+               return correct values immediately - if peak_usage were
+               zero and current_pos were non-zero, the invariant
+               peak_usage >= current_pos would be violated until the
+               next allocate.
+    @End Implementation
+
+    @Performance_Hints:
+        One read, two writes. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Modifies only the descriptor metadata. The data buffer is
+        unaffected.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return
+    End If
+
+    Let dummy1 be proc memory_set_integer from MemoryCore with heap, 56, 0
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let dummy2 be proc memory_set_integer from MemoryCore with heap, 64, current_pos
+
+    Return
+End Process
+
+Process called "owned_heap_profile" takes heap as Integer returns Integer:
+    @Reasoning:
+        Build a 40-byte profile blob describing allocation behaviour: how
+        utilised is the heap (current_pos / capacity), what is the average
+        allocation size, what is the allocation rate, and how much memory
+        is wasted (capacity - current_pos). Used for tuning the default
+        heap size and triggering owned_heap_optimize. The profile is a
+        snapshot - it does not track history between calls.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Allocate 40 bytes from the owned heap for the profile blob.
+            3. Read current_pos and capacity. Compute utilization as
+               (current_pos * 100) / capacity if capacity > 0, else 0.
+               Write to profile offset 0.
+            4. Read allocation_count. Compute average_size as current_pos /
+               allocation_count if count > 0, else 0. Write to profile
+               offset 8.
+            5. Write a constant 100 to profile offset 16
+               (allocation_efficiency - bump allocators are 100% efficient
+               by construction; there is no per-allocation header or
+               free-list overhead).
+            6. Compute waste = capacity - current_pos and write to
+               profile offset 24.
+            7. Write allocation_count to profile offset 32
+               (allocation_rate proxy - lifetime count is a coarse rate
+               estimate when divided by lifetime, which the caller does
+               with their own timing).
+            8. Return the profile blob pointer.
+
+        Note: the divisions guard against capacity = 0 and
+        allocation_count = 0 to avoid a divide-by-zero trap.
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocate plus a constant number of memory_get/set
+        ops, two divisions, and one multiplication. Sub-microsecond.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The returned blob is heap-allocated; callers must release it via
+        MemoryLayout.deallocate. Reveals only summary metadata - no
+        information about the data buffer contents leaks.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let profile_size be 40
+    Let profile_ptr be proc allocate from MemoryLayout with profile_size
+
+    If profile_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    Note: Compute utilization percentage, guarded against capacity == 0
+    Let utilization be 0
+    If capacity is greater than 0:
+        Let hundred be 100
+        Let numerator be current_pos multiplied by hundred
+        Set utilization to numerator divided by capacity
+    End If
+
+    Let dummy1 be proc memory_set_integer from MemoryCore with profile_ptr, 0, utilization
+
+    Note: Compute average allocation size, guarded against count == 0
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Let average_size be 0
+    If allocation_count is greater than 0:
+        Set average_size to current_pos divided by allocation_count
+    End If
+
+    Let dummy2 be proc memory_set_integer from MemoryCore with profile_ptr, 8, average_size
+
+    Note: Allocation efficiency: 100% for bump allocator (no per-alloc overhead)
+    Let efficiency be 100
+    Let dummy3 be proc memory_set_integer from MemoryCore with profile_ptr, 16, efficiency
+
+    Let waste be capacity minus current_pos
+    Let dummy4 be proc memory_set_integer from MemoryCore with profile_ptr, 24, waste
+
+    Let dummy5 be proc memory_set_integer from MemoryCore with profile_ptr, 32, allocation_count
+
+    Return profile_ptr
+End Process
+
+Process called "owned_heap_optimize" takes heap as Integer returns Integer:
+    @Reasoning:
+        Apply the owned-heap optimization heuristic: if current usage is
+        less than a quarter of capacity, shrink the heap down to
+        current_pos + headroom. The quarter-capacity threshold balances
+        responsiveness (don't shrink prematurely) against memory pressure
+        (release unused pages back to the kernel when usage stays low).
+        Returns 1 on success (whether or not a shrink was actually
+        performed - "the heap is already optimal" is also success).
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read current_pos and capacity.
+            3. Compute quarter_capacity = capacity / 4 (integer division;
+               the heuristic does not need sub-page precision).
+            4. If current_pos < quarter_capacity, call owned_heap_shrink
+               and return its result.
+            5. Otherwise return 1 (no work needed).
+
+        The threshold is the constant OWNED_HEAP_SHRINK_THRESHOLD = 4,
+        documented at the constants block. Changing the threshold here
+        would require updating that constant in parallel.
+    @End Implementation
+
+    @Performance_Hints:
+        Fast path (no shrink needed): two qword reads, one division, one
+        comparison. ~10 nanoseconds. Slow path (shrink): inherits the
+        owned_heap_shrink + owned_heap_resize syscall cost.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Inherits Linux-only restriction from owned_heap_resize when the
+        shrink path is taken. Pointers handed out by allocate may be
+        invalidated if the kernel relocates the mmap region during shrink.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    Let quarter_capacity be capacity divided by 4
+    If current_pos is less than quarter_capacity:
+        Let result be proc owned_heap_shrink with heap
+        Return result
+    End If
+
+    Return 1
+End Process
+
+Process called "owned_heap_benchmark" takes heap as Integer, iterations as Integer returns Integer:
+    @Reasoning:
+        Run an in-place benchmark of the descriptor heap: allocate a
+        fixed 64-byte block repeatedly for iterations rounds, measure
+        wall-clock time via clock_gettime(CLOCK_MONOTONIC), and report
+        allocations-per-second, average per-allocation time in
+        nanoseconds, total time, and the iteration count. After the
+        benchmark loop the heap is reset so the benchmark does not
+        permanently consume capacity.
+
+        The 64-byte fixed allocation size is chosen because it matches a
+        typical compiler-data-structure footprint (AST node, IR
+        instruction, symbol entry). Callers who want to benchmark
+        different allocation profiles can call benchmark with different
+        heap configurations.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL/zero-iter guards: return 0 if heap == 0 or iterations
+               < 1.
+            2. Allocate a 32-byte BenchmarkResults blob from the owned heap.
+            3. Allocate a 16-byte timespec scratch buffer from the owned
+               heap. clock_gettime writes into this buffer; the buffer is
+               freed after the benchmark completes.
+            4. Read CLOCK_MONOTONIC start time via syscall_2(228, ...).
+               The 228 syscall number is Linux x86_64 clock_gettime;
+               chained_arena.runa uses the same constant in its benchmark.
+            5. Run the allocate loop: iterations rounds of
+               owned_heap_allocate(heap, 64, 8).
+            6. Read CLOCK_MONOTONIC end time. Convert both endpoints to
+               nanoseconds (sec * 1_000_000_000 + nsec) and subtract.
+            7. Write total_time (offset 16), average_time = total / iter
+               (offset 8), allocs_per_sec = iter * 1e9 / total
+               (offset 0), and iter (offset 24) to the results blob.
+            8. Reset the heap to release the iterations*64 bytes that
+               were just allocated.
+            9. Free the timespec scratch buffer via
+               MemoryLayout.deallocate.
+           10. Return the results blob pointer (the caller must release
+               it with MemoryLayout.deallocate).
+    @End Implementation
+
+    @Performance_Hints:
+        Cost is two clock_gettime syscalls plus iterations bump
+        allocations plus the heap reset. The benchmark itself is the
+        thing being measured. For statistically meaningful results
+        choose iterations > 10000 so the syscall overhead is amortised.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Modifies the heap by allocating iterations * 64 bytes and then
+        resetting it. Existing pointers handed out by the heap before
+        benchmark was called are invalidated by the reset at step 8.
+        Callers must ensure no live pointers into the heap exist when
+        benchmark is called. The clock_gettime syscall is Linux-specific;
+        on other platforms the benchmark will record nonsense times.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    If iterations is less than 1:
+        Return 0
+    End If
+
+    Let results_size be 32
+    Let results_ptr be proc allocate from MemoryLayout with results_size
+
+    If results_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let timespec_ptr be proc allocate from MemoryLayout with TIMESPEC_SIZE
+
+    Note: Get start timestamp via clock_gettime(CLOCK_MONOTONIC)
+    Let dummy1 be proc syscall_2 from Syscall with SYSCALL_CLOCK_GETTIME, CLOCK_MONOTONIC, timespec_ptr
+
+    Let start_sec be proc memory_get_integer from MemoryCore with timespec_ptr, 0
+    Let start_nsec be proc memory_get_integer from MemoryCore with timespec_ptr, 8
+    Let start_time be start_sec multiplied by NANOSECONDS_PER_SECOND
+    Set start_time to start_time plus start_nsec
+
+    Note: Run the benchmark loop
+    Let test_size be 64
+    Let alignment be 8
+    Let i be 0
+    While i is less than iterations:
+        Let alloc_ptr be proc owned_heap_allocate with heap, test_size, alignment
+        Set i to i plus 1
+    End While
+
+    Note: Get end timestamp
+    Let dummy2 be proc syscall_2 from Syscall with SYSCALL_CLOCK_GETTIME, CLOCK_MONOTONIC, timespec_ptr
+
+    Let end_sec be proc memory_get_integer from MemoryCore with timespec_ptr, 0
+    Let end_nsec be proc memory_get_integer from MemoryCore with timespec_ptr, 8
+    Let end_time be end_sec multiplied by NANOSECONDS_PER_SECOND
+    Set end_time to end_time plus end_nsec
+
+    Let total_time be end_time minus start_time
+    Let dummy3 be proc memory_set_integer from MemoryCore with results_ptr, 16, total_time
+
+    Let average_time be 0
+    If iterations is greater than 0:
+        Set average_time to total_time divided by iterations
+    End If
+    Let dummy4 be proc memory_set_integer from MemoryCore with results_ptr, 8, average_time
+
+    Let allocs_per_sec be 0
+    If total_time is greater than 0:
+        Let iterations_times_billion be iterations multiplied by NANOSECONDS_PER_SECOND
+        Set allocs_per_sec to iterations_times_billion divided by total_time
+    End If
+    Let dummy5 be proc memory_set_integer from MemoryCore with results_ptr, 0, allocs_per_sec
+
+    Let dummy6 be proc memory_set_integer from MemoryCore with results_ptr, 24, iterations
+
+    Note: Reset the heap to release the benchmark's allocations
+    Let dummy7 be proc owned_heap_reset with heap
+
+    Note: Free the timespec scratch buffer
+    Let dummy8 be proc deallocate from MemoryLayout with timespec_ptr
+
+    Return results_ptr
+End Process
+
+Note:
+============================================================================
+OwnedHeap Debugging Operations
+============================================================================
+:End Note
+
+Process called "owned_heap_validate" takes heap as Integer returns Integer:
+    @Reasoning:
+        Sanity-check the descriptor's metadata fields against a set of
+        invariants that any live descriptor MUST satisfy:
+            - heap != null
+            - memory_block != null (the data buffer must exist)
+            - current_pos in [0, capacity]
+            - size <= capacity
+            - allocation_count >= 0
+            - peak_usage <= capacity
+
+        Any violation indicates either a corrupted descriptor or a use-
+        after-destroy. Returns 0 on any violation so that callers can
+        early-out before touching the underlying data buffer.
+    @End Reasoning
+
+    @Implementation:
+        Sequential checks of each invariant, returning 0 at the first
+        violation. The checks are ordered cheapest-to-most-expensive
+        (null check first, then field reads, then arithmetic comparisons)
+        so that the common "all good" path is fast and the common
+        failure modes are caught early.
+    @End Implementation
+
+    @Performance_Hints:
+        Best case: one null check (~1ns). Worst case (all checks): six
+        memory reads and six comparisons (~50ns). O(1) regardless.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only the descriptor metadata; does not dereference
+        memory_block. Safe to call on a descriptor whose data buffer has
+        already been unmapped but whose 80-byte header is still
+        accessible.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+    If memory_block is equal to 0:
+        Return 0
+    End If
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    If current_pos is less than 0:
+        Return 0
+    End If
+
+    If current_pos is greater than capacity:
+        Return 0
+    End If
+
+    Let size be proc memory_get_integer from MemoryCore with heap, 16
+    If size is greater than capacity:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    If allocation_count is less than 0:
+        Return 0
+    End If
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with heap, 64
+    If peak_usage is greater than capacity:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "owned_heap_dump" takes heap as Integer returns Integer:
+    @Reasoning:
+        Snapshot the descriptor state into a 64-byte debug blob suitable
+        for logging, post-mortem analysis, or comparison across
+        diagnostic checkpoints. Captures: memory_block pointer, current
+        bump pointer, size, capacity, allocation count, peak usage, the
+        valid/corrupted flag (computed via owned_heap_validate), and a
+        utilisation percentage. The returned blob is allocated from the
+        owned heap; caller must release it.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Allocate 64 bytes for the dump blob.
+            3. For each of memory_block, current_pos, size, capacity,
+               allocation_count, peak_usage: read from descriptor at
+               documented offset, write to dump blob at the corresponding
+               offset (0, 8, 16, 24, 32, 40 respectively).
+            4. Call owned_heap_validate(heap) and write the 0/1 result to
+               offset 48 (is_valid field).
+            5. Compute utilization = (current_pos * 100) / capacity if
+               capacity > 0 else 0. Write to offset 56.
+            6. Return the dump pointer.
+
+        Dump field layout (documented in the file header above as well):
+            offset  0: memory_block_ptr
+            offset  8: current_position
+            offset 16: size
+            offset 24: capacity
+            offset 32: allocation_count
+            offset 40: peak_usage
+            offset 48: is_valid
+            offset 56: utilization_percent
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocate plus six memory reads, eight memory
+        writes, one division, one multiplication. Sub-microsecond.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Returned blob is heap-allocated; caller must release. The blob
+        reveals the data buffer's address (memory_block) which is sensitive
+        on platforms with ASLR; callers should not log dump blobs without
+        a security review on hardened deployments.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let dump_size be 64
+    Let dump_ptr be proc allocate from MemoryLayout with dump_size
+
+    If dump_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+    Let dummy1 be proc memory_set_integer from MemoryCore with dump_ptr, 0, memory_block
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let dummy2 be proc memory_set_integer from MemoryCore with dump_ptr, 8, current_pos
+
+    Let size be proc memory_get_integer from MemoryCore with heap, 16
+    Let dummy3 be proc memory_set_integer from MemoryCore with dump_ptr, 16, size
+
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+    Let dummy4 be proc memory_set_integer from MemoryCore with dump_ptr, 24, capacity
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Let dummy5 be proc memory_set_integer from MemoryCore with dump_ptr, 32, allocation_count
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with heap, 64
+    Let dummy6 be proc memory_set_integer from MemoryCore with dump_ptr, 40, peak_usage
+
+    Let is_valid be proc owned_heap_validate with heap
+    Let dummy7 be proc memory_set_integer from MemoryCore with dump_ptr, 48, is_valid
+
+    Let utilization be 0
+    If capacity is greater than 0:
+        Let hundred be 100
+        Let numerator be current_pos multiplied by hundred
+        Set utilization to numerator divided by capacity
+    End If
+    Let dummy8 be proc memory_set_integer from MemoryCore with dump_ptr, 56, utilization
+
+    Return dump_ptr
+End Process
+
+Process called "owned_heap_trace" takes heap as Integer returns Integer:
+    @Reasoning:
+        Snapshot allocation history into a 48-byte trace blob. Distinct
+        from owned_heap_dump in that dump captures POSITION state
+        (current_pos, capacity, is_valid) while trace captures HISTORY
+        state (total allocations, average size). Per-allocation history
+        is not tracked today; the trace reports aggregate metrics derived
+        from the descriptor's lifetime counters. Future per-allocation
+        tracking (via the OwnedAllocation Type's reserved fields) would
+        produce a richer trace; the current shape is forward-compatible.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Allocate 48 bytes for the trace blob.
+            3. Read allocation_count and current_pos.
+            4. Write total_allocations (offset 0) = allocation_count.
+            5. Write total_bytes_allocated (offset 8) = current_pos. This
+               is the lifetime byte total because bump allocators never
+               free individually - current_pos is the cumulative total.
+            6. Write current_allocations (offset 16) = allocation_count
+               (every allocation is "current" - bump allocators do not
+               distinguish current from freed).
+            7. Compute average_size = current_pos / allocation_count when
+               count > 0, else 0.
+            8. Write largest_allocation (offset 24), smallest_allocation
+               (offset 32), and average_allocation_size (offset 40) all
+               to average_size. The largest/smallest fields would require
+               per-allocation tracking to populate distinctly; today they
+               report the average, with the understanding that this is
+               the best aggregate available from descriptor-level
+               counters.
+            9. Return the trace blob.
+
+        Note on trace fidelity: the largest/smallest fields are not
+        false-precision; they are documented as average aggregates in the
+        absence of per-allocation tracking. A future enhancement that
+        populates the OwnedAllocation chain would update this Process to
+        scan the chain for true min/max.
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocate plus a handful of memory ops and one
+        division. Sub-microsecond.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Returned blob is heap-allocated; caller must release. Reveals
+        only summary lifetime metrics; no information about individual
+        allocations or their contents leaks.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let trace_size be 48
+    Let trace_ptr be proc allocate from MemoryLayout with trace_size
+
+    If trace_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Let dummy1 be proc memory_set_integer from MemoryCore with trace_ptr, 0, allocation_count
+
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let dummy2 be proc memory_set_integer from MemoryCore with trace_ptr, 8, current_pos
+
+    Let dummy3 be proc memory_set_integer from MemoryCore with trace_ptr, 16, allocation_count
+
+    Let average_size be 0
+    If allocation_count is greater than 0:
+        Set average_size to current_pos divided by allocation_count
+    End If
+
+    Let dummy4 be proc memory_set_integer from MemoryCore with trace_ptr, 24, average_size
+    Let dummy5 be proc memory_set_integer from MemoryCore with trace_ptr, 32, average_size
+    Let dummy6 be proc memory_set_integer from MemoryCore with trace_ptr, 40, average_size
+
+    Return trace_ptr
+End Process
+
+Process called "owned_heap_check_leaks" takes heap as Integer returns Integer:
+    @Reasoning:
+        Report the number of "leaked" allocations: allocations that are
+        still live (current_pos > 0) when the caller expected the heap
+        to be drained. Returns allocation_count when both
+        allocation_count > 0 and current_pos > 0 simultaneously - that
+        is, "the heap holds N allocations that nobody freed before
+        leak-check ran." Returns 0 when the heap is empty (no leaks by
+        definition) or when allocation_count is 0 (heap was never used).
+
+        Note that this is descriptor-scoped leak detection, not process-
+        scoped. A bump allocator does not have individual frees, so
+        "leak" here means "the descriptor was not reset/destroyed before
+        leak check fired."
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read allocation_count (offset 56) and current_pos
+               (offset 8).
+            3. If allocation_count > 0 AND current_pos > 0, return
+               allocation_count.
+            4. Otherwise return 0.
+    @End Implementation
+
+    @Performance_Hints:
+        Two qword reads and two comparisons. O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only descriptor metadata. Reports a coarse "did the user
+        forget to drain this heap?" signal. Cannot identify individual
+        leaked allocations because they are not tracked individually.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+
+    If allocation_count is greater than 0:
+        If current_pos is greater than 0:
+            Return allocation_count
+        End If
+    End If
+
+    Return 0
+End Process
+
+Process called "owned_heap_verify" takes heap as Integer returns Integer:
+    @Reasoning:
+        Deeper than validate: in addition to validate's invariants,
+        verify checks consistency between related fields (current_pos
+        <= size, peak_usage >= current_pos) and confirms the
+        memory_block pointer is 8-byte aligned (a freshly-mmap'd page
+        is page-aligned, so any non-8-aligned memory_block indicates
+        descriptor corruption). Use verify when you suspect descriptor
+        damage and want a more thorough check than validate provides.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Call owned_heap_validate. If validate failed, return 0.
+            3. Read memory_block, current_pos, size, capacity from the
+               descriptor.
+            4. Verify current_pos <= size (the bump pointer cannot
+               exceed the logical size of the buffer).
+            5. Verify size <= capacity.
+            6. Read allocation_count; verify it's not negative.
+            7. Read peak_usage; verify peak_usage >= current_pos and
+               peak_usage <= capacity.
+            8. Check that memory_block & 7 == 0 (8-byte alignment).
+            9. Return 1 if all checks pass.
+
+        Note on the validate + verify redundancy: validate already
+        checks current_pos <= capacity and peak_usage <= capacity, so
+        those are repeated here for explicitness. The additional checks
+        unique to verify are: current_pos <= size (intra-descriptor
+        consistency), peak_usage >= current_pos (peak invariant), and
+        memory_block & 7 == 0 (page alignment).
+    @End Implementation
+
+    @Performance_Hints:
+        validate cost plus a handful of additional reads and comparisons.
+        ~100 nanoseconds total. Use only at debug checkpoints, not in
+        hot paths.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Reads only descriptor metadata. Does not dereference
+        memory_block. Safe to call on a descriptor whose data buffer
+        has been unmapped.
+    @End Security_Scope
+
+    If heap is equal to 0:
+        Return 0
+    End If
+
+    Let is_valid be proc owned_heap_validate with heap
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Let memory_block be proc memory_get_integer from MemoryCore with heap, 0
+    Let current_pos be proc memory_get_integer from MemoryCore with heap, 8
+    Let size be proc memory_get_integer from MemoryCore with heap, 16
+    Let capacity be proc memory_get_integer from MemoryCore with heap, 24
+
+    Note: Intra-descriptor consistency: bump pointer within logical size
+    If current_pos is greater than size:
+        Return 0
+    End If
+
+    If size is greater than capacity:
+        Return 0
+    End If
+
+    Let allocation_count be proc memory_get_integer from MemoryCore with heap, 56
+    If allocation_count is less than 0:
+        Return 0
+    End If
+
+    Let peak_usage be proc memory_get_integer from MemoryCore with heap, 64
+    If peak_usage is less than current_pos:
+        Return 0
+    End If
+
+    If peak_usage is greater than capacity:
+        Return 0
+    End If
+
+    Note: memory_block must be at least 8-byte aligned (mmap returns page-aligned)
+    Let alignment_mask be 7
+    Let offset be proc bitwise_and from BitwiseCore with memory_block, alignment_mask
+    If offset is not equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
