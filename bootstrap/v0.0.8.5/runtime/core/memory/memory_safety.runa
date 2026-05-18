@@ -1,0 +1,1452 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+This file implements MEMORY SAFETY validation primitives for the Runa runtime
+memory system.
+
+MEMORY SAFETY - Runtime Memory Validation Engine
+- Process memory safety checks and memory validation operations
+- Handle memory bounds checking and null pointer dereference detection
+- Manage memory corruption detection (canaries + guards) and error reporting
+- Process memory safety optimization and memory safety performance utilities
+- Provide a centralized memory-safety surface for runtime allocators
+
+This file is essential because of the following reasons:
+- Memory safety enables robust operation and prevents memory-related crashes
+- Proper memory safety handling ensures correct memory usage and data integrity
+- Memory safety utilities support all subsystems that need memory validation
+  and error detection (arena, chained arena, ARC heap, owned heap)
+- Memory safety validation provides deterministic memory management
+
+This file consists of the following functions/features/operation types:
+- Memory bounds checking and validation operations
+- Null pointer dereference detection and prevention
+- Memory corruption detection (canary + guard protocols) and error reporting
+- Memory safety wrappers for safe allocate / free / read / write / copy / move
+- Aggregate validation entry points and diagnostic reporting
+
+Migration history:
+- 2026-05-18: Moved from compiler/internal/memory_safety.runa into the runtime
+  tree per the CEO-ratified "memory infrastructure lives in runtime/core/memory/"
+  ruling. Two latent bugs that the source carried were corrected during the move
+  (self-recursive wrong-alias call in memory_bounds_validate, and dot-syntax
+  delegation in memory_validate_pointer). Same-file calls have been rewritten
+  to the canonical no-module-clause form. Full annotation coverage was added to
+  every Process during the same migration pass.
+
+Dependencies:
+- Imports compiler/internal/memory_utils.runa for the kernel-space pointer
+  validation helper, the allocate/deallocate facade, and the allocate_aligned
+  helper used by memory_safe_alloc.
+- Imports compiler/frontend/primitives/core/memory_core.runa for raw memory
+  qword/integer/pointer read and write primitives.
+- Imports compiler/frontend/primitives/core/pointer_primitive.runa for
+  primitive null and alignment pointer queries.
+:End Note
+
+Import "compiler/internal/memory_utils.runa" as MemoryUtils
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/core/pointer_primitive.runa" as PointerPrimitive
+
+Note:
+============================================================================
+Memory Safety Structures
+============================================================================
+:End Note
+
+Note:
+MemoryBounds structure layout (40 bytes, 5 qwords):
+  Offset  0: base_ptr     Base pointer of the protected memory region
+  Offset  8: size         Size of the region in bytes
+  Offset 16: end_ptr      Cached end pointer (base_ptr + size)
+  Offset 24: is_valid     1 if the bounds describe a live region, 0 if invalidated
+  Offset 32: protection   Bitwise OR of MEMORY_PROTECTION_* flags
+
+This structure is owned by memory_bounds_create / memory_bounds_destroy. The
+end_ptr is cached at creation time and is recomputed by memory_bounds_extend
+and memory_bounds_shrink so that bounds_check can avoid recomputing it per
+access. The is_valid flag is cleared before deallocation so that a stale
+copy of a bounds pointer cannot pass a bounds check by accident.
+:End Note
+
+Type called "MemoryBounds":
+    base_ptr as Integer       Note: Base pointer of memory region
+    size as Integer           Note: Size of memory region
+    end_ptr as Integer        Note: Cached end pointer (base_ptr + size)
+    is_valid as Integer       Note: Boolean: 1 if bounds are valid
+    protection as Integer     Note: Memory protection flags (READ/WRITE/EXECUTE)
+End Type
+
+Note:
+MemoryCheck describes a single validated access against a MemoryBounds
+region. It is intentionally a passive record (no allocator owns it) and is
+intended for diagnostic dumps from memory_safety_report or similar reporters.
+:End Note
+
+Type called "MemoryCheck":
+    ptr as Integer            Note: Pointer to check
+    size as Integer           Note: Size of access
+    bounds as Integer         Note: Pointer to MemoryBounds structure
+    is_safe as Integer        Note: Boolean: 1 if access is safe
+    error_code as Integer     Note: Error code if unsafe (MEMORY_SAFETY_*)
+End Type
+
+Note:
+MemorySafetyStats accumulates lifetime counters for safety checks performed
+through this module. It is intentionally a passive record; allocators may
+choose to maintain one per subsystem if they want safety telemetry. The
+runtime does not maintain a global instance by design - each subsystem
+that wants stats owns its own.
+:End Note
+
+Type called "MemorySafetyStats":
+    total_checks as Integer        Note: Total number of safety checks
+    bounds_violations as Integer   Note: Number of bounds violations
+    null_dereferences as Integer   Note: Number of null dereferences
+    corruption_detected as Integer Note: Number of corruption detections
+    safety_time as Integer         Note: Time spent on safety checks
+End Type
+
+Note:
+============================================================================
+Memory Safety Constants
+============================================================================
+:End Note
+
+Constant MEMORY_SAFETY_SUCCESS as Integer is 0
+Constant MEMORY_SAFETY_BOUNDS_VIOLATION as Integer is -1
+Constant MEMORY_SAFETY_NULL_DEREFERENCE as Integer is -2
+Constant MEMORY_SAFETY_CORRUPTION as Integer is -3
+Constant MEMORY_SAFETY_INVALID_PTR as Integer is -4
+Constant MEMORY_SAFETY_DOUBLE_FREE as Integer is -5
+
+Constant MEMORY_PROTECTION_READ as Integer is 1
+Constant MEMORY_PROTECTION_WRITE as Integer is 2
+Constant MEMORY_PROTECTION_EXECUTE as Integer is 4
+Constant MEMORY_PROTECTION_NONE as Integer is 0
+
+Constant MEMORY_ALIGNMENT_MIN as Integer is 1
+Constant MEMORY_ALIGNMENT_DEFAULT as Integer is 8
+Constant MEMORY_ALIGNMENT_MAX as Integer is 64
+
+Constant MEMORY_CANARY_VALUE as Integer is 3735928559   Note: 0xDEADBEEF
+Constant MEMORY_GUARD_VALUE as Integer is 3203398366    Note: 0xBEEFCAFE
+
+Note:
+============================================================================
+Memory Bounds Checking
+============================================================================
+:End Note
+
+Process called "memory_bounds_create" takes base_ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Materialize a MemoryBounds record describing a contiguous memory
+        region so that subsequent accesses can be cheaply validated against
+        its precomputed end pointer. Caching end_ptr at creation time avoids
+        recomputing it on every memory_bounds_check call, which is the hot
+        path; updates only happen at extend/shrink which are cold by design.
+        Returning 0 on bad input keeps the contract simple: callers test for
+        zero, no exception channel is needed.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Reject null base_ptr and non-positive size with a 0 return.
+            2. Allocate 40 bytes on the owned heap (full MemoryBounds layout).
+            3. Write base_ptr at offset 0 via memory_set_pointer.
+            4. Write size at offset 8 via memory_set_integer.
+            5. Compute end_ptr = base_ptr + size and write at offset 16.
+            6. Mark is_valid=1 at offset 24.
+            7. Compute default protection = READ | WRITE (binary 011 = 3)
+               and write at offset 32.
+            8. Return the bounds pointer.
+        If allocation fails the function returns 0 without partial state.
+    @End Implementation
+
+    @Performance_Hints:
+        One owned-heap allocation plus five memory writes. Amortizes the
+        end-pointer computation so that subsequent bounds_check calls are
+        pure compare-and-branch with no arithmetic on the hot path.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The protection field is initialized to READ | WRITE which is the
+        most permissive non-executable setting. Callers wanting stricter
+        access (e.g., read-only or no-access regions) must set the field
+        after creation; bounds_check itself does not consult the field
+        today and is purely a range check, so protection serves as
+        bookkeeping for higher-level enforcement.
+    @End Security_Scope
+
+    If base_ptr is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Let bounds be proc allocate from MemoryUtils with 40  Note: MemoryBounds is 40 bytes
+    If bounds is equal to 0:
+        Return 0
+    End If
+
+    Note: Set base_ptr
+    Let dummy be proc memory_set_pointer from MemoryCore with bounds, 0, base_ptr
+
+    Note: Set size
+    Set dummy to proc memory_set_integer from MemoryCore with bounds, 8, size
+
+    Note: Calculate and set end_ptr
+    Let end_ptr be base_ptr plus size
+    Set dummy to proc memory_set_pointer from MemoryCore with bounds, 16, end_ptr
+
+    Note: Set is_valid to 1
+    Set dummy to proc memory_set_integer from MemoryCore with bounds, 24, 1
+
+    Note: Set default protection (READ | WRITE)
+    Let default_protection be MEMORY_PROTECTION_READ plus MEMORY_PROTECTION_WRITE
+    Set dummy to proc memory_set_integer from MemoryCore with bounds, 32, default_protection
+
+    Return bounds
+End Process
+
+Process called "memory_bounds_destroy" takes bounds as Integer returns Nothing:
+    @Reasoning:
+        Tear down a MemoryBounds record cleanly. Invalidating the structure
+        before deallocation is a defense-in-depth measure: if any other
+        thread or stale caller still holds the bounds pointer and reads
+        from it before the heap reuses the slot, the is_valid=0 flag will
+        cause bounds_check to refuse the access. This converts a
+        use-after-free of the bounds record itself into a clean rejection
+        instead of an arbitrary memory result.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard: do nothing on bounds==0 (idempotent destroy).
+            2. Set is_valid (offset 24) to 0 via memory_set_integer.
+            3. Deallocate the 40-byte block via the heap facade.
+    @End Implementation
+
+    @Security_Scope:
+        Invalidating before freeing closes the window between deallocation
+        and heap reuse during which a stale bounds pointer could grant
+        access. The deallocate call zeroes the slot in the layout
+        registry, ensuring even the address is no longer recognized as a
+        live allocation.
+    @End Security_Scope
+
+    If bounds is equal to 0:
+        Return
+    End If
+
+    Note: Invalidate bounds before freeing (defense in depth)
+    Let dummy be proc memory_set_integer from MemoryCore with bounds, 24, 0
+
+    Set dummy to proc deallocate from MemoryUtils with bounds
+    Return
+End Process
+
+Process called "memory_bounds_check" takes ptr as Integer, size as Integer, bounds as Integer returns Integer:
+    @Reasoning:
+        The core hot-path predicate of the bounds subsystem. Given a pointer
+        and access size, decide whether the access [ptr, ptr+size) lies
+        entirely inside the bounds record. Returning 1/0 instead of an
+        error code keeps the call sites tight (single comparison).
+    @End Reasoning
+
+    @Implementation:
+        Validation order is chosen so that the cheapest tests fail fast:
+            1. NULL ptr or NULL bounds -> reject.
+            2. Non-positive size -> reject.
+            3. Read is_valid (offset 24); if 0 -> reject. This catches
+               stale-bounds use-after-free of the record itself.
+            4. Read base_ptr (offset 0), end_ptr (offset 16).
+            5. Test ptr >= base_ptr (lower bound).
+            6. Compute access_end = ptr + size and test access_end <=
+               end_ptr (upper bound). end_ptr was precomputed at create.
+        bounds_size at offset 8 is read for parity with the layout doc
+        but the actual comparison uses the cached end_ptr.
+    @End Implementation
+
+    @Performance_Hints:
+        ~5 memory reads plus 4 compare-and-branch. No arithmetic on the
+        upper-bound test because end_ptr was cached at create time.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The is_valid check at step 3 closes the use-after-free window on
+        the bounds record. The upper bound uses a single addition
+        (ptr+size); on signed-64-bit overflow the sum becomes negative
+        and the comparison against end_ptr will reject. Pointer overflow
+        from a non-malicious caller is impossible because end_ptr was
+        validated at creation; only adversarial inputs could trigger it
+        and the rejection is the correct behaviour.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    If bounds is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Check if bounds are valid
+    Let is_valid be proc memory_get_integer from MemoryCore with bounds, 24
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Get bounds information
+    Let base_ptr be proc memory_get_pointer from MemoryCore with bounds, 0
+    Let bounds_size be proc memory_get_integer from MemoryCore with bounds, 8
+    Let end_ptr be proc memory_get_pointer from MemoryCore with bounds, 16
+
+    Note: Check if ptr is greater than or equal to base_ptr
+    If ptr is less than base_ptr:
+        Return 0
+    End If
+
+    Note: Calculate access end
+    Let access_end be ptr plus size
+
+    Note: Check if access_end is less than or equal to end_ptr
+    If access_end is greater than end_ptr:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "memory_bounds_validate" takes bounds as Integer returns Integer:
+    @Reasoning:
+        Self-check of a MemoryBounds record's internal consistency. Distinct
+        from memory_bounds_check (which checks an access against bounds);
+        this validates that the bounds record itself has not been corrupted.
+        Used by extend / shrink to refuse to operate on damaged records,
+        and available to callers who store bounds pointers across long
+        operations and want to sanity-check before reuse.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Read is_valid (offset 24); if 0, the bounds were
+               intentionally invalidated -> return 0.
+            3. Read base_ptr (offset 0), size (offset 8), end_ptr
+               (offset 16).
+            4. base_ptr must be non-null and size must be positive
+               (matches the creation contract).
+            5. Recompute calculated_end = base_ptr + size and compare
+               against the stored end_ptr. A mismatch indicates the
+               record was overwritten or corrupted in place.
+            6. Return 1 only if all checks pass.
+
+        Bug fix during 2026-05-18 migration:
+            The pre-migration source contained
+                Let is_valid be proc memory_bounds_validate from MemoryCore
+                                                                  with bounds
+            inside memory_bounds_extend and memory_bounds_shrink. That call
+            references memory_bounds_validate "from MemoryCore", which is
+            wrong on two counts: (a) the validator lives in this file, not
+            in MemoryCore, and (b) the qualified form would self-recurse
+            via transitive import. The migration rewrote those callsites to
+            the canonical same-file form (`proc memory_bounds_validate
+            with bounds` without a `from` clause), and consolidated the
+            real validation logic here so it has a single owner.
+    @End Implementation
+
+    @Performance_Hints:
+        Three memory reads plus three comparisons. Constant time.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The end_ptr cross-check at step 5 catches in-place corruption that
+        a flag-only check would miss: an attacker who overwrites only the
+        size field but not end_ptr (or vice versa) is detected because
+        the derived equality no longer holds.
+    @End Security_Scope
+
+    If bounds is equal to 0:
+        Return 0
+    End If
+
+    Note: Check is_valid flag
+    Let is_valid be proc memory_get_integer from MemoryCore with bounds, 24
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Get bounds data
+    Let base_ptr be proc memory_get_pointer from MemoryCore with bounds, 0
+    Let size be proc memory_get_integer from MemoryCore with bounds, 8
+    Let end_ptr be proc memory_get_pointer from MemoryCore with bounds, 16
+
+    Note: Validate base_ptr is not equal to 0
+    If base_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate size is positive
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Validate end_ptr is consistent (catches in-place corruption)
+    Let calculated_end be base_ptr plus size
+    If end_ptr is not equal to calculated_end:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "memory_bounds_extend" takes bounds as Integer, new_size as Integer returns Integer:
+    @Reasoning:
+        Grow a bounds record to cover a larger region in place. Callers use
+        this after reallocating the underlying buffer to a larger size and
+        wanting the existing bounds record (and any references the safety
+        layer holds to it) to remain valid. Refuses non-growth so that
+        misuse (e.g., new_size <= current) cannot quietly shrink via this
+        entrypoint - memory_bounds_shrink is the explicit shrink path.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Self-validate via memory_bounds_validate. If the record is
+               corrupted, refuse to mutate it.
+            3. Read current size from offset 8.
+            4. Reject new_size that is not strictly greater than current.
+            5. Write new size at offset 8.
+            6. Recompute end_ptr = base_ptr + new_size and write at offset 16.
+            7. Return 1 on success.
+
+        Bug fix: same as memory_bounds_validate - rewrote the validate call
+        at step 2 from `proc memory_bounds_validate from MemoryCore` to the
+        correct same-file form `proc memory_bounds_validate with bounds`.
+    @End Implementation
+
+    @Security_Scope:
+        Step 2 validation prevents extending a corrupted record into a
+        larger corrupted record. Combined with the strict-growth check in
+        step 4, this entrypoint cannot be used as a confused-deputy to
+        mutate bounds into a state that would expand reachable memory
+        without first re-validating internal consistency.
+    @End Security_Scope
+
+    If bounds is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate bounds first (self-call, no module clause - canonical same-file form)
+    Let is_valid be proc memory_bounds_validate with bounds
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current size
+    Let current_size be proc memory_get_integer from MemoryCore with bounds, 8
+
+    Note: New size must be larger
+    If new_size is less than or equal to current_size:
+        Return 0
+    End If
+
+    Note: Update size
+    Let dummy be proc memory_set_integer from MemoryCore with bounds, 8, new_size
+
+    Note: Update end_ptr to keep the cached end consistent with the new size
+    Let base_ptr be proc memory_get_pointer from MemoryCore with bounds, 0
+    Let new_end be base_ptr plus new_size
+    Set dummy to proc memory_set_pointer from MemoryCore with bounds, 16, new_end
+
+    Return 1
+End Process
+
+Process called "memory_bounds_shrink" takes bounds as Integer, new_size as Integer returns Integer:
+    @Reasoning:
+        Reduce a bounds record to cover a smaller region in place. Used
+        when a buffer has been logically truncated and the safety layer
+        should refuse subsequent accesses to the now-removed tail.
+        Symmetric counterpart to memory_bounds_extend.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard.
+            2. Self-validate via memory_bounds_validate. If the record is
+               corrupted, refuse to mutate.
+            3. Read current size from offset 8.
+            4. Reject non-positive new_size.
+            5. Reject new_size >= current_size (use extend for growth).
+            6. Write new size at offset 8.
+            7. Recompute end_ptr = base_ptr + new_size and write at offset 16.
+            8. Return 1 on success.
+
+        Bug fix: rewrote the validate call at step 2 from the wrong-alias
+        `from MemoryCore` form to the correct same-file `with bounds` form.
+    @End Implementation
+
+    @Security_Scope:
+        Refusing to grow via this entrypoint preserves the invariant that
+        shrink can only shrink. Pairing extend/shrink with validate ensures
+        a corrupted record is never extended or shrunk into a more usable
+        state, only rejected.
+    @End Security_Scope
+
+    If bounds is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate bounds first (self-call, no module clause - canonical same-file form)
+    Let is_valid be proc memory_bounds_validate with bounds
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Get current size
+    Let current_size be proc memory_get_integer from MemoryCore with bounds, 8
+
+    Note: New size must be smaller but positive
+    If new_size is less than or equal to 0:
+        Return 0
+    End If
+
+    If new_size is greater than or equal to current_size:
+        Return 0
+    End If
+
+    Note: Update size
+    Let dummy be proc memory_set_integer from MemoryCore with bounds, 8, new_size
+
+    Note: Update end_ptr to keep the cached end consistent with the new size
+    Let base_ptr be proc memory_get_pointer from MemoryCore with bounds, 0
+    Let new_end be base_ptr plus new_size
+    Set dummy to proc memory_set_pointer from MemoryCore with bounds, 16, new_end
+
+    Return 1
+End Process
+
+Note:
+============================================================================
+Null Pointer Detection
+============================================================================
+:End Note
+
+Process called "memory_check_null" takes ptr as Integer returns Integer:
+    @Reasoning:
+        Thin delegation to the primitive null check. Exists at this layer
+        so that callers writing through the safety facade do not need to
+        import PointerPrimitive directly; the safety module is the single
+        consistent surface for all pointer-validation predicates.
+    @End Reasoning
+
+    @Implementation:
+        Returns the result of PointerPrimitive.pointer_is_null verbatim:
+        1 if ptr == 0, 0 otherwise.
+    @End Implementation
+
+    @Performance_Hints:
+        Single comparison. The compiler should inline this through the
+        delegation; if it does not, the cost is one extra call frame on a
+        cold path (null checks at the API boundary, not in inner loops).
+    @End Performance_Hints
+
+    Return proc pointer_is_null from PointerPrimitive with ptr
+End Process
+
+Process called "memory_check_null_dereference" takes ptr as Integer returns Integer:
+    @Reasoning:
+        Predicate form: "is this pointer safe to dereference with respect
+        to null-checking alone?" Returns 1 if the pointer is non-null and
+        therefore at least not a guaranteed segfault, 0 if null. This is
+        deliberately weaker than memory_validate_pointer (which also
+        checks alignment and kernel-space) - this predicate is the
+        first-stage fast-path test.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Call memory_check_null (same file).
+            2. Invert: null -> 0 (unsafe to deref), non-null -> 1 (safe wrt
+               null only).
+
+        Bug fix: rewrote the source's
+            Let is_null be proc memory_check_null from MemoryCore with ptr
+        to the canonical same-file
+            Let is_null be proc memory_check_null with ptr
+        memory_check_null is defined in THIS file, not in MemoryCore.
+    @End Implementation
+
+    @Security_Scope:
+        Returning 1 here does not guarantee the pointer is valid - only
+        that it is not null. Higher-level wrappers must combine this with
+        alignment and range checks (memory_validate_pointer does so).
+    @End Security_Scope
+
+    Note: Check if pointer is null (same-file call, no module clause)
+    Let is_null be proc memory_check_null with ptr
+    If is_null is equal to 1:
+        Return 0  Note: Unsafe - null dereference
+    End If
+
+    Return 1  Note: Safe - pointer is not null
+End Process
+
+Process called "memory_validate_pointer" takes ptr as Integer returns Integer:
+    @Reasoning:
+        The fully-qualified pointer-validity predicate exposed to external
+        callers. Composes null-check, default-alignment check, and the
+        user-space-only kernel-space exclusion provided by
+        MemoryUtils.validate_pointer. Returning 1 here is the strongest
+        signal this module gives that a raw pointer can be dereferenced
+        safely with respect to address-space validity (it does not check
+        liveness in the allocation registry; that is layout.runa's job).
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard -> return 0.
+            2. Alignment check: pointer_is_aligned with
+               MEMORY_ALIGNMENT_DEFAULT (8). Non-8-aligned pointers cannot
+               legally point at qword-sized objects.
+            3. Delegate to MemoryUtils.validate_pointer for the
+               kernel-space and large-value exclusions.
+
+        Bug fix: the pre-migration source contained
+            Return proc MemoryUtils.validate_pointer with ptr
+        which uses the wrong call syntax (dot-form invocation rather than
+        the canonical `from`-form). The migration rewrote it to
+            Return proc validate_pointer from MemoryUtils with ptr
+        which is what every other Runa caller of MemoryUtils.validate_pointer
+        in the codebase uses, and what the parser actually expects.
+    @End Implementation
+
+    @Performance_Hints:
+        Three short tests; fast-fails on the cheapest comparison (null)
+        first. Inlinable in principle. The MemoryUtils.validate_pointer
+        delegation does range checks that are themselves O(1).
+    @End Performance_Hints
+
+    @Security_Scope:
+        This is the live API of the memory_safety module - the two
+        in-tree callers (arena allocators in runtime/core/memory) call
+        this before trusting a pointer is in user space and aligned.
+        Strengthening this function strengthens those callers' safety;
+        weakening it weakens theirs. Do not relax any of the three checks
+        without auditing those callers.
+    @End Security_Scope
+
+    Note: Check if pointer is null
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Check basic alignment (8-byte for 64-bit systems)
+    Let is_aligned be proc pointer_is_aligned from PointerPrimitive with ptr, MEMORY_ALIGNMENT_DEFAULT
+    If is_aligned is equal to 0:
+        Return 0
+    End If
+
+    Note: Check if pointer is in valid user space (canonical `from`-form)
+    Return proc validate_pointer from MemoryUtils with ptr
+End Process
+
+Process called "memory_check_alignment" takes ptr as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Alignment-only check with a sanity bound on the alignment value
+        itself. Separated from memory_validate_pointer so callers who only
+        need to enforce a specific alignment (not necessarily the default
+        8-byte alignment) can do so without paying for the other checks.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL ptr -> reject.
+            2. Reject alignment outside [MEMORY_ALIGNMENT_MIN,
+               MEMORY_ALIGNMENT_MAX]. This catches both 0/negative and
+               absurdly large alignment requests that would otherwise
+               consume excessive padding.
+            3. Delegate to PointerPrimitive.pointer_is_aligned for the
+               actual modular arithmetic.
+    @End Implementation
+
+    @Performance_Hints:
+        Two range checks plus one primitive call. Constant time.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The alignment-bound check at step 2 prevents a caller from passing
+        a malformed alignment value (e.g., 0 would cause the primitive to
+        divide by zero, large values would silently truncate to the
+        target's word size) - both edge cases are rejected here.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate alignment is within accepted range
+    If alignment is less than MEMORY_ALIGNMENT_MIN:
+        Return 0
+    End If
+
+    If alignment is greater than MEMORY_ALIGNMENT_MAX:
+        Return 0
+    End If
+
+    Return proc pointer_is_aligned from PointerPrimitive with ptr, alignment
+End Process
+
+Process called "memory_check_pointer_range" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Lightweight precondition: "is (ptr, size) a syntactically plausible
+        access?" Catches the three universal degenerate cases - null
+        pointer, non-positive size, and address-space wraparound when ptr +
+        size overflows past the top of the signed-64-bit range. Used as a
+        gate by every safe-* operation in this file.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Reject ptr == 0.
+            2. Reject size <= 0.
+            3. Compute end_ptr = ptr + size. If end_ptr < ptr the addition
+               wrapped around (twos-complement signed-overflow), which is
+               always invalid for a legitimate pointer range.
+            4. Return 1.
+    @End Implementation
+
+    @Performance_Hints:
+        One addition, three comparisons. The overflow check uses the
+        end < ptr trick instead of computing the high bits explicitly.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The overflow check at step 3 is the primary defense against
+        attacker-controlled size values causing later arithmetic to wrap
+        and produce a smaller-than-expected end pointer that would pass
+        downstream bounds checks. Rejecting wraparound here keeps that
+        invariant out of the rest of the module.
+    @End Security_Scope
+
+    Note: Check pointer is not null
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Check size is positive
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Check for overflow (end_ptr wrapping past top of address space)
+    Let end_ptr be ptr plus size
+    If end_ptr is less than ptr:
+        Return 0  Note: Overflow detected
+    End If
+
+    Return 1
+End Process
+
+Note:
+============================================================================
+Memory Corruption Detection (Canary + Guard Protocol)
+============================================================================
+:End Note
+
+Process called "memory_check_corruption" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Composite corruption check: validates the (ptr, size) range and
+        then, if the data appears to be carrying the canary/guard protocol
+        installed by memory_safe_alloc, verifies both sentinels. The
+        conditional canary check means this function returns "clean" for
+        raw allocations without canaries rather than complaining that
+        canaries are missing - that matches the intent that canaries are
+        opt-in via memory_safe_alloc.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. memory_check_pointer_range (same file) - reject malformed
+               (ptr, size).
+            2. Read 8 bytes at ptr-8 (the canary slot used by
+               memory_safe_alloc).
+            3. If those 8 bytes equal MEMORY_CANARY_VALUE the allocation
+               is canary-protected; also read and verify the guard at
+               ptr+size via memory_check_guard.
+            4. If the guard is corrupted, return 0.
+            5. Otherwise return 1 (no detected corruption).
+
+        Bug fix: rewrote the same-file call
+            Let is_valid be proc memory_check_pointer_range
+                                              from MemoryCore with ptr, size
+        to the canonical
+            Let is_valid be proc memory_check_pointer_range with ptr, size
+        Same for the memory_check_guard delegation. Both functions are
+        defined in this file, not MemoryCore.
+    @End Implementation
+
+    @Security_Scope:
+        The protocol detects buffer-underrun (canary at ptr-8) and
+        buffer-overrun (guard at ptr+size). It does NOT detect arbitrary
+        in-place modification within (ptr, ptr+size); that would require
+        cryptographic checksums beyond the scope of this validator. The
+        canary value is a publicly known constant - the protocol assumes
+        an attacker has not arranged to write the canary value exactly,
+        which is a tradeoff for cheap detection.
+    @End Security_Scope
+
+    Note: Validate pointer range first (same-file call)
+    Let is_valid be proc memory_check_pointer_range with ptr, size
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Check canary (if present - allocated with memory_safe_alloc)
+    Note: Canary is at ptr-8, contains MEMORY_CANARY_VALUE
+    Let canary_ptr be ptr minus 8
+    Let canary_value be proc memory_get_integer from MemoryCore with canary_ptr, 0
+
+    Note: If canary exists and matches, check guard too
+    If canary_value is equal to MEMORY_CANARY_VALUE:
+        Note: Canary found, also check guard (same-file call)
+        Let guard_result be proc memory_check_guard with ptr, size
+        If guard_result is equal to 0:
+            Return 0  Note: Guard corrupted
+        End If
+    End If
+
+    Note: All corruption checks passed
+    Return 1
+End Process
+
+Process called "memory_validate_integrity" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Public integrity-check entrypoint that composes the range check
+        and the corruption check in one call. Distinguished from
+        memory_check_corruption only by also returning 0 on a malformed
+        (ptr, size) input - the observable result is the same because
+        the corruption check also rejects malformed input, but the
+        composition is kept as a separate function so the intent at the
+        call site is documented.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. memory_check_pointer_range with (ptr, size). Reject on 0.
+            2. Return memory_check_corruption(ptr, size) verbatim.
+
+        Bug fix: rewrote both same-file calls from `from MemoryCore` to
+        the canonical no-module form.
+    @End Implementation
+
+    Note: Check pointer range (same-file call)
+    Let is_valid be proc memory_check_pointer_range with ptr, size
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Check for corruption (same-file call)
+    Return proc memory_check_corruption with ptr, size
+End Process
+
+Process called "memory_check_canary" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Unconditionally check that the canary at ptr-8 holds
+        MEMORY_CANARY_VALUE. Unlike memory_check_corruption (which only
+        looks for a canary if one might be present), this function always
+        expects a canary and returns 0 if none is found. Used by callers
+        who know the allocation was made through memory_safe_alloc.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard on ptr.
+            2. Non-positive size guard.
+            3. Read 8 bytes at ptr-8.
+            4. Compare against MEMORY_CANARY_VALUE. Mismatch -> 0,
+               match -> 1.
+
+        The size parameter is currently used only for input validation
+        (rejecting size <= 0). It is retained in the signature for parity
+        with memory_check_guard whose check at ptr+size genuinely needs
+        size, so allocator code can pair the two checks symmetrically.
+    @End Implementation
+
+    @Security_Scope:
+        Catches buffer underruns that have clobbered the canary. The
+        publicly known canary value means an adversary who can write
+        arbitrary bytes can re-establish a fake canary; this is the
+        standard limitation of static canaries. For stronger protection
+        rotate canaries per-allocation (out of scope here).
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Canary is at ptr - 8 (8 bytes before data)
+    Let canary_ptr be ptr minus 8
+
+    Note: Read canary value
+    Let canary_value be proc memory_get_integer from MemoryCore with canary_ptr, 0
+
+    Note: Check if canary matches expected value
+    If canary_value is not equal to MEMORY_CANARY_VALUE:
+        Return 0  Note: Canary corrupted
+    End If
+
+    Return 1  Note: Canary intact
+End Process
+
+Process called "memory_set_canary" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Install the canary sentinel at ptr-8 so a later memory_check_canary
+        or memory_check_corruption can detect underruns. Paired with
+        memory_set_guard at the allocation site (memory_safe_alloc).
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL and size guards (return 0).
+            2. Write MEMORY_CANARY_VALUE at ptr-8 via memory_set_integer.
+            3. Return 1.
+
+        Assumes the caller allocated at least 8 extra bytes immediately
+        before ptr to host the canary - memory_safe_alloc allocates
+        size+16 (8 canary + 8 guard) and returns the data midpoint, so
+        the canary slot is always valid for buffers it produced.
+    @End Implementation
+
+    @Security_Scope:
+        Writing to ptr-8 assumes the caller owns that byte. Calling this
+        function on a pointer that does not have its canary slot
+        allocated will corrupt whatever sits at ptr-8. Only callers that
+        know the allocation contract (memory_safe_alloc users) may call
+        this.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Canary is at ptr - 8 (8 bytes before data)
+    Let canary_ptr be ptr minus 8
+
+    Note: Write canary value
+    Let dummy be proc memory_set_integer from MemoryCore with canary_ptr, 0, MEMORY_CANARY_VALUE
+
+    Return 1
+End Process
+
+Process called "memory_check_guard" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Check that the guard sentinel at ptr+size (immediately past the
+        valid data region) still holds MEMORY_GUARD_VALUE. Detects buffer
+        overruns. Paired with memory_check_canary for full underrun +
+        overrun coverage.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL and size guards (return 0).
+            2. Read 8 bytes at ptr+size.
+            3. Compare against MEMORY_GUARD_VALUE; mismatch -> 0.
+    @End Implementation
+
+    @Security_Scope:
+        Catches buffer overruns that have written past the legal end of
+        the allocation. Same publicly-known-sentinel limitation as the
+        canary.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Guard is at ptr + size (after data)
+    Let guard_ptr be ptr plus size
+
+    Note: Read guard value
+    Let guard_value be proc memory_get_integer from MemoryCore with guard_ptr, 0
+
+    Note: Check if guard matches expected value
+    If guard_value is not equal to MEMORY_GUARD_VALUE:
+        Return 0  Note: Guard corrupted
+    End If
+
+    Return 1  Note: Guard intact
+End Process
+
+Process called "memory_set_guard" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Install the guard sentinel at ptr+size. Paired with memory_set_canary
+        at allocation time.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL and size guards (return 0).
+            2. Write MEMORY_GUARD_VALUE at ptr+size via memory_set_integer.
+            3. Return 1.
+
+        Assumes the caller owns the 8 bytes at ptr+size. memory_safe_alloc
+        ensures this by allocating size+16.
+    @End Implementation
+
+    @Security_Scope:
+        Same allocation-contract assumption as memory_set_canary: writing
+        at ptr+size requires the caller to have allocated trailer space.
+        Calling this without that space will corrupt subsequent
+        allocations.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Guard is at ptr + size (after data)
+    Let guard_ptr be ptr plus size
+
+    Note: Write guard value
+    Let dummy be proc memory_set_integer from MemoryCore with guard_ptr, 0, MEMORY_GUARD_VALUE
+
+    Return 1
+End Process
+
+Note:
+============================================================================
+Memory Safety Operations (Allocate / Free / Read / Write / Copy / Move)
+============================================================================
+:End Note
+
+Process called "memory_safe_alloc" takes size as Integer, alignment as Integer returns Integer:
+    @Reasoning:
+        Allocate a buffer of caller-requested logical size and pad it with
+        a canary slot before the data and a guard slot after, so the
+        returned pointer points at a buffer ready for the corruption-
+        detection protocol. The 8+8 byte overhead is the smallest that
+        supports both a leading canary and a trailing guard.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Reject non-positive size with 0 return.
+            2. Compute safe_size = size + 16 (8 for canary + 8 for guard).
+            3. Allocate safe_size bytes. If alignment > 1, route through
+               MemoryUtils.allocate_aligned, otherwise through the
+               regular allocate facade.
+            4. If allocation fails, return 0.
+            5. Compute data_ptr = ptr + 8 (skip the canary slot).
+            6. Install canary at data_ptr-8 via memory_set_canary.
+            7. Install guard at data_ptr+size via memory_set_guard.
+            8. Return data_ptr (the address callers will read/write).
+
+        Bug fix: rewrote
+            Set ptr to proc MemoryUtils.allocate_aligned with safe_size, alignment
+        to the canonical
+            Set ptr to proc allocate_aligned from MemoryUtils with safe_size, alignment
+        and rewrote the same-file canary/guard install calls from
+        `from MemoryCore` to the canonical no-module form.
+    @End Implementation
+
+    @Performance_Hints:
+        Cost = one allocator call + 2 memory writes (canary + guard). The
+        +16-byte overhead is fixed per allocation regardless of size, so
+        small allocations pay proportionally more overhead than large
+        ones.
+    @End Performance_Hints
+
+    @Security_Scope:
+        The returned pointer is data_ptr = raw_ptr + 8, so callers MUST
+        free via memory_safe_free (which backs the pointer out by 8 to
+        recover raw_ptr). Passing data_ptr to a non-safe deallocator will
+        corrupt the heap because the heap entry starts at raw_ptr, not
+        data_ptr.
+    @End Security_Scope
+
+    If size is less than or equal to 0:
+        Return 0
+    End If
+
+    Note: Add space for canary and guard (8 bytes each)
+    Let safe_size be size plus 16
+
+    Let ptr be 0
+    If alignment is greater than 1:
+        Set ptr to proc allocate_aligned from MemoryUtils with safe_size, alignment
+    Otherwise:
+        Set ptr to proc allocate from MemoryUtils with safe_size
+    End If
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Set canary before data (same-file call)
+    Let data_ptr be ptr plus 8
+    Let dummy be proc memory_set_canary with data_ptr, size
+
+    Note: Set guard after data (same-file call)
+    Set dummy to proc memory_set_guard with data_ptr, size
+
+    Note: Return pointer to data (after canary)
+    Return data_ptr
+End Process
+
+Process called "memory_safe_free" takes ptr as Integer returns Integer:
+    @Reasoning:
+        Release a buffer that was originally allocated by
+        memory_safe_alloc. Validates the pointer (null + alignment +
+        user-space) before computing the raw allocation pointer (ptr-8)
+        and handing it to the deallocator. A corrupt or non-safe pointer
+        is rejected without freeing - it is safer to leak a buffer than
+        to release a wrong address.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. NULL guard on ptr.
+            2. memory_validate_pointer (same file) - rejects null /
+               misaligned / kernel-space.
+            3. Compute alloc_ptr = ptr - 8 (the address allocate
+               originally returned).
+            4. proc deallocate from MemoryUtils with alloc_ptr.
+            5. Return 1.
+
+        Bug fix: rewrote
+            Let is_valid be proc memory_validate_pointer from MemoryCore with ptr
+        to the canonical same-file form
+            Let is_valid be proc memory_validate_pointer with ptr
+        memory_validate_pointer is defined in THIS file.
+    @End Implementation
+
+    @Security_Scope:
+        The validate-before-free policy converts wild-pointer frees into
+        rejected operations (leak) rather than heap corruption. Combined
+        with the allocator-side canary installation, double-free attacks
+        on this allocator will fail the canary check on the second
+        memory_safe_free path (because the freed slot's canary was
+        overwritten or recycled).
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate pointer (same-file call)
+    Let is_valid be proc memory_validate_pointer with ptr
+    If is_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Get original allocation pointer (before canary)
+    Let alloc_ptr be ptr minus 8
+
+    Note: Free the memory
+    Let dummy be proc deallocate from MemoryUtils with alloc_ptr
+    Return 1
+End Process
+
+Process called "memory_safe_read" takes ptr as Integer, size as Integer, bounds as Integer returns Integer:
+    @Reasoning:
+        Safe-read predicate. Returns 1 if (ptr, size) is a permitted read
+        inside the supplied bounds, 0 otherwise. The caller performs the
+        actual read after the predicate clears - this function is the
+        sentinel, not the data path.
+    @End Reasoning
+
+    @Implementation:
+        Single delegation to memory_bounds_check. The read/write split is
+        kept at this surface for symmetry with memory_safe_write and as
+        the documented extension point for read-only enforcement via the
+        protection field; both read and write today call the same bounds
+        check, which is the intended behaviour until the protection field
+        gains an enforcement consumer.
+
+        Bug fix: rewrote `from MemoryCore` to no-module same-file form.
+    @End Implementation
+
+    Note: Check bounds (same-file call)
+    Return proc memory_bounds_check with ptr, size, bounds
+End Process
+
+Process called "memory_safe_write" takes ptr as Integer, size as Integer, bounds as Integer returns Integer:
+    @Reasoning:
+        Safe-write predicate. Symmetric to memory_safe_read - a permission
+        gate before the caller performs the write. The intentional
+        symmetry preserves the option to differentiate read and write
+        enforcement later via the protection field on the bounds record.
+    @End Reasoning
+
+    @Implementation:
+        Single delegation to memory_bounds_check.
+
+        Bug fix: rewrote `from MemoryCore` to no-module same-file form.
+    @End Implementation
+
+    Note: Check bounds (same-file call)
+    Return proc memory_bounds_check with ptr, size, bounds
+End Process
+
+Process called "memory_safe_copy" takes dest as Integer, src as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Safe-copy variant of memory_copy. Validates both pointers and the
+        size before invoking the primitive copy. Rejects with 0 on bad
+        input instead of risking an out-of-bounds copy. Returns 1 on
+        success.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. memory_check_pointer_range on dest. Reject on 0.
+            2. memory_check_pointer_range on src. Reject on 0.
+            3. proc memory_copy from MemoryCore with dest, src, size
+               (the actual byte move).
+            4. Return 1.
+
+        memory_copy in MemoryCore does not itself handle overlap. The
+        intended use is for non-overlapping regions. For overlapping
+        regions there is no separate safe-move primitive in MemoryCore
+        today; memory_safe_move (next function) preserves the historic
+        API by performing the same bytewise copy as memory_safe_copy.
+        That historical equivalence is documented at memory_safe_move's
+        @Reasoning block.
+
+        Bug fix: rewrote both range-check calls from `from MemoryCore` to
+        the canonical no-module same-file form. memory_check_pointer_range
+        is defined in this file.
+    @End Implementation
+
+    @Security_Scope:
+        Both pointer-range checks must succeed before any byte moves.
+        This prevents a partial copy followed by a rejection - either
+        the copy succeeds completely or it does not start.
+    @End Security_Scope
+
+    Note: Validate destination (same-file call)
+    Let dest_valid be proc memory_check_pointer_range with dest, size
+    If dest_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate source (same-file call)
+    Let src_valid be proc memory_check_pointer_range with src, size
+    If src_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Perform copy
+    Let dummy be proc memory_copy from MemoryCore with dest, src, size
+
+    Return 1
+End Process
+
+Process called "memory_safe_move" takes dest as Integer, src as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Historic API for "move with overlap support". Today the
+        underlying MemoryCore.memory_copy is a forward bytewise copy,
+        which is correct only when dest <= src OR src+size <= dest. This
+        function preserves the API entry point with the same range checks
+        as memory_safe_copy and dispatches to the same underlying copy.
+        Genuine overlap-safe move (memmove-style) requires a backward
+        loop when dest > src AND src+size > dest, which is not yet
+        implemented in MemoryCore. Callers needing true overlap safety
+        must avoid overlapping regions until that primitive is added.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. memory_check_pointer_range on dest.
+            2. memory_check_pointer_range on src.
+            3. proc memory_copy from MemoryCore with dest, src, size.
+            4. Return 1.
+
+        Bug fix: rewrote both same-file range-check calls from `from
+        MemoryCore` to the canonical no-module form.
+    @End Implementation
+
+    @Security_Scope:
+        Pointer-range validation is performed before any bytes move.
+        Overlap correctness is the caller's responsibility today; see
+        @Reasoning for the contract.
+    @End Security_Scope
+
+    Note: Validate destination (same-file call)
+    Let dest_valid be proc memory_check_pointer_range with dest, size
+    If dest_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Validate source (same-file call)
+    Let src_valid be proc memory_check_pointer_range with src, size
+    If src_valid is equal to 0:
+        Return 0
+    End If
+
+    Note: Perform move (delegates to memory_copy; see @Reasoning for overlap contract)
+    Let dummy be proc memory_copy from MemoryCore with dest, src, size
+
+    Return 1
+End Process
+
+Note:
+============================================================================
+Memory Safety Validation (Composite + Reporting)
+============================================================================
+:End Note
+
+Process called "memory_validate_all" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        One-call composite validator for callers that want every
+        safety predicate this module offers in a single pass. Useful at
+        API boundaries where the cost of all four checks is dominated by
+        the cost of the operation being protected.
+    @End Reasoning
+
+    @Implementation:
+        Steps (all gates must return 1):
+            1. memory_check_null_dereference(ptr) - null check inverted
+               to "safe to deref".
+            2. memory_check_pointer_range(ptr, size) - range plus
+               overflow.
+            3. memory_check_alignment(ptr, MEMORY_ALIGNMENT_DEFAULT) -
+               default alignment.
+            4. memory_check_corruption(ptr, size) - canary + guard if
+               present.
+            5. Return 1 only after all four return 1.
+
+        Bug fix: rewrote all four same-file calls from `from MemoryCore`
+        to the canonical no-module form.
+    @End Implementation
+
+    @Performance_Hints:
+        Four sequential predicates. Short-circuits on the first failure.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Composite validation gives the strongest single-call assurance
+        this module can provide for a raw pointer. It does not check
+        liveness in the layout registry; pair with primitives/memory/
+        layout.runa for that.
+    @End Security_Scope
+
+    Note: Check null pointer (same-file call)
+    Let null_check be proc memory_check_null_dereference with ptr
+    If null_check is equal to 0:
+        Return 0
+    End If
+
+    Note: Check pointer range (same-file call)
+    Let range_check be proc memory_check_pointer_range with ptr, size
+    If range_check is equal to 0:
+        Return 0
+    End If
+
+    Note: Check alignment (same-file call)
+    Let align_check be proc memory_check_alignment with ptr, MEMORY_ALIGNMENT_DEFAULT
+    If align_check is equal to 0:
+        Return 0
+    End If
+
+    Note: Check corruption (same-file call)
+    Let corruption_check be proc memory_check_corruption with ptr, size
+    If corruption_check is equal to 0:
+        Return 0
+    End If
+
+    Return 1  Note: All checks passed
+End Process
+
+Process called "memory_safety_report" takes ptr as Integer, size as Integer returns Integer:
+    @Reasoning:
+        Diagnostic entry point that returns a specific error code instead
+        of a boolean, so callers writing logs / error reports can record
+        the precise reason a pointer was rejected. Distinguishes
+        null-dereference, invalid-range, and corruption as separate
+        outcomes; the success path returns MEMORY_SAFETY_SUCCESS.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. ptr == 0 -> MEMORY_SAFETY_NULL_DEREFERENCE.
+            2. memory_check_pointer_range(ptr, size) - if 0 ->
+               MEMORY_SAFETY_INVALID_PTR.
+            3. memory_check_corruption(ptr, size) - if 0 ->
+               MEMORY_SAFETY_CORRUPTION.
+            4. Return MEMORY_SAFETY_SUCCESS.
+
+        Bug fix: rewrote both same-file calls from `from MemoryCore` to
+        the canonical no-module form.
+    @End Implementation
+
+    @Security_Scope:
+        Returning a specific error code (negative integer) instead of a
+        boolean lets the caller correlate failures with the failing
+        predicate, which is useful in security telemetry and incident
+        analysis. The constants are stable - downstream tooling can rely
+        on the numeric values.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return MEMORY_SAFETY_NULL_DEREFERENCE
+    End If
+
+    Note: Same-file call
+    Let range_check be proc memory_check_pointer_range with ptr, size
+    If range_check is equal to 0:
+        Return MEMORY_SAFETY_INVALID_PTR
+    End If
+
+    Note: Same-file call
+    Let corruption_check be proc memory_check_corruption with ptr, size
+    If corruption_check is equal to 0:
+        Return MEMORY_SAFETY_CORRUPTION
+    End If
+
+    Return MEMORY_SAFETY_SUCCESS
+End Process
+
+Note:
+============================================================================
+Memory Safety Complete - Runtime Memory Validation Surface
+============================================================================
+:End Note
