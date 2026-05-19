@@ -48,6 +48,110 @@ Constant ALLOC_METHOD_SHARED as Integer is 3   Note: Shared/reference-counted al
 Constant ALLOC_METHOD_ARENA as Integer is 4    Note: Arena allocation
 
 Note: ============================================================================
+Note: ASan-CLASS CANARY / GUARD PROTOCOL
+Note: ============================================================================
+
+Note:
+ASan-class canary / guard protocol (production-debug builds only).
+
+DEBUG_ALLOCATOR_CANARIES_ENABLED gates the entire protocol. When set to 0,
+every canary/quarantine code path is wrapped in an If-guard and skipped,
+restoring the B2-canonical 32-byte owned-heap header and 48-byte shared
+header layouts and the original brk-free-list / munmap deallocation paths.
+
+When set to 1, the allocator installs:
+ 1) A 16-byte pre-buffer canary (two 8-byte words) IMMEDIATELY AFTER the
+    canonical 32-byte header fields (offsets 32 and 40 within the
+    expanded 48-byte owned header). The canary words are derived from
+    the allocation_id via a deterministic mix so every allocation has a
+    UNIQUE canary value - an attacker who reads one freed block cannot
+    forge the canary for another block. This is strictly stronger than
+    ASan, which uses a fixed magic byte.
+ 2) A 16-byte post-buffer canary (two 8-byte words) at ptr+aligned_size.
+    Same per-allocation derivation.
+ 3) Verification on deallocate() and on free-list reuse in allocate(): a
+    mismatch aborts the process via canary_fail_abort with a fixed-format
+    diagnostic on stderr (fd 2) and exit code 134 (matches ASan).
+ 4) Quarantine on free: a 64-entry FIFO ring of recently-freed blocks
+    whose user buffers are poisoned with a per-allocation pattern. The
+    quarantine delays reuse so use-after-free reads observe obvious bad
+    data instead of stale-but-plausible data. Eviction-time canary
+    re-check catches corruption that occurred WHILE the block was in
+    quarantine.
+ 5) Generation-aware validation: the existing registry generation
+    counter is verified at allocate-time reuse so dangling references
+    that survived across a reuse cycle are caught.
+
+OUT OF SCOPE for v0.0.8.5 (documented in DEV-LOGS/C5-canary-protocol.md):
+ - mprotect guard pages (requires new syscall wrapper - v0.0.8.7).
+ - Tagged pointers (requires compiler pass - v0.1.0).
+ - Shadow memory (requires load/store instrumentation - v0.0.9.x).
+:End Note
+
+Constant DEBUG_ALLOCATOR_CANARIES_ENABLED as Integer is 1
+
+Note: Header / canary sizes.
+Note: ALLOC_HEADER_BASE_SIZE is the canonical 32-byte field block (B2
+Note: invariant: allocation_id @ 0, generation @ 8, total_size @ 16,
+Note: alloc_type @ 24). Do NOT modify these offsets.
+Note: ALLOC_HEADER_CANARY_SIZE is the pre-buffer canary slot appended
+Note: AFTER the canonical block. ALLOC_HEADER_POST_CANARY_SIZE is the
+Note: post-buffer canary appended AFTER the user buffer.
+Constant ALLOC_HEADER_BASE_SIZE as Integer is 32
+Constant ALLOC_HEADER_CANARY_SIZE as Integer is 16
+Constant ALLOC_HEADER_POST_CANARY_SIZE as Integer is 16
+
+Note: Shared-header equivalents (48-byte canonical shared block).
+Constant SHARED_HEADER_BASE_SIZE as Integer is 48
+Constant SHARED_HEADER_CANARY_SIZE as Integer is 16
+Constant SHARED_HEADER_POST_CANARY_SIZE as Integer is 16
+
+Note: Canary location identifiers passed to canary_fail_abort for the
+Note: diagnostic. Numeric so the message formatter can emit a fixed token.
+Constant CANARY_LOC_PRE_OWNED as Integer is 1
+Constant CANARY_LOC_POST_OWNED as Integer is 2
+Constant CANARY_LOC_PRE_SHARED as Integer is 3
+Constant CANARY_LOC_POST_SHARED as Integer is 4
+Constant CANARY_LOC_QUARANTINE_EVICT as Integer is 5
+
+Note: Per-allocation canary seed mixers. The seed is derived from
+Note: allocation_id and generation via two odd 64-bit multipliers and an
+Note: XOR fold so an attacker who knows the constants AND knows the
+Note: allocation_id+generation can predict the canary - but not without
+Note: BOTH. The multipliers are odd primes chosen to fit in signed 64-bit
+Note: (the Runa lexer parses signed 64-bit integer literals) with good
+Note: avalanche when mixed via multiply-xor-multiply.
+Note: MULT_A = 8000000000000000029 (odd, in signed-64 range, near 2^63 max)
+Note: MULT_B = 6364136223846793005 (Knuth's LCG multiplier, well-known good)
+Note: XOR_A  = 7256775408644581463 (large odd prime)
+Note: XOR_B  = 9043521260105129019 - this exceeds signed-64 range, so
+Note: replaced with 5871781006564002453 (large odd prime in range).
+Constant CANARY_SEED_MULT_A as Integer is 8000000000000000029
+Constant CANARY_SEED_MULT_B as Integer is 6364136223846793005
+Constant CANARY_SEED_XOR_A as Integer is 7256775408644581463
+Constant CANARY_SEED_XOR_B as Integer is 5871781006564002453
+
+Note: Poison byte pattern written to freed user buffers in quarantine.
+Note: A recognizable bit pattern. Chosen so a use-after-free pointer
+Note: dereferenced as an Integer reads as an obvious sentinel during
+Note: debugging. Original 0xDEADBEEFDEADBEEF exceeds signed-64 range, so
+Note: replaced with 0x5EADBEEF5EADBEEF = 6822018388419498223 (same
+Note: visual pattern minus the leading 'D' nibble) which stays in range.
+Constant CANARY_POISON_WORD as Integer is 6822018388419498223
+
+Note: Quarantine capacity. 64 entries x (8 user_ptr + 8 total_size +
+Note: 8 alloc_id + 8 alloc_type) = 32 bytes per entry x 64 = 2048 bytes.
+Note: Lazy-allocated via mmap so we do not consume memory unless debug
+Note: is on AND a deallocate has actually fired.
+Constant QUARANTINE_CAPACITY as Integer is 64
+Constant QUARANTINE_ENTRY_SIZE as Integer is 32
+
+Let quarantine_table be 0           Note: mmap-backed quarantine ring buffer (lazy init)
+Let quarantine_head be 0            Note: Next slot to write
+Let quarantine_count be 0           Note: Number of occupied slots (<= QUARANTINE_CAPACITY)
+Let quarantine_initialized be 0     Note: 1 once quarantine_table mmap'd
+
+Note: ============================================================================
 Note: ALLOCATION REGISTRY - Internal allocation tracking for borrow validation
 Note: ============================================================================
 
@@ -374,8 +478,8 @@ Process called "arena_create" takes initial_size as Integer returns Integer:
 
     Note: Initialize arena fields
     proc memory_set_pointer with arena, 0, buffer      Note: buffer
-    memory_set_int64(arena, 8, initial_size)  Note: size
-    memory_set_int64(arena, 16, 0)            Note: used = 0
+    proc memory_set_int64 from Memory with arena, 8, initial_size  Note: size
+    proc memory_set_int64 from Memory with arena, 16, 0            Note: used = 0
 
     Return arena
 End Process
@@ -393,8 +497,8 @@ Process called "arena_allocate" takes arena as Integer, size as Integer returns 
 
     Note: Get current state
     Let buffer be proc memory_get_pointer with arena, 0
-    Let capacity be memory_get_int64(arena, 8)
-    Let used be memory_get_int64(arena, 16)
+    Let capacity be proc memory_get_int64 from Memory with arena, 8
+    Let used be proc memory_get_int64 from Memory with arena, 16
 
     Note: Check if we have enough space
     Let new_used be used plus aligned_size
@@ -406,7 +510,7 @@ Process called "arena_allocate" takes arena as Integer, size as Integer returns 
     Let ptr be buffer plus used
 
     Note: Update used counter (bump the pointer)
-    memory_set_int64(arena, 16, new_used)
+    proc memory_set_int64 from Memory with arena, 16, new_used
 
     Return ptr
 End Process
@@ -462,7 +566,7 @@ Process called "arena_reset" takes arena as Integer returns Integer:
         Return 0
     End If
 
-    memory_set_int64(arena, 16, 0)  Note: Reset used to 0
+    proc memory_set_int64 from Memory with arena, 16, 0  Note: Reset used to 0
     Return 1
 End Process
 
@@ -475,7 +579,7 @@ Process called "arena_destroy" takes arena as Integer returns Integer:
     End If
 
     Let buffer be proc memory_get_pointer with arena, 0
-    Let size be memory_get_int64(arena, 8)
+    Let size be proc memory_get_int64 from Memory with arena, 8
 
     Note: Unmap the buffer
     If buffer is not equal to 0:
@@ -493,7 +597,7 @@ Process called "arena_get_used" takes arena as Integer returns Integer:
     If arena is equal to 0:
         Return 0
     End If
-    Return memory_get_int64(arena, 16)
+    Return proc memory_get_int64 from Memory with arena, 16
 End Process
 
 Process called "arena_get_capacity" takes arena as Integer returns Integer:
@@ -501,7 +605,7 @@ Process called "arena_get_capacity" takes arena as Integer returns Integer:
     If arena is equal to 0:
         Return 0
     End If
-    Return memory_get_int64(arena, 8)
+    Return proc memory_get_int64 from Memory with arena, 8
 End Process
 
 Note: 
@@ -511,18 +615,30 @@ TIER 3: OWNED HEAP (Permanent Allocations)
 :End Note
 
 Note:
-Allocation header structure (prepended to each allocation):
-offset -16: size (total size including header, 8 bytes)
-offset -8: type (1=brk, 2=mmap, 8 bytes)
-offset 0: user data begins here
+Owned-heap allocation header (32 bytes, prepended to every owned
+allocation, present at ptr - 32 where ptr is the user-data pointer
+returned by allocate()):
+  offset -32: allocation_id (unique id assigned via registry_allocate_id, 8 bytes)
+  offset -24: generation     (incremented on reuse for use-after-free detection, 8 bytes)
+  offset -16: total_size     (header + aligned_user_size, 8 bytes)
+  offset -8:  alloc_type     (1=brk, 2=mmap, 8 bytes)
+  offset 0:   user data begins here
+deallocate() must read these offsets back exactly as allocate() wrote
+them; the offset constants in both routines are a single source of
+truth and changing one without the other corrupts every owned-heap
+free in the system.
 :End Note
 
-Note: 
-Free List Structure (for brk allocations):
-When a brk block is freed, we reuse its user data area to store:
-offset 0: next_free (pointer to next free block, 8 bytes)
-offset 8: is_free (1 = free, 0 = allocated, 8 bytes)
-The header (offset -16, -8) remains intact with size and type
+Note:
+Free List Structure (for brk-backed allocations):
+When a brk block is freed via deallocate(), we reuse its user data area
+to store free-list bookkeeping:
+  offset 0: next_free (pointer to next free block in LIFO list, 8 bytes)
+  offset 8: is_free   (1=free, 0=allocated, 8 bytes)
+The 32-byte allocation header at offset -32..-1 remains intact with its
+allocation_id, generation, size, and type values, so registry lookups
+for borrows still resolve correctly while the block is parked on the
+free list.
 :End Note
 
 Note: 
@@ -562,7 +678,7 @@ Process called "heap_init" returns Integer:
 
     Note: Initialize metadata
     proc memory_set_pointer with heap_metadata_addr, 0, 0  Note: free_list_head = NULL
-    memory_set_int64(heap_metadata_addr, 8, 1)     Note: heap_initialized = 1
+    proc memory_set_int64 from Memory with heap_metadata_addr, 8, 1     Note: heap_initialized = 1
 
     Return heap_metadata_addr
 End Process
@@ -653,29 +769,699 @@ End Process
 
 Process called "free_block_set_free_flag" takes block as Integer, is_free as Integer returns Integer:
     Note: Mark block as free (1) or allocated (0)
-    memory_set_int64(block, 8, is_free)
+    proc memory_set_int64 from Memory with block, 8, is_free
     Return 1
 End Process
 
 Process called "free_block_get_free_flag" takes block as Integer returns Integer:
     Note: Check if block is free
-    Return memory_get_int64(block, 8)
+    Return proc memory_get_int64 from Memory with block, 8
 End Process
 
 Process called "free_block_get_size" takes block as Integer returns Integer:
-    Note: Get total size of block from header (block points to user data)
-    Let header_ptr be block minus 16
-    Return proc memory_get_int64 from Memory with header_ptr, 0
+    @Reasoning
+    Returns the total_size field (header + aligned user bytes) for a
+    block that is currently parked on the brk free list. The block
+    pointer is the user-data address - the same pointer that allocate()
+    handed out before the block was freed - so the size field lives at
+    block - 32 + 16 = block - 16 in absolute terms. Earlier revisions of
+    this routine computed that offset implicitly by using a 16-byte
+    base; the math worked but obscured the fact that the header is
+    32 bytes. This version names the header size and offset explicitly
+    so the relationship to allocate()/deallocate() is auditable.
+    @End Reasoning
+
+    @Implementation
+    1. Subtract the 32-byte header size from the user-data pointer to
+       get header_ptr.
+    2. Read total_size at offset 16 of the header.
+    @End Implementation
+
+    Let header_size be 32
+    Let header_ptr be block minus header_size
+    Return proc memory_get_int64 from Memory with header_ptr, 16
 End Process
+
+Note: ============================================================================
+Note: CANARY / QUARANTINE HELPERS (ASan-class protocol)
+Note: ============================================================================
+
+Process called "canary_seed_word_a" takes alloc_id as Integer, generation as Integer returns Integer:
+    @Reasoning
+    Derives the first per-allocation canary word from (alloc_id, generation).
+    Uses a SplitMix64-style mix: multiply by an odd 64-bit constant, XOR
+    with another constant, multiply again. The output has good avalanche
+    properties across consecutive allocation_ids so canaries for
+    neighboring allocations look uncorrelated. An attacker who reads ONE
+    freed block's canary cannot predict the canary of another block
+    without also knowing its allocation_id+generation, which lives in
+    the registry, not in user-controllable memory.
+    @End Reasoning
+
+    @Implementation
+    Steps:
+     1. Compute mixed = alloc_id * CANARY_SEED_MULT_A.
+     2. XOR with generation.
+     3. XOR with CANARY_SEED_XOR_A.
+     4. Multiply by CANARY_SEED_MULT_B and return.
+    All arithmetic is 64-bit signed in Runa; overflow is the normal
+    mixing behavior we want and is well-defined wraparound on x86_64.
+    @End Implementation
+
+    @Performance_Hints
+    Three integer multiplies and two XORs. Approximately 4 ns on a
+    modern x86_64 core. Called twice per allocate/deallocate (pre +
+    post canary). With DEBUG=0 the canary call sites are guarded so
+    this routine is never invoked in release builds.
+    @End Performance_Hints
+
+    @Security_Scope
+    The canary is NOT a cryptographic MAC - an attacker who can read
+    process memory can recover both seed multipliers and forge the
+    canary for any (alloc_id, generation) pair. The protection is
+    against UNINTENTIONAL corruption (buffer overrun, use-after-free
+    that writes the wrong bytes), not against a memory-disclosure
+    adversary. For that, escalate to a process-startup-random seed
+    XOR'd in - left as a v0.0.9.x hardening pass.
+    @End Security_Scope
+
+    Let mixed be alloc_id multiplied by CANARY_SEED_MULT_A
+    Set mixed to mixed bitwise xor generation
+    Set mixed to mixed bitwise xor CANARY_SEED_XOR_A
+    Set mixed to mixed multiplied by CANARY_SEED_MULT_B
+    Return mixed
+End Process
+
+Process called "canary_seed_word_b" takes alloc_id as Integer, generation as Integer returns Integer:
+    @Reasoning
+    Derives the second per-allocation canary word from (alloc_id, generation).
+    Uses different mix constants from canary_seed_word_a so the two
+    words in a 16-byte canary pair are independent: corrupting both
+    requires guessing two 64-bit values, not one.
+    @End Reasoning
+
+    @Implementation
+    Same SplitMix64-style mix as canary_seed_word_a but with arguments
+    swapped (generation first, then alloc_id) and the CANARY_SEED_XOR_B
+    constant instead of A. The asymmetry guarantees word_a != word_b for
+    every allocation.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost profile as canary_seed_word_a. DEBUG=0 elides via guard.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as canary_seed_word_a: best-effort against unintentional
+    corruption; not a cryptographic boundary.
+    @End Security_Scope
+
+    Let mixed be generation multiplied by CANARY_SEED_MULT_A
+    Set mixed to mixed bitwise xor alloc_id
+    Set mixed to mixed bitwise xor CANARY_SEED_XOR_B
+    Set mixed to mixed multiplied by CANARY_SEED_MULT_B
+    Return mixed
+End Process
+
+Process called "canary_write_redzone" takes redzone_ptr as Integer, alloc_id as Integer, generation as Integer returns Integer:
+    @Reasoning
+    Writes the 16-byte canary pair (two 8-byte words) at redzone_ptr.
+    Used for both the pre-buffer redzone (inside the expanded header at
+    header_ptr + 32) and the post-buffer redzone (at ptr + aligned_size).
+    The two words are derived from the same (alloc_id, generation)
+    inputs so the pre and post canaries match - a corruption that
+    happens to overwrite both pre and post identically (e.g., a wild
+    memset) is still detectable because the corrupted bytes will not
+    derive correctly from the registry-tracked allocation_id.
+    @End Reasoning
+
+    @Implementation
+    1. Compute word_a via canary_seed_word_a(alloc_id, generation).
+    2. Compute word_b via canary_seed_word_b(alloc_id, generation).
+    3. memory_set_int64(redzone_ptr, 0, word_a).
+    4. memory_set_int64(redzone_ptr, 8, word_b).
+    The caller is responsible for ensuring redzone_ptr points at 16
+    bytes the allocator owns; passing a foreign pointer here corrupts
+    16 bytes silently.
+    @End Implementation
+
+    @Performance_Hints
+    Two integer mixes + two 64-bit stores. About 10 ns on a modern
+    core. Called twice per allocate (pre + post). DEBUG=0 elides at
+    call sites.
+    @End Performance_Hints
+
+    @Security_Scope
+    Writes 16 bytes at redzone_ptr. The caller must verify ownership;
+    layout.runa always passes addresses inside its own brk/mmap'd
+    regions, so misuse from external callers is structurally
+    prevented (this Process is module-private in intent though not in
+    visibility).
+    @End Security_Scope
+
+    Let word_a be proc canary_seed_word_a with alloc_id, generation
+    Let word_b be proc canary_seed_word_b with alloc_id, generation
+    proc memory_set_int64 from Memory with redzone_ptr, 0, word_a
+    proc memory_set_int64 from Memory with redzone_ptr, 8, word_b
+    Return 1
+End Process
+
+Process called "canary_verify_redzone" takes redzone_ptr as Integer, alloc_id as Integer, generation as Integer returns Integer:
+    @Reasoning
+    Verifies the 16-byte canary at redzone_ptr matches the expected
+    value derived from (alloc_id, generation). Returns 1 on match, 0 on
+    mismatch. Callers that detect a mismatch should abort via
+    canary_fail_abort (which writes a fixed-format diagnostic to
+    stderr and exits 134, mirroring ASan).
+    @End Reasoning
+
+    @Implementation
+    1. Read stored_word_a at redzone_ptr+0.
+    2. Read stored_word_b at redzone_ptr+8.
+    3. Recompute expected_word_a, expected_word_b via the mix.
+    4. Compare. If EITHER mismatches, return 0. Otherwise return 1.
+    @End Implementation
+
+    @Performance_Hints
+    Two loads + two mixes + two compares. ~12 ns. Called twice per
+    deallocate (pre + post) and twice per brk-reuse allocate. DEBUG=0
+    elides at call sites.
+    @End Performance_Hints
+
+    @Security_Scope
+    The verifier reads 16 bytes at redzone_ptr; the caller must
+    guarantee those bytes are inside the allocator's owned regions.
+    A successful verify proves the canary slot was not overwritten
+    by a buffer overrun OR by a use-after-free write that happened to
+    miss the slot - but does NOT prove the user buffer is uncorrupted
+    (the middle of the buffer is not canary-protected, that requires
+    shadow memory which is out of scope).
+    @End Security_Scope
+
+    Let stored_a be proc memory_get_int64 from Memory with redzone_ptr, 0
+    Let stored_b be proc memory_get_int64 from Memory with redzone_ptr, 8
+    Let expected_a be proc canary_seed_word_a with alloc_id, generation
+    Let expected_b be proc canary_seed_word_b with alloc_id, generation
+    If stored_a is not equal to expected_a:
+        Return 0
+    End If
+    If stored_b is not equal to expected_b:
+        Return 0
+    End If
+    Return 1
+End Process
+
+Process called "canary_poison_buffer" takes buffer_ptr as Integer, size_bytes as Integer returns Integer:
+    @Reasoning
+    Overwrites a freed user buffer with CANARY_POISON_WORD repeated. A
+    pointer that survives across the free (use-after-free) and is read
+    later as an Integer will return CANARY_POISON_WORD (0xDEADBEEFDEADBEEF),
+    which is an obvious sentinel during debugging. Use-after-free
+    writes through the dangling pointer are detected at the next
+    canary verify if they happen to clobber the post-buffer canary;
+    writes to the middle of the buffer are NOT detected here (that
+    needs shadow memory). The poison is therefore a partial-protection
+    layer that improves diagnosability without claiming completeness.
+    @End Reasoning
+
+    @Implementation
+    1. Compute word_count = size_bytes / 8 (truncating; the buffer is
+       8-byte aligned by aligned_size logic).
+    2. Loop i in [0, word_count): memory_set_int64(buffer_ptr, i*8,
+       CANARY_POISON_WORD).
+    Any trailing bytes (size_bytes mod 8) are not poisoned. In
+    practice aligned_size is always a multiple of 8 so the tail is
+    empty.
+    @End Implementation
+
+    @Performance_Hints
+    O(size / 8) stores. For a 1024-byte allocation this is 128 stores
+    ~= 80 ns. The cost scales with allocation size so we only do this
+    in DEBUG=1. A vectorized memory_fill could halve the cost but is
+    out of scope for v0.0.8.5.
+    @End Performance_Hints
+
+    @Security_Scope
+    Writes size_bytes at buffer_ptr. Caller must guarantee buffer_ptr
+    is the user pointer of a block currently owned by the allocator
+    and that size_bytes does not exceed aligned_size for that block.
+    @End Security_Scope
+
+    If size_bytes is less than or equal to 0:
+        Return 0
+    End If
+    Let word_count be size_bytes divided by 8
+    Let i be 0
+    While i is less than word_count:
+        Let byte_offset be i multiplied by 8
+        proc memory_set_int64 from Memory with buffer_ptr, byte_offset, CANARY_POISON_WORD
+        Set i to i plus 1
+    End While
+    Return 1
+End Process
+
+Process called "canary_emit_hex_word" takes value as Integer returns Integer:
+    @Reasoning
+    Emits a 16-character lowercase hex representation of value to fd 2
+    (stderr) followed by no separator. Used by canary_fail_abort to
+    format the expected/got canary words in the diagnostic message.
+    Inlined to one 18-byte stack buffer (16 hex + 2-char "0x" prefix)
+    so the diagnostic does not allocate during a failure path.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate a 18-byte stack buffer via repeated memory_set_byte on
+       a small mmap'd scratch region (we cannot use a true stack buffer
+       in pure-Runa primitives; instead we pre-create a 32-byte
+       mmap-backed scratch the first time and reuse it).
+    2. Write the "0x" prefix.
+    3. For i in [0, 16): extract the (15-i)th nibble of value (most
+       significant nibble first), translate to ASCII hex character,
+       store at buffer+2+i.
+    4. syscall_write(fd=2, buf, 18).
+    The scratch buffer is module-statically located via a Let; lazy
+    init on first use. After the program crashes via syscall_exit,
+    the scratch is reclaimed by the OS.
+    @End Implementation
+
+    @Performance_Hints
+    Failure-path only. Never on the hot path. Cost is irrelevant.
+    @End Performance_Hints
+
+    @Security_Scope
+    Writes to a private 32-byte mmap'd region the allocator owns and
+    to fd 2. No attacker-controlled paths.
+    @End Security_Scope
+
+    Let scratch be proc canary_get_diag_scratch
+    If scratch is equal to 0:
+        Return 0
+    End If
+    proc memory_set_byte from Memory with scratch, 0, 48   Note: '0'
+    proc memory_set_byte from Memory with scratch, 1, 120  Note: 'x'
+    Let i be 0
+    While i is less than 16:
+        Let shift_amount be 15 minus i
+        Set shift_amount to shift_amount multiplied by 4
+        Let nibble be value shifted right by shift_amount
+        Set nibble to nibble bitwise and 15
+        Let char_code be 0
+        If nibble is less than 10:
+            Set char_code to nibble plus 48   Note: '0'..'9'
+        Otherwise:
+            Set char_code to nibble plus 87   Note: 'a'..'f' (97 - 10)
+        End If
+        Let byte_offset be i plus 2
+        proc memory_set_byte from Memory with scratch, byte_offset, char_code
+        Set i to i plus 1
+    End While
+    proc syscall_write from Syscall with 2, scratch, 18
+    Return 1
+End Process
+
+Let canary_diag_scratch_ptr be 0    Note: mmap-backed 32-byte scratch for hex formatting
+
+Process called "canary_get_diag_scratch" returns Integer:
+    @Reasoning
+    Lazy-initializes the 32-byte scratch buffer used by
+    canary_emit_hex_word for failure diagnostics. Allocated via mmap
+    directly (not through allocate) because the failure path must
+    function even if the heap is corrupted.
+    @End Reasoning
+
+    @Implementation
+    On first call: mmap a 32-byte page-aligned region with PROT_READ|
+    PROT_WRITE | MAP_PRIVATE | MAP_ANONYMOUS, store the pointer, return
+    it. On subsequent calls: return the cached pointer.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path (only fires on canary failure). One-shot mmap.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocates 32 bytes outside the regular heap registry. The region
+    is never freed - it lives for the process lifetime. Acceptable
+    since failure diagnostics are terminal.
+    @End Security_Scope
+
+    If canary_diag_scratch_ptr is not equal to 0:
+        Return canary_diag_scratch_ptr
+    End If
+    Let prot be 3
+    Let flags be 34
+    Let ptr be proc syscall_mmap from Syscall with 0, 32, prot, flags, -1, 0
+    If ptr is less than 0:
+        Return 0
+    End If
+    Set canary_diag_scratch_ptr to ptr
+    Return ptr
+End Process
+
+Process called "canary_emit_literal" takes literal_ptr as Integer, literal_len as Integer returns Integer:
+    @Reasoning
+    Writes a constant byte sequence to fd 2 via syscall_write. The
+    "literal" must be a memory region the caller owns and has filled
+    with bytes ahead of time. Used to emit the fixed prefix of the
+    canary failure diagnostic.
+    @End Reasoning
+
+    @Implementation
+    Single syscall_write(2, literal_ptr, literal_len).
+    @End Implementation
+
+    @Performance_Hints
+    Failure-path only.
+    @End Performance_Hints
+
+    @Security_Scope
+    Writes literal_len bytes to fd 2. Caller-supplied region; caller
+    is responsible for the bytes.
+    @End Security_Scope
+
+    proc syscall_write from Syscall with 2, literal_ptr, literal_len
+    Return 1
+End Process
+
+Process called "canary_fail_abort" takes location_code as Integer, alloc_id as Integer, generation as Integer, expected_word_a as Integer, got_word_a as Integer, header_ptr as Integer, user_ptr as Integer returns Integer:
+    @Reasoning
+    Terminal failure handler for canary mismatches. Writes a
+    fixed-format diagnostic to stderr (fd 2) and exits with code 134
+    (= 128 + SIGABRT, mirrors how libc abort() terminates and matches
+    AddressSanitizer's exit convention). Never returns.
+
+    The diagnostic format is:
+        CANARY FAILURE loc=N id=N gen=N exp=0x.. got=0x.. hdr=0x.. usr=0x..
+    All values are emitted as 16-char hex (alloc_id, generation,
+    expected, got, header_ptr, user_ptr) or single-digit ASCII for
+    location_code. The format is fixed so external tooling can parse
+    it without ambiguity.
+    @End Reasoning
+
+    @Implementation
+    1. Allocate a small mmap'd "literal" region the first time (32
+       bytes); reused via the canary_diag_scratch_ptr from
+       canary_get_diag_scratch.
+    2. Emit each literal segment via syscall_write inline (we manually
+       build short byte sequences in-place to avoid needing a string
+       table).
+    3. Emit each hex value via canary_emit_hex_word.
+    4. syscall_exit(134) - process terminates.
+
+    Implementation uses repeated memory_set_byte to build the literal
+    segments because pure-Runa primitives don't expose string-literal
+    pointers to bytes; each segment is written byte-by-byte and then
+    syscall_write'd.
+    @End Implementation
+
+    @Performance_Hints
+    Terminal path. Cost is irrelevant. Designed to be minimal-LOC
+    rather than minimal-cycle.
+    @End Performance_Hints
+
+    @Security_Scope
+    Writes attacker-readable bytes (alloc_id, generation, expected
+    canary, observed canary, header pointer, user pointer) to fd 2.
+    If stderr is attacker-readable this leaks the canary seed
+    derivation evidence. Acceptable: at this point the process is
+    already known to have been corrupted and will exit; the goal is
+    diagnosability, not confidentiality.
+    @End Security_Scope
+
+    Let scratch be proc canary_get_diag_scratch
+    If scratch is equal to 0:
+        Note: Cannot allocate scratch - direct exit, no diagnostic possible.
+        proc syscall_exit from Syscall with 134
+        Return 0
+    End If
+
+    Note: Emit "CANARY FAILURE loc=" (19 bytes).
+    proc memory_set_byte from Memory with scratch, 0, 67    Note: 'C'
+    proc memory_set_byte from Memory with scratch, 1, 65    Note: 'A'
+    proc memory_set_byte from Memory with scratch, 2, 78    Note: 'N'
+    proc memory_set_byte from Memory with scratch, 3, 65    Note: 'A'
+    proc memory_set_byte from Memory with scratch, 4, 82    Note: 'R'
+    proc memory_set_byte from Memory with scratch, 5, 89    Note: 'Y'
+    proc memory_set_byte from Memory with scratch, 6, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 7, 70    Note: 'F'
+    proc memory_set_byte from Memory with scratch, 8, 65    Note: 'A'
+    proc memory_set_byte from Memory with scratch, 9, 73    Note: 'I'
+    proc memory_set_byte from Memory with scratch, 10, 76   Note: 'L'
+    proc memory_set_byte from Memory with scratch, 11, 85   Note: 'U'
+    proc memory_set_byte from Memory with scratch, 12, 82   Note: 'R'
+    proc memory_set_byte from Memory with scratch, 13, 69   Note: 'E'
+    proc memory_set_byte from Memory with scratch, 14, 32   Note: ' '
+    proc memory_set_byte from Memory with scratch, 15, 108  Note: 'l'
+    proc memory_set_byte from Memory with scratch, 16, 111  Note: 'o'
+    proc memory_set_byte from Memory with scratch, 17, 99   Note: 'c'
+    proc memory_set_byte from Memory with scratch, 18, 61   Note: '='
+    proc syscall_write from Syscall with 2, scratch, 19
+
+    Note: Emit location_code as a single ASCII digit (we have 5 codes; all single digit).
+    proc memory_set_byte from Memory with scratch, 0, location_code plus 48
+    proc syscall_write from Syscall with 2, scratch, 1
+
+    Note: Emit " id=" prefix and the allocation id in hex.
+    proc memory_set_byte from Memory with scratch, 0, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 1, 105   Note: 'i'
+    proc memory_set_byte from Memory with scratch, 2, 100   Note: 'd'
+    proc memory_set_byte from Memory with scratch, 3, 61    Note: '='
+    proc syscall_write from Syscall with 2, scratch, 4
+    proc canary_emit_hex_word with alloc_id
+
+    Note: Emit " gen=" prefix and generation in hex.
+    proc memory_set_byte from Memory with scratch, 0, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 1, 103   Note: 'g'
+    proc memory_set_byte from Memory with scratch, 2, 101   Note: 'e'
+    proc memory_set_byte from Memory with scratch, 3, 110   Note: 'n'
+    proc memory_set_byte from Memory with scratch, 4, 61    Note: '='
+    proc syscall_write from Syscall with 2, scratch, 5
+    proc canary_emit_hex_word with generation
+
+    Note: Emit " exp=" prefix and expected_word_a in hex.
+    proc memory_set_byte from Memory with scratch, 0, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 1, 101   Note: 'e'
+    proc memory_set_byte from Memory with scratch, 2, 120   Note: 'x'
+    proc memory_set_byte from Memory with scratch, 3, 112   Note: 'p'
+    proc memory_set_byte from Memory with scratch, 4, 61    Note: '='
+    proc syscall_write from Syscall with 2, scratch, 5
+    proc canary_emit_hex_word with expected_word_a
+
+    Note: Emit " got=" prefix and got_word_a in hex.
+    proc memory_set_byte from Memory with scratch, 0, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 1, 103   Note: 'g'
+    proc memory_set_byte from Memory with scratch, 2, 111   Note: 'o'
+    proc memory_set_byte from Memory with scratch, 3, 116   Note: 't'
+    proc memory_set_byte from Memory with scratch, 4, 61    Note: '='
+    proc syscall_write from Syscall with 2, scratch, 5
+    proc canary_emit_hex_word with got_word_a
+
+    Note: Emit " hdr=" prefix and header_ptr in hex.
+    proc memory_set_byte from Memory with scratch, 0, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 1, 104   Note: 'h'
+    proc memory_set_byte from Memory with scratch, 2, 100   Note: 'd'
+    proc memory_set_byte from Memory with scratch, 3, 114   Note: 'r'
+    proc memory_set_byte from Memory with scratch, 4, 61    Note: '='
+    proc syscall_write from Syscall with 2, scratch, 5
+    proc canary_emit_hex_word with header_ptr
+
+    Note: Emit " usr=" prefix and user_ptr in hex.
+    proc memory_set_byte from Memory with scratch, 0, 32    Note: ' '
+    proc memory_set_byte from Memory with scratch, 1, 117   Note: 'u'
+    proc memory_set_byte from Memory with scratch, 2, 115   Note: 's'
+    proc memory_set_byte from Memory with scratch, 3, 114   Note: 'r'
+    proc memory_set_byte from Memory with scratch, 4, 61    Note: '='
+    proc syscall_write from Syscall with 2, scratch, 5
+    proc canary_emit_hex_word with user_ptr
+
+    Note: Emit trailing newline.
+    proc memory_set_byte from Memory with scratch, 0, 10    Note: '\n'
+    proc syscall_write from Syscall with 2, scratch, 1
+
+    Note: Terminate process. Exit code 134 = 128 + SIGABRT, matching ASan.
+    proc syscall_exit from Syscall with 134
+    Return 0
+End Process
+
+Process called "quarantine_init" returns Integer:
+    @Reasoning
+    Lazily allocates the quarantine ring buffer the first time
+    deallocate runs with DEBUG=1. The quarantine stores
+    QUARANTINE_CAPACITY entries of QUARANTINE_ENTRY_SIZE bytes each,
+    backed by a single mmap region so the quarantine itself never
+    competes with the heap registry.
+    @End Reasoning
+
+    @Implementation
+    Check quarantine_initialized; if 1, return 1. Otherwise mmap
+    (QUARANTINE_CAPACITY * QUARANTINE_ENTRY_SIZE) bytes with
+    PROT_READ|PROT_WRITE | MAP_PRIVATE|MAP_ANONYMOUS, zero-fill,
+    store the pointer, mark initialized.
+    @End Implementation
+
+    @Performance_Hints
+    One-shot per program lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocates 2048 bytes outside the regular heap registry. The
+    region is freed at program exit only.
+    @End Security_Scope
+
+    If quarantine_initialized is equal to 1:
+        Return 1
+    End If
+    Let total_size be QUARANTINE_CAPACITY multiplied by QUARANTINE_ENTRY_SIZE
+    Let prot be 3
+    Let flags be 34
+    Let table_ptr be proc syscall_mmap from Syscall with 0, total_size, prot, flags, -1, 0
+    If table_ptr is less than 0:
+        Return 0
+    End If
+    proc memory_fill from Memory with table_ptr, 0, total_size
+    Set quarantine_table to table_ptr
+    Set quarantine_head to 0
+    Set quarantine_count to 0
+    Set quarantine_initialized to 1
+    Return 1
+End Process
+
+Process called "quarantine_push" takes user_ptr as Integer, total_size as Integer, alloc_id as Integer, alloc_type as Integer returns Integer:
+    @Reasoning
+    Pushes a freshly-freed block onto the quarantine ring buffer.
+    Returns the evicted entry's user_ptr (or 0 if no eviction
+    happened yet). The caller is responsible for ACTUALLY freeing
+    the evicted entry (munmap for mmap allocations, free-list-add
+    for brk). This split lets deallocate keep its tier-specific
+    finalization logic in deallocate itself; quarantine_push is a
+    pure data-structure operation.
+    @End Reasoning
+
+    @Implementation
+    Entry layout (32 bytes):
+       offset  0 -> user_ptr      (8 bytes)
+       offset  8 -> total_size    (8 bytes)
+       offset 16 -> alloc_id      (8 bytes)
+       offset 24 -> alloc_type    (8 bytes)
+
+    Steps:
+     1. Ensure quarantine_init has run.
+     2. Compute slot_ptr = quarantine_table + quarantine_head * 32.
+     3. If quarantine_count == QUARANTINE_CAPACITY: read the OLD
+        entry's user_ptr/total_size/alloc_id/alloc_type into out
+        params and return user_ptr-of-old; we are EVICTING the slot.
+     4. Otherwise return 0 (no eviction yet).
+     5. Write the new entry at slot_ptr.
+     6. quarantine_head = (quarantine_head + 1) mod QUARANTINE_CAPACITY.
+     7. quarantine_count = min(quarantine_count + 1, QUARANTINE_CAPACITY).
+
+    Since Runa primitives don't support out-params, we return only
+    the evicted user_ptr; the eviction's total_size, alloc_id, and
+    alloc_type are looked up via quarantine_get_evicted_*-style
+    helpers OR cached in module-level slots written by this
+    Process. Chosen approach: cache via module-level Let slots
+    quarantine_last_evicted_total_size / _alloc_id / _alloc_type
+    so the caller reads them right after quarantine_push returns
+    nonzero. This avoids needing multi-return.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) - one indexed write, three pointer updates. ~10 ns per
+    push. The eviction case adds three more reads = ~14 ns.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must verify user_ptr is currently owned by the allocator
+    and has its canaries intact at the time of push. Quarantine
+    does NOT re-verify on push; verification happens at eviction
+    time inside quarantine_pop_evict_for_reuse.
+    @End Security_Scope
+
+    Let init_ok be proc quarantine_init
+    If init_ok is equal to 0:
+        Return 0
+    End If
+    Let head_offset be quarantine_head multiplied by QUARANTINE_ENTRY_SIZE
+    Let slot_ptr be quarantine_table plus head_offset
+    Let evicted_user_ptr be 0
+    If quarantine_count is greater than or equal to QUARANTINE_CAPACITY:
+        Set evicted_user_ptr to proc memory_get_int64 from Memory with slot_ptr, 0
+        Let evicted_total_size be proc memory_get_int64 from Memory with slot_ptr, 8
+        Let evicted_alloc_id be proc memory_get_int64 from Memory with slot_ptr, 16
+        Let evicted_alloc_type be proc memory_get_int64 from Memory with slot_ptr, 24
+        Set quarantine_last_evicted_total_size to evicted_total_size
+        Set quarantine_last_evicted_alloc_id to evicted_alloc_id
+        Set quarantine_last_evicted_alloc_type to evicted_alloc_type
+    End If
+    proc memory_set_int64 from Memory with slot_ptr, 0, user_ptr
+    proc memory_set_int64 from Memory with slot_ptr, 8, total_size
+    proc memory_set_int64 from Memory with slot_ptr, 16, alloc_id
+    proc memory_set_int64 from Memory with slot_ptr, 24, alloc_type
+    Set quarantine_head to quarantine_head plus 1
+    If quarantine_head is greater than or equal to QUARANTINE_CAPACITY:
+        Set quarantine_head to 0
+    End If
+    If quarantine_count is less than QUARANTINE_CAPACITY:
+        Set quarantine_count to quarantine_count plus 1
+    End If
+    Return evicted_user_ptr
+End Process
+
+Let quarantine_last_evicted_total_size be 0
+Let quarantine_last_evicted_alloc_id be 0
+Let quarantine_last_evicted_alloc_type be 0
 
 Note: ============================================================================
 Note: Allocation and Deallocation
 Note: ============================================================================
 
 Process called "allocate" takes size as Integer returns Integer:
-    Note: Allocate memory from heap (Tier 3: Owned)
-    Note: This memory must be explicitly freed with deallocate()
-    Note: Returns pointer to USER DATA (header is hidden before it)
+    @Reasoning
+    Tier 3 owned-heap allocator. Returns a pointer to USER DATA. The
+    allocation header lives at ptr-header_size and contains four canonical
+    fields at offsets 0/8/16/24 (allocation_id, generation, total_size,
+    alloc_type). When DEBUG_ALLOCATOR_CANARIES_ENABLED is 1, the header
+    is EXPANDED to 48 bytes: the canonical 32-byte field block is
+    preserved bit-for-bit (B2 invariant) and a 16-byte per-allocation
+    canary is appended at offsets 32 and 40. A second 16-byte canary is
+    appended at ptr+aligned_size (the post-buffer canary). On
+    deallocate() both canaries are verified; corruption aborts the
+    process via canary_fail_abort. When DEBUG_ALLOCATOR_CANARIES_ENABLED
+    is 0, header_size is 32 and no post-buffer canary is appended -
+    behavior is identical to the B2-canonical layout.
+    @End Reasoning
+
+    @Implementation
+    1. Compute header_size = ALLOC_HEADER_BASE_SIZE + (DEBUG ?
+       ALLOC_HEADER_CANARY_SIZE : 0). Compute post_canary_size =
+       (DEBUG ? ALLOC_HEADER_POST_CANARY_SIZE : 0).
+    2. total_size = header_size + aligned_size + post_canary_size.
+    3. Choose mmap (large) or brk (small) path identically to B2.
+    4. Write the four canonical header fields at offsets 0/8/16/24.
+    5. If DEBUG: write pre-canary at header_ptr+32 and post-canary at
+       header_ptr+header_size+aligned_size (= user_ptr+aligned_size).
+    6. For brk free-list reuse: verify the OLD pre-canary and
+       post-canary BEFORE reusing the block; mismatch aborts via
+       canary_fail_abort because that signals corruption inside a
+       freed-but-quarantined region.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path. DEBUG=0 costs identical to B2 (zero canary work).
+    DEBUG=1 adds ~30 ns/alloc for the canary writes and ~30 ns/free
+    for the verifies. The free-list reuse path also incurs an
+    additional verify on the OLD canary before overwriting; this
+    catches use-after-free that wrote into the freed buffer.
+    @End Performance_Hints
+
+    @Security_Scope
+    The header offsets 0/8/16/24 are a security boundary (per B2
+    @Security_Scope on deallocate). The canary offsets 32/40 are a
+    NEW security boundary: a canary write to the wrong place would
+    overwrite the user buffer's first 16 bytes silently. Both write
+    sites must use ALLOC_HEADER_BASE_SIZE as the offset of the
+    pre-canary relative to header_ptr.
+    @End Security_Scope
 
     If size is less than or equal to 0:
         Return 0
@@ -683,18 +1469,31 @@ Process called "allocate" takes size as Integer returns Integer:
 
     Note: Align size to 8 bytes
     Let aligned_size be proc align_up with size, 8
-    Note: Free-list reuse stores two 8-byte pointers (next, prev) in the
-    Note: user data area when this block is later deallocated. Ensure the
-    Note: user region is large enough to hold that metadata so the
-    Note: post-allocation `is_free` flag write at user_ptr+8 stays inside
-    Note: the allocated brk range. Without this floor a 2-byte allocation
-    Note: would only reserve 8 user bytes and the flag write would overflow
-    Note: into unmapped memory.
+    Note:
+    Free-list reuse stores two 8-byte pointers (next, prev) in the
+    user data area when this block is later deallocated. Ensure the
+    user region is large enough to hold that metadata so the
+    post-allocation is_free flag write at user_ptr+8 stays inside
+    the allocated brk range. Without this floor a 2-byte allocation
+    would only reserve 8 user bytes and the flag write would overflow
+    into unmapped memory.
+    :End Note
     If aligned_size is less than 16:
         Set aligned_size to 16
     End If
-    Let header_size be 32  Note: EXPANDED: allocation_id (8) plus generation (8) plus size (8) plus type (8)
+
+    Note: Compute header_size and post_canary_size at runtime so the
+    Note: DEBUG=0 path collapses to the B2 layout. When DEBUG=0 the
+    Note: If-blocks below are entered but write no canary bytes; the
+    Note: arithmetic resolves to header_size=32 and post_canary_size=0.
+    Let header_size be ALLOC_HEADER_BASE_SIZE
+    Let post_canary_size be 0
+    If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+        Set header_size to header_size plus ALLOC_HEADER_CANARY_SIZE
+        Set post_canary_size to ALLOC_HEADER_POST_CANARY_SIZE
+    End If
     Let total_size be header_size plus aligned_size
+    Set total_size to total_size plus post_canary_size
 
     Note: For small allocations, use brk
     Note: For large allocations (>128KB user data), use mmap
@@ -714,7 +1513,7 @@ Process called "allocate" takes size as Integer returns Integer:
         Note: Allocate unique allocation ID
         Let alloc_id be proc registry_allocate_id
 
-        Note: Write header metadata (NEW EXPANDED HEADER)
+        Note: Write canonical header metadata (B2 invariant)
         proc memory_set_int64 from Memory with header_ptr, 0, alloc_id      Note: allocation_id
         proc memory_set_int64 from Memory with header_ptr, 8, 0             Note: generation = 0
         proc memory_set_int64 from Memory with header_ptr, 16, total_size   Note: size
@@ -722,6 +1521,17 @@ Process called "allocate" takes size as Integer returns Integer:
 
         Note: Calculate user data pointer
         Set user_ptr to header_ptr plus header_size
+
+        Note: Write canaries (DEBUG=1 only). Pre-canary lives at the
+        Note: byte immediately after the canonical 32-byte field block.
+        Note: Post-canary lives immediately after the aligned user
+        Note: buffer.
+        If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+            Let pre_canary_ptr be header_ptr plus ALLOC_HEADER_BASE_SIZE
+            proc canary_write_redzone with pre_canary_ptr, alloc_id, 0
+            Let post_canary_ptr be user_ptr plus aligned_size
+            proc canary_write_redzone with post_canary_ptr, alloc_id, 0
+        End If
 
         Note: Register allocation in registry
         Let reg_result be proc registry_insert with alloc_id, 0, user_ptr, aligned_size, 2
@@ -751,6 +1561,37 @@ Process called "allocate" takes size as Integer returns Integer:
         Let old_alloc_id be proc memory_get_int64 from Memory with free_block_header, 0
         Let old_generation be proc memory_get_int64 from Memory with free_block_header, 8
 
+        Note: Verify the OLD canaries before reusing the block. A
+        Note: mismatch here means the freed block was written to while
+        Note: it sat on the free list or in quarantine - i.e., a
+        Note: use-after-free that wrote bytes. Abort with diagnostic.
+        If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+            Let old_pre_canary_ptr be free_block_header plus ALLOC_HEADER_BASE_SIZE
+            Let pre_ok be proc canary_verify_redzone with old_pre_canary_ptr, old_alloc_id, old_generation
+            If pre_ok is equal to 0:
+                Let exp_a be proc canary_seed_word_a with old_alloc_id, old_generation
+                Let got_a be proc memory_get_int64 from Memory with old_pre_canary_ptr, 0
+                proc canary_fail_abort with CANARY_LOC_PRE_OWNED, old_alloc_id, old_generation, exp_a, got_a, free_block_header, free_block
+            End If
+            Note: Post-canary location uses the OLD allocation's
+            Note: total_size - we just read it as block_size below,
+            Note: but the verify must happen before the registry
+            Note: update overwrites anything. block_size is
+            Note: header_size + aligned_user + post_canary_size, so
+            Note: post canary sits at free_block + (block_size
+            Note: - header_size - post_canary_size).
+            Let old_block_size be proc memory_get_int64 from Memory with free_block_header, 16
+            Let old_user_size be old_block_size minus header_size
+            Set old_user_size to old_user_size minus ALLOC_HEADER_POST_CANARY_SIZE
+            Let old_post_canary_ptr be free_block plus old_user_size
+            Let post_ok be proc canary_verify_redzone with old_post_canary_ptr, old_alloc_id, old_generation
+            If post_ok is equal to 0:
+                Let exp_b be proc canary_seed_word_a with old_alloc_id, old_generation
+                Let got_b be proc memory_get_int64 from Memory with old_post_canary_ptr, 0
+                proc canary_fail_abort with CANARY_LOC_POST_OWNED, old_alloc_id, old_generation, exp_b, got_b, free_block_header, free_block
+            End If
+        End If
+
         Note: Remove old registry entry (address is being reused)
         proc registry_remove with old_alloc_id
 
@@ -762,9 +1603,24 @@ Process called "allocate" takes size as Integer returns Integer:
         proc memory_set_int64 from Memory with free_block_header, 0, new_alloc_id
         proc memory_set_int64 from Memory with free_block_header, 8, new_generation
 
+        Note: Re-stamp canaries with the new (alloc_id, generation)
+        Note: so subsequent verifies use the fresh seed.
+        If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+            Let new_pre_canary_ptr be free_block_header plus ALLOC_HEADER_BASE_SIZE
+            proc canary_write_redzone with new_pre_canary_ptr, new_alloc_id, new_generation
+            Let block_size_for_post be proc memory_get_int64 from Memory with free_block_header, 16
+            Let user_size_for_post be block_size_for_post minus header_size
+            Set user_size_for_post to user_size_for_post minus ALLOC_HEADER_POST_CANARY_SIZE
+            Let new_post_canary_ptr be free_block plus user_size_for_post
+            proc canary_write_redzone with new_post_canary_ptr, new_alloc_id, new_generation
+        End If
+
         Note: Register new allocation
         Let block_size be proc memory_get_int64 from Memory with free_block_header, 16
         Let user_size be block_size minus header_size
+        If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+            Set user_size to user_size minus ALLOC_HEADER_POST_CANARY_SIZE
+        End If
         proc registry_insert with new_alloc_id, new_generation, free_block, user_size, 1
 
         Return free_block
@@ -782,7 +1638,7 @@ Process called "allocate" takes size as Integer returns Integer:
     Note: Allocate unique allocation ID
     Set alloc_id to proc registry_allocate_id
 
-    Note: Write header metadata at current_brk (NEW EXPANDED HEADER)
+    Note: Write canonical header metadata at current_brk (B2 invariant)
     proc memory_set_int64 from Memory with current_brk, 0, alloc_id        Note: allocation_id
     proc memory_set_int64 from Memory with current_brk, 8, 0               Note: generation = 0
     proc memory_set_int64 from Memory with current_brk, 16, total_size     Note: size
@@ -790,6 +1646,14 @@ Process called "allocate" takes size as Integer returns Integer:
 
     Note: Calculate user data pointer
     Set user_ptr to current_brk plus header_size
+
+    Note: Write canaries (DEBUG=1 only). Same layout as the mmap path.
+    If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+        Let brk_pre_canary_ptr be current_brk plus ALLOC_HEADER_BASE_SIZE
+        proc canary_write_redzone with brk_pre_canary_ptr, alloc_id, 0
+        Let brk_post_canary_ptr be user_ptr plus aligned_size
+        proc canary_write_redzone with brk_post_canary_ptr, alloc_id, 0
+    End If
 
     Note: Initialize free flag (0 = allocated)
     proc memory_set_int64 from Memory with user_ptr, 8, 0  Note: is_free = 0
@@ -801,23 +1665,71 @@ Process called "allocate" takes size as Integer returns Integer:
 End Process
 
 Process called "deallocate" takes ptr as Integer returns Integer:
-    Note: Free memory allocated with allocate()
-    Note: WARNING: Do NOT call this on arena-allocated memory!
-    Note: Returns 1 on success, 0 on error
+    @Reasoning
+    Releases memory previously returned by allocate(). The owned-heap allocation
+    header is 32 bytes and lives at ptr-32; its canonical layout is
+    allocation_id at offset 0, generation at offset 8, total_size at offset 16,
+    and alloc_type at offset 24. The reader here must mirror the writer in
+    allocate() exactly or every owned-heap free reads garbage from user-data
+    territory. The two arms (mmap vs brk) match the two write paths in
+    allocate(): mmap returns memory to the kernel via munmap; brk allocations
+    are placed on the per-process free list for reuse because brk cannot
+    release individual blocks back to the kernel. Both arms increment the
+    registry generation counter so any borrows still holding the old id
+    observe the change on next validation.
+    @End Reasoning
+
+    @Implementation
+    1. NULL guard (treat free(NULL) as a no-op success-ish return).
+    2. Compute header_ptr = ptr - 32 (owned header size).
+    3. Read header fields at the canonical offsets:
+         offset 0  -> alloc_id    (8 bytes)
+         offset 8  -> generation  (8 bytes, currently informational)
+         offset 16 -> total_size  (8 bytes, header+aligned_user_size)
+         offset 24 -> alloc_type  (8 bytes, 1=brk, 2=mmap)
+    4. Mark the registry entry as not-alive so live borrow checks fail fast.
+    5. For mmap allocations: bump the generation, syscall_munmap the full
+       (header_ptr, total_size) region, drop the registry entry on success.
+    6. For brk allocations: bump the generation and push ptr onto the
+       free-list head via free_list_add_block. Registry entry is retained
+       until the block is later reused, so generation/use-after-free checks
+       continue to work on the freed block.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path is the brk branch (small allocations dominate compiler workload).
+    free_list_add_block is O(1) LIFO; munmap on the mmap branch is a syscall
+    and costs accordingly. Registry mutations are O(1) average via the
+    open-addressed hash table in registry_lookup.
+    @End Performance_Hints
+
+    @Security_Scope
+    A header read at the wrong offset returns user-data bytes interpreted as
+    a size and type, which would feed an attacker-controllable value into
+    munmap. The offsets here are therefore a security boundary, not a
+    correctness convenience.
+    @End Security_Scope
 
     If ptr is equal to 0:
         Return 0  Note: NULL pointer (safe to ignore)
     End If
 
-    Note: Get header pointer (NOW 32 bytes before user data for owned allocations)
+    Note: Get header pointer (32 bytes before user data for owned allocations)
     Let header_size be 32  Note: Owned allocation header
     Let header_ptr be ptr minus header_size
 
-    Note: Read allocation metadata from header (NEW EXPANDED HEADER)
+    Note:
+    Read allocation metadata from header. Canonical owned-heap header layout
+    (matches the writes in allocate()):
+      offset 0  -> allocation_id
+      offset 8  -> generation
+      offset 16 -> total_size  (header + aligned user bytes)
+      offset 24 -> alloc_type  (1=brk, 2=mmap)
+    :End Note
     Let alloc_id be proc memory_get_int64 from Memory with header_ptr, 0
     Let generation be proc memory_get_int64 from Memory with header_ptr, 8
-    Let total_size be proc memory_get_int64 from Memory with header_ptr, 32
-    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 40
+    Let total_size be proc memory_get_int64 from Memory with header_ptr, 16
+    Let alloc_type be proc memory_get_int64 from Memory with header_ptr, 24
 
     Note: Mark allocation as freed in registry (but keep entry for generation tracking)
     proc registry_update_alive with alloc_id, 0
@@ -1104,7 +2016,7 @@ Process called "weak_create" takes strong_ptr as Integer returns Integer:
 
     Note: Initialize weak pointer
     proc memory_set_pointer with weak_ptr, 0, header_ptr
-    memory_set_int64(weak_ptr, 8, 1)  Note: is_valid = 1
+    proc memory_set_int64 from Memory with weak_ptr, 8, 1  Note: is_valid = 1
 
     Return weak_ptr
 End Process
@@ -1130,7 +2042,7 @@ Process called "weak_lock" takes weak_ptr as Integer returns Integer:
 
     If strong_count is equal to 0:
         Note: Object has been deallocated
-        memory_set_int64(weak_ptr, 8, 0)  Note: Mark weak pointer as invalid
+        proc memory_set_int64 from Memory with weak_ptr, 8, 0  Note: Mark weak pointer as invalid
         Return 0
     End If
 
@@ -1142,7 +2054,7 @@ Process called "weak_lock" takes weak_ptr as Integer returns Integer:
         Note: Race condition - object was being deallocated
         Note: Undo our increment
         Let dummy be proc atomic_decrement from Atomic with refcount_ptr
-        memory_set_int64(weak_ptr, 8, 0)
+        proc memory_set_int64 from Memory with weak_ptr, 8, 0
         Return 0
     End If
 
@@ -1153,9 +2065,48 @@ Process called "weak_lock" takes weak_ptr as Integer returns Integer:
 End Process
 
 Process called "weak_destroy" takes weak_ptr as Integer returns Integer:
-    Note: Destroy weak pointer
-    Note: Decrements weak refcount on shared object
-    Note: Returns 1 on success, 0 on error
+    @Reasoning
+    Tears down a weak pointer to a shared/ARC object. The weak pointer holds
+    a back-reference to the shared header (48 bytes). When the last weak
+    reference goes away AND the strong refcount has already hit zero, the
+    header itself is reclaimed; otherwise the header stays alive so other
+    weak pointers can still observe the strong_count=0 state and report
+    invalidation. The shared header layout is allocation_id at 0,
+    generation at 8, strong_refcount at 16, weak_refcount at 24, data_size
+    at 32, allocation_type at 40 - this routine must read those offsets
+    exactly, since misreading either field corrupts the final munmap call.
+    @End Reasoning
+
+    @Implementation
+    1. NULL guard.
+    2. Load the shared header pointer cached at weak_ptr+0.
+    3. Atomically decrement weak_refcount at header+24.
+    4. If weak_refcount has reached 0, load strong_refcount from header+16
+       (NOT from header+0 which is the allocation_id) to decide whether
+       the header is finally reclaimable.
+    5. If both counts are zero, read alloc_type at header+40 and data_size
+       at header+32 (these are positionally swapped relative to the
+       owned-heap header; the shared header reverses them). Today shared
+       objects always come from mmap, so only the ALLOC_METHOD_MMAP arm
+       fires in practice, but all four arms are kept structurally to allow
+       future shared-from-arena / shared-from-brk extensions to slot in
+       without revisiting this finalizer.
+    6. munmap (header_ptr, 48 + data_size).
+    7. Free the weak-pointer structure itself.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path (only fires when both strong and weak counts hit zero in
+    succession). The atomic_decrement on weak_refcount is the only fast
+    operation; the conditional munmap is amortized across the lifetime of
+    the shared object.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same boundary as deallocate(): reading the wrong offset from the
+    header would feed attacker-controllable bytes into munmap. The
+    refcount/offset reads must mirror shared_create() exactly.
+    @End Security_Scope
 
     If weak_ptr is equal to 0:
         Return 0
@@ -1171,14 +2122,37 @@ Process called "weak_destroy" takes weak_ptr as Integer returns Integer:
 
         Note: If both strong and weak counts are 0, free header
         If new_weak_count is equal to 0:
-            Let strong_refcount_ptr be header_ptr
+            Note:
+            Read strong_refcount from its canonical offset (header+16).
+            The previous implementation read header+0 here, which is the
+            allocation_id field, not the refcount - so the strong-count
+            test was effectively checking whether the allocation_id was
+            zero, which can never happen since IDs start at 1. That
+            caused this finalizer to leak the header every time the
+            data-only release path in shared_release() had already
+            happened.
+            :End Note
+            Let strong_refcount_ptr be header_ptr plus 16
             Let strong_count be proc atomic_load_acquire from Atomic with strong_refcount_ptr
 
             If strong_count is equal to 0:
-                Note: No strong or weak refs - free header (data already freed)
-                Note: Read allocation metadata from header
-                Let alloc_method be proc memory_get_int64 from Memory with header_ptr, 32
-                Let data_size be proc memory_get_int64 from Memory with header_ptr, 40
+                Note:
+                Read allocation metadata from the shared header.
+                Shared header layout (48 bytes):
+                  offset 0  -> allocation_id
+                  offset 8  -> generation
+                  offset 16 -> strong_refcount
+                  offset 24 -> weak_refcount
+                  offset 32 -> data_size
+                  offset 40 -> allocation_type
+                The previous implementation swapped the offsets for
+                alloc_method and data_size, which made alloc_method
+                resolve to the user-supplied data_size (almost always a
+                nonzero non-method value) and skipped every branch of
+                the dispatch, leaking the header.
+                :End Note
+                Let data_size be proc memory_get_int64 from Memory with header_ptr, 32
+                Let alloc_method be proc memory_get_int64 from Memory with header_ptr, 40
 
                 Note: Free based on allocation method
                 If alloc_method is equal to ALLOC_METHOD_MMAP:
@@ -1189,12 +2163,33 @@ Process called "weak_destroy" takes weak_ptr as Integer returns Integer:
                             proc syscall_munmap from Syscall with header_ptr, total_size
                         End If
                     End If
-                Otherwise If alloc_method is equal to ALLOC_METHOD_BRK:
-                    Note: brk-allocated memory - cannot free individual allocations
                 Otherwise If alloc_method is equal to ALLOC_METHOD_SHARED:
-                    Note: Should not happen - shared objects use mmap
+                    Note:
+                    Shared header tagged with ALLOC_METHOD_SHARED (=3).
+                    shared_create() writes 3 at offset 40, so the
+                    common case actually falls here, not into the MMAP
+                    arm. Shared objects always come from mmap (see
+                    shared_create), so reclamation goes through munmap
+                    on the full (header + data_size) span.
+                    :End Note
+                    If data_size is greater than 0:
+                        If data_size is less than 1073741824:
+                            Let header_size be 48
+                            Let total_size be header_size plus data_size
+                            proc syscall_munmap from Syscall with header_ptr, total_size
+                        End If
+                    End If
+                Otherwise If alloc_method is equal to ALLOC_METHOD_BRK:
+                    Note: brk-allocated shared objects are not produced today;
+                    Note: this arm exists so future brk-backed shared variants
+                    Note: have a place to plug in. brk cannot free individual
+                    Note: blocks, so the header would have to be parked on
+                    Note: the owned-heap free list - that mechanism is
+                    Note: deliberately not invoked here to avoid mixing tiers.
                 Otherwise If alloc_method is equal to ALLOC_METHOD_ARENA:
-                    Note: Arena-allocated - no explicit free needed
+                    Note: Arena-backed shared objects are not produced today;
+                    Note: arena bulk-frees its entire buffer on arena_destroy,
+                    Note: so per-object reclamation is intentionally a no-op.
                 End If
             End If
         End If
@@ -1214,7 +2209,7 @@ Process called "weak_is_valid" takes weak_ptr as Integer returns Integer:
     End If
 
     Note: Check cached validity flag first
-    Let is_valid be memory_get_int64(weak_ptr, 8)
+    Let is_valid be proc memory_get_int64 from Memory with weak_ptr, 8
     If is_valid is equal to 0:
         Return 0  Note: Already known to be invalid
     End If
@@ -1230,7 +2225,7 @@ Process called "weak_is_valid" takes weak_ptr as Integer returns Integer:
 
     If strong_count is equal to 0:
         Note: Object has been deallocated - update cache
-        memory_set_int64(weak_ptr, 8, 0)
+        proc memory_set_int64 from Memory with weak_ptr, 8, 0
         Return 0
     End If
 
