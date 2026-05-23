@@ -1143,6 +1143,62 @@ Process called "codegen_get_expression_type" takes codegen as Integer, expr as I
         Return 0
     End If
 
+    If expr_type is equal to 25:  Note: EXPR_QUALIFIED_CALL (Module.function() or `proc f from Module with ...`)
+        Note:
+        Mirror EXPR_FUNCTION_CALL: look up the callee's declared return type so
+        that callers like `Let key be proc get_platform_key from Selector with ...`
+        learn `key`'s type is `String` rather than falling through as unknown (0).
+        Without this branch, canonical-mode `key is equal to "linux_x86_64"` does
+        not route to `string_equals` in `codegen_generate_comparison` and silently
+        degrades to pointer comparison — the regression first noted in
+        `codegen-string-equals-fix.md` under "Edge cases discovered" #2.
+
+        Resolution model: read `function_name` from EXPR_QUALIFIED_CALL offset 16
+        (layout shared with the EXPR_QUALIFIED_CALL emission branch at the
+        codegen.runa "If expr_type is equal to 25" site that emits
+        `call <name>@PLT`, and with `codegen_collect_strings_from_expression`'s
+        qualified-call branch). The module-alias prefix at offset 8 is source-level
+        only — `import_system.runa::merge_imported_functions` flattens every
+        imported function into the main program's function table under its PLAIN
+        name, so we look up the plain name directly against
+        `program->functions` (offset 0) / `program->function_count` (offset 8),
+        identical to how EXPR_FUNCTION_CALL resolves above.
+
+        Conservative fallback: if `current_program` is NULL, the function table is
+        empty, the function isn't found, or the matched function has no declared
+        return type, return 0 — same fall-through as every other unhandled case.
+        :End Note
+        Let qc_func_name be memory_get_pointer(expr, 16)  Note: qualified_call.function_name
+        If qc_func_name is equal to 0:
+            Return 0
+        End If
+        Let qc_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program
+        If qc_program is equal to 0:
+            Return 0
+        End If
+        Let qc_function_count be memory_get_int32(qc_program, 8)  Note: PROGRAM_FUNCTION_COUNT
+        Let qc_functions be memory_get_pointer(qc_program, 0)     Note: PROGRAM_FUNCTIONS
+        If qc_functions is equal to 0:
+            Return 0
+        End If
+
+        Let qc_i be 0
+        While qc_i is less than qc_function_count:
+            Let qc_func be memory_get_pointer(qc_functions, qc_i multiplied by 8)
+            If qc_func is greater than 65536:
+                Let qc_name be memory_get_pointer(qc_func, 0)  Note: func->name
+                If qc_name is not equal to 0:
+                    If string_equals(qc_name, qc_func_name) is equal to 1:
+                        Let qc_ret_type be memory_get_pointer(qc_func, 24)  Note: func->return_type
+                        Return qc_ret_type
+                    End If
+                End If
+            End If
+            Set qc_i to qc_i plus 1
+        End While
+        Return 0
+    End If
+
     If expr_type is equal to 6:  Note: EXPR_FIELD_ACCESS
         Let field_access_ptr be expr plus 8  Note: &expr->data.field_access
         Let object be memory_get_pointer(field_access_ptr, 0)       Note: field_access.object
@@ -2120,6 +2176,84 @@ Process called "codegen_generate_comparison" takes codegen as Integer, expr as I
     Let left be memory_get_pointer(expr, 8)           Note: comparison.left
     Let right be memory_get_pointer(expr, 16)         Note: comparison.right
     Let comparison_op be memory_get_integer(expr, 24) Note: comparison.comparison_op
+
+    Note:
+    Canonical-mode String equality routing.
+    For TOKEN_EQUAL (22) and TOKEN_NOT_EQUAL (23), when both operands are
+    statically typed as String, emit a call to the runtime string_equals
+    (value comparison) instead of the default cmpq (pointer comparison).
+    This is conservative: routing only fires when codegen_get_expression_type
+    returns the literal type-name "String" for BOTH operands. If either side
+    is an EXPR_INTEGER (e.g. null sentinel `s is equal to 0`), a qualified
+    call whose return type the codegen cannot resolve, or any other
+    non-String type, the routing condition fails and the existing
+    pointer-compare path runs unchanged.
+    :End Note
+    If comparison_op is equal to 22:
+        Let route_to_string_equals be 0
+        Let left_type be codegen_get_expression_type(codegen, left)
+        Let right_type be codegen_get_expression_type(codegen, right)
+        If left_type is not equal to 0:
+            If right_type is not equal to 0:
+                If string_equals(left_type, "String") is equal to 1:
+                    If string_equals(right_type, "String") is equal to 1:
+                        Set route_to_string_equals to 1
+                    End If
+                End If
+            End If
+        End If
+        If route_to_string_equals is equal to 1:
+            Note:
+            Emit `string_equals(left, right)` using the same calling
+            convention as EXPR_QUALIFIED_CALL: push args in reverse,
+            pop into rdi (arg 1) and rsi (arg 2), call via PLT.
+            Result (0 or 1) is already in %rax and matches what
+            `cmpq + sete` would have produced for an integer equality,
+            so no post-processing is needed for TOKEN_EQUAL.
+            :End Note
+            codegen_generate_expression(codegen, right)
+            emit_line(output_file, "    pushq %rax")
+            codegen_generate_expression(codegen, left)
+            emit_line(output_file, "    pushq %rax")
+            emit_line(output_file, "    popq %rdi")
+            emit_line(output_file, "    popq %rsi")
+            emit_line(output_file, "    call string_equals@PLT")
+            Return 0
+        End If
+    End If
+    If comparison_op is equal to 23:
+        Let route_to_string_equals_ne be 0
+        Let left_type_ne be codegen_get_expression_type(codegen, left)
+        Let right_type_ne be codegen_get_expression_type(codegen, right)
+        If left_type_ne is not equal to 0:
+            If right_type_ne is not equal to 0:
+                If string_equals(left_type_ne, "String") is equal to 1:
+                    If string_equals(right_type_ne, "String") is equal to 1:
+                        Set route_to_string_equals_ne to 1
+                    End If
+                End If
+            End If
+        End If
+        If route_to_string_equals_ne is equal to 1:
+            Note:
+            Same call sequence as TOKEN_EQUAL routing, then invert the
+            boolean result: `not string_equals(a, b)`. `testq %rax, %rax`
+            sets ZF=1 iff string_equals returned 0; `sete %al` then yields
+            1 when they were unequal, 0 when they were equal.
+            :End Note
+            codegen_generate_expression(codegen, right)
+            emit_line(output_file, "    pushq %rax")
+            codegen_generate_expression(codegen, left)
+            emit_line(output_file, "    pushq %rax")
+            emit_line(output_file, "    popq %rdi")
+            emit_line(output_file, "    popq %rsi")
+            emit_line(output_file, "    call string_equals@PLT")
+            emit_line(output_file, "    testq %rax, %rax")
+            emit_line(output_file, "    sete %al")
+            emit_line(output_file, "    movzbq %al, %rax")
+            Return 0
+        End If
+    End If
 
     Note: Generate left operand (result in %rax)
     codegen_generate_expression(codegen, left)
@@ -5739,6 +5873,13 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         Let raw_text be memory_get_pointer(stmt, 8)
         Let text_length be memory_get_int32(stmt, 16)
 
+        Note: Platform inline-asm blocks are authored in Intel syntax (dest-first,
+        Note: no register/immediate sigils). The host GNU assembler defaults to AT&T,
+        Note: so wrap the block in a syntax directive pair: switch to Intel before the
+        Note: raw text, then restore AT&T afterward because the compiler's own emitted
+        Note: code is AT&T syntax.
+        file_write_buffered(output_file, "    .intel_syntax noprefix\n", 0)
+
         Note: Write raw text directly to output, character by character
         Note: Add 4-space indentation to each line for proper assembly formatting
         Let char_idx be 0
@@ -5777,6 +5918,9 @@ Process called "codegen_generate_statement" takes codegen as Integer, stmt as In
         If at_line_start is equal to 0:
             file_write_buffered(output_file, "\n", 0)
         End If
+
+        Note: Restore AT&T syntax for the compiler's own subsequent emitted code.
+        file_write_buffered(output_file, "    .att_syntax prefix\n", 0)
 
         Return 0
     End If

@@ -212,7 +212,7 @@ block                 ::= ':' INDENT statement* DEDENT
 ## Variable Declarations and Assignments
 
 ```ebnf
-let_statement         ::= "Let" (identifier | pattern) type_annotation? "be" expression
+let_statement         ::= "Let" (identifier | pattern) "be" expression trailing_type_annotation?
 
 define_statement      ::= "Define" ["constant"] identifier type_annotation? "as" expression
 
@@ -233,6 +233,23 @@ imperative_assignment ::= "Increase" assignable "by" expression
 assignable            ::= identifier | member_access | index_access
 
 type_annotation       ::= "as" type_expression
+
+trailing_type_annotation ::= "of" "type" type_expression
+
+Note: On `Let`, type annotations follow the bound expression rather than appearing between
+Note: the identifier and the value. The pre-value form "Let X as Type be Value" was removed
+Note: at v0.0.8.5 because it was ambiguous with multi-word natural-language identifiers
+Note: containing "as" (e.g. "Let my grades as a highschooler be 12"). The new sentinel is
+Note: the two-token sequence "of type" appearing AFTER the bound expression. The constructor
+Note: expression "a value of type T with ..." consumes its own "of type" internally and does
+Note: not collide with the trailing form, because the trailing form is recognised only once
+Note: the bound expression has fully terminated.
+Note:
+Note: `Define` and `Constant` declarations retain the pre-value `as Type` form because
+Note: their value-introduction keyword is `as` (in `Define`'s `as expression` rule) or
+Note: `is` (in `Constant NAME as TYPE is VALUE`). Those forms are unambiguous: their
+Note: introduction keywords are distinct from the type-annotation `as`, so multi-word
+Note: identifier collection has a clean stop signal. Only `Let` needed the migration.
 ```
 
 **Key Pattern**: Variable operations use encasing syntax:

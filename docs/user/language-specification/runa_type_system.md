@@ -154,16 +154,21 @@ matrix: Array[Integer, 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 #### Canon Mode
 ```runa
-Note: Explicit type annotation
-Let user_name as String be "Alice"
-Let user_age as Integer be 30
-Let user_scores as List of Integer be a list containing 85, 92, 78
+Note: Explicit type annotation (trailing `of type` form)
+Let user_name be "Alice" of type String
+Let user_age be 30 of type Integer
+Let user_scores be a list containing 85, 92, 78 of type List of Integer
 
 Note: Type inference (preferred when obvious)
 Let user_name be "Alice"          Note: Inferred as String
 Let user_age be 30                Note: Inferred as Integer
 Let user_scores be a list containing 85, 92, 78  Note: Inferred as List of Integer
 ```
+
+The annotation appears AFTER the bound expression with the two-token sentinel
+`of type`. The earlier pre-value form `Let X as Type be Value` was removed at
+v0.0.8.5 because it was ambiguous with multi-word natural-language identifiers
+containing `as` (for example, `Let my grades as a highschooler be 12`).
 
 #### Developer Mode
 ```runa
@@ -183,7 +188,7 @@ user_scores = [85, 92, 78]   Note: Inferred as List of Integer
 ##### The Any Type (Discouraged)
 ```runa
 Note: Canon Mode - requires explicit type checking
-Let mixed_list as List of Any be a list containing 1, "hello", 3.14
+Let mixed_list be a list containing 1, "hello", 3.14 of type List of Any
 
 Note: Developer Mode - requires explicit type checking
 mixed_list: List[Any] = [1, "hello", 3.14]
@@ -195,7 +200,7 @@ Note: Define union type first for type safety
 Type StringIntFloat is String OR Integer OR Float
 
 Note: Canon Mode - type-safe mixed list
-Let mixed_list as List of StringIntFloat be a list containing 1, "hello", 3.14
+Let mixed_list be a list containing 1, "hello", 3.14 of type List of StringIntFloat
 
 Note: Developer Mode - type-safe mixed list
 mixed_list: List[StringIntFloat] = [1, "hello", 3.14]

@@ -1132,7 +1132,7 @@ mixed = [1, "hello", 3.14]  Note: List[Any]
 #### The Any Type (Discouraged)
 ```runa
 Note: Canon Mode - explicit Any type
-Let mixed_list as List of Any be a list containing 1, "hello", 3.14
+Let mixed_list be a list containing 1, "hello", 3.14 of type List of Any
 
 Note: Developer Mode
 mixed_list: List[Any] = [1, "hello", 3.14]
@@ -1144,7 +1144,7 @@ Note: Define union type first
 Type StringIntFloat is String OR Integer OR Float
 
 Note: Canon Mode - type-safe mixed list
-Let mixed_list as List of StringIntFloat be a list containing 1, "hello", 3.14
+Let mixed_list be a list containing 1, "hello", 3.14 of type List of StringIntFloat
 
 Note: Developer Mode
 mixed_list: List[StringIntFloat] = [1, "hello", 3.14]
@@ -1265,7 +1265,7 @@ Let mixed be a list containing 1, "hello", true
 
 Note: Compatible types -> Union type (when explicitly defined)
 Type NumberOrString is Integer OR String
-Let compatible as List of NumberOrString be a list containing 1, "hello", 42
+Let compatible be a list containing 1, "hello", 42 of type List of NumberOrString
 ```
 
 ## Advanced Collection Patterns
@@ -1501,24 +1501,54 @@ values = user.values()
 
 ## Type Annotations
 
+### Trailing Type Annotations on Let
+
+Type annotations on `Let` declarations appear AFTER the bound expression using the
+two-token sentinel `of type`:
+
+```
+Let <identifier> be <expression> [of type <type-expression>]
+```
+
+This trailing form is the only accepted syntax. The earlier pre-value form
+`Let X as Type be Value` was removed because `as` is a legal token inside a
+multi-word natural-language identifier (for example,
+`Let my grades as a highschooler be 12`), and a pre-value `as` lookahead is
+ambiguous in that context. The trailing `of type` sentinel is unambiguous: the
+expression parser greedily consumes everything that belongs to the value, and the
+`of type` annotation is recognised only after the bound expression has terminated.
+
+The constructor expression `a value of type T with field as v, ...` consumes its
+own `of type` internally and is unaffected — the trailing annotation only applies
+to a `Let` binding once the inner expression is complete. Both of the following
+parse cleanly:
+
+```runa
+Note: Constructor on the RHS, no trailing type annotation
+Let p be a value of type Point with x as 10
+
+Note: Constructor on the RHS, trailing type annotation also present
+Let p be a value of type Point with x as 10 of type Point
+```
+
 ### Explicit Type Annotations
 
 #### Canon Mode
 ```runa
 Note: Explicit list type
-Let scores as List of Integer be a list containing 95, 87, 92
+Let scores be a list containing 95, 87, 92 of type List of Integer
 
 Note: Explicit dictionary type
-Let user_data as Dictionary of String, Any be a dictionary containing:
+Let user_data be a dictionary containing:
     "name" as "Alice",
     "age" as 30
-End Dictionary
+End Dictionary of type Dictionary of String, Any
 
 Note: Complex nested type
-Let matrix as List of List of Float be a list containing:
+Let matrix be a list containing:
     a list containing 1.0, 2.0, 3.0,
     a list containing 4.0, 5.0, 6.0
-End List
+End List of type List of List of Float
 ```
 
 #### Developer Mode
@@ -1555,7 +1585,7 @@ matrix: List[List[Float]] = [
 
 ```runa
 Note: Use Arrays for fixed-size numeric data
-Let vertex as Array of 3 Floats be an array containing x, y, z
+Let vertex be an array containing x, y, z of type Array of 3 Floats
 
 Note: Use Lists for dynamic collections
 Let items be a list containing initial_items
@@ -1572,11 +1602,11 @@ End Dictionary
 ### Type Errors
 ```runa
 Note: This will cause a compile-time error:
-Let numbers as List of Integer be a list containing 1, "two", 3
+Let numbers be a list containing 1, "two", 3 of type List of Integer
 Note: Error: Cannot assign String "two" to List of Integer
 
 Note: This requires explicit handling:
-Let mixed as List of Any be a list containing 1, "two", 3
+Let mixed be a list containing 1, "two", 3 of type List of Any
 Note: Runtime type checking required when accessing elements
 ```
 
@@ -1601,17 +1631,17 @@ Note: Good - let the compiler infer
 Let numbers be a list containing 1, 2, 3, 4, 5
 
 Note: Unnecessary - type is obvious
-Let numbers as List of Integer be a list containing 1, 2, 3, 4, 5
+Let numbers be a list containing 1, 2, 3, 4, 5 of type List of Integer
 ```
 
 ### 2. Use Union Types for Mixed Data
 ```runa
 Note: Good - explicit and type-safe
 Type JsonValue is String OR Integer OR Float OR Boolean OR None
-Let json_array as List of JsonValue be a list containing 1, "hello", 3.14, true, None
+Let json_array be a list containing 1, "hello", 3.14, true, None of type List of JsonValue
 
 Note: Avoid - requires runtime type checking everywhere
-Let json_array as List[Any] = [1, "hello", 3.14, true, None]
+Let json_array be a list containing 1, "hello", 3.14, true, None of type List of Any
 ```
 
 ### 3. Choose Appropriate Collection Types
@@ -4433,8 +4463,8 @@ Type called "Node" with annotation @ARC:
     prev as weak Node      Note: Weak reference (does NOT increment)
 End Type
 
-Let a as @ARC be Node.new(1)
-Let b as @ARC be Node.new(2)
+Let a be Node.new(1) of type @ARC
+Let b be Node.new(2) of type @ARC
 
 Set a.next to b     Note: Strong: a → b (b.count = 1)
 Set b.prev to a     Note: Weak: b ⇢ a (a.count still 1, no cycle)
