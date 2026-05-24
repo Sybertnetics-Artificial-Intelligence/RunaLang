@@ -565,105 +565,345 @@ Process called "Console_readChar" takes console as Integer returns Integer:
 End Process
 
 Note: ============================================================================
-Note: Convenience Functions (Global Console Instance)
+Note: Convenience Functions
 Note: ============================================================================
 
-Note: Global console instance for convenience
-Note: Initialized lazily on first use
-Constant GLOBAL_CONSOLE_PTR as Integer is 0
+Note:
+These convenience entry points (print, println, printErr, printlnErr, readLine,
+readInput) are stateless wrappers over the I/O primitives in console_primitive.
+They do NOT cache a Console object. Programs that need TTY detection,
+auto-flush control, terminal size, buffered I/O, or read state should
+construct an explicit Console via Console_create and use the Console_* methods.
 
-Process called "getGlobalConsole" returns Integer:
-    Note: Get or create global console instance
-    Note: Returns: Pointer to global Console instance
+The previous implementation maintained a GLOBAL_CONSOLE_PTR cache cell
+initialized lazily on first call. That cache layer was removed because:
+(1) it added no measurable value over the primitives' direct fd routing,
+(2) it introduced soft init-order constraints between the allocator and the
+write path, and (3) the "Constant X is 0" + memory_set_int64 pattern used to
+maintain the cache compiled to a literal-inlining lowering under the
+bootstrap codegen, producing a NULL dereference on every convenience call.
+The fix removes the cache entirely; the primitives already encapsulate every
+piece of state these wrappers need.
 
-    Note: Check if already initialized
-    Let current be proc memory_get_int64 from Memory with GLOBAL_CONSOLE_PTR, 0
-
-    If current is not equal to 0:
-        Return current
-    End If
-
-    Note: Create new console
-    Let console be proc Console_create
-
-    If console is equal to 0:
-        Return 0
-    End If
-
-    Note: Store globally
-    proc memory_set_int64 from Memory with GLOBAL_CONSOLE_PTR, 0, console
-
-    Return console
-End Process
+See DEV-LOG #115 and the P1-A console+arc globals design document for the
+full diagnosis and ratification record.
+:End Note
 
 Process called "print" takes message as Integer returns Integer:
-    Note: Convenience function: print to stdout using global console
-    Note: Returns: IOResult pointer
+    @Reasoning:
+        Goal: provide the simplest possible stdout write entry point for user
+        programs, returning a structured IOResult that distinguishes success
+        from error without requiring the caller to construct any Console
+        object. The previous implementation went through a lazy-initialized
+        global Console cache; that cache contributed nothing to the actual
+        write path (the primitive itself owns the fd and length probing) and
+        introduced the NULL-dereference described in DEV-LOG #115. Going
+        directly to console_write_string_stdout eliminates the failure mode
+        without losing any functionality.
+    @End Reasoning
 
-    Let console be proc getGlobalConsole
-    If console is equal to 0:
-        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_HANDLE from IOCore, 0
+    @Implementation:
+        Steps:
+            1. Reject NULL message immediately with IO_ERROR_INVALID_ARGUMENT
+               so callers cannot trigger a primitive-level fault.
+            2. Forward the message pointer to console_write_string_stdout,
+               which writes via the write(STDOUT_FD, ...) syscall.
+            3. Negative return from the primitive is a negated errno: invert
+               its sign to produce the positive error_code that IOResult
+               expects, then wrap as io_result_error.
+            4. Non-negative return is the byte count: wrap as io_result_success.
+    @End Implementation
+
+    @Performance_Hints:
+        Single function-call hop plus one write(2) syscall. The primitive
+        invokes string_length once on the message to determine the write
+        length, which is O(n) in message size. No allocation, no cache
+        maintenance, no init-order constraints.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller controls message pointer only. NULL is explicitly rejected.
+        Non-NULL pointers are passed through to the primitive, which performs
+        a length probe (string_length) before the syscall; that probe will
+        walk memory until a 0 byte, so callers MUST guarantee the message is
+        a valid null-terminated buffer they own. No allocation occurs here,
+        so no resource leak is possible regardless of the primitive result.
+    @End Security_Scope
+
+    If message is equal to 0:
+        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_ARGUMENT from IOCore, 0
     End If
 
-    Return proc Console_write with console, message
+    Let bytes_written be proc console_write_string_stdout from ConsolePrimitive with message
+
+    If bytes_written is less than 0:
+        Let error_code be 0 minus bytes_written
+        Return proc io_result_error from IOCore with error_code, 0
+    End If
+
+    Return proc io_result_success from IOCore with bytes_written
 End Process
 
 Process called "println" takes message as Integer returns Integer:
-    Note: Convenience function: print + newline to stdout using global console
-    Note: Returns: IOResult pointer
+    @Reasoning:
+        Goal: write a message followed by a single LF byte to stdout in one
+        atomic primitive call. Atomicity here matters because interleaved
+        writes from concurrent processes would otherwise be possible if the
+        message and the newline were written as two separate write(2) calls.
+        console_writeln_stdout owns the concatenation strategy at the
+        primitive level, so this wrapper just forwards the message and the
+        error/result envelope.
+    @End Reasoning
 
-    Let console be proc getGlobalConsole
-    If console is equal to 0:
-        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_HANDLE from IOCore, 0
+    @Implementation:
+        Steps:
+            1. NULL guard returning IO_ERROR_INVALID_ARGUMENT.
+            2. Forward to console_writeln_stdout, which writes message bytes
+               plus the terminating LF in one syscall when possible.
+            3. Negative primitive return -> io_result_error(abs(rc), 0).
+            4. Non-negative primitive return -> io_result_success(bytes_written),
+               where bytes_written includes the newline byte.
+    @End Implementation
+
+    @Performance_Hints:
+        Same complexity as print: one length probe (O(n)) followed by one
+        write(2) syscall. The primitive may issue a second syscall on
+        unusually short writes to flush the newline, but the common case is
+        a single combined write.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller controls message pointer only. NULL is rejected. Length is
+        determined by the primitive via string_length; caller must guarantee
+        the message buffer is null-terminated and owned. No allocation here.
+    @End Security_Scope
+
+    If message is equal to 0:
+        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_ARGUMENT from IOCore, 0
     End If
 
-    Return proc Console_writeln with console, message
+    Let bytes_written be proc console_writeln_stdout from ConsolePrimitive with message
+
+    If bytes_written is less than 0:
+        Let error_code be 0 minus bytes_written
+        Return proc io_result_error from IOCore with error_code, 0
+    End If
+
+    Return proc io_result_success from IOCore with bytes_written
 End Process
 
 Process called "printErr" takes message as Integer returns Integer:
-    Note: Convenience function: print to stderr using global console
-    Note: Returns: IOResult pointer
+    @Reasoning:
+        Goal: stderr counterpart to print. stderr is unbuffered on most
+        platforms by default, which matters for diagnostic output: a crash
+        between print() and an explicit flush could swallow the user's
+        diagnostic. Routing diagnostics through stderr via this wrapper
+        preserves that property without forcing the caller to manage the fd.
+    @End Reasoning
 
-    Let console be proc getGlobalConsole
-    If console is equal to 0:
-        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_HANDLE from IOCore, 0
+    @Implementation:
+        Steps:
+            1. NULL guard returning IO_ERROR_INVALID_ARGUMENT.
+            2. Forward to console_write_string_stderr, which targets
+               STDERR_FD instead of STDOUT_FD.
+            3. Negative -> io_result_error(abs(rc), 0).
+            4. Non-negative -> io_result_success(bytes_written).
+    @End Implementation
+
+    @Performance_Hints:
+        Identical cost profile to print: O(n) length probe plus one write(2)
+        syscall, with no allocation. stderr is conventionally unbuffered, so
+        each call results in an immediate kernel write rather than batching
+        into a user-space buffer.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller controls message pointer only. NULL is rejected. Length is
+        determined by the primitive via string_length; caller must guarantee
+        the message buffer is null-terminated and owned. Output goes to
+        STDERR_FD which may be redirected by the parent process, but
+        this wrapper does not introspect or modify that routing.
+    @End Security_Scope
+
+    If message is equal to 0:
+        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_ARGUMENT from IOCore, 0
     End If
 
-    Return proc Console_writeErr with console, message
+    Let bytes_written be proc console_write_string_stderr from ConsolePrimitive with message
+
+    If bytes_written is less than 0:
+        Let error_code be 0 minus bytes_written
+        Return proc io_result_error from IOCore with error_code, 0
+    End If
+
+    Return proc io_result_success from IOCore with bytes_written
 End Process
 
 Process called "printlnErr" takes message as Integer returns Integer:
-    Note: Convenience function: print + newline to stderr using global console
-    Note: Returns: IOResult pointer
+    @Reasoning:
+        Goal: stderr counterpart to println. Same atomicity argument as
+        println applies: diagnostic lines should not be split across writes,
+        otherwise interleaved output from concurrent processes corrupts the
+        diagnostic stream. The primitive console_writeln_stderr concatenates
+        the message and LF in one syscall when possible.
+    @End Reasoning
 
-    Let console be proc getGlobalConsole
-    If console is equal to 0:
-        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_HANDLE from IOCore, 0
+    @Implementation:
+        Steps:
+            1. NULL guard returning IO_ERROR_INVALID_ARGUMENT.
+            2. Forward to console_writeln_stderr.
+            3. Negative -> io_result_error(abs(rc), 0).
+            4. Non-negative -> io_result_success(bytes_written including LF).
+    @End Implementation
+
+    @Performance_Hints:
+        Same O(n) length probe plus one (usually) write(2) syscall. stderr
+        is unbuffered, so the LF byte takes effect immediately.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller controls message pointer only. NULL rejected. No allocation
+        occurs in this function; no leak is possible on the primitive's
+        error path.
+    @End Security_Scope
+
+    If message is equal to 0:
+        Return proc io_result_error from IOCore with proc IO_ERROR_INVALID_ARGUMENT from IOCore, 0
     End If
 
-    Return proc Console_writelnErr with console, message
+    Let bytes_written be proc console_writeln_stderr from ConsolePrimitive with message
+
+    If bytes_written is less than 0:
+        Let error_code be 0 minus bytes_written
+        Return proc io_result_error from IOCore with error_code, 0
+    End If
+
+    Return proc io_result_success from IOCore with bytes_written
 End Process
 
 Process called "readLine" takes max_length as Integer returns Integer:
-    Note: Convenience function: read line from stdin using global console
-    Note: Returns: Pointer to allocated string, or 0 on failure/EOF
+    @Reasoning:
+        Goal: read one line of input from stdin into a freshly allocated
+        buffer that the caller can treat as a null-terminated string. The
+        previous Console-based implementation routed through a cached
+        Console object; that cache layer is gone, so we allocate the buffer
+        directly and call the primitive line-reader. Returning 0 on every
+        failure mode (alloc failure, primitive error, EOF, invalid size)
+        keeps the caller contract uniform: a non-zero return is always a
+        valid owned buffer the caller must eventually deallocate.
+    @End Reasoning
 
-    Let console be proc getGlobalConsole
-    If console is equal to 0:
+    @Implementation:
+        Steps:
+            1. Reject max_length < 2: the primitive requires room for at
+               least one byte of content plus the null terminator.
+            2. Allocate a buffer of max_length bytes from the layout
+               allocator. Return 0 on alloc failure.
+            3. Call console_read_line_stdin, which reads bytes until either
+               newline or max_length-1 bytes have been read, then writes a
+               null terminator at the end of the content.
+            4. On primitive error (negative return), deallocate the buffer
+               and return 0 so no leak survives the failure.
+            5. On success, return the buffer pointer. The primitive has
+               already null-terminated; no extra termination needed.
+    @End Implementation
+
+    @Performance_Hints:
+        One allocation (max_length bytes) plus at least one read(2) syscall.
+        The primitive reads byte-by-byte to detect the newline, so total
+        syscall count is O(line_length); for typical interactive input this
+        is dominated by user think-time, not syscall overhead.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller controls max_length only. Buffer is allocated here and the
+        ownership of the returned pointer transfers to the caller, who must
+        deallocate it via the matching layout deallocate. On any error path,
+        this function deallocates internally so no leak occurs. The primitive
+        bounds the read by max_length-1, preventing buffer overflow.
+    @End Security_Scope
+
+    If max_length is less than 2:
         Return 0
     End If
 
-    Return proc Console_readln with console, max_length
+    Let buffer be proc allocate from Layout with max_length
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_read be proc console_read_line_stdin from ConsolePrimitive with buffer, max_length
+
+    If bytes_read is less than 0:
+        proc deallocate from Layout with buffer
+        Return 0
+    End If
+
+    Return buffer
 End Process
 
 Process called "readInput" takes length as Integer returns Integer:
-    Note: Convenience function: read bytes from stdin using global console
-    Note: Returns: Pointer to allocated buffer, or 0 on failure/EOF
+    @Reasoning:
+        Goal: read an arbitrary byte range from stdin into a freshly
+        allocated buffer that the caller can treat as a null-terminated
+        C-style string. Unlike readLine, this does NOT stop on newline -
+        the caller asked for exactly length bytes (or fewer on EOF). The
+        underlying primitive is console_read_stdin_raw which performs a
+        single read(2) without delimiter handling.
+    @End Reasoning
 
-    Let console be proc getGlobalConsole
-    If console is equal to 0:
+    @Implementation:
+        Steps:
+            1. Reject length < 1.
+            2. Allocate length + 1 bytes (extra byte for the null
+               terminator we append ourselves; the raw primitive does NOT
+               null-terminate).
+            3. Call console_read_stdin_raw with the buffer and the requested
+               length (NOT length + 1 - the extra byte is exclusively for
+               our terminator).
+            4. On error, deallocate and return 0.
+            5. On success, write a 0 byte at offset bytes_read so the buffer
+               is a valid null-terminated string regardless of input content
+               (a short read leaves the slop region uninitialized; we
+               terminate at the actual content boundary).
+    @End Implementation
+
+    @Performance_Hints:
+        One allocation (length + 1 bytes) plus one read(2) syscall. Unlike
+        readLine, this is a single-shot read: the kernel returns whatever
+        is available up to length bytes, without per-byte newline detection.
+        Total cost is dominated by the syscall for non-trivial lengths.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Caller controls length only. Buffer is allocated here and the
+        ownership of the returned pointer transfers to the caller. On any
+        error path this function deallocates internally. The +1 extra byte
+        guarantees null termination cannot overflow the allocated region.
+        The read is bounded at length bytes; no overflow into the
+        terminator slot is possible.
+    @End Security_Scope
+
+    If length is less than 1:
         Return 0
     End If
 
-    Return proc Console_read with console, length
+    Let buffer_size be length plus 1
+    Let buffer be proc allocate from Layout with buffer_size
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_read be proc console_read_stdin_raw from ConsolePrimitive with buffer, length
+
+    If bytes_read is less than 0:
+        proc deallocate from Layout with buffer
+        Return 0
+    End If
+
+    Note: Null-terminate immediately after the read region so the caller
+    Note: can treat the buffer as a C-style string regardless of input content.
+    proc memory_set_byte from Memory with buffer, bytes_read, 0
+
+    Return buffer
 End Process

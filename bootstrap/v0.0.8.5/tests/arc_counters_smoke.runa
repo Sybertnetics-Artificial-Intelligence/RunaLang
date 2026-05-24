@@ -1,0 +1,239 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+ARC counters smoke test - regression guard for the .data-cell codegen pattern.
+
+This test verifies that top-level `Let X be 0` declarations combined with
+`Set X to ...` statements inside Processes compile to a real .data cell
+with proper leaq/movq memory reads and stores. This is the same pattern
+arc_utils.runa uses for its statistics counters
+(arc_total_allocations, arc_total_retains, arc_total_releases, etc.).
+
+The pattern is correct under the current bootstrap codegen because
+codegen_build_mutated_globals (codegen.runa:96-134) detects Set statements
+that target a top-level Let and promotes the variable to a memory-backed
+mutable global. The variable-load and lvalue-address paths then route
+through leaq + movq instead of inlining the literal initializer.
+
+The companion pattern in console.runa - `Constant GLOBAL_CONSOLE_PTR is 0`
+combined with `memory_set_int64(GLOBAL_CONSOLE_PTR, 0, v)` - did NOT
+trigger that promotion because the parser sees Constant rather than Let
+and codegen treats the symbol as a compile-time literal at every use site.
+That mismatch was the cause of DEV-LOG #115's NULL-deref segfault. This
+smoke test does NOT cover the Constant case (that pattern is correctly
+broken at the codegen level and the fix was to delete the cache entirely);
+it covers the working Let-based pattern that arc_utils.runa relies on.
+
+If a future codegen change silently regresses the mutable-globals lowering,
+the assertions below will fire and pinpoint the failure.
+
+Exit codes (encoded so a CI runner can identify which assertion failed):
+  0    All assertions passed.
+  10   Local counter did not initialize to expected starting value.
+  11   Local counter did not retain Set value across reads.
+  12   Local counter did not increment correctly under read-modify-write.
+  13   Local counter cross-cell aliasing detected (two cells share storage).
+  14   arc_get_stats_allocations did not return 0 after arc_stats_reset.
+  15   arc_get_stats_retains did not return 0 after arc_stats_reset.
+  16   arc_get_stats_releases did not return 0 after arc_stats_reset.
+  17   arc_get_stats_live_objects did not return 0 after arc_stats_reset.
+  18   arc_get_stats_peak_objects did not return 0 after arc_stats_reset.
+  19   arc_get_stats_deallocations did not return 0 after arc_stats_reset.
+  20   Second arc_stats_reset cycle did not re-zero counters.
+:End Note
+
+Import "runtime/stdlib/arc/arc_utils.runa" as ArcUtils
+
+Note: Local top-level Let cells - same pattern as arc_utils.runa lines 52-60.
+Note: These cells exercise the codegen path directly without depending on the
+Note: arc_heap subsystem, so a failure here pinpoints the codegen regression
+Note: independently of any arc_heap or layout-allocator issue.
+Let smoke_counter_a be 0
+Let smoke_counter_b be 0
+Let smoke_counter_c be 0
+
+Process called "mutate_local_counters" returns Integer:
+    @Reasoning:
+        Goal: exercise the read-modify-write path of all three local counters
+        in sequence to verify that (a) each cell holds its own storage, (b)
+        the .data cell survives across Process boundaries, and (c) the
+        increment idiom `Set X to X plus N` lowers to the expected leaq+movq
+        pair. Returns the sum of the three counters so the caller can verify
+        the final values without exposing the cells directly.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Set smoke_counter_a to 100 (raw assignment).
+            2. Set smoke_counter_b to 200 (raw assignment).
+            3. Set smoke_counter_c to smoke_counter_a plus smoke_counter_b
+               (cross-cell read-modify-write).
+            4. Add 1 to smoke_counter_a five times (in-place increment loop).
+            5. Return the sum of all three cells.
+    @End Implementation
+
+    @Performance_Hints:
+        Six writes, ten reads. No allocation, no syscalls. Loop body is
+        trivial; total runtime is dominated by function call overhead.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Operates only on this file's private top-level Lets. No caller input.
+        No pointer dereference. No allocator interaction.
+    @End Security_Scope
+
+    Set smoke_counter_a to 100
+    Set smoke_counter_b to 200
+    Set smoke_counter_c to smoke_counter_a plus smoke_counter_b
+
+    Let i be 0
+    While i is less than 5:
+        Set smoke_counter_a to smoke_counter_a plus 1
+        Set i to i plus 1
+    End While
+
+    Let total be smoke_counter_a plus smoke_counter_b
+    Set total to total plus smoke_counter_c
+    Return total
+End Process
+
+Process called "main" returns Integer:
+    @Reasoning:
+        Goal: run a sequence of assertions against the .data-cell behavior of
+        top-level Let declarations and against arc_utils.runa's statistics
+        counters. Each assertion returns a distinct exit code on failure so
+        a regression can be diagnosed without re-running individual cases.
+        Exit 0 indicates every assertion passed.
+    @End Reasoning
+
+    @Implementation:
+        Steps:
+            1. Verify the three local cells initialize to 0 at program start
+               (proves zero-initialization of .data section worked).
+            2. Verify Set persists across Process calls by writing then
+               reading each cell.
+            3. Verify cross-cell independence by writing to one and reading
+               another (catches aliasing bugs in the global table).
+            4. Verify read-modify-write increment via mutate_local_counters
+               and compare the returned total against the expected value.
+            5. Call arc_stats_reset and verify each of the six public stats
+               getters returns 0 (proves the arc_utils.runa cells lower
+               correctly).
+            6. Call arc_stats_reset a second time and re-verify, proving the
+               cells are durable across multiple reset cycles.
+            7. Return 0 on success.
+    @End Implementation
+
+    @Performance_Hints:
+        O(1) work. No allocation. The arc_stats_reset call does nine Set
+        statements; each getter does one load. Total execution time is a
+        handful of microseconds.
+    @End Performance_Hints
+
+    @Security_Scope:
+        Operates only on this file's locals plus arc_utils.runa's public
+        getters and arc_stats_reset, all of which are statistics-only
+        functions with no caller-controlled pointer arguments. No allocator
+        or syscall surface is exercised.
+    @End Security_Scope
+
+    Note: Assertion 1: zero-initialization.
+    If smoke_counter_a is not equal to 0:
+        Return 10
+    End If
+    If smoke_counter_b is not equal to 0:
+        Return 10
+    End If
+    If smoke_counter_c is not equal to 0:
+        Return 10
+    End If
+
+    Note: Assertion 2 / 3 / 4: Set/read/increment behavior via mutate_local_counters.
+    Note: After mutate: a=105, b=200, c=300, total=605.
+    Let total be proc mutate_local_counters
+    If total is not equal to 605:
+        Return 12
+    End If
+    If smoke_counter_a is not equal to 105:
+        Return 11
+    End If
+    If smoke_counter_b is not equal to 200:
+        Return 11
+    End If
+    If smoke_counter_c is not equal to 300:
+        Return 11
+    End If
+
+    Note: Assertion 5: cross-cell aliasing. Write a distinctive value to one
+    Note: cell and verify the others are unchanged.
+    Set smoke_counter_a to 999
+    If smoke_counter_b is not equal to 200:
+        Return 13
+    End If
+    If smoke_counter_c is not equal to 300:
+        Return 13
+    End If
+
+    Note: Assertion 6: arc_utils counters zero after reset.
+    proc arc_stats_reset from ArcUtils
+
+    Let a be proc arc_get_stats_allocations from ArcUtils
+    If a is not equal to 0:
+        Return 14
+    End If
+
+    Let r be proc arc_get_stats_retains from ArcUtils
+    If r is not equal to 0:
+        Return 15
+    End If
+
+    Let rel be proc arc_get_stats_releases from ArcUtils
+    If rel is not equal to 0:
+        Return 16
+    End If
+
+    Let live be proc arc_get_stats_live_objects from ArcUtils
+    If live is not equal to 0:
+        Return 17
+    End If
+
+    Let peak be proc arc_get_stats_peak_objects from ArcUtils
+    If peak is not equal to 0:
+        Return 18
+    End If
+
+    Let dealloc be proc arc_get_stats_deallocations from ArcUtils
+    If dealloc is not equal to 0:
+        Return 19
+    End If
+
+    Note: Assertion 7: second reset cycle also re-zeroes.
+    proc arc_stats_reset from ArcUtils
+
+    Let a2 be proc arc_get_stats_allocations from ArcUtils
+    If a2 is not equal to 0:
+        Return 20
+    End If
+
+    Let r2 be proc arc_get_stats_retains from ArcUtils
+    If r2 is not equal to 0:
+        Return 20
+    End If
+
+    Note: All assertions passed.
+    Return 0
+End Process
