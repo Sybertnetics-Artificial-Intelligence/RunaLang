@@ -219,18 +219,35 @@ Process called "token_can_continue_identifier" takes token_type as Integer retur
         Return 1
     Otherwise If token_type is equal to 181:  Note: TOKEN_FOREVER
         Return 1
-    Otherwise If token_type is equal to 182:  Note: TOKEN_JOINED
-        Return 1
     Otherwise If token_type is equal to 177:  Note: TOKEN_LEFT
         Return 1
     Otherwise If token_type is equal to 178:  Note: TOKEN_RIGHT
         Return 1
-    Otherwise If token_type is equal to 175:  Note: TOKEN_BITWISE
-        Return 1
-    Otherwise If token_type is equal to 176:  Note: TOKEN_SHIFTED
-        Return 1
-    Otherwise If token_type is equal to 179:  Note: TOKEN_CONTAINS
-        Return 1
+    Note:
+    TOKEN_BITWISE (175), TOKEN_SHIFTED (176), TOKEN_CONTAINS (179), and
+    TOKEN_JOINED (182) are EXCLUDED from the continuation set. Each of
+    these tokens unambiguously introduces a binary-operator phrase at
+    use-position:
+      - `X bitwise and/or/xor [by] Y`
+      - `X shifted left/right by Y`
+      - `X contains Y`           (with optional `key`/`index` discriminator)
+      - `X joined with Y`        (string concatenation)
+    Including them as continuation words caused the multi-word identifier
+    collector to greedily swallow the operator keyword as part of the
+    left operand's name (e.g. `value shifted right by amount` was
+    collected as identifier `value_shifted_right`, leaving `by` as the
+    next token and producing a spurious parser error). The lexer already
+    tokenises underscore-joined forms like `bitwise_or` as a single
+    TOKEN_IDENTIFIER (since `_` is part of the word-character class in
+    lexer_read_word), so the D8 space-underscore equivalence is preserved
+    for actual identifier names — only the bare operator triggers are
+    excluded here. TOKEN_LEFT (177) and TOKEN_RIGHT (178) remain in the
+    continuation set: they only carry operator semantics AFTER
+    TOKEN_SHIFTED, never as the lone start of an operator phrase in
+    expression context, so they cannot independently misbind. (Bug
+    diagnosed via canary_emit_hex_word on memory/layout.runa:1284; see
+    DEV-LOGS/104-layout-runa-parser-fix.md.)
+    :End Note
     Otherwise If token_type is equal to 150:  Note: TOKEN_KEY
         Return 1
     Otherwise If token_type is equal to 151:  Note: TOKEN_LENGTH
@@ -257,21 +274,38 @@ End Process
 Note:
 parser_collect_multiword_identifier — multi-word identifier collector.
 
-Stage 1 dead-code helper (task #95). Reads the current identifier token as
+Stage 1 helper (task #95), upgraded under Stage 3 v2 with the CTO-ratified
+SAME-LINE CONTINUATION CONSTRAINT. Reads the current identifier token as
 the first word, then greedily collects continuation words from successive
-cached tokens (gated by token_can_continue_identifier above). Words are
-joined with a single underscore between them — per CEO ruling D8, spaces and
-underscores are equivalent in identifier names, and the v0.0.8.5 codebase
-canonically uses underscore form, so producing "my_count" for source
-"my count" means downstream codegen/symbol-table lookups continue to match
-their existing storage form without any further canonicalization at the
-lookup site.
+cached tokens. Continuation acceptance requires BOTH:
+  (a) token_can_continue_identifier returns 1 for the candidate type, AND
+  (b) the candidate token's source line equals the FIRST word's source line.
+Words are joined with a single underscore between them — per CEO ruling D8,
+spaces and underscores are equivalent in identifier names, and the v0.0.8.5
+codebase canonically uses underscore form, so producing "my_count" for
+source "my count" means downstream codegen/symbol-table lookups continue
+to match their existing storage form without any further canonicalization
+at the lookup site.
+
+Same-line constraint rationale (2026-05-23 CTO ruling): the Runa lexer
+skips ALL whitespace including newlines and emits NO statement-terminator
+tokens. At variable-USE positions in `parser_parse_primary`, the token
+following a single-word identifier may be the first token of the NEXT
+statement (commonly TOKEN_IDENTIFIER for function-call statements). Without
+the same-line constraint, the collector would greedily consume that
+next-statement IDENT as a continuation word, producing nonsense joined
+names like `token_type_parser_eat`. The same-line constraint stops the
+collector at the end of any single-line statement: cross-line consumption
+becomes impossible. Multi-word identifiers in idiomatic Runa do not span
+lines, so the constraint loses no legitimate program. Token line is
+populated by the lexer at offset 16 of the token struct.
 
 Contract:
 - Caller has already verified the current token is identifier-eligible
   (token_can_be_identifier returned 1).
 - The current token is consumed (eaten) along with every subsequent token
-  that token_can_continue_identifier accepts.
+  that (i) token_can_continue_identifier accepts AND (ii) lies on the same
+  source line as the first word.
 - Returns a freshly heap-allocated, NUL-terminated string containing the
   joined name. Caller owns the allocation.
 
@@ -280,23 +314,27 @@ parser_eat, parser_advance lexes the next token and re-caches it there.
 The collector therefore does NOT need lexer save/restore: it inspects the
 cached token at parser+8 as the candidate next word, and either commits
 (parser_eat consumes it and re-caches the following token) or stops. No
-token is consumed unless token_can_continue_identifier accepted it, so the
-lexer state is never disturbed.
+token is consumed unless both gates accept it, so the lexer state is
+never disturbed.
 :End Note
 Process called "parser_collect_multiword_identifier" takes parser as Integer returns Integer:
     Note: First word — captured from the currently cached token, which the
-    Note: caller has already verified is identifier-eligible.
+    Note: caller has already verified is identifier-eligible. We also
+    Note: capture the first word's source line (token offset 16) so that
+    Note: the continuation loop can enforce the same-line constraint.
     Let mw_first_token be memory_get_pointer(parser, 8)
     Let mw_first_type be memory_get_integer(mw_first_token, 0)
     Let mw_first_value be memory_get_pointer(mw_first_token, 8)
+    Let mw_first_line be memory_get_int32(mw_first_token, 16)
     Let mw_accum be string_duplicate_parser(mw_first_value)
     parser_eat(parser, mw_first_type)
 
     Note: Continuation loop. Each iteration inspects the freshly cached token
-    Note: at parser+8 as the candidate next word. If it passes the
-    Note: continuation predicate, we commit (eat it, append "_word" to the
-    Note: accumulator, and the next parser_advance inside parser_eat re-caches
-    Note: the following token). Otherwise we stop without consuming anything.
+    Note: at parser+8 as the candidate next word. If it passes BOTH the
+    Note: continuation predicate AND the same-line guard, we commit (eat it,
+    Note: append "_word" to the accumulator, and the next parser_advance
+    Note: inside parser_eat re-caches the following token). Otherwise we
+    Note: stop without consuming anything.
     Let mw_loop be 1
     While mw_loop is equal to 1:
         Let mw_cand_token be memory_get_pointer(parser, 8)
@@ -305,14 +343,17 @@ Process called "parser_collect_multiword_identifier" takes parser as Integer ret
         Let mw_cand_value_dup be 0
         If mw_cand_token is not equal to 0:
             Set mw_cand_type to memory_get_integer(mw_cand_token, 0)
-            Let mw_cand_ok be token_can_continue_identifier(mw_cand_type)
-            If mw_cand_ok is equal to 1:
-                Note: Duplicate the candidate's word value before we eat the
-                Note: token; parser_eat -> parser_advance -> token_destroy
-                Note: will free the token-owned string, but our duplicate
-                Note: lives on independently.
-                Set mw_cand_value_dup to string_duplicate_parser(memory_get_pointer(mw_cand_token, 8))
-                Set mw_continue to 1
+            Let mw_cand_line be memory_get_int32(mw_cand_token, 16)
+            If mw_cand_line is equal to mw_first_line:
+                Let mw_cand_ok be token_can_continue_identifier(mw_cand_type)
+                If mw_cand_ok is equal to 1:
+                    Note: Duplicate the candidate's word value before we eat
+                    Note: the token; parser_eat -> parser_advance -> token_destroy
+                    Note: will free the token-owned string, but our duplicate
+                    Note: lives on independently.
+                    Set mw_cand_value_dup to string_duplicate_parser(memory_get_pointer(mw_cand_token, 8))
+                    Set mw_continue to 1
+                End If
             End If
         End If
 
@@ -336,6 +377,83 @@ Process called "parser_collect_multiword_identifier" takes parser as Integer ret
     End While
 
     Return mw_accum
+End Process
+
+Note:
+parser_collect_multiword_identifier_binding — multi-word identifier
+collector for BINDING positions.
+
+Task #95 Stages 5-9 architectural addendum. Identical to
+parser_collect_multiword_identifier except TOKEN_AS (34) terminates the
+collection instead of continuing it. This distinction reflects a
+fundamental grammar fact: at BINDING positions (Let-name, For-each
+iterator, For-from range variable, Process parameter, Type field name,
+Constant name, Lambda parameter), the keyword `as` introduces a type
+clause that delimits the identifier — `Let x as Type be V`,
+`For each x as Type in C`, `takes x as Type returns R`,
+`field as Type`, `Constant N as Type is V`, `lambda (x as Type) -> E`.
+At USE positions (expression-level variable references), `as` may
+legitimately appear inside a multi-word identifier — the CEO motivating
+example "my grades as a highschooler" is a USE-position reference.
+
+Same-line constraint, continuation-set semantics, and underscore-joiner
+canonicalization are identical to the base collector. The only
+difference is the AS short-circuit at the start of each loop body: if
+the candidate token type is TOKEN_AS, we stop before invoking the
+continuation predicate.
+
+Contract: same as parser_collect_multiword_identifier — caller has
+verified the current token is identifier-eligible; returns a
+freshly-allocated NUL-terminated joined-name string.
+:End Note
+Process called "parser_collect_multiword_identifier_binding" takes parser as Integer returns Integer:
+    Let mwb_first_token be memory_get_pointer(parser, 8)
+    Let mwb_first_type be memory_get_integer(mwb_first_token, 0)
+    Let mwb_first_value be memory_get_pointer(mwb_first_token, 8)
+    Let mwb_first_line be memory_get_int32(mwb_first_token, 16)
+    Let mwb_accum be string_duplicate_parser(mwb_first_value)
+    parser_eat(parser, mwb_first_type)
+
+    Let mwb_loop be 1
+    While mwb_loop is equal to 1:
+        Let mwb_cand_token be memory_get_pointer(parser, 8)
+        Let mwb_continue be 0
+        Let mwb_cand_type be 0
+        Let mwb_cand_value_dup be 0
+        If mwb_cand_token is not equal to 0:
+            Set mwb_cand_type to memory_get_integer(mwb_cand_token, 0)
+            Note: BINDING-context short-circuit: TOKEN_AS (34) always
+            Note: delimits an identifier at a binding position. We stop
+            Note: BEFORE running the continuation predicate so that
+            Note: `Let x as Type`, `takes x as Type`, etc., parse
+            Note: correctly with x as a single-word name (or with the
+            Note: collected multi-word name accumulated so far).
+            If mwb_cand_type is not equal to 34:
+                Let mwb_cand_line be memory_get_int32(mwb_cand_token, 16)
+                If mwb_cand_line is equal to mwb_first_line:
+                    Let mwb_cand_ok be token_can_continue_identifier(mwb_cand_type)
+                    If mwb_cand_ok is equal to 1:
+                        Set mwb_cand_value_dup to string_duplicate_parser(memory_get_pointer(mwb_cand_token, 8))
+                        Set mwb_continue to 1
+                    End If
+                End If
+            End If
+        End If
+
+        If mwb_continue is equal to 1:
+            parser_eat(parser, mwb_cand_type)
+            Let mwb_sep be memory_allocate(2)
+            memory_set_byte(mwb_sep, 0, 95)
+            memory_set_byte(mwb_sep, 1, 0)
+            Let mwb_with_sep be string_concat(mwb_accum, mwb_sep)
+            Let mwb_joined be string_concat(mwb_with_sep, mwb_cand_value_dup)
+            Set mwb_accum to mwb_joined
+        Otherwise:
+            Set mwb_loop to 0
+        End If
+    End While
+
+    Return mwb_accum
 End Process
 
 Note:
@@ -878,18 +996,23 @@ Process called "parser_parse_primary_with_postfix" takes parser as Integer retur
                 End If
             End If
 
-            Let token_value be memory_get_pointer(current_token2, 8)
-            Let field_name be string_duplicate_parser(token_value)
-            Note: Eat the actual token class — keyword-class tokens like TOKEN_LENGTH
-            Note: are accepted as field names via token_can_be_identifier, but a hard-coded
-            Note: parser_eat(parser, 53) would fail on those.
-            If dot_can_id is equal to 1:
-                parser_eat(parser, token_type2)
-            Otherwise:
-                parser_eat(parser, 53)
-            End If
-
-            Note: Check if this is module.function() by peeking for '('
+            Note:
+            Read the field-access RHS via the binding-context multi-word
+            collector — task #95 Stage 10. The binding collector reads
+            the first word and joins same-line non-AS continuation
+            tokens with single underscores (D8 canonicalization).
+            Critical Stage 10 invariant: `obj.field plus 5` must parse
+            as `(obj.field) plus 5`, NOT `obj.(field plus 5)`. The
+            continuation set excludes TOKEN_PLUS (16) and all binary
+            operators (per Stage 1 design), so the collector terminates
+            at `plus`. Same-line constraint (Stage 3 v2) prevents
+            cross-statement consumption of the next statement's first
+            identifier. For a single-word field name, the loop exits
+            immediately and the returned name is byte-identical to
+            what the previous string_duplicate_parser + parser_eat
+            path produced.
+            :End Note
+            Let field_name be parser_collect_multiword_identifier_binding(parser)
             Let next_token be memory_get_pointer(parser, 8)
             Let next_type be memory_get_integer(next_token, 0)
             If next_type is equal to 48:  Note: TOKEN_LPAREN - this is module.function()
@@ -1987,15 +2110,21 @@ Note: function-body statement parser inside parser_parse_function.
 Process called "parser_parse_call_statement" takes parser as Integer returns Integer:
     parser_eat(parser, 183)  Note: Eat 'Call'
 
-    Let call_name_token be memory_get_pointer(parser, 8)
-    Let call_name_type be memory_get_integer(call_name_token, 0)
-    Let call_func_name be string_duplicate_parser(memory_get_pointer(call_name_token, 8))
-    Let call_name_can_id be token_can_be_identifier(call_name_type)
-    If call_name_can_id is equal to 1:
-        parser_eat(parser, call_name_type)
-    Otherwise:
-        parser_eat(parser, 53)
-    End If
+    Note:
+    Parse the Call statement's function name via the binding-context
+    multi-word identifier collector — task #95 Stage 9. The binding
+    collector reads the first word and joins same-line non-AS
+    continuation tokens with single underscores (D8 canonicalization).
+    At a Call site the next token after the function name is one of
+    TOKEN_DOT (51, module-qualified), TOKEN_FROM (144, from-Module
+    clause), TOKEN_WITH (114, with-args clause), or a statement
+    boundary — none of which are in the continuation set, so the
+    collector terminates correctly. AS does not legitimately follow a
+    Call's function-name in the current grammar; using the binding
+    variant is a defensive consistency choice that aligns with other
+    name-read sites at Stage 9.
+    :End Note
+    Let call_func_name be parser_collect_multiword_identifier_binding(parser)
 
     Note: Optional dot notation: Call Module.function
     Let call_module_name be 0
@@ -2274,9 +2403,26 @@ Process called "parser_parse_a_value_of_type" takes parser as Integer, value_kw_
             If avot_is_field is equal to 0:
                 Set avot_parsing_fields to 0
             Otherwise:
-                Let avot_field_name_raw be memory_get_pointer(avot_field_token, 8)
-                Let avot_field_name be string_duplicate(avot_field_name_raw)
-                parser_eat(parser, avot_field_tt)
+                Note:
+                Read the field name. If the first token is a string
+                literal (avot_field_tt == 10), preserve the existing
+                single-token dictionary-literal path (the string's value
+                pointer already holds the unquoted content). Otherwise,
+                use the binding-context multi-word collector so that
+                multi-word field names declared with the Stage 7 wiring
+                (e.g. `x coordinate as Integer`) can be initialized at
+                constructor sites (e.g. `with x coordinate as 3`). The
+                binding variant terminates on TOKEN_AS so the trailing
+                `as <value>` clause parses correctly. — task #95 Stage 7.
+                :End Note
+                Let avot_field_name be 0
+                If avot_field_tt is equal to 10:
+                    Let avot_field_name_raw be memory_get_pointer(avot_field_token, 8)
+                    Set avot_field_name to string_duplicate(avot_field_name_raw)
+                    parser_eat(parser, avot_field_tt)
+                Otherwise:
+                    Set avot_field_name to parser_collect_multiword_identifier_binding(parser)
+                End If
                 parser_eat(parser, 34)  Note: TOKEN_AS
                 Let avot_val_expr be parser_parse_expression(parser)
                 Let avot_val_offset be avot_field_count multiplied by 8
@@ -2403,7 +2549,13 @@ Process called "parser_parse_proc_expression" takes parser as Integer returns In
                 End While
             End If
 
-            Let proc_arg_expr be parser_parse_expression(parser)
+            Note: Use additive-level parsing for `with`-form args (no closing delimiter)
+            Note: so trailing comparisons/logical ops bind to the WHOLE call expression,
+            Note: not to the last argument. Matches behavior of the parens-form arg parser
+            Note: at parser_parse_primary_with_postfix. Fixes BF: `While proc f from M with
+            Note: a, b is not equal to 0:` was mis-parsed with `is not equal to 0` absorbed
+            Note: into arg `b`, so the proc-call result became the While condition.
+            Let proc_arg_expr be parser_parse_additive(parser)
             Set proc_arg_expr to parser_handle_named_arg_capture(parser, proc_arg_expr, proc_name_slot)
             Let proc_arg_name be memory_get_pointer(proc_name_slot, 0)
             Set proc_last_was_named to 0
@@ -3388,19 +3540,25 @@ Note: immutability, so the constant just becomes a regular local. Callers should
 Note: use Set sparingly to preserve the intended semantics.
 Process called "parser_parse_local_constant_statement" takes parser as Integer returns Integer:
     parser_eat(parser, 164)  Note: Eat 'Constant'
-    Let lc_name_tok be memory_get_pointer(parser, 8)
-    Let lc_name_type be memory_get_integer(lc_name_tok, 0)
-    Let lc_name_val be memory_get_pointer(lc_name_tok, 8)
-    Let lc_name be 0
-    If lc_name_val is not equal to 0:
-        Set lc_name to string_duplicate_parser(lc_name_val)
-    End If
-    Let lc_name_can_id be token_can_be_identifier(lc_name_type)
-    If lc_name_can_id is equal to 1:
-        parser_eat(parser, lc_name_type)
-    Otherwise:
-        parser_eat(parser, 53)
-    End If
+    Note:
+    Parse the local constant's name via the binding-context multi-word
+    identifier collector — task #95 Stage 8. The binding collector
+    reads the first word, joins same-line non-AS continuation tokens
+    with single underscores (D8 canonicalization), and stops at the
+    trailing TOKEN_AS that introduces the type clause. For a
+    single-word constant name, the loop exits immediately and the
+    returned name is byte-identical to what the previous
+    string_duplicate_parser path produced. The previous can_be_id
+    gating + single-token eat is subsumed by the collector, which is
+    safe because the binding collector itself relies on
+    token_can_continue_identifier (a more conservative predicate than
+    token_can_be_identifier) starting from the first token; the
+    caller's responsibility is to pass a first token that is
+    legitimately an identifier start. Constant-statement parsing
+    reaches this point only after eating TOKEN_CONSTANT, so the next
+    token is the name by grammar.
+    :End Note
+    Let lc_name be parser_collect_multiword_identifier_binding(parser)
 
     parser_eat(parser, 34)  Note: Eat 'as'
 
@@ -4394,9 +4552,22 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             exit_with_code(1)
         End If
 
-        Let token_value be memory_get_pointer(current_token, 8)
-        Let field_name be string_duplicate_parser(token_value)
-        parser_eat(parser, 53)  Note: Eat field name
+        Note:
+        Read the field name in the canonical `the FIELD of OBJECT`
+        form via the binding-context multi-word collector — task #95
+        Stage 10. The TOKEN_IDENTIFIER gate above ensures the first
+        token is a plain identifier; the collector then joins same-line
+        non-AS continuation tokens. TOKEN_OF (125) is excluded from
+        the continuation set, so the collector terminates correctly
+        at the trailing `of` clause. The `Let token_value be 0`
+        declaration below preserves the function-scope variable
+        `token_value` that downstream Set-statements (line ~4570 in
+        the collection-literal branch) write to; the prior code
+        introduced `token_value` here via `Let token_value be
+        memory_get_pointer(...)` before reading the field name.
+        :End Note
+        Let token_value be 0
+        Let field_name be parser_collect_multiword_identifier_binding(parser)
 
         Note: Expect 'of' keyword
         Set current_token to memory_get_pointer(parser, 8)
@@ -5219,7 +5390,45 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             End If
         End If
 
-        Let dummy7 be parser_eat(parser, token_type)
+        Note:
+        Multi-word identifier dispatch — task #95 Stage 3 v2. The general
+        identifier branch in parser_parse_primary handles variable USE,
+        type-name constructor, and variant-name constructor paths. Only the
+        plain variable-USE case (is_type == 0 AND is_variant == 0) should
+        consume continuation words via the multi-word collector — the type
+        and variant constructor paths downstream (lines 5260+ for explicit
+        `TypeName as Variant`, ~5351 for implicit variant construction)
+        all require `name` to remain the exact single-word constructor
+        target so that string_equals against the type / variant registries
+        keeps matching. For those paths we retain the original
+        single-token parser_eat.
+
+        For the variable-USE case, parser_collect_multiword_identifier
+        eats the first token AND every subsequent same-line continuation
+        token gated by token_can_continue_identifier, returning the
+        underscore-joined name. The same-line constraint (ratified by the
+        CTO under Stage 3 v2 — see lead Note on the collector at line
+        ~257) prevents the collector from greedily consuming the first
+        token of the next statement, which was the architectural blocker
+        identified in the prior Stage 3 attempt. We then replace the
+        previously-captured single-word `name` (from
+        Let name be string_duplicate_parser(value_str) at line 4875) with
+        the collector's multi-word return so the default
+        expression_create_variable(name) emission downstream produces the
+        correct EXPR_VARIABLE.
+        :End Note
+        Let mw_use_collector be 1
+        If is_type is equal to 1:
+            Set mw_use_collector to 0
+        End If
+        If is_variant is equal to 1:
+            Set mw_use_collector to 0
+        End If
+        If mw_use_collector is equal to 1:
+            Set name to parser_collect_multiword_identifier(parser)
+        Otherwise:
+            Let dummy7 be parser_eat(parser, token_type)
+        End If
 
         Note: Check for explicit variant syntax "TypeName as VariantName".
         Note: GATED on is_type=1 - the variant-constructor path requires that the
@@ -5777,7 +5986,19 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
         Let param_size be param_capacity multiplied by 8
         Set param_names to memory_allocate(param_size)
 
-        Note: Parse first parameter
+        Note:
+        Parse first lambda parameter via the binding-context multi-word
+        identifier collector — task #95 Stage 8. Lambda parameter
+        grammar uses `,` or `:` after each parameter name (no `as Type`
+        clause inside the parameter list), so the AS short-circuit in
+        the binding collector is not strictly needed here; it is
+        nevertheless used for uniformity at all binding positions. The
+        gate on TOKEN_IDENTIFIER (53) is preserved for error-message
+        compatibility — the lexer emits the lambda's first parameter
+        word as TOKEN_IDENTIFIER in current grammars; if a more
+        permissive first-token policy is desired in the future, the
+        gate can be widened.
+        :End Note
         Let param_token be memory_get_pointer(parser, 8)
         Let param_token_type be memory_get_int32(param_token, 0)
         If param_token_type is not equal to 53:  Note: TOKEN_IDENTIFIER
@@ -5785,11 +6006,9 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
             print_newline()
             exit_with_code(1)
         End If
-        Let param_name_temp be memory_get_pointer(param_token, 8)
-        Let param_name be string_duplicate_parser(param_name_temp)
+        Let param_name be parser_collect_multiword_identifier_binding(parser)
         memory_set_pointer(param_names, 0, param_name)
         Set param_count to 1
-        parser_eat(parser, 53)  Note: Eat parameter name
 
         Note: Parse additional parameters (comma-separated)
         Let continue_params be 1
@@ -5809,14 +6028,17 @@ Process called "parser_parse_primary" takes parser as Integer returns Integer:
                     exit_with_code(1)
                 End If
 
-                Let param_name_temp2 be memory_get_pointer(param_token2, 8)
-                Let param_name2 be string_duplicate_parser(param_name_temp2)
+                Note:
+                Parse additional lambda parameter via the binding-context
+                multi-word identifier collector — task #95 Stage 8.
+                Mirror of the first-parameter site above.
+                :End Note
+                Let param_name2 be parser_collect_multiword_identifier_binding(parser)
 
                 Note: Store parameter
                 Let param_offset be param_count multiplied by 8
                 memory_set_pointer(param_names plus param_offset, 0, param_name2)
                 Set param_count to param_count plus 1
-                parser_eat(parser, 53)  Note: Eat parameter name
             Otherwise:
                 Set continue_params to 0
             End If
@@ -6306,12 +6528,23 @@ Process called "parser_parse_for_range_statement" takes parser as Integer return
     If peek_token_type is equal to 145:  Note: TOKEN_EACH
         parser_eat(parser, 145)  Note: TOKEN_EACH
 
-        Note: Parse loop variable name
-        Let current_token be memory_get_pointer(parser, 8)
-        Let token_type be memory_get_int32(current_token, 0)
-        Let var_name_temp be memory_get_pointer(current_token, 8)
-        Let var_name be string_duplicate(var_name_temp)
-        parser_eat(parser, token_type)
+        Note:
+        Parse loop variable name. Task #95 Stage 5 — wire the multi-word
+        identifier collector at the For-Each loop variable position.
+        Uses the BINDING-context collector so the optional `as Type`
+        clause that follows (lines below) is left intact for the
+        existing TOKEN_AS-detection branch. The collector reads the
+        first word, then joins any same-line non-AS continuation tokens
+        with single underscores (D8 canonicalization). For a single-word
+        loop variable (e.g. "i" or "item"), the loop exits immediately
+        and the returned name is byte-identical to what the previous
+        single-token path produced. The same-line constraint (Stage 3 v2)
+        prevents cross-statement consumption. The previously-declared
+        local names current_token, token_type, var_name_temp, and
+        var_name are no longer needed at this site; the collector
+        encapsulates the read and eat together.
+        :End Note
+        Let var_name be parser_collect_multiword_identifier_binding(parser)
 
         Note: Optional type annotation: `For each X as Type in collection`.
         Note: Captures the type name as a duplicated string so the codegen can
@@ -6371,13 +6604,24 @@ Process called "parser_parse_for_range_statement" takes parser as Integer return
         Return foreach_stmt
     End If
 
-    Note: Handle "For i from start to end by step"
-    Note: Parse loop variable name
-    Set current_token to memory_get_pointer(parser, 8)
-    Set token_type to memory_get_int32(current_token, 0)
-    Set var_name_temp to memory_get_pointer(current_token, 8)
-    Set var_name to string_duplicate(var_name_temp)
-    parser_eat(parser, token_type)
+    Note:
+    Handle "For i from start to end by step". Task #95 Stage 5 — the
+    multi-word identifier binding-context collector is wired at the
+    For-from range variable position. Same rationale as the For-Each
+    site above: the binding collector reads the first word, then joins
+    same-line non-AS continuation tokens (D8 canonicalization to
+    underscores). For a single-word range variable, the collector
+    returns the single word; for a multi-word name, the same-line
+    constraint (Stage 3 v2) prevents over-consumption of TOKEN_FROM
+    (which is excluded from the continuation set) or the next
+    statement's first identifier. The previously-used helper locals
+    current_token, token_type, var_name_temp, and the string_duplicate
+    call are subsumed by the collector. The binding variant is used for
+    symmetry with the For-Each site, even though the For-from grammar
+    has no AS clause — uniformity at all binding sites simplifies
+    reasoning.
+    :End Note
+    Set var_name to parser_collect_multiword_identifier_binding(parser)
 
     parser_eat(parser, 144)  Note: TOKEN_FROM
     Let start_expr be parser_parse_expression(parser)
@@ -6577,10 +6821,22 @@ Process called "parser_parse_match_statement" takes parser as Integer returns In
                     Set pattern_type to PATTERN_WILDCARD
                     parser_eat(parser, 161)
                 Otherwise If pattern_token_type is equal to 53:  Note: TOKEN_IDENTIFIER
-                    Note: Peek ahead to see if this is "identifier of type" pattern
-                    Let ident_value_temp be memory_get_pointer(pattern_token, 8)
-                    Let ident_value be string_duplicate_parser(ident_value_temp)
-                    parser_eat(parser, 53)
+                    Note:
+                    Read the variant / variable / type-pattern leading
+                    identifier via the binding-context multi-word
+                    collector — task #95 Stage 9. The collector reads
+                    the first word and joins same-line non-AS
+                    continuation tokens with single underscores (D8
+                    canonicalization). TOKEN_AS terminates the
+                    collection so the trailing `with field as binding`
+                    field-binding clause parses correctly. For a
+                    single-word variant name, the loop exits
+                    immediately. The downstream OF-peek (line ~6791)
+                    and FROM-Module peek (line ~6839) continue to
+                    inspect the cached token via the existing offsets,
+                    unchanged.
+                    :End Note
+                    Let ident_value be parser_collect_multiword_identifier_binding(parser)
 
                     Let after_ident_token be memory_get_pointer(parser, 8)
                     Let after_ident_type be memory_get_int32(after_ident_token, 0)
@@ -7040,6 +7296,30 @@ Process called "parser_parse_inline_assembly_statement" takes parser as Integer 
     Let dummy1 be parser_eat(parser, 121)  Note: Eat "Inline"
     Let dummy2 be parser_eat(parser, 122)  Note: Eat "Assembly"
 
+    Note: Optional dialect qualifier: "Inline Assembly intel:" or "Inline Assembly att:".
+    Note: When absent, default to Intel (matches the platform/linux_x86_64/* files which
+    Note: are authored in Intel syntax). When "att", codegen emits verbatim with no
+    Note: syntax-switch directives - used by files whose inline asm is already AT&T.
+    Let dialect be 0  Note: 0=intel (default), 1=att
+    Let dialect_check_tok be memory_get_pointer(parser, 8)
+    Let dialect_check_type be memory_get_integer(dialect_check_tok, 0)
+    If dialect_check_type is equal to 53:  Note: TOKEN_IDENTIFIER
+        Let dialect_val be memory_get_pointer(dialect_check_tok, 8)
+        If dialect_val is not equal to 0:
+            Let is_intel be string_equals(dialect_val, "intel")
+            Let is_att be string_equals(dialect_val, "att")
+            If is_intel is equal to 1:
+                Set dialect to 0
+                Let dummy_dialect_intel be parser_advance(parser)
+            Otherwise:
+                If is_att is equal to 1:
+                    Set dialect to 1
+                    Let dummy_dialect_att be parser_advance(parser)
+                End If
+            End If
+        End If
+    End If
+
     Note: Don't eat ":" via parser - we need lexer to be right at it for raw reading
     Note: Get lexer from parser to read raw text
     Let lexer be memory_get_pointer(parser, 0)
@@ -7048,7 +7328,8 @@ Process called "parser_parse_inline_assembly_statement" takes parser as Integer 
     Let colon_char be memory_get_byte(lexer, 20)  Note: Should be ':'
     Let dummy_colon be lexer_advance(lexer)
 
-    Note: Allocate statement: type (4 bytes) + raw_text_ptr (8 bytes) + text_length (4 bytes) = 20 bytes
+    Note: Allocate statement: type (4 bytes) + raw_text_ptr (8 bytes) + text_length (4 bytes)
+    Note: + dialect (4 bytes at offset 20). 32 bytes allocated (room for alignment).
     Let stmt be allocate(32)
     Let stmt_type be 16  Note: STMT_INLINE_ASSEMBLY
     memory_set_int32(stmt, 0, stmt_type)
@@ -7060,6 +7341,9 @@ Process called "parser_parse_inline_assembly_statement" takes parser as Integer 
     Let text_length be string_length(raw_text)
     memory_set_pointer(stmt, 8, raw_text)
     memory_set_int32(stmt, 16, text_length)
+
+    Note: Store dialect flag at offset 20 (0=intel, 1=att) for codegen
+    memory_set_int32(stmt, 20, dialect)
 
     Note: After reading raw text, parser needs to get next token
     Note: The lexer has consumed up to and including "End Assembly"
@@ -7318,9 +7602,22 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                 exit(1)
             End If
 
-            Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-            Let field_name be string_duplicate(token_value)
-            parser_eat(parser, token_type)
+            Note:
+            Parse the field name via the binding-context multi-word
+            identifier collector — task #95 Stage 7. The binding
+            collector reads the first word, then joins same-line non-AS
+            continuation tokens with single underscores (D8
+            canonicalization). TOKEN_AS terminates the collection so
+            the trailing `as Type` field-type clause parses correctly.
+            For a single-word field name, the loop exits immediately
+            and the returned name is byte-identical to what the
+            previous string_duplicate(token_value) path produced. The
+            field_name_ok gate above has already confirmed the first
+            token is identifier-eligible (handling keywords like
+            length, key, count, type, A that are accepted as field
+            names in addition to plain identifiers).
+            :End Note
+            Let field_name be parser_collect_multiword_identifier_binding(parser)
             parser_eat(parser, 34)
 
             Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
@@ -7673,9 +7970,13 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                             exit(1)
                         End If
 
-                        Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-                        Set field_name to string_duplicate(token_value)
-                        parser_eat(parser, 53)
+                        Note:
+                        Variant field name — task #95 Stage 11 audit
+                        migration. Binding-context collector applies:
+                        TOKEN_AS terminates the collection so the
+                        trailing field-type clause parses correctly.
+                        :End Note
+                        Set field_name to parser_collect_multiword_identifier_binding(parser)
                         parser_eat(parser, 34)
 
                         Set current_token to memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
@@ -7753,9 +8054,12 @@ Process called "parser_parse_type_definition" takes parser as Integer returns In
                             exit(1)
                         End If
 
-                        Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-                        Set field_name to string_duplicate(token_value)
-                        parser_eat(parser, 53)
+                        Note:
+                        Variant field name (and-form) — task #95
+                        Stage 11 audit migration. Binding-context
+                        collector: TOKEN_AS terminates correctly.
+                        :End Note
+                        Set field_name to parser_collect_multiword_identifier_binding(parser)
                         parser_eat(parser, 34)
 
                         Note: Parse field type
@@ -7937,9 +8241,20 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
             exit(1)
         End If
 
-        Set token_value to memory_get_pointer(current_token, TOKEN_VALUE_OFFSET)
-        Let param_name be string_duplicate(token_value)
-        parser_eat(parser, token_type)
+        Note:
+        Parse the first parameter's name via the binding-context
+        multi-word identifier collector — task #95 Stage 6. The binding
+        collector reads the first word, then joins same-line non-AS
+        continuation tokens with single underscores (D8 canonicalization).
+        TOKEN_AS terminates the collection so the trailing
+        `as Type` clause parses correctly. For a single-word parameter
+        name, the loop exits immediately and the returned name is
+        byte-identical to what the previous string_duplicate(token_value)
+        path produced. The previously-used token_value local is no
+        longer needed at this site; the collector encapsulates the
+        first-token read and eat.
+        :End Note
+        Let param_name be parser_collect_multiword_identifier_binding(parser)
         parser_eat(parser, 34)
 
         Note: Accept ANY valid type token for parameter types
@@ -8003,9 +8318,14 @@ Process called "parser_parse_function" takes parser as Integer returns Integer:
                 exit(1)
             End If
 
-            Let param_token_value be memory_get_pointer(param_current_token, TOKEN_VALUE_OFFSET)
-            Set param_name to string_duplicate(param_token_value)
-            parser_eat(parser, param_token_type)
+            Note:
+            Parse additional-parameter name via the binding-context
+            multi-word identifier collector — task #95 Stage 6.
+            Mirror of the first-parameter site above. TOKEN_AS
+            terminates the collection so the trailing type clause
+            parses correctly.
+            :End Note
+            Set param_name to parser_collect_multiword_identifier_binding(parser)
             parser_eat(parser, 34)
 
             Note: Accept ANY valid type token for parameter types
@@ -8307,7 +8627,18 @@ End Process
 
 Note: Size constants for structures
 Let SIZEOF_PARSER be 32
-Let SIZEOF_PROGRAM be 64
+Note:
+SIZEOF_PROGRAM = 72.  The Program struct is 64 bytes for the 8-field core
+(functions/types/imports/globals × pointer+count+capacity), plus 4 bytes at
+offset 64 for main_global_count (own-globals boundary captured by main
+before import-merge appends imported globals), plus 4 bytes at offset 68
+for main_global_count_set (boundary-recorded flag). The pre-import main()
+unconditionally writes both fields via memory_set_int32(program, 64, ...)
+and memory_set_int32(program, 68, ...) - SIZEOF_PROGRAM must include them
+or those stores land outside the program allocation and corrupt whatever
+the allocator placed there. Mirrors program_create's 72-byte allocation.
+:End Note
+Let SIZEOF_PROGRAM be 72
 
 Note: Offsets for parser structure
 Let PARSER_LEXER be 0           Note: Lexer *lexer
@@ -8433,6 +8764,17 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
     memory_set_int32(program, PROGRAM_TYPE_CAPACITY, 0)
     memory_set_int32(program, PROGRAM_IMPORT_CAPACITY, 0)
     memory_set_int32(program, PROGRAM_GLOBAL_CAPACITY, 0)
+
+    Note:
+    Initialize the import-boundary fields at offsets 64 and 68. main() writes
+    these after parsing completes to record which globals were declared in
+    the input file versus appended from imports; codegen reads offset 64 to
+    emit only the input file's own globals in .data. Initialize to zero/zero
+    so reads before main's write see a defined state rather than allocator
+    junk. (Matches program_create's initialization for the same fields.)
+    :End Note
+    memory_set_int32(program, 64, 0)  Note: main_global_count = 0
+    memory_set_int32(program, 68, 0)  Note: main_global_count_set = 0
 
     Note: Set current program for type lookups
     memory_set_pointer(parser, PARSER_CURRENT_PROGRAM_OFFSET, program)
@@ -8584,8 +8926,15 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                 Let global_token_type be memory_get_int32(global_current_token, TOKEN_TYPE_OFFSET)
 
                 If global_token_type is equal to 53:  Note: identifier
-                    Let var_name be string_duplicate_parser(memory_get_pointer(global_current_token, TOKEN_VALUE_OFFSET))
-                    parser_eat(parser, 53)
+                    Note:
+                    Parse the global Let's variable name via the
+                    binding-context multi-word identifier collector
+                    — task #95 Stage 11 audit-sweep migration. Mirror
+                    of the function-body Let-statement site at
+                    parser_parse_let_statement. Same-line constraint
+                    and AS-termination apply uniformly.
+                    :End Note
+                    Let var_name be parser_collect_multiword_identifier_binding(parser)
 
                     Let global_be_token be memory_get_pointer(parser, PARSER_CURRENT_TOKEN_OFFSET)
                     Let global_be_type be memory_get_int32(global_be_token, TOKEN_TYPE_OFFSET)
@@ -8633,8 +8982,15 @@ Process called "parser_parse_program" takes parser as Integer returns Integer:
                 Let const_name_type be memory_get_int32(const_name_token, TOKEN_TYPE_OFFSET)
                 Let const_name_is_id be token_can_be_identifier(const_name_type)
                 If const_name_is_id is equal to 1:
-                    Let const_name be string_duplicate_parser(memory_get_pointer(const_name_token, TOKEN_VALUE_OFFSET))
-                    parser_eat(parser, const_name_type)  Note: Eat name (identifier or keyword)
+                    Note:
+                    Parse the global constant's name via the
+                    binding-context multi-word identifier collector —
+                    task #95 Stage 8. Mirror of the local-constant
+                    site at parser_parse_local_constant_statement.
+                    TOKEN_AS terminates the collection so the trailing
+                    type clause parses correctly.
+                    :End Note
+                    Let const_name be parser_collect_multiword_identifier_binding(parser)
 
                     Note: Expect 'as'
                     parser_eat(parser, 34)  Note: Eat 'as'

@@ -143,35 +143,181 @@ Process called "boolean_to_string_alert" that takes value as Integer, buffer as 
 End Process
 
 Process called "float_to_string_alert" that takes value as Integer, buffer as Integer, buffer_size as Integer returns Integer:
-    Note: Convert float to string representation for Alert
-    Note: Returns length of string written, or 0 on error
+    @Reasoning
+    Convert an IEEE 754 binary64 (passed as raw 64-bit integer bits) into a
+    decimal string suitable for stderr diagnostic output. Handles the
+    special cases (NaN, +-infinity, +-zero) up front and otherwise decodes
+    the bit pattern into sign / biased-exponent / mantissa, scales the
+    significand by 10^p (p = 6 fractional digits), and emits the resulting
+    integer's decimal expansion with a decimal point inserted at the
+    appropriate position.
+
+    This is not a Grisu/Ryu shortest-representation formatter - it emits a
+    fixed 6 fractional digits, which is the precision contract Alert callers
+    rely on. For higher-precision output (e.g. analytical exporters), use
+    float128_to_string_auto from string_primitive.runa instead.
+    @End Reasoning
 
     If buffer_size is less than 32:
-        Return 0  Note: Need space for sign, digits, decimal, precision, null
-    End If
-
-    Note: For now, convert the integer part and add ".000000"
-    Note: Full IEEE 754 float parsing requires complex bit manipulation
-    Note: This is a simplified implementation for integers stored as floats
-
-    Let integer_part be value  Note: Treating as integer for simplified version
-    Let int_len be proc integer_to_string_alert with integer_part, buffer, buffer_size minus 8
-
-    If int_len is equal to 0:
         Return 0
     End If
 
-    Note: Add decimal point and zeros
-    proc memory_set_byte from MemoryCore with buffer plus int_len, 0, 46   Note: '.'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 1, 0, 48  Note: '0'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 2, 0, 48  Note: '0'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 3, 0, 48  Note: '0'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 4, 0, 48  Note: '0'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 5, 0, 48  Note: '0'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 6, 0, 48  Note: '0'
-    proc memory_set_byte from MemoryCore with buffer plus int_len plus 7, 0, 0   Note: null
+    Let bits be value
+    Let sign be (bits shifted right by 63) bitwise_and 1
+    Let exp_bits be (bits shifted right by 52) bitwise_and 2047
+    Let mant_bits be bits bitwise_and 4503599627370495
 
-    Return int_len plus 7
+    Note: Special cases: NaN, +/-Infinity, +/-Zero
+    If exp_bits is equal to 2047:
+        If mant_bits is not equal to 0:
+            Note: NaN
+            proc memory_set_byte from MemoryCore with buffer, 0, 110         Note: 'n'
+            proc memory_set_byte from MemoryCore with buffer plus 1, 0, 97   Note: 'a'
+            proc memory_set_byte from MemoryCore with buffer plus 2, 0, 110  Note: 'n'
+            proc memory_set_byte from MemoryCore with buffer plus 3, 0, 0
+            Return 3
+        End If
+        Let pos be 0
+        If sign is equal to 1:
+            proc memory_set_byte from MemoryCore with buffer, 0, 45           Note: '-'
+            Set pos to 1
+        End If
+        proc memory_set_byte from MemoryCore with buffer plus pos, 0, 105     Note: 'i'
+        proc memory_set_byte from MemoryCore with buffer plus pos plus 1, 0, 110  Note: 'n'
+        proc memory_set_byte from MemoryCore with buffer plus pos plus 2, 0, 102  Note: 'f'
+        proc memory_set_byte from MemoryCore with buffer plus pos plus 3, 0, 0
+        Return pos plus 3
+    End If
+
+    Note: Zero (subnormals with very small magnitude also fall through here)
+    If exp_bits is equal to 0:
+        If mant_bits is equal to 0:
+            Let zp be 0
+            If sign is equal to 1:
+                proc memory_set_byte from MemoryCore with buffer, 0, 45       Note: '-'
+                Set zp to 1
+            End If
+            proc memory_set_byte from MemoryCore with buffer plus zp, 0, 48        Note: '0'
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 1, 0, 46 Note: '.'
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 2, 0, 48 Note: '0'
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 3, 0, 48
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 4, 0, 48
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 5, 0, 48
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 6, 0, 48
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 7, 0, 48
+            proc memory_set_byte from MemoryCore with buffer plus zp plus 8, 0, 0
+            Return zp plus 8
+        End If
+    End If
+
+    Note: Normal finite value. Reconstruct full significand (53 bits) and unbiased exponent.
+    Let significand be mant_bits
+    Let unbiased_exp be exp_bits minus 1023
+    If exp_bits is not equal to 0:
+        Set significand to significand bitwise_or 4503599627370496      Note: implied 1.xxx bit
+    Otherwise:
+        Note: Subnormal: implied bit is 0, true exponent is 1 - 1023 = -1022
+        Set unbiased_exp to 0 minus 1022
+    End If
+
+    Note: Now significand * 2^(unbiased_exp - 52) is the value. We want to emit
+    Note: it as an integer times 10^-6, so multiply by 10^6 and bit-shift to
+    Note: align with 2^0. The product fits comfortably in 64 bits for values
+    Note: in the typical alert range (|x| < ~1e13); larger values lose
+    Note: fractional precision but remain readable. Values whose absolute
+    Note: magnitude exceeds 1e15 fall back to scientific-mantissa form below.
+
+    Let effective_exp be unbiased_exp minus 52
+    Let int_part be 0
+    Let frac_x_million be 0
+    Let too_large be 0
+
+    If effective_exp is greater than or equal to 0:
+        Note: Pure-integer value (or larger). Build int_part = significand << effective_exp.
+        Note: Bail to scientific form if it would overflow 60-bit signed range.
+        If effective_exp is greater than 11:
+            Set too_large to 1
+        Otherwise:
+            Set int_part to significand shifted left by effective_exp
+        End If
+        Set frac_x_million to 0
+    Otherwise:
+        Let shift be 0 minus effective_exp
+        If shift is greater than or equal to 63:
+            Note: value < 2^-10 effectively rounds to 0 at 6 digits precision.
+            Set int_part to 0
+            Set frac_x_million to 0
+        Otherwise:
+            Let one be 1
+            Let denom be one shifted left by shift
+            Set int_part to significand divided by denom
+            Let remainder be significand minus (int_part multiplied by denom)
+            Note: frac_x_million = round(remainder * 10^6 / denom)
+            Note: Compute (remainder * 10^6) carefully to stay in 64 bits when shift > 20.
+            If shift is greater than 24:
+                Let pre_shift be shift minus 24
+                Let rem_top be remainder shifted right by pre_shift
+                Let denom_top be denom shifted right by pre_shift
+                If denom_top is equal to 0:
+                    Set denom_top to 1
+                End If
+                Set frac_x_million to (rem_top multiplied by 1000000) divided by denom_top
+            Otherwise:
+                Set frac_x_million to (remainder multiplied by 1000000) divided by denom
+            End If
+            If frac_x_million is greater than 999999:
+                Set frac_x_million to 999999
+            End If
+        End If
+    End If
+
+    If too_large is equal to 1:
+        Note: Magnitude beyond the fixed-format range. Emit "inf"-style
+        Note: sentinel "huge" rather than producing a garbled number.
+        Let hp be 0
+        If sign is equal to 1:
+            proc memory_set_byte from MemoryCore with buffer, 0, 45     Note: '-'
+            Set hp to 1
+        End If
+        proc memory_set_byte from MemoryCore with buffer plus hp, 0, 104          Note: 'h'
+        proc memory_set_byte from MemoryCore with buffer plus hp plus 1, 0, 117   Note: 'u'
+        proc memory_set_byte from MemoryCore with buffer plus hp plus 2, 0, 103   Note: 'g'
+        proc memory_set_byte from MemoryCore with buffer plus hp plus 3, 0, 101   Note: 'e'
+        proc memory_set_byte from MemoryCore with buffer plus hp plus 4, 0, 0
+        Return hp plus 4
+    End If
+
+    Note: Emit sign + integer digits + '.' + 6 fractional digits.
+    Let pos be 0
+    If sign is equal to 1:
+        proc memory_set_byte from MemoryCore with buffer plus pos, 0, 45
+        Set pos to pos plus 1
+    End If
+
+    Let int_len be proc integer_to_string_alert with int_part, buffer plus pos, buffer_size minus pos minus 8
+    If int_len is equal to 0:
+        Return 0
+    End If
+    Set pos to pos plus int_len
+
+    proc memory_set_byte from MemoryCore with buffer plus pos, 0, 46    Note: '.'
+    Set pos to pos plus 1
+
+    Note: Emit 6 fractional digits, zero-padded on the left.
+    Let divisor be 100000
+    Let remaining be frac_x_million
+    Let dcount be 0
+    While dcount is less than 6:
+        Let d be remaining divided by divisor
+        proc memory_set_byte from MemoryCore with buffer plus pos, 0, d plus 48
+        Set pos to pos plus 1
+        Set remaining to remaining minus (d multiplied by divisor)
+        Set divisor to divisor divided by 10
+        Set dcount to dcount plus 1
+    End While
+
+    proc memory_set_byte from MemoryCore with buffer plus pos, 0, 0
+    Return pos
 End Process
 
 Note: ============================================================================

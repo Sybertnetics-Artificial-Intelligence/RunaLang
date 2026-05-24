@@ -93,7 +93,7 @@ ChainedArena structure layout (88 bytes, 11 qwords):
   Offset 56: is_active           1 if the arena is live, 0 if destroyed
   Offset 64: allocation_count    Lifetime allocation count
   Offset 72: total_allocated     Sum of allocation sizes across all blocks
-  Offset 80: peak_usage          Maximum observed usage (sum-of-used) across lifetime
+  Offset 80: peak_usage          High-water mark of total_allocated across lifetime
 
 The 80-byte offset for peak_usage is new in this migration. Prior to the move
 out of compiler/internal/arena_utils.runa, three readers (peak getter, stats
@@ -101,6 +101,22 @@ reset, validate) claimed to read peak_usage but actually read total_allocated
 at offset 72. The struct has been extended to a true 88-byte layout with a
 dedicated peak_usage cell at offset 80 that is updated by chained_arena_allocate
 after every successful bump.
+
+Task #118 (2026-05-24): The peak_usage cell at offset 80 is now maintained
+in O(1) by copying the just-updated total_allocated (offset 72) into it on
+every successful bump. The earlier implementation walked the entire block
+chain on every allocate to recompute sum(block.used) + current_pos, which
+was O(block_count) per allocation and O(N^2) across the parse-phase hot
+path. Because ChainedArena has no per-allocation deallocate (lifetime ops
+are bulk-only), total_allocated is monotonically non-decreasing between
+resets and is identically equal to the peak. The new tracker maintains
+the invariant peak_usage >= current_total_bytes (offset 72) >= 0 by
+construction: all three resetters (create, reset, clear) zero offsets 72
+and 80 together; clone copies both fields verbatim. The peak value
+reported by chained_arena_get_peak_usage now reflects the high-water
+mark of requested-allocation bytes rather than allocation-bytes-plus-
+alignment-padding; this is the figure callers want for capacity planning
+and is monotonically maximal across the arena's life.
 :End Note
 
 Type called "ChainedArena":
@@ -713,22 +729,45 @@ Process called "chained_arena_allocate" takes arena as Integer, size as Integer,
                size=new_block_size, capacity=new_block_size.
             7. Fall through to the fast-path bump using the new block.
 
-        Peak tracking:
-            After every successful bump, compute the arena's current total
-            usage by summing committed block.used across the chain plus the
-            new current_pos. If this exceeds the stored peak_usage at offset
-            80, write the new peak. This costs an O(block_count) chain walk
-            per allocation, which is acceptable because chains stay short
-            (geometric growth keeps log-many blocks even at extreme sizes).
+        Peak tracking (O(1) incremental, Task #118):
+            After every successful bump, write new_total (the just-updated
+            total_allocated at offset 72) into peak_usage at offset 80.
+            Because ChainedArena exposes no per-allocation deallocate path
+            (lifetime ops are bulk-only: destroy, reset, clear), the running
+            sum total_allocated is monotonically non-decreasing for the
+            arena's lifetime between resets, and so is identically equal
+            to the peak. No chain walk is required to compute the maximum.
+
+            Invariant maintained:
+                peak_usage >= current_total_bytes >= 0
+            where current_total_bytes is offset 72 (total_allocated). All
+            three resetters (create, reset, clear) zero offsets 72 and 80
+            together so the invariant survives recycling. The clone path
+            copies both fields verbatim so the snapshot inherits the same
+            invariant.
+
+            Historical note: prior to Task #118 the peak tracker walked the
+            entire block chain on every allocate to recompute sum(block.used)
+            + current_pos. That implementation was O(block_count) per
+            allocation, producing O(N^2) total cost across N allocations
+            in a chain whose block count grows logarithmically with N. For
+            parser-sized inputs the walk dominated parse-phase wall time
+            (see docs/dev/PARSER_PERF_BASELINE.md Win #1). The walk
+            included alignment-padding bytes; the O(1) replacement does
+            not. The peak field remains monotonically correct as a
+            diagnostic measure: it reports the high-water mark of
+            requested allocation bytes, which is the figure callers
+            actually need for capacity planning.
     @End Implementation
 
     @Performance_Hints:
-        Fast path: O(1) plus the peak-tracking chain walk, dominated by the
-        memory_get_integer / memory_set_integer pair on the arena header.
+        Fast path: O(1) with a single memory_get_integer / memory_set_integer
+        pair on the arena header for total_allocated update plus a second
+        memory_set_integer for peak_usage. No loops, no chain walks.
         Slow path: O(1) per grow (two allocate calls plus pointer updates).
-        Peak tracking can be omitted by callers that do not need diagnostics,
-        but is always-on here because the cost is amortized into roughly the
-        same order as the allocation itself for short chains.
+        The O(1) peak tracker was introduced by Task #118; it replaced an
+        O(block_count) chain walk that turned every allocate into a small
+        loop and was the dominant cost on the parse-phase hot path.
     @End Performance_Hints
 
     @Security_Scope:
@@ -853,21 +892,16 @@ Process called "chained_arena_allocate" takes arena as Integer, size as Integer,
     Let new_total be total_allocated plus size
     Let dummy13 be proc memory_set_integer from MemoryCore with arena, 72, new_total
 
-    Note: Update peak usage if current total usage exceeds stored peak.
-    Note: Current total usage = sum of committed block.used + arena.current_pos.
-    Let total_used be 0
-    Let walk_block be proc memory_get_integer from MemoryCore with arena, 40  Note: first_block
-    While walk_block is not equal to 0:
-        Let walk_used be proc memory_get_integer from MemoryCore with walk_block, 16
-        Set total_used to total_used plus walk_used
-        Set walk_block to proc memory_get_integer from MemoryCore with walk_block, 24
-    End While
-    Set total_used to total_used plus new_pos
-
-    Let stored_peak be proc memory_get_integer from MemoryCore with arena, 80
-    If total_used is greater than stored_peak:
-        Let dummy14 be proc memory_set_integer from MemoryCore with arena, 80, total_used
-    End If
+    Note: Update peak usage in O(1). Task #118: ChainedArena has no per-
+    Note: allocation deallocate path (all lifetime ops are bulk: destroy,
+    Note: reset, clear). total_allocated at offset 72 is therefore mono-
+    Note: tonically non-decreasing between resets and is identically equal
+    Note: to the high-water mark. We write new_total directly into the
+    Note: peak_usage cell at offset 80 -- no chain walk required. The
+    Note: invariant peak_usage >= current_total_bytes (offset 72) >= 0 is
+    Note: maintained because new_total is the freshly stored offset-72
+    Note: value and we copy it forward into offset 80 in the same call.
+    Let dummy14 be proc memory_set_integer from MemoryCore with arena, 80, new_total
 
     Return alloc_ptr
 End Process

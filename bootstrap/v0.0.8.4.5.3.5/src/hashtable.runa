@@ -640,14 +640,87 @@ End Process
 
 Note: ==== Memory Helper Functions ====
 
+Note:
+============================================================================
+FUNCTION-POINTER INVOCATION BRIDGE
+============================================================================
+@Reasoning
+The hashtable is generic over its key/value types and uses caller-supplied
+function pointers for hashing (hash_func), equality (compare_func), and
+destruction (free_key, free_value). Runa itself has no first-class call
+site for raw Integer-typed function pointers, so we drop to inline
+assembly to perform the indirect call. Doing this in-source (rather than
+relying on a runtime symbol) keeps stage1 fully self-contained: the
+bootstrap link line does not have to drag in runtime_api.runa just to
+satisfy hashtable's two callbacks.
+@End Reasoning
+
+@Implementation
+System V AMD64 calling convention:
+  - First integer argument is passed in %rdi
+  - Second integer argument is passed in %rsi
+  - Integer return value comes back in %rax
+We load the function pointer into %r11. %r11 is a scratch register that
+the callee may clobber freely, and it is not used to pass arguments, so
+there is no aliasing concern with %rdi/%rsi. The compiler-emitted
+prologue (pushq %rbp; movq %rsp, %rbp; subq $16384, %rsp) already
+aligns %rsp to a 16-byte boundary before the call, so we do not need to
+re-align manually.
+
+Stage1 stack-frame layout (verified empirically against runac):
+  call_function_1(func, arg1):
+    func at -8(%rbp), arg1 at -16(%rbp), result at -24(%rbp)
+  call_function_2(func, arg1, arg2):
+    func at -8(%rbp), arg1 at -16(%rbp), arg2 at -24(%rbp),
+    result at -32(%rbp)
+
+The Let-binding for `result` reserves the slot the inline block writes
+back into; the compiler then loads that slot into %rax for the Return.
+@End Implementation
+
+@Performance_Hints
+A single indirect CALL through %r11. No allocation, no branching, no
+stack manipulation beyond the prologue/epilogue the compiler emits for
+every Process. Callees see a perfectly normal C-ABI call frame.
+@End Performance_Hints
+
+@Security_Scope
+The caller is responsible for ensuring `func` points at executable code
+with the expected (Integer)->Integer or (Integer,Integer)->Integer
+signature. There is no way to validate this at the call site - the
+hashtable trusts whatever the user installed in hash_func / compare_func
+/ free_key / free_value at table-creation time. This matches the C
+source we are transliterating from.
+@End Security_Scope
+:End Note
+
 Process called "call_function_1" takes func as Integer, arg1 as Integer returns Integer:
-    Note: This will be implemented by runtime to call function pointer with 1 arg
-    Return 0
+    Let result be 0
+    Inline Assembly att:
+        # func at -8(%rbp), arg1 at -16(%rbp), result at -24(%rbp).
+        # Load the single integer argument into %rdi per SystemV, the
+        # function pointer into %r11 (scratch), and indirect-call.
+        movq -16(%rbp), %rdi
+        movq -8(%rbp), %r11
+        callq *%r11
+        movq %rax, -24(%rbp)
+    End Assembly
+    Return result
 End Process
 
 Process called "call_function_2" takes func as Integer, arg1 as Integer, arg2 as Integer returns Integer:
-    Note: This will be implemented by runtime to call function pointer with 2 args
-    Return 0
+    Let result be 0
+    Inline Assembly att:
+        # func at -8(%rbp), arg1 at -16(%rbp), arg2 at -24(%rbp),
+        # result at -32(%rbp). Load both integer arguments into the
+        # SystemV registers, function pointer into %r11, indirect-call.
+        movq -16(%rbp), %rdi
+        movq -24(%rbp), %rsi
+        movq -8(%rbp), %r11
+        callq *%r11
+        movq %rax, -32(%rbp)
+    End Assembly
+    Return result
 End Process
 
 Note: Runtime memory functions - provided by C runtime library

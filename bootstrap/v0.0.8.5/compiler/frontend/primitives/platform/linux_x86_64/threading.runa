@@ -17,26 +17,94 @@ Note: pthread syscall numbers (x86_64 Linux)
 Note: clone = 56, futex = 202, set_robust_list = 273
 
 Process called "thread_create" takes function_ptr as Integer, arg_ptr as Integer returns Integer:
-    Note: Create thread using clone syscall
-    Note: Returns thread ID (TID) or 0 on failure
+    Note:
+    Create a new thread that runs function_ptr(arg_ptr) using the Linux clone(2)
+    syscall directly. Returns the child TID (positive) in the parent on success
+    and a negative errno on failure. The child never returns from this function -
+    it jumps directly to function_ptr and is responsible for calling thread_exit.
 
-    Note: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
-    Let flags be 16842752  Note: 0x01010100
+    CLONE flag set for a POSIX-style thread (shared address space, shared FDs,
+    shared signal handlers, same thread group, share SysV SEM_UNDO):
+      CLONE_VM       0x00000100
+      CLONE_FS       0x00000200
+      CLONE_FILES    0x00000400
+      CLONE_SIGHAND  0x00000800
+      CLONE_THREAD   0x00010000
+      CLONE_SYSVSEM  0x00040000
+    Sum = 0x00050F00 = 331520
 
-    Note: Allocate 8KB stack for new thread
-    Let stack_size be 8192
+    Stack layout: we mmap a fresh 64 KiB anonymous region and seed the top of
+    the stack with [function_ptr, arg_ptr] so the child can `ret` into the user
+    function with the correct argument in rdi. Then we invoke clone() inline -
+    immediately after the syscall the child has rax=0 and the parent has rax=tid.
+    We check rax in inline assembly and dispatch:
+      - Parent path: store tid, return normally to caller.
+      - Child path:  pop arg into rdi, pop function_ptr into rax, jump to it.
+        When function_ptr returns, we call exit(0) (syscall 60) so the thread
+        cleanly tears down its stack.
+
+    This routine is the lowest-level threading primitive in the Runa runtime.
+    Every other thread-creation API (thread pools, work-stealing, async runtime)
+    is built on top of this single inline-assembly trampoline.
+    :End Note
+
+    Note: Allocate 64KB stack for new thread (mmap MAP_PRIVATE|MAP_ANONYMOUS, RW)
+    Let stack_size be 65536
     Let stack be proc syscall_mmap from Syscall with 0, stack_size, 3, 34, -1, 0
     If stack is less than 0:
-        Return 0
+        Return -1
     End If
 
-    Note: Stack grows down, so pass stack + size as stack pointer
-    Let stack_ptr be stack plus stack_size
+    Note: Seed top of new stack with [function_ptr, arg_ptr] so child can ret into it.
+    Note: stack_top must remain 16-byte aligned per x86_64 SysV ABI after the two pushes.
+    Let stack_top be stack plus stack_size
 
-    Note: clone(flags, stack_ptr, parent_tid, child_tid, tls)
-    Let tid be proc syscall_5 from Syscall with 56, flags, stack_ptr, 0, 0, 0
+    Note:
+    Lay out child stack from the top down:
+      stack_top - 8  = function_ptr  (popped by child first)
+      stack_top - 16 = arg_ptr       (popped by child second into rdi)
+    Child's rsp on entry will point to stack_top - 16.
+    :End Note
+    proc memory_set_int64 from Memory with stack_top, -8, function_ptr
+    proc memory_set_int64 from Memory with stack_top, -16, arg_ptr
 
-    Return tid
+    Let child_rsp be stack_top minus 16
+    Let flags be 331520
+    Let result be 0
+
+    Inline Assembly att:
+        # clone(flags, child_stack, ptid=NULL, ctid=NULL, tls=NULL)
+        # Locals were allocated in order: function_ptr(rdi)=-8, arg_ptr(rsi)=-16,
+        # stack_size=-24, stack=-32, stack_top=-40, child_rsp=-48, flags=-56, result=-64.
+        movq $56, %rax               # __NR_clone
+        movq -56(%rbp), %rdi         # flags
+        movq -48(%rbp), %rsi         # child_rsp
+        xorq %rdx, %rdx              # ptid = NULL
+        xorq %r10, %r10              # ctid = NULL
+        xorq %r8, %r8                # tls  = NULL
+        syscall
+
+        # rax == 0 in child, == tid in parent, == -errno on failure
+        testq %rax, %rax
+        jnz 1f
+
+        # --- Child path ---
+        # rsp is now child_rsp. Pop arg_ptr into rdi, then function_ptr into rax.
+        popq %rdi                    # arg_ptr
+        popq %rax                    # function_ptr
+        call *%rax                   # invoke user function with arg in rdi
+
+        # User function returned. Cleanly exit this thread.
+        movq $60, %rax               # __NR_exit
+        xorq %rdi, %rdi              # exit status 0
+        syscall
+
+        # --- Parent path / error return ---
+    1:
+        movq %rax, -64(%rbp)         # result <- tid or -errno
+    End Assembly
+
+    Return result
 End Process
 
 Process called "thread_join" takes handle as Integer returns Integer:
