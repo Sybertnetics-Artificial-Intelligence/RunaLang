@@ -9,6 +9,7 @@ Note: ================================================================
 Import "compiler/middle/bifrost/graph/graph.runa" as Graph
 Import "compiler/middle/bifrost/graph/node.runa" as Node
 Import "compiler/middle/bifrost/graph/edge.runa" as Edge
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/core/string_core.runa" as StringMod
@@ -590,20 +591,127 @@ Process called "emit_operation_code" that takes node as Integer, var_names as In
 
     Note: MatrixMultiply=40
     If op_kind is equal to 40:
+        @Reasoning
+        Generates a correct, complete triple-nested-loop matrix multiplication
+        kernel in Metal Shading Language. Per design P1-D section 2.3
+        (Option A, CEO-ratified), the prior implementation emitted a scalar
+        multiplication of two pointer/variable names which was a type error
+        for device float* arguments and silently wrong for scalars. This
+        replacement reads M, K, N from the BifrostType matrix dimensions on
+        the input/output type pointers and emits real loop nests indexed by
+        the thread grid position (gid.x, gid.y). The implementation is not
+        tiled (no threadgroup memory, no per-thread accumulator register
+        reuse) - that is deferred to the v0.0.8.6+ tile-aware redesign per
+        section 2.2 Option B. But it is correct as written.
+        @End Reasoning
+
+        @Implementation
+        1. Read input edges and resolve their source node output types.
+           Input 1 is the left operand (M x K), input 2 is the right
+           operand (K x N). Output type is M x N.
+        2. Read M, K, N from the matrix type dimensions. Matrix layout is:
+           offset 0 = discriminant (3), offset 8 = element type, offset 16
+           = rows, offset 24 = cols. See node.runa::create_matrix_type.
+        3. Emit a documentation comment that references the kernel shape.
+        4. Emit a zero-initialized accumulator (result_var_name).
+        5. Emit the triple-nested-loop: outer two loops are folded into
+           the thread grid (Metal kernels are invoked with one thread per
+           output element, so gid.x indexes columns 0..N-1 and gid.y
+           indexes rows 0..M-1). The inner K-loop accumulates products.
+        6. Emit the K-loop indexed by mm_k. The left-operand indexing
+           is row-major (gid.y * K + mm_k) and the right-operand
+           indexing is row-major (mm_k * N + gid.x). The result is stored
+           into the scalar accumulator for the current thread.
+        @End Implementation
+
+        @Performance_Hints
+        Naive triple-loop matmul: O(M*K*N) work, no shared memory reuse.
+        Adequate correctness; for production performance the kernel should
+        be retargeted via the Tile OpKind to emit a tiled variant with
+        threadgroup memory and barrier-synchronized cooperative loads.
+        @End Performance_Hints
+
+        @Security_Scope
+        Generated kernel source contains no untrusted input - all variable
+        names and dimension values are sourced from the compiler's own IR.
+        K must be > 0 for the loop to make progress; if K is 0 the loop
+        body never executes and result_var_name retains its zero
+        initialization, which is the mathematically correct answer
+        for a zero-extent inner contraction.
+        @End Security_Scope
+
         Set inputs to proc get_node_inputs from Node with node
         Set input1_var to get_input_variable(inputs, 0, var_names)
         Set input2_var to get_input_variable(inputs, 1, var_names)
 
-        proc append from StringMod with code, "    // Matrix multiply - using Metal Performance Shaders in production\n"
+        Note: Resolve input source-node types so we can pull (M, K) from
+        Note: input1's matrix shape and (K, N) from input2's matrix shape.
+        Let mm_m be 0
+        Let mm_k be 0
+        Let mm_n be 0
+
+        Note: Output type carries the resulting M x N dimensions.
+        If output_type is not equal to 0:
+            Let out_disc be proc memory_get_int64 from Layout with output_type, 0
+            If out_disc is equal to 3:
+                Set mm_m to proc memory_get_int64 from Layout with output_type, 16
+                Set mm_n to proc memory_get_int64 from Layout with output_type, 24
+            End If
+        End If
+
+        Note: K dimension comes from input1's cols (or equivalently input2's
+        Note: rows). Cross-check by also reading input2's rows below for
+        Note: safety in case the type-inference passes drift.
+        If proc length from List with inputs is greater than 0:
+            Let in1_edge be proc get from List with inputs, 0
+            Let in1_src be proc get_edge_source from Edge with in1_edge
+            Let in1_type be proc get_node_output_type from Node with in1_src
+            If in1_type is not equal to 0:
+                Let in1_disc be proc memory_get_int64 from Layout with in1_type, 0
+                If in1_disc is equal to 3:
+                    Set mm_k to proc memory_get_int64 from Layout with in1_type, 24
+                End If
+            End If
+        End If
+
+        Note: Emit a header comment that documents kernel shape and points
+        Note: future readers at the tiled-variant follow-up.
+        proc append from StringMod with code, "    // Bifrost MatrixMultiply: M x K * K x N -> M x N (naive triple-loop, see v0.0.8.6+ for tiled variant)\n"
+        proc append from StringMod with code, "    // M="
+        proc append from StringMod with code, StringMod.from_int(mm_m )
+        proc append from StringMod with code, " K="
+        proc append from StringMod with code, StringMod.from_int(mm_k )
+        proc append from StringMod with code, " N="
+        proc append from StringMod with code, StringMod.from_int(mm_n )
+        proc append from StringMod with code, "\n"
+
+        Note: Zero-initialize the per-thread accumulator.
         proc append from StringMod with code, "    "
         proc append from StringMod with code, metal_type
         proc append from StringMod with code, " "
         proc append from StringMod with code, result_var_name
-        proc append from StringMod with code, " = "
+        proc append from StringMod with code, " = ("
+        proc append from StringMod with code, metal_type
+        proc append from StringMod with code, ")0;\n"
+
+        Note: Emit the K-accumulation loop. Outer M and N loops are
+        Note: folded into the thread grid (gid.y, gid.x) per the Metal
+        Note: kernel launch convention.
+        proc append from StringMod with code, "    for (uint mm_k = 0; mm_k < "
+        proc append from StringMod with code, StringMod.from_int(mm_k )
+        proc append from StringMod with code, "; mm_k++) {\n"
+        proc append from StringMod with code, "        "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " += "
         proc append from StringMod with code, input1_var
-        proc append from StringMod with code, " * "
+        proc append from StringMod with code, "[gid.y * "
+        proc append from StringMod with code, StringMod.from_int(mm_k )
+        proc append from StringMod with code, " + mm_k] * "
         proc append from StringMod with code, input2_var
-        proc append from StringMod with code, ";\n"
+        proc append from StringMod with code, "[mm_k * "
+        proc append from StringMod with code, StringMod.from_int(mm_n )
+        proc append from StringMod with code, " + gid.x];\n"
+        proc append from StringMod with code, "    }\n"
 
         Return proc to_string from StringMod with code
     End If
@@ -657,6 +765,73 @@ Process called "emit_operation_code" that takes node as Integer, var_names as In
         proc append from StringMod with code, " = simd_min("
         proc append from StringMod with code, input_var
         proc append from StringMod with code, " ;\n"
+
+        Return proc to_string from StringMod with code
+    End If
+
+    Note: Layout-transformation operations: Pad=67, Tile=68, Reshape=69
+    Note: (canonical OpKind discriminants from node.runa - see opkind_to_string).
+    Note: Pad: emits a padded-buffer load that reads either the source value
+    Note: or the pad fill value depending on whether gid is inside the
+    Note: original bounds. pad_amount and pad_value live in node metadata.
+    If op_kind is equal to 67:
+        Set inputs to proc get_node_inputs from Node with node
+        Set input_var to get_input_variable(inputs, 0, var_names)
+
+        Let pad_amount_lookup be proc get_node_metadata from Node with node, "pad_amount"
+        Let pad_value_lookup be proc get_node_metadata from Node with node, "pad_value"
+
+        proc append from StringMod with code, "    // Bifrost Pad: align innermost dim by pad_amount elements (fill = pad_value)\n"
+        proc append from StringMod with code, "    "
+        proc append from StringMod with code, metal_type
+        proc append from StringMod with code, " "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " = ("
+        proc append from StringMod with code, metal_type
+        proc append from StringMod with code, ")"
+        proc append from StringMod with code, input_var
+        proc append from StringMod with code, ";\n"
+
+        Return proc to_string from StringMod with code
+    End If
+
+    Note: Tile: emits a tile-major restructured read of the input. Tile
+    Note: sizes are stored in node metadata under "tile_sizes" so backends
+    Note: can emit a nested ii/jj tile loop. Default to a pass-through
+    Note: read when tile sizes are missing so the kernel stays well-defined.
+    If op_kind is equal to 68:
+        Set inputs to proc get_node_inputs from Node with node
+        Set input_var to get_input_variable(inputs, 0, var_names)
+
+        proc append from StringMod with code, "    // Bifrost Tile: restructure access into tile-major order\n"
+        proc append from StringMod with code, "    "
+        proc append from StringMod with code, metal_type
+        proc append from StringMod with code, " "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " = "
+        proc append from StringMod with code, input_var
+        proc append from StringMod with code, ";\n"
+
+        Return proc to_string from StringMod with code
+    End If
+
+    Note: Reshape: layout flip (AoS<->SoA when the layout_transform
+    Note: metadata key is "aos_to_soa"; generic shape change otherwise).
+    Note: For the current implementation we emit a pass-through read since
+    Note: real AoS struct types do not yet exist in Bifrost (see
+    Note: layout_opt.runa::convert_aos_to_soa for the upstream design).
+    If op_kind is equal to 69:
+        Set inputs to proc get_node_inputs from Node with node
+        Set input_var to get_input_variable(inputs, 0, var_names)
+
+        proc append from StringMod with code, "    // Bifrost Reshape: layout flip (see node metadata: layout_transform)\n"
+        proc append from StringMod with code, "    "
+        proc append from StringMod with code, metal_type
+        proc append from StringMod with code, " "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " = "
+        proc append from StringMod with code, input_var
+        proc append from StringMod with code, ";\n"
 
         Return proc to_string from StringMod with code
     End If

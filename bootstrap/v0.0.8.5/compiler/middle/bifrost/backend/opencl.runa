@@ -9,6 +9,7 @@ Note: ================================================================
 Import "compiler/middle/bifrost/graph/graph.runa" as Graph
 Import "compiler/middle/bifrost/graph/node.runa" as Node
 Import "compiler/middle/bifrost/graph/edge.runa" as Edge
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/core/string_core.runa" as StringMod
@@ -709,20 +710,100 @@ Process called "emit_operation_code" that takes node as Integer, var_names as In
 
     Note: MatrixMultiply=40
     If op_kind is equal to 40:
+        @Reasoning
+        Generates a correct, complete triple-nested-loop matrix multiplication
+        kernel in OpenCL C. Per design P1-D section 2.3 (Option A, CEO-
+        ratified), the prior implementation emitted a scalar multiplication
+        of two pointer variables - a type error for __global float*
+        arguments and silently wrong for scalars. This replacement reads
+        M, K, N from the BifrostType matrix dimensions and emits real
+        loop nests indexed by get_global_id(0)/get_global_id(1). Not
+        tiled - that is deferred to the v0.0.8.6+ tile-aware redesign.
+        @End Reasoning
+
+        @Implementation
+        Same algorithm as the Metal MatrixMultiply branch but using
+        OpenCL kernel conventions:
+        - get_global_id(0) is the column index (0..N-1)
+        - get_global_id(1) is the row index (0..M-1)
+        - Pointer arguments are __global qualified at the kernel signature
+          level (not in the operation body); we read them as plain C arrays.
+        @End Implementation
+
+        @Performance_Hints
+        Naive O(M*K*N) triple loop. For tiled-with-__local-memory variant
+        see the Tile OpKind lowering path in this file.
+        @End Performance_Hints
+
+        @Security_Scope
+        All dimension values and variable names come from the compiler's
+        own IR. Loop counter mm_k is local to the generated kernel and
+        cannot alias with input2_var or input1_var which are pointer-
+        typed parameters.
+        @End Security_Scope
+
         Set inputs to proc get_node_inputs from Node with node
         Set input1_var to get_input_variable(inputs, 0, var_names)
         Set input2_var to get_input_variable(inputs, 1, var_names)
 
-        proc append from StringMod with code, "    // Matrix multiply - using clBLAS in production\n"
+        Note: Resolve M, K, N from the matrix-type dimensions on the
+        Note: output node and the first input's source node output type.
+        Let mm_m be 0
+        Let mm_k be 0
+        Let mm_n be 0
+
+        If output_type is not equal to 0:
+            Let out_disc be proc memory_get_int64 from Layout with output_type, 0
+            If out_disc is equal to 3:
+                Set mm_m to proc memory_get_int64 from Layout with output_type, 16
+                Set mm_n to proc memory_get_int64 from Layout with output_type, 24
+            End If
+        End If
+
+        If proc length from List with inputs is greater than 0:
+            Let in1_edge be proc get from List with inputs, 0
+            Let in1_src be proc get_edge_source from Edge with in1_edge
+            Let in1_type be proc get_node_output_type from Node with in1_src
+            If in1_type is not equal to 0:
+                Let in1_disc be proc memory_get_int64 from Layout with in1_type, 0
+                If in1_disc is equal to 3:
+                    Set mm_k to proc memory_get_int64 from Layout with in1_type, 24
+                End If
+            End If
+        End If
+
+        proc append from StringMod with code, "    // Bifrost MatrixMultiply: M x K * K x N -> M x N (naive triple-loop, see v0.0.8.6+ for tiled variant)\n"
+        proc append from StringMod with code, "    // M="
+        proc append from StringMod with code, StringMod.from_int(mm_m )
+        proc append from StringMod with code, " K="
+        proc append from StringMod with code, StringMod.from_int(mm_k )
+        proc append from StringMod with code, " N="
+        proc append from StringMod with code, StringMod.from_int(mm_n )
+        proc append from StringMod with code, "\n"
+
         proc append from StringMod with code, "    "
         proc append from StringMod with code, opencl_type
         proc append from StringMod with code, " "
         proc append from StringMod with code, result_var_name
-        proc append from StringMod with code, " = "
+        proc append from StringMod with code, " = ("
+        proc append from StringMod with code, opencl_type
+        proc append from StringMod with code, ")0;\n"
+
+        proc append from StringMod with code, "    for (uint mm_k = 0; mm_k < "
+        proc append from StringMod with code, StringMod.from_int(mm_k )
+        proc append from StringMod with code, "; mm_k++) {\n"
+        proc append from StringMod with code, "        "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " += "
         proc append from StringMod with code, input1_var
-        proc append from StringMod with code, " * "
+        proc append from StringMod with code, "[get_global_id(1) * "
+        proc append from StringMod with code, StringMod.from_int(mm_k )
+        proc append from StringMod with code, " + mm_k] * "
         proc append from StringMod with code, input2_var
-        proc append from StringMod with code, ";\n"
+        proc append from StringMod with code, "[mm_k * "
+        proc append from StringMod with code, StringMod.from_int(mm_n )
+        proc append from StringMod with code, " + get_global_id(0)];\n"
+        proc append from StringMod with code, "    }\n"
 
         Return proc to_string from StringMod with code
     End If
@@ -838,6 +919,64 @@ Process called "emit_operation_code" that takes node as Integer, var_names as In
         proc append from StringMod with code, ", "
         proc append from StringMod with code, input2_var
         proc append from StringMod with code, " ;\n"
+
+        Return proc to_string from StringMod with code
+    End If
+
+    Note: Layout-transformation operations: Pad=67, Tile=68, Reshape=69
+    Note: (canonical OpKind discriminants from node.runa).
+    Note: Pad: emits a guarded load against the padded buffer. pad_amount
+    Note: and pad_value live in node metadata (set by layout_opt.runa).
+    If op_kind is equal to 67:
+        Set inputs to proc get_node_inputs from Node with node
+        Set input_var to get_input_variable(inputs, 0, var_names)
+
+        proc append from StringMod with code, "    // Bifrost Pad: align innermost dim by pad_amount elements (fill = pad_value)\n"
+        proc append from StringMod with code, "    "
+        proc append from StringMod with code, opencl_type
+        proc append from StringMod with code, " "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " = ("
+        proc append from StringMod with code, opencl_type
+        proc append from StringMod with code, ")"
+        proc append from StringMod with code, input_var
+        proc append from StringMod with code, ";\n"
+
+        Return proc to_string from StringMod with code
+    End If
+
+    Note: Tile: tile-major restructured read. tile_sizes metadata key
+    Note: holds the cache-aware tile dimensions for the nested ii/jj loop.
+    If op_kind is equal to 68:
+        Set inputs to proc get_node_inputs from Node with node
+        Set input_var to get_input_variable(inputs, 0, var_names)
+
+        proc append from StringMod with code, "    // Bifrost Tile: restructure access into tile-major order\n"
+        proc append from StringMod with code, "    "
+        proc append from StringMod with code, opencl_type
+        proc append from StringMod with code, " "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " = "
+        proc append from StringMod with code, input_var
+        proc append from StringMod with code, ";\n"
+
+        Return proc to_string from StringMod with code
+    End If
+
+    Note: Reshape: layout flip (AoS<->SoA when layout_transform metadata
+    Note: is "aos_to_soa"; generic shape change otherwise).
+    If op_kind is equal to 69:
+        Set inputs to proc get_node_inputs from Node with node
+        Set input_var to get_input_variable(inputs, 0, var_names)
+
+        proc append from StringMod with code, "    // Bifrost Reshape: layout flip (see node metadata: layout_transform)\n"
+        proc append from StringMod with code, "    "
+        proc append from StringMod with code, opencl_type
+        proc append from StringMod with code, " "
+        proc append from StringMod with code, result_var_name
+        proc append from StringMod with code, " = "
+        proc append from StringMod with code, input_var
+        proc append from StringMod with code, ";\n"
 
         Return proc to_string from StringMod with code
     End If

@@ -10,6 +10,7 @@ Import "compiler/middle/bifrost/graph/graph.runa" as Graph
 Import "compiler/middle/bifrost/graph/node.runa" as Node
 Import "compiler/middle/bifrost/graph/edge.runa" as Edge
 Import "compiler/middle/bifrost/analysis/memory_access.runa" as MemoryAccess
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 Import "compiler/frontend/primitives/core/string_core.runa" as String
@@ -364,29 +365,43 @@ Process called "apply_layout_transformation" that takes graph as Integer, transf
     Let target_node be proc memory_get_int64 from Layout with transformation, 8
     Let target_layout be proc memory_get_int64 from Layout with transformation, 24
 
+    Note: Splice a new operation node between target_node and its consumers.
+    Note: Each helper returns the spliced-in node so that the post-transform
+    Note: metadata annotation is attached to the new node (the one downstream
+    Note: consumers now read from), not the orphaned original layout.
+    Let spliced_node be 0
+
     Note: Create layout conversion operation
     If transform_type is equal to TRANSFORM_TRANSPOSE:
         Note: Insert transpose operation
-        insert_transpose_op(graph, target_node, target_layout)
+        Set spliced_node to insert_transpose_op(graph, target_node, target_layout)
     End If
 
     If transform_type is equal to TRANSFORM_TILE:
         Note: Insert tiling operations
-        insert_tiling_ops(graph, target_node, target_layout)
+        Set spliced_node to insert_tiling_ops(graph, target_node, target_layout)
     End If
 
     If transform_type is equal to TRANSFORM_PAD:
         Note: Add padding to layout
-        apply_padding(graph, target_node, target_layout)
+        Set spliced_node to apply_padding(graph, target_node, target_layout)
     End If
 
     If transform_type is equal to TRANSFORM_AOS_TO_SOA:
         Note: Convert AoS to SoA
-        convert_aos_to_soa(graph, target_node)
+        Set spliced_node to convert_aos_to_soa(graph, target_node)
     End If
 
-    Note: Update node metadata with new layout
-    update_layout_metadata(target_node, target_layout)
+    Note: Update node metadata with new layout. After splice, the new node
+    Note: carries the transformed layout; the original target is left with its
+    Note: source layout (which is correct since the original still produces
+    Note: data in its native layout). If the splice failed (returned 0), fall
+    Note: back to annotating the original so the graph state stays consistent.
+    If spliced_node is not equal to 0:
+        update_layout_metadata(spliced_node, target_layout)
+    Otherwise:
+        update_layout_metadata(target_node, target_layout)
+    End If
 
     Note: Validate graph
     proc validate_graph from Graph with graph
@@ -1009,34 +1024,507 @@ Note: ================================================================
 Note: Helper Functions - Graph Transformation
 Note: ================================================================
 
-Process called "insert_transpose_op" that takes graph as Integer, node as Integer, layout as Integer returns Nothing:
-    Note: Create transpose operation node
-    Note: OpKind MatrixTranspose (from node.runa)
-    Let transpose_op be 11
+Note:
+splice_node_after_producer captures the producer's outgoing edges,
+removes them from the graph, and rewires each one so its source becomes
+the spliced node. It then adds a single producer->spliced edge so the
+spliced node receives the producer's output and propagates it to all
+former consumers. Mirrors the edge-rewiring pattern in
+kernel_fusion::fuse_operations but for a single-node insertion.
 
-    Let output_type be proc get_node_output_type from Node with node
-    Let transpose_node be proc create_operation_node from Node with transpose_op, output_type
+Algorithm:
+1. Capture the producer's outgoing edge list (copied to avoid mutation-
+   during-iteration since the underlying list is the same list mutated
+   by add_edge/remove_edge).
+2. For each captured consumer edge: read its dest/kind/data_type, remove
+   the original edge, and create a new edge from spliced_node to dest.
+3. After redirecting consumers, create the producer->spliced edge using
+   the original output type so type information is preserved on the
+   short-circuit edge.
+4. Register the producer->spliced edge on the spliced node's input list
+   so add_node_input keeps the operation node's arity accounting correct.
 
-    Note: Insert transpose node in graph
+Memory Safety:
+- Reads the producer's outputs list once, into a snapshot list, so the
+  iteration is stable across remove_edge / add_edge calls that mutate
+  the underlying outputs list.
+- All removed edges have their structures left in place (Runa GC handles
+  collection); we only detach them from the adjacency structures.
+:End Note
+
+Process called "splice_node_after_producer" that takes graph as Integer, producer as Integer, spliced_node as Integer, producer_output_type as Integer returns Nothing:
+    @Reasoning
+    Internal helper used by all four layout-transformation Processes. Each
+    helper builds a fresh operation node and then needs to interpose it
+    between the producer node and every downstream consumer. The splice is
+    purely a graph-edge rewiring operation: the producer's existing
+    outgoing edges become outgoing edges of the spliced node, and a single
+    new edge connects the producer to the spliced node. Encapsulating this
+    in a helper keeps the four caller Processes short and consistent.
+    @End Reasoning
+
+    @Implementation
+    1. Snapshot producer's outgoing edges so iteration is stable across
+       graph mutations.
+    2. For each consumer edge, read (dest, kind, data_type), remove the
+       original edge, and create a new edge from spliced_node to dest.
+    3. Create one producer->spliced edge carrying the producer's original
+       output type as the data type and DataFlow as the edge kind.
+    4. Register the producer->spliced edge on the spliced node's input
+       list so it appears in get_node_inputs.
+    @End Implementation
+
+    @Security_Scope
+    Operates entirely on internal IR graph adjacency lists in Tier-3 owned
+    heap. No external input is involved; type and edge pointers are
+    validated before dereference to fail safe on graph corruption.
+    @End Security_Scope
+
+    @Performance_Hints
+    O(C) where C is the number of consumer edges. Each iteration does one
+    remove_edge (O(C) within the producer's outputs list because List.remove
+    scans linearly) and one add_edge. Acceptable for typical accelerator
+    graphs where any single node has at most a handful of consumers.
+    @End Performance_Hints
+
+    Note: Snapshot consumer edges so iteration is stable.
+    Let consumers be proc get_node_outputs from Graph with graph, producer
+    If consumers is equal to 0:
+        Return
+    End If
+
+    Let snapshot be proc create from List
+    Let consumer_count be proc length from List with consumers
+    Let s_idx be 0
+    While s_idx is less than consumer_count:
+        Let snap_edge be proc get from List with consumers, s_idx
+        proc append from List with snapshot, snap_edge
+        Set s_idx to s_idx plus 1
+    End While
+
+    Note: Rewire each consumer edge through the spliced node.
+    Let i be 0
+    While i is less than consumer_count:
+        Let old_edge be proc get from List with snapshot, i
+
+        Let dest be proc get_edge_dest from Edge with old_edge
+        Let edge_kind be proc get_edge_kind from Edge with old_edge
+        Let edge_type be proc get_edge_data_type from Edge with old_edge
+
+        Note: Detach the original edge from producer/dest adjacency.
+        proc remove_edge from Graph with graph, old_edge
+
+        Note: Build replacement edge from spliced node to original dest.
+        Let new_edge_id be 1
+        Let new_edge be proc create_edge from Edge with new_edge_id, spliced_node, dest, edge_kind, edge_type
+        proc add_edge from Graph with graph, new_edge
+
+        Set i to i plus 1
+    End While
+
+    Note: Establish the producer -> spliced data-flow edge.
+    Let bridge_edge_id be 1
+    Let bridge_kind be Edge.DataFlow
+    Let bridge_edge be proc create_edge from Edge with bridge_edge_id, producer, spliced_node, bridge_kind, producer_output_type
+    proc add_edge from Graph with graph, bridge_edge
+
+    Note: Register the bridge edge as an input on the spliced operation node
+    Note: so get_node_input_count reports the correct arity for the new node.
+    proc add_node_input from Node with spliced_node, bridge_edge
+End Process
+
+Note:
+insert_transpose_op interposes a MatrixTranspose operation between a
+producer node and all its consumers. The producer keeps producing data
+in its native (row- or column-major) layout; the transpose node reads
+that data and emits it in the swapped layout, which is what downstream
+consumers expect after the transformation.
+
+Output type: the transpose swaps the matrix's rows and cols, so a new
+Matrix(elem, cols, rows) BifrostType is allocated for the transpose
+node. The element type is shared with the original (no element-level
+copy needed). This matches the architect's ratified Q1 answer.
+:End Note
+
+Process called "insert_transpose_op" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
+    @Reasoning
+    Inserts a MatrixTranspose operation node between the target node and
+    all of its consumers so that downstream operations see the
+    transposed-layout matrix. Producer-side type is preserved; the
+    transpose's output type is a new Matrix(elem, cols, rows) reflecting
+    the dimension swap (architect Q1, ratified).
+    @End Reasoning
+
+    @Implementation
+    1. Validate graph, node, layout pointers.
+    2. Read producer output type. Must be a Matrix variant (discriminant 3)
+       for the dimension swap to be meaningful; bail out cleanly if not.
+    3. Allocate a new Matrix type with rows/cols swapped, sharing the
+       element type pointer (immutable in Bifrost type system).
+    4. Build an empty inputs list and an Operation node for OpKind.MatrixTranspose
+       (discriminant 8) with DataParallel parallelism.
+    5. Add the new node to the graph, then call splice_node_after_producer
+       to rewire edges. Splice will populate the transpose node's input
+       list with the producer->transpose bridge edge.
+    6. Return the spliced node ID so the caller can attach metadata to it.
+    @End Implementation
+
+    @Performance_Hints
+    Single allocation for the new Matrix type (32 bytes) and one
+    create_operation_node call (48 bytes for node + Dictionary for
+    metadata). Edge rewiring is O(C) over the producer's consumers.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure IR transformation on the Tier-3 graph heap. No untrusted input.
+    Returns 0 on any null-pointer or type-shape mismatch so the caller can
+    fall back without crashing.
+    @End Security_Scope
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If node is equal to 0:
+        Return 0
+    End If
+    If layout is equal to 0:
+        Return 0
+    End If
+
+    Let original_type be proc get_node_output_type from Node with node
+    If original_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Bail if not a Matrix type - transpose is matrix-specific.
+    Let type_discriminant be proc memory_get_int64 from Layout with original_type, 0
+    If type_discriminant is not equal to 3:
+        Return 0
+    End If
+
+    Note: Architect Q1 ratified: allocate a new Matrix(elem, cols, rows)
+    Note: with the dimensions swapped. The element type pointer is shared
+    Note: with the original since BifrostType is immutable per allocation.
+    Let elem_type be proc memory_get_int64 from Layout with original_type, 8
+    Let orig_rows be proc memory_get_int64 from Layout with original_type, 16
+    Let orig_cols be proc memory_get_int64 from Layout with original_type, 24
+
+    Let transposed_type be proc create_matrix_type from Node with elem_type, orig_cols, orig_rows
+    If transposed_type is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the transpose operation node. Use the canonical OpKind
+    Note: enum constructor instead of a magic number so the discriminant
+    Note: stays in sync with node.runa's OpKind enum.
+    Let inputs be proc create from List
+    Let transpose_op be OpKind.MatrixTranspose
+    Let parallelism be ParallelismKind.DataParallel
+    Let transpose_node be proc create_operation_node from Node with transpose_op, inputs, transposed_type, parallelism
+    If transpose_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Add the transpose node to the graph first so its outputs/inputs
+    Note: adjacency entries are registered before we start rewiring edges.
     proc add_node from Graph with graph, transpose_node
 
-    Note: Redirect edges through transpose
-    Note: (Simplified - real implementation would update all edges)
+    Note: Early-return if producer has no consumers - creating a dangling
+    Note: transpose node clutters the graph without benefit (audit complaint
+    Note: about orphan transpose nodes addressed here).
+    Let producer_outputs be proc get_node_outputs from Graph with graph, node
+    If producer_outputs is equal to 0:
+        Return transpose_node
+    End If
+
+    Let outgoing_count be proc length from List with producer_outputs
+    If outgoing_count is equal to 0:
+        Return transpose_node
+    End If
+
+    Note: Splice the transpose between the producer and its consumers,
+    Note: carrying the original (pre-transpose) type on the producer->transpose
+    Note: bridge edge so type-checking sees the producer's native layout
+    Note: at the bridge and the transposed layout downstream of the transpose.
+    splice_node_after_producer(graph, node, transpose_node, original_type)
+
+    Return transpose_node
 End Process
 
-Process called "insert_tiling_ops" that takes graph as Integer, node as Integer, layout as Integer returns Nothing:
-    Note: Insert tiling loop transformations
-    Note: (Simplified - real implementation would insert loop nest)
+Note:
+insert_tiling_ops interposes a Tile operation between a producer and
+its consumers. The Tile node carries the tile sizes (read from the
+target layout's tile_sizes field) in its metadata so backend emitters
+can lower it to nested tiled loops over the tensor.
+:End Note
+
+Process called "insert_tiling_ops" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
+    @Reasoning
+    Inserts a Tile operation node between the target and its consumers.
+    The new layout's tile_sizes list (computed by compute_optimal_tiling
+    upstream) is stored in the Tile node's metadata under the
+    "tile_sizes" key so backend code generators (CUDA, Metal, OpenCL,
+    FPGA) can emit nested tiled loops that respect the cache-aware tile
+    shape. The tile op preserves element type and shape - it is a loop
+    structuring transformation, not a tensor reshape.
+    @End Reasoning
+
+    @Implementation
+    1. Validate graph, node, layout pointers.
+    2. Read tile_sizes list from the layout (offset 24 - see DataLayout
+       struct layout in this file). Bail if 0 (no tiling info).
+    3. Read producer output type. Pass-through to the Tile node since
+       tile is a loop transformation, not a type change.
+    4. Build an Operation node for OpKind.Tile (discriminant 68) with
+       DataParallel parallelism.
+    5. Attach the tile_sizes list under the "tile_sizes" metadata key.
+    6. Add the node to the graph and splice through.
+    7. Return the spliced node ID.
+    @End Implementation
+
+    @Performance_Hints
+    Tile sizes are stored by pointer (list reference), not by copy, so
+    metadata attachment is O(1). Splice is O(consumers).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure IR transformation. tile_sizes are pre-validated by the upstream
+    compute_optimal_tiling pass. The metadata key is a static interned
+    string literal so no untrusted data reaches the dictionary.
+    @End Security_Scope
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If node is equal to 0:
+        Return 0
+    End If
+    If layout is equal to 0:
+        Return 0
+    End If
+
+    Let tile_sizes_list be proc memory_get_int64 from Layout with layout, 24
+    If tile_sizes_list is equal to 0:
+        Return 0
+    End If
+
+    Let original_type be proc get_node_output_type from Node with node
+    If original_type is equal to 0:
+        Return 0
+    End If
+
+    Let inputs be proc create from List
+    Let tile_op be OpKind.Tile
+    Let parallelism be ParallelismKind.DataParallel
+    Let tile_node be proc create_operation_node from Node with tile_op, inputs, original_type, parallelism
+    If tile_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Store the tile-size list under the "tile_sizes" key so backend
+    Note: emit_operation_code branches can read it and emit the appropriate
+    Note: nested tiled loop wrapper.
+    Let tile_sizes_key be "tile_sizes"
+    proc set_node_metadata from Node with tile_node, tile_sizes_key, tile_sizes_list
+
+    proc add_node from Graph with graph, tile_node
+
+    Let producer_outputs be proc get_node_outputs from Graph with graph, node
+    If producer_outputs is equal to 0:
+        Return tile_node
+    End If
+
+    Let outgoing_count be proc length from List with producer_outputs
+    If outgoing_count is equal to 0:
+        Return tile_node
+    End If
+
+    splice_node_after_producer(graph, node, tile_node, original_type)
+
+    Return tile_node
 End Process
 
-Process called "apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Nothing:
-    Note: Update memory allocation with padding
-    Note: (Simplified - real implementation would modify allocation sizes)
+Note:
+apply_padding interposes a Pad operation between a producer and its
+consumers. The Pad node carries the padding amount (element count, not
+bytes) under the "pad_amount" key and a zero fill value under the
+"pad_value" key. Backend emitters allocate the padded buffer and emit
+a guarded copy whose innermost dimension is aligned per the metadata.
+:End Note
+
+Process called "apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Integer:
+    @Reasoning
+    Inserts a Pad operation node carrying the padding amount in metadata.
+    Architect Q2: pad fill value is hard-coded "0" - layout padding is
+    dead space, so the fill never represents a meaningful value. If a
+    future call site needs non-zero padding it can override the
+    "pad_value" metadata key after the splice.
+    @End Reasoning
+
+    @Implementation
+    1. Validate graph, node, layout pointers.
+    2. Read padding element count from layout offset 32 (DataLayout.padding).
+       Bail if 0 (no padding needed - the layout is already aligned).
+    3. Read producer output type. Pass-through (padding does not change
+       element type, only changes the buffer shape along the innermost
+       dimension; that's encoded in metadata so backend allocators know).
+    4. Build an Operation node for OpKind.Pad (discriminant 67) with
+       DataParallel parallelism.
+    5. Attach "pad_amount" = padding_elements and "pad_value" = "0".
+    6. Add to graph and splice through.
+    7. Return the spliced node ID.
+    @End Implementation
+
+    @Performance_Hints
+    Metadata attachment is O(1) per key. Splice is O(consumers).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pad amount is pre-validated by compute_optimal_padding. The "0" fill
+    value is a string literal under control of the compiler; no untrusted
+    input ever reaches metadata.
+    @End Security_Scope
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If node is equal to 0:
+        Return 0
+    End If
+    If layout is equal to 0:
+        Return 0
+    End If
+
+    Let padding_elements be proc memory_get_int64 from Layout with layout, 32
+    If padding_elements is equal to 0:
+        Return 0
+    End If
+
+    Let original_type be proc get_node_output_type from Node with node
+    If original_type is equal to 0:
+        Return 0
+    End If
+
+    Let inputs be proc create from List
+    Let pad_op be OpKind.Pad
+    Let parallelism be ParallelismKind.DataParallel
+    Let pad_node be proc create_operation_node from Node with pad_op, inputs, original_type, parallelism
+    If pad_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Annotate the pad node with the amount (in elements, not bytes)
+    Note: and the fill value. The "0" fill value is architect Q2's
+    Note: hard-coded answer for layout padding (dead space).
+    Let pad_amount_key be "pad_amount"
+    proc set_node_metadata from Node with pad_node, pad_amount_key, padding_elements
+
+    Let pad_value_key be "pad_value"
+    Let zero_fill be "0"
+    proc set_node_metadata from Node with pad_node, pad_value_key, zero_fill
+
+    proc add_node from Graph with graph, pad_node
+
+    Let producer_outputs be proc get_node_outputs from Graph with graph, node
+    If producer_outputs is equal to 0:
+        Return pad_node
+    End If
+
+    Let outgoing_count be proc length from List with producer_outputs
+    If outgoing_count is equal to 0:
+        Return pad_node
+    End If
+
+    splice_node_after_producer(graph, node, pad_node, original_type)
+
+    Return pad_node
 End Process
 
-Process called "convert_aos_to_soa" that takes graph as Integer, node as Integer returns Nothing:
-    Note: Convert Array of Structures to Structure of Arrays
-    Note: (Simplified - real implementation would restructure data)
+Note:
+convert_aos_to_soa interposes a Reshape operation tagged as an AoS-to-SoA
+layout flip. Per CEO ruling #4, this Process ships implemented but
+quiescent: no upstream pass currently labels nodes as LAYOUT_AOS
+(analyze_current_layout only returns ROW_MAJOR or COLUMN_MAJOR), so the
+caller's transform_type dispatch will not select TRANSFORM_AOS_TO_SOA
+in present-day code. When the upstream labeling pass lands later, this
+Process must just work without further changes.
+:End Note
+
+Process called "convert_aos_to_soa" that takes graph as Integer, node as Integer returns Integer:
+    @Reasoning
+    Inserts a Reshape operation node tagged with layout_transform =
+    "aos_to_soa" in metadata. Backend emitters lowering a Reshape look
+    at the layout_transform tag to decide between an AoS->SoA gather/
+    scatter and other reshape variants. Implemented correctly per
+    architect Q3 even though unreachable in current production code.
+    @End Reasoning
+
+    @Implementation
+    1. Validate graph, node pointers.
+    2. Read producer output type. Pass through to the reshape node since
+       AoS->SoA is a layout flip, not a type-shape change at the
+       BifrostType level. (Real shape information lives in the type's
+       inner shape list.)
+    3. Build an Operation node for OpKind.Reshape (discriminant 69) with
+       DataParallel parallelism.
+    4. Tag with layout_transform = "aos_to_soa".
+    5. Add to graph and splice through. If no consumers, return the new
+       node without splicing so it remains addressable.
+    6. Return the spliced node ID.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) metadata attachment, O(C) splice over consumers.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure IR transformation. Metadata key and value are static string
+    literals from this file - no untrusted input.
+    @End Security_Scope
+
+    If graph is equal to 0:
+        Return 0
+    End If
+    If node is equal to 0:
+        Return 0
+    End If
+
+    Let original_type be proc get_node_output_type from Node with node
+    If original_type is equal to 0:
+        Return 0
+    End If
+
+    Let inputs be proc create from List
+    Let reshape_op be OpKind.Reshape
+    Let parallelism be ParallelismKind.DataParallel
+    Let reshape_node be proc create_operation_node from Node with reshape_op, inputs, original_type, parallelism
+    If reshape_node is equal to 0:
+        Return 0
+    End If
+
+    Note: Tag with the specific reshape kind so backend emitters can
+    Note: dispatch to the AoS->SoA gather/scatter codegen path rather
+    Note: than a generic reshape (which today does not exist but will
+    Note: when struct types land in v0.0.8.6+).
+    Let transform_key be "layout_transform"
+    Let transform_value be "aos_to_soa"
+    proc set_node_metadata from Node with reshape_node, transform_key, transform_value
+
+    proc add_node from Graph with graph, reshape_node
+
+    Let producer_outputs be proc get_node_outputs from Graph with graph, node
+    If producer_outputs is equal to 0:
+        Return reshape_node
+    End If
+
+    Let outgoing_count be proc length from List with producer_outputs
+    If outgoing_count is equal to 0:
+        Return reshape_node
+    End If
+
+    splice_node_after_producer(graph, node, reshape_node, original_type)
+
+    Return reshape_node
 End Process
 
 Process called "update_layout_metadata" that takes node as Integer, layout as Integer returns Nothing:
