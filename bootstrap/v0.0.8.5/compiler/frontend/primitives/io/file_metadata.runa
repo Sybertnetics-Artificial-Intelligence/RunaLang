@@ -26,13 +26,21 @@ all 20+ Runa target platforms:
 - Windows (x86_64, ARM64)
 - BSD variants (FreeBSD, NetBSD, OpenBSD on x86_64 and ARM64)
 
-All platforms use native syscalls with proper struct stat layout handling.
-No external dependencies, pure Runa implementation.
+All platforms use native syscalls with proper struct stat layout handling
+via the canonical primitives/assembly/syscall.runa dispatcher. Pure Runa
+implementation, no C runtime dependency.
+
+Migration note (P1-B, 2026-05-24): the previous in-file syscall2 thunk
+was a Return-0 stub; replaced with do_stat_syscall routing through the
+18-platform syscall_2 / syscall_4 ladder. This restores correctness for
+every consumer of get_file_size, file_exists, get_file_modification_time,
+and the type/permission predicates. Behavioral change: file_exists now
+correctly returns 0 for nonexistent paths (previously always returned 1).
 :End Note
 
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
-Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
 
 Note: ============================================================================
 Note: Platform Detection and Configuration
@@ -84,7 +92,7 @@ Process called "get_stat_config" that takes platform_id as Integer returns Integ
     Note:   offset 56: st_nlink_offset
 
     Note: Allocate config structure (64 bytes)
-    Let config be proc allocate_from_arena from Layout with 0, 64
+    Let config be proc allocate from Layout with 64
 
     Note: Linux x86_64
     If platform_id is equal to 1:
@@ -329,7 +337,10 @@ Process called "do_stat" that takes file_path as Integer, stat_buffer as Integer
     End If
 
     Let syscall_num be proc memory_get_qword from MemoryCore with config, 0
-    Let file_path_cstr be proc string_to_cstring from StringCore with file_path
+
+    Note: Runa String values are pointers to NUL-terminated byte sequences,
+    Note: so file_path is already a valid C-string for the kernel. No copy
+    Note: or conversion is required before passing it to the stat syscall.
 
     Note: Windows platforms (6, 7) have no POSIX stat; Win32 callers must
     Note: use file_io_open + fstat or the future win32_get_file_info. We
@@ -339,25 +350,74 @@ Process called "do_stat" that takes file_path as Integer, stat_buffer as Integer
         Return minus 1
     End If
 
-    Note: POSIX stat syscall (all other platforms)
-    Let result be proc syscall2 with syscall_num, file_path_cstr, stat_buffer
+    Note: POSIX stat syscall (all other platforms) routed through the
+    Note: platform-correct 2-arg / 4-arg ABI dispatcher.
+    Let result be proc do_stat_syscall with platform_id, syscall_num, file_path, stat_buffer
 
-    Note: Arena memory will be cleaned up when arena is reset
-    Return result
+    Note: Normalize syscall return to 0-on-success, -1-on-error. POSIX stat
+    Note: returns 0 on success; the Linux kernel writes a negative errno on
+    Note: the negative-return path. Callers downstream test for nonzero.
+    If result is less than 0:
+        Return minus 1
+    End If
+    Return 0
 End Process
 
-Process called "syscall2" that takes syscall_num as Integer, arg1 as Integer, arg2 as Integer returns Integer:
-    Note: Local 2-argument syscall thunk. The canonical syscall path goes
-    Note: through primitives/assembly/syscall.runa's syscall_2 dispatcher
-    Note: ladder; we keep file_metadata decoupled from that import boundary
-    Note: so consumers of get_file_size do not pull the full 1188-branch
-    Note: dispatcher. The thunk currently returns 0 to signal "no host-side
-    Note: fast path", forcing callers down the file_io_open + fstat path
-    Note: which DOES wire to the canonical dispatcher. The bootstrap codegen
-    Note: cannot yet emit compact inline-asm syscalls from this leaf module
-    Note: without dragging in the dispatcher; once that is resolved, this
-    Note: thunk will be replaced by an inline-asm fast path.
-    Return 0
+Process called "do_stat_syscall" that takes platform_id as Integer, syscall_num as Integer, path as Integer, statbuf as Integer returns Integer:
+    Note:
+    Dispatch the per-platform stat syscall using the correct kernel ABI
+    shape. POSIX-style stat is a 2-argument syscall stat(path, statbuf)
+    on most platforms, but Linux ARM64 and RISC-V kernels dropped 2-arg
+    stat entirely in favor of the 4-argument fstatat(dirfd, path, statbuf,
+    flags) variant. Linux ARM32 still exposes 2-arg stat64 (syscall 106)
+    for legacy compat, so it stays on the 2-arg path.
+
+    Platform routing:
+        platform_id  syscall    arg shape       AT_FDCWD/flags
+        ===========  =========  ==============  ==============
+         1 LinuxX64    stat    2-arg            n/a
+         2 LinuxARM64  fstatat 4-arg            -100, 0
+         3 LinuxARM32  stat64  2-arg            n/a (legacy)
+         4 DarwinX64   stat64  2-arg            n/a
+         5 DarwinARM64 stat64  2-arg            n/a
+         8 FreeBSDX64  stat    2-arg            n/a
+         9 FreeBSDARM  stat    2-arg            n/a
+        10 NetBSDX64   __stat50 2-arg           n/a
+        11 NetBSDARM   __stat50 2-arg           n/a
+        12 OpenBSDX64  stat    2-arg            n/a
+        13 OpenBSDARM  stat    2-arg            n/a
+        14 RISC-V 32   fstatat 4-arg            -100, 0
+        15 RISC-V 64   fstatat 4-arg            -100, 0
+        16 PowerPC     stat    2-arg            n/a
+        17 MIPS 32     stat64  2-arg            n/a (uses 2-arg ABI)
+        18 MIPS 64     stat    2-arg            n/a
+
+    Windows platforms (6, 7) never reach this dispatcher; do_stat short-
+    circuits them with -1 before calling.
+
+    AT_FDCWD = -100 is the cross-platform constant on all Linux kernels;
+    the flags argument 0 means "follow symlinks like stat", matching POSIX
+    stat semantics rather than lstat.
+
+    The 2-arg-vs-4-arg decision is made here at the file_metadata layer
+    because the per-platform syscall numbers in get_stat_config encode
+    which kernel entrypoint is being called, and only this module knows
+    the ABI shape associated with each syscall number.
+    :End Note
+
+    Note: 4-arg fstatat platforms: Linux ARM64 (2), RISC-V 32 (14), RISC-V 64 (15)
+    If platform_id is equal to 2:
+        Return proc syscall_4 from Syscall with syscall_num, minus 100, path, statbuf, 0
+    End If
+    If platform_id is equal to 14:
+        Return proc syscall_4 from Syscall with syscall_num, minus 100, path, statbuf, 0
+    End If
+    If platform_id is equal to 15:
+        Return proc syscall_4 from Syscall with syscall_num, minus 100, path, statbuf, 0
+    End If
+
+    Note: 2-arg stat / stat64 / __stat50 on all remaining POSIX platforms
+    Return proc syscall_2 from Syscall with syscall_num, path, statbuf
 End Process
 
 Note: ============================================================================
@@ -375,18 +435,18 @@ Process called "get_file_size" that takes file_path as Integer returns Integer:
     End If
 
     Let stat_size be proc memory_get_qword from MemoryCore with config, 8
-    Let stat_buffer be proc allocate_from_arena from Layout with 0, stat_size
+    Let stat_buffer be proc allocate from Layout with stat_size
 
     Let result be proc do_stat with file_path, stat_buffer
     If result is not equal to 0:
-        Note: Arena memory will be cleaned up when arena is reset
+        Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
         Return 0
     End If
 
     Let st_size_offset be proc memory_get_qword from MemoryCore with config, 16
     Let file_size be proc memory_get_qword from MemoryCore with stat_buffer, st_size_offset
 
-    Note: Arena memory will be cleaned up when arena is reset
+    Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
     Return file_size
 End Process
 
@@ -401,18 +461,18 @@ Process called "get_file_modification_time" that takes file_path as Integer retu
     End If
 
     Let stat_size be proc memory_get_qword from MemoryCore with config, 8
-    Let stat_buffer be proc allocate_from_arena from Layout with 0, stat_size
+    Let stat_buffer be proc allocate from Layout with stat_size
 
     Let result be proc do_stat with file_path, stat_buffer
     If result is not equal to 0:
-        Note: Arena memory will be cleaned up when arena is reset
+        Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
         Return 0
     End If
 
     Let st_mtime_offset be proc memory_get_qword from MemoryCore with config, 24
     Let mtime be proc memory_get_qword from MemoryCore with stat_buffer, st_mtime_offset
 
-    Note: Arena memory will be cleaned up when arena is reset
+    Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
     Return mtime
 End Process
 
@@ -427,18 +487,18 @@ Process called "get_file_access_time" that takes file_path as Integer returns In
     End If
 
     Let stat_size be proc memory_get_qword from MemoryCore with config, 8
-    Let stat_buffer be proc allocate_from_arena from Layout with 0, stat_size
+    Let stat_buffer be proc allocate from Layout with stat_size
 
     Let result be proc do_stat with file_path, stat_buffer
     If result is not equal to 0:
-        Note: Arena memory will be cleaned up when arena is reset
+        Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
         Return 0
     End If
 
     Let st_atime_offset be proc memory_get_qword from MemoryCore with config, 32
     Let atime be proc memory_get_qword from MemoryCore with stat_buffer, st_atime_offset
 
-    Note: Arena memory will be cleaned up when arena is reset
+    Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
     Return atime
 End Process
 
@@ -456,18 +516,18 @@ Process called "get_file_change_time" that takes file_path as Integer returns In
     End If
 
     Let stat_size be proc memory_get_qword from MemoryCore with config, 8
-    Let stat_buffer be proc allocate_from_arena from Layout with 0, stat_size
+    Let stat_buffer be proc allocate from Layout with stat_size
 
     Let result be proc do_stat with file_path, stat_buffer
     If result is not equal to 0:
-        Note: Arena memory will be cleaned up when arena is reset
+        Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
         Return 0
     End If
 
     Let st_ctime_offset be proc memory_get_qword from MemoryCore with config, 40
     Let ctime be proc memory_get_qword from MemoryCore with stat_buffer, st_ctime_offset
 
-    Note: Arena memory will be cleaned up when arena is reset
+    Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
     Return ctime
 End Process
 
@@ -482,18 +542,18 @@ Process called "get_file_permissions" that takes file_path as Integer returns In
     End If
 
     Let stat_size be proc memory_get_qword from MemoryCore with config, 8
-    Let stat_buffer be proc allocate_from_arena from Layout with 0, stat_size
+    Let stat_buffer be proc allocate from Layout with stat_size
 
     Let result be proc do_stat with file_path, stat_buffer
     If result is not equal to 0:
-        Note: Arena memory will be cleaned up when arena is reset
+        Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
         Return 0
     End If
 
     Let st_mode_offset be proc memory_get_qword from MemoryCore with config, 48
     Let mode be proc memory_get_qword from MemoryCore with stat_buffer, st_mode_offset
 
-    Note: Arena memory will be cleaned up when arena is reset
+    Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
     Return mode
 End Process
 
@@ -562,11 +622,11 @@ Process called "file_exists" that takes file_path as Integer returns Integer:
     End If
 
     Let stat_size be proc memory_get_qword from MemoryCore with config, 8
-    Let stat_buffer be proc allocate_from_arena from Layout with 0, stat_size
+    Let stat_buffer be proc allocate from Layout with stat_size
 
     Let result be proc do_stat with file_path, stat_buffer
 
-    Note: Arena memory will be cleaned up when arena is reset
+    Note: stat_buffer is owned-heap; P1-D will add deallocate (deferred)
 
     If result is equal to 0:
         Return 1

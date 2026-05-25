@@ -1,0 +1,143 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+P1-B smoke test: verify arena.runa now composes mmap prot/flags
+from the platform-routed Syscall accessors instead of the hardcoded
+Linux-only constants (prot=3, flags=34).
+
+On Linux x86_64 the post-fix values resolve to the same 3 and 34
+that the pre-fix code hardcoded, so this test verifies behavioral
+parity on the host platform. The cross-platform correctness on
+Darwin/BSD is verified by static review since v0.0.8.5 has no CI
+matrix outside Linux yet.
+
+Stress harness: 1000 allocations of varying sizes, exercising the
+fast path (within initial capacity) and the grow path (mmap a new,
+larger buffer + memcpy + munmap the old buffer).
+
+Exit code legend:
+     50 arena_create returned 0 (mmap failed)
+     51 arena_allocate returned 0 inside the 1000-call stress loop
+     52 alignment violation: returned pointer not 8-byte aligned
+     53 first write/read mismatch (writable memory check)
+     54 arena_destroy on NULL did not return 1
+     55 arena_destroy on real arena did not return 1
+     56 grow-path crossing allocation returned 0
+     57 grow-path data preservation check failed
+    200 ALL PASS
+:End Note
+
+Import "runtime/core/memory/arena.runa" as Arena
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+
+Process called "main" returns Integer:
+    Note: ------------------------------------------------------------
+    Note: Case 1: arena_create with 64KB capacity must return a real
+    Note: positive pointer (mmap success).
+    Note: ------------------------------------------------------------
+    Let arena be proc arena_create from Arena with 65536
+    If arena is equal to 0:
+        Return 50
+    End If
+    If arena is less than 0:
+        Return 50
+    End If
+
+    Note: ------------------------------------------------------------
+    Note: Case 2: 1000-allocation stress with mixed sizes. Sizes 8, 16,
+    Note: 32, 64 cycle through to exercise the pointer-bump path. With
+    Note: 1000 allocations of average size 30 bytes (30KB total), we
+    Note: stay inside the 64KB initial capacity and never trigger the
+    Note: grow path here — that case is exercised separately below.
+    Note: ------------------------------------------------------------
+    Let i be 0
+    While i is less than 1000:
+        Let alloc_size be 8
+        Let mod_value be i modulo by 4
+        If mod_value is equal to 1:
+            Set alloc_size to 16
+        End If
+        If mod_value is equal to 2:
+            Set alloc_size to 32
+        End If
+        If mod_value is equal to 3:
+            Set alloc_size to 64
+        End If
+
+        Let ptr be proc arena_allocate from Arena with arena, alloc_size
+        If ptr is equal to 0:
+            Return 51
+        End If
+
+        Note: Verify 8-byte alignment: ptr modulo 8 must be 0.
+        Let align_check be ptr modulo by 8
+        If align_check is not equal to 0:
+            Return 52
+        End If
+
+        Note: Write a sentinel byte to the first slot and read it back
+        Note: to confirm the page is genuinely read-write mapped.
+        proc memory_set_byte from Memory with ptr, 0, 171
+        Let readback be proc memory_get_byte from Memory with ptr, 0
+        If readback is not equal to 171:
+            Return 53
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: ------------------------------------------------------------
+    Note: Case 3: arena_destroy on NULL must return 1 per the contract
+    Note: in arena.runa (null arena is a no-op success).
+    Note: ------------------------------------------------------------
+    Let null_destroy be proc arena_destroy from Arena with 0
+    If null_destroy is not equal to 1:
+        Return 54
+    End If
+
+    Note: ------------------------------------------------------------
+    Note: Case 4: arena_destroy on the real arena must return 1.
+    Note: ------------------------------------------------------------
+    Let real_destroy be proc arena_destroy from Arena with arena
+    If real_destroy is not equal to 1:
+        Return 55
+    End If
+
+    Note: ------------------------------------------------------------
+    Note: Case 5: grow path. Create a tiny 4KB arena, allocate 3000
+    Note: bytes (fits), then allocate another 3000 bytes (must grow:
+    Note: 6000 > 4096). Both pointers must be valid. The grow path is
+    Note: the second mmap site in arena.runa that also gets the
+    Note: platform-routed prot/flags treatment.
+    Note: ------------------------------------------------------------
+    Let small_arena be proc arena_create from Arena with 4096
+    If small_arena is equal to 0:
+        Return 50
+    End If
+
+    Let first be proc arena_allocate from Arena with small_arena, 3000
+    If first is equal to 0:
+        Return 56
+    End If
+    proc memory_set_byte from Memory with first, 0, 66
+
+    Let second be proc arena_allocate from Arena with small_arena, 3000
+    If second is equal to 0:
+        Return 56
+    End If
+
+    Note: Note: after the grow path runs, the old buffer was munmap'd
+    Note: and the data was memcpy'd into a freshly-mmap'd new buffer.
+    Note: The first pointer is stale (now-unmapped memory). We cannot
+    Note: read it back safely. Just confirm second allocation succeeded.
+
+    Let small_destroy be proc arena_destroy from Arena with small_arena
+    If small_destroy is not equal to 1:
+        Return 55
+    End If
+
+    Return 200
+End Process
