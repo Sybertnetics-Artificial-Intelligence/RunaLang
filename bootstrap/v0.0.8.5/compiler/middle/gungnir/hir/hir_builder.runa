@@ -48,6 +48,7 @@ Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
 Import "compiler/frontend/parsing/ast.runa" as AST
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
+Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
 Note: ============================================================================
@@ -77,11 +78,14 @@ Process called "create_builder_context" returns Integer:
     @End Reasoning
 
     @Implementation:
-    HIRBuilderContext: 8 fields × 8 bytes = 64 bytes
-    Initialize with root scope and empty error list.
+    HIRBuilderContext: 10 fields × 8 bytes = 80 bytes (P2-D Q4: added unsafe_depth + unsafe_externals registry)
+    Initialize with root scope and empty error list. unsafe_depth starts at 0.
+    unsafe_externals dict holds (name_string -> 1) for every external declared
+    with the unsafe flag; lower_call_expression consults this for compile-time
+    unsafe-call rejection.
     @End Implementation
 
-    Let context_size be 64
+    Let context_size be 80
     Let context be proc allocate from Layout with context_size
 
     If context is equal to 0:
@@ -114,6 +118,9 @@ Process called "create_builder_context" returns Integer:
         Return 0
     End If
 
+    Note: Create unsafe-externals registry (P2-D Q4)
+    Let unsafe_externals_dict be proc create from Dictionary
+
     Note: Initialize context fields
     proc memory_set_int64 from Layout with context, 0, root_scope
     proc memory_set_int64 from Layout with context, 8, scope_stack
@@ -122,8 +129,210 @@ Process called "create_builder_context" returns Integer:
     proc memory_set_int64 from Layout with context, 32, error_list
     proc memory_set_int64 from Layout with context, 40, 0  Note: current_function
     proc memory_set_int64 from Layout with context, 48, 0  Note: loop_depth
+    proc memory_set_int64 from Layout with context, 56, 0  Note: unsafe_depth (P2-D Q4)
+    proc memory_set_int64 from Layout with context, 64, unsafe_externals_dict  Note: unsafe_externals registry
+    proc memory_set_int64 from Layout with context, 72, 0  Note: reserved for future semantic state
 
     Return context
+End Process
+
+Process called "hir_context_unsafe_depth" takes context as Integer returns Integer:
+    @Reasoning
+    Returns the current unsafe-scope nesting depth carried in the HIR
+    context. The semantic check in lower_call_expression gates calls to
+    `unsafe External` declarations behind unsafe_depth > 0; this accessor
+    is the single read of that depth. Keeping the depth in the context
+    (rather than a module-global) lets nested compile passes that hold
+    separate HIR contexts retain independent unsafe scopes.
+    @End Reasoning
+
+    @Implementation
+    Single 8-byte load from offset 56 of the HIRBuilderContext layout
+    (P2-D Q4 v2). Returns 0 if the context pointer is null, which the
+    caller treats as "no active context, no unsafe permission".
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load. Called once per HIR call expression lowering
+    when the callee is a registered unsafe external; cold path under
+    typical compile workloads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The depth field is incremented exclusively by
+    hir_context_enter_unsafe (and decremented by hir_context_leave_unsafe)
+    from lower_unsafe_block; user FFI code does not reach this surface.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with context, 56
+End Process
+
+Process called "hir_context_enter_unsafe" takes context as Integer returns Integer:
+    @Reasoning
+    Increments the HIR context's unsafe-scope counter. Called by
+    lower_unsafe_block at the start of an Unsafe Block; the matching
+    decrement is performed unconditionally on block exit so even an
+    error-path return from the body restores the depth invariant.
+    Supporting unsafe_depth as a counter (rather than a boolean) is
+    intentional: nested Unsafe Blocks must not "leak" permission to
+    the outer scope on inner-block exit.
+    @End Reasoning
+
+    @Implementation
+    Load-add-store on offset 56 of HIRBuilderContext. Returns the new
+    depth value so callers can assert the increment was applied. Returns
+    0 if the context is null, which the caller treats as a fatal error.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One load, one add, one store. Called once per Unsafe Block
+    entry; cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The depth counter is private to the HIR builder; user code cannot
+    reach this Process directly. Only lower_unsafe_block, which has
+    already validated the AST_UNSAFE_BLOCK node, may invoke it.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+    Let depth be proc memory_get_int64 from Layout with context, 56
+    proc memory_set_int64 from Layout with context, 56, depth plus 1
+    Return depth plus 1
+End Process
+
+Process called "hir_context_leave_unsafe" takes context as Integer returns Integer:
+    @Reasoning
+    Decrements the HIR context's unsafe-scope counter. Called by
+    lower_unsafe_block on every exit path from an Unsafe Block, including
+    error-path returns. Saturating at 0 (never going negative) prevents a
+    malformed AST from underflowing the counter into a wraparound that
+    would mistakenly grant unsafe permission to outer scopes.
+    @End Reasoning
+
+    @Implementation
+    Load offset 56, decrement only if positive, store the result. Returns
+    the new depth value. Returns 0 if the context is null.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One load, one compare, one optional subtract, one store. Called
+    once per Unsafe Block exit; cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Saturation at 0 is the security boundary: it ensures that a stray or
+    duplicate leave (from a malformed AST or compiler bug) cannot decrement
+    the depth below 0 and create a phantom unsafe scope. Only
+    lower_unsafe_block invokes this Process.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+    Let depth be proc memory_get_int64 from Layout with context, 56
+    If depth is greater than 0:
+        Set depth to depth minus 1
+    End If
+    proc memory_set_int64 from Layout with context, 56, depth
+    Return depth
+End Process
+
+Process called "hir_context_register_unsafe_external" takes context as Integer, name as Integer returns Integer:
+    @Reasoning
+    Registers a name in the unsafe-externals dictionary so subsequent
+    lower_call_expression invocations can recognize the callee as
+    requiring an Unsafe Block wrapping. The registration is keyed by the
+    callee identifier string pointer; HIR string interning ensures that
+    every reference to the same source identifier resolves to the same
+    pointer, so equality comparison is sufficient.
+    @End Reasoning
+
+    @Implementation
+    Lazily allocates the unsafe-externals Dictionary at offset 64 of
+    HIRBuilderContext if it has not been allocated yet (this guards
+    against early-init paths where the constructor's allocation may
+    have failed). Inserts (name, 1) so lookup returns a truthy value.
+    @End Implementation
+
+    @Performance_Hints
+    Amortized O(1) dictionary insert. Called once per unsafe-flagged
+    External declaration during HIR lowering; cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The registry is module-private to the HIR builder. Only the
+    AST_EXTERNAL_DECLARATION lowering path that has already extracted
+    and verified the FFI_FLAG_UNSAFE bit at offset 144 of the AST node
+    reaches this Process; user code cannot poison the registry.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let dict be proc memory_get_int64 from Layout with context, 64
+    If dict is equal to 0:
+        Set dict to proc create from Dictionary
+        proc memory_set_int64 from Layout with context, 64, dict
+    End If
+    proc set from Dictionary with dict, name, 1
+    Return 1
+End Process
+
+Process called "hir_context_is_unsafe_external" takes context as Integer, name as Integer returns Integer:
+    @Reasoning
+    Returns 1 if the given callee identifier was registered as an unsafe
+    external during HIR lowering of External declarations, 0 otherwise.
+    This is the lookup half of the Q4 semantic check; lower_call_expression
+    pairs it with hir_context_unsafe_depth to enforce the requirement that
+    unsafe-flagged callees may only be invoked from within an Unsafe Block.
+    @End Reasoning
+
+    @Implementation
+    Reads the Dictionary at offset 64 of HIRBuilderContext and looks up
+    the name. A nonzero value indicates registration; the registry never
+    stores 0 deliberately, so the simple "nonzero means present" decoding
+    is correct. Returns 0 for null context, null name, or unallocated
+    registry.
+    @End Implementation
+
+    @Performance_Hints
+    Amortized O(1) dictionary lookup. Called once per HIR call expression
+    lowering. Branch-predictable: most calls in real programs are not
+    unsafe externals, so the dictionary miss path is the common case.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. A false negative (registered name reported as
+    not-registered) would defeat the Q4 rejection; this is prevented by
+    using HIR string interning for identifier comparison. A false positive
+    is acceptable safety-wise (it forces extra Unsafe Block wrapping but
+    does not weaken the check).
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let dict be proc memory_get_int64 from Layout with context, 64
+    If dict is equal to 0:
+        Return 0
+    End If
+    Let value be proc get from Dictionary with dict, name
+    If value is equal to 0:
+        Return 0
+    End If
+    Return 1
 End Process
 
 Process called "destroy_builder_context" takes context as Integer returns Integer:
@@ -449,6 +658,11 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
         Return proc lower_block_statement with context, ast_node, line, column
     End If
 
+    Note: Unsafe Block (P2-D Q4 — CEO amendment 2026-05-24)
+    If node_type is equal to AST_UNSAFE_BLOCK from AST:
+        Return proc lower_unsafe_block with context, ast_node, line, column
+    End If
+
     Note: Declarations (3000-3999)
     If node_type is equal to AST_PROCESS_DEFINITION from AST:
         Return proc lower_process_definition with context, ast_node, line, column
@@ -456,6 +670,24 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
 
     If node_type is equal to AST_TYPE_DEFINITION from AST:
         Return proc lower_type_definition with context, ast_node, line, column
+    End If
+
+    Note: External declaration (P2-D FFI Foundation)
+    If node_type is equal to AST_EXTERNAL_DECLARATION from AST:
+        Let external_hir be proc hir_external_lower_from_ast from HIR with ast_node
+
+        Note: Register unsafe externals in the context's unsafe-call registry
+        Note: so subsequent call sites can be validated against Unsafe Block scope.
+        Let ast_flags be proc memory_get_int64 from Layout with ast_node, 144
+        Let unsafe_bit be ast_flags bitwise and 1
+        If unsafe_bit is equal to 1:
+            Let ext_name be proc memory_get_int64 from Layout with ast_node, 80
+            If ext_name is not equal to 0:
+                proc hir_context_register_unsafe_external with context, ext_name
+            End If
+        End If
+
+        Return external_hir
     End If
 
     Note: Unknown node type - return null HIR node
@@ -654,6 +886,41 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
     Let callee_ast be proc memory_get_int64 from Layout with ast_node, 80
     Let arguments_ast be proc memory_get_int64 from Layout with ast_node, 88
     Let arg_count be proc memory_get_int64 from Layout with ast_node, 96
+
+    Note: P2-D Q4 — Unsafe-external call gate.
+    Note: If the callee is a bare identifier, extract the name (AST_IDENTIFIER stores
+    Note: its name at offset 40 — the value field) and check whether it is a
+    Note: registered unsafe External. If so AND we are not inside an Unsafe Block
+    Note: (unsafe_depth == 0), emit a hard compile error and abort lowering of
+    Note: this expression.
+    If callee_ast is not equal to 0:
+        Let callee_kind be proc memory_get_int64 from Layout with callee_ast, 0
+        If callee_kind is equal to AST_IDENTIFIER from AST:
+            Let callee_name be proc ast_node_get_value from AST with callee_ast
+            If callee_name is not equal to 0:
+                Let is_unsafe_extern be proc hir_context_is_unsafe_external with context, callee_name
+                If is_unsafe_extern is equal to 1:
+                    Let current_unsafe_depth be proc hir_context_unsafe_depth with context
+                    If current_unsafe_depth is equal to 0:
+                        Note: Emit the rejection diagnostic per CEO Q4 amendment.
+                        Note: The full message is split across multiple Display calls
+                        Note: because the runtime string-formation API the compiler
+                        Note: relies on at this stage of HIR lowering does not yet
+                        Note: have a stable string_concat callable from Runa source.
+                        Note: Each Display line goes to stderr-equivalent diagnostic stream.
+                        Display "[FFI ERROR] Cannot call unsafe External '"
+                        Display callee_name
+                        Display "' outside an Unsafe Block. Wrap the call site in 'Unsafe Block: ... End Unsafe'."
+                        Let err_list be proc memory_get_int64 from Layout with context, 32
+                        If err_list is not equal to 0:
+                            proc append from List with err_list, callee_name
+                        End If
+                        Return 0
+                    End If
+                End If
+            End If
+        End If
+    End If
 
     Note: Lower callee
     Let callee_hir be proc lower_ast_node with context, callee_ast
@@ -1709,6 +1976,76 @@ Process called "lower_block_statement" takes context as Integer, ast_node as Int
     proc pop_scope with context
 
     Return base_hir
+End Process
+
+Process called "lower_unsafe_block" takes context as Integer, ast_node as Integer, line as Integer, column as Integer returns Integer:
+    @Reasoning
+    Lowers an AST_UNSAFE_BLOCK (= 2019) into HIR. Per CEO Q4 amendment, an
+    Unsafe Block is a compile-time scope marker that grants permission to
+    call unsafe-flagged externals from within its body; there is no runtime
+    representation distinct from a regular block. The lowering therefore:
+      - Increments the HIR context's unsafe_depth before lowering the body.
+      - Recursively lowers the child block statement.
+      - Decrements the unsafe_depth on every exit path, including the
+        body-lowering-failure path, to preserve the depth invariant.
+    @End Reasoning
+
+    @Implementation
+    The AST_UNSAFE_BLOCK node has its body block statement as a single
+    child at index 0 of the children list (AST node offset 24, count at
+    offset 32). After entering the unsafe scope, the child is lowered via
+    the standard lower_ast_node dispatch -- usually it is an
+    AST_BLOCK_STATEMENT that itself lowers to an HIR_BLOCK. The unsafe
+    scope is left unconditionally before returning so a body-lowering
+    failure (body_hir == 0) does not leak unsafe permission into the
+    parent scope.
+
+    Returns the lowered body HIR node directly; no distinct HIR
+    "unsafe-block" node exists, matching the Q4 semantic that the
+    Unsafe Block is purely a compile-time gate.
+    @End Implementation
+
+    @Performance_Hints
+    Two depth-counter operations plus one recursive lower_ast_node call.
+    The depth operations are O(1) word operations; recursion cost
+    dominates and is proportional to the body's AST size, identical to
+    lowering any other block.
+    @End Performance_Hints
+
+    @Security_Scope
+    The unconditional leave_unsafe (after lower_ast_node returns,
+    regardless of body_hir == 0) is the security-critical detail: it
+    prevents an early-exit code path through lower_ast_node from leaving
+    a phantom unsafe scope active for sibling code in the surrounding
+    block. Failure to maintain this invariant would let a malformed AST
+    promote subsequent calls to unsafe externals without an explicit
+    user-visible Unsafe Block wrapping.
+    @End Security_Scope
+
+    Note: The AST_UNSAFE_BLOCK node has a single child: the body block statement.
+    Let children_list be proc memory_get_int64 from Layout with ast_node, 24
+    Let child_count be proc memory_get_int64 from Layout with ast_node, 32
+
+    Note: Enter unsafe scope
+    proc hir_context_enter_unsafe with context
+
+    Note: Lower the body -- typically a single AST_BLOCK_STATEMENT child
+    Let body_hir be 0
+    If child_count is greater than 0:
+        Let body_ast be proc get from List with children_list, 0
+        If body_ast is not equal to 0:
+            Set body_hir to proc lower_ast_node with context, body_ast
+        End If
+    End If
+
+    Note: Leave unsafe scope (always -- even on body lowering failure)
+    proc hir_context_leave_unsafe with context
+
+    If body_hir is equal to 0:
+        Return 0
+    End If
+
+    Return body_hir
 End Process
 
 Note: ============================================================================

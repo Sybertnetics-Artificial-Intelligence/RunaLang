@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,184 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles type marshaling and data conversion for the Runa runtime integration system.
+TYPE MARSHALING — Runtime FFI Type Conversion (P2-D D-FFI-10)
 
-This file performs the following tasks:
-- Process type marshaling and data conversion
-- Handle type conversion and type mapping
-- Manage marshaling buffers and marshaling coordination
-- Process marshaling error handling and marshaling feedback
+Runtime-side companion to compiler-frontend type marshaling. Where the
+compiler decides at codegen time which register class to use, the
+runtime resolver handles per-call adjustments that cannot be expressed
+at codegen time:
+  - String NUL-termination guarantee for `const char*` parameters
+  - Pointer-validity checks for Pointer[T] parameters
+  - Endianness handling for cross-platform wire-format types
+  - Sign-extension / zero-extension for narrow integer C types crossing
+    Runa's 64-bit integer boundary
 
-This file is essential because of the following reasons:
-- type_marshaling enables comprehensive type marshaling and data conversion
-- Proper marshaling handling ensures correct data conversion and user experience
-- type_marshaling support enables Runa compilation for type marshaling workflows
-
-This file consists of the following functions/features/operation types:
-- Type marshaling and data conversion
-- Type conversion and type mapping
-- Marshaling buffers and marshaling coordination
-- Marshaling error handling and marshaling feedback
+Most marshaling happens at compile time (the type_marshal.runa table at
+compiler/frontend/primitives/ffi/ maps HIR types to C ABI categories);
+this file holds the runtime helpers for the parts that genuinely
+require runtime work.
 :End Note
 
-Note: TODO - Implement type_marshaling functionality
+Note: ============================================================================
+Note: String marshaling — NUL-termination guarantee
+Note: ============================================================================
+
+Process called "ffi_string_to_cstr" takes runa_string as Integer returns Integer:
+    @Reasoning
+    Returns a pointer to a NUL-terminated C string suitable for passing as
+    a `const char*` parameter across the FFI boundary. Runa strings produced
+    by string_core are guaranteed NUL-terminated, so this is a zero-copy
+    pointer pass for the common case. For strings produced by manual byte-
+    buffer manipulation that may not be NUL-terminated, this helper
+    defensively returns a copy with the terminator appended.
+
+    Per Risk #2 in the P2-D design doc.
+    @End Reasoning
+
+    @Implementation
+    1. Validate runa_string pointer.
+    2. Read the string length (offset 0 of the standard Runa string header)
+       and the data pointer (offset 8).
+    3. Check the byte at data[length] — if it is 0, return data pointer
+       unchanged (zero-copy fast path).
+    4. Otherwise, allocate length+1 bytes, copy the source, NUL-terminate,
+       and return the new buffer.
+
+    Tier-2 (arena) allocation when a copy is needed — the FFI call site
+    arena owns the copy through the call's lifetime.
+    @End Implementation
+
+    @Performance_Hints
+    Fast path is a single byte check + pointer return (~3 ns).
+    Slow path is O(length) memcpy plus allocation (~100 ns for short strings).
+    Hot FFI paths should ensure string producers always NUL-terminate to stay
+    on the fast path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returning a pointer into the Runa heap to a C callee allows the callee
+    to read past the string end if it doesn't honor length. For Runa code
+    crossing FFI, the caller is responsible for ensuring the callee respects
+    string bounds. Unsafe externals that may write through the pointer require
+    explicit `unsafe` declaration + Unsafe Block call site (Q4).
+    @End Security_Scope
+
+    If runa_string is equal to 0:
+        Return 0
+    End If
+
+    Let length be memory_get_int64(runa_string, 0)
+    Let data_ptr be memory_get_int64(runa_string, 8)
+
+    If data_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Fast path — check if already NUL-terminated.
+    Let terminator_byte be memory_get_byte(data_ptr, length)
+    If terminator_byte is equal to 0:
+        Return data_ptr
+    End If
+
+    Note: Slow path — copy with explicit NUL terminator.
+    Let copy_ptr be allocate(length plus 1)
+    If copy_ptr is equal to 0:
+        Return 0
+    End If
+
+    memory_copy(copy_ptr, data_ptr, length)
+    memory_set_byte(copy_ptr, length, 0)
+
+    Return copy_ptr
+End Process
+
+Process called "ffi_cstr_to_runa_string" takes cstr as Integer returns Integer:
+    @Reasoning
+    Converts a C-side NUL-terminated string back into a Runa string. Used
+    for FFI return values typed `String`. Allocates a fresh Runa string
+    header + data buffer; the C-side pointer is not retained.
+    @End Reasoning
+
+    @Implementation
+    1. Validate cstr.
+    2. Scan for the NUL terminator to compute length.
+    3. Allocate Runa string header (16 bytes: length + data pointer).
+    4. Allocate data buffer (length+1 bytes including NUL).
+    5. Copy data and NUL-terminate.
+    6. Return the Runa string pointer.
+    @End Implementation
+
+    If cstr is equal to 0:
+        Return 0
+    End If
+
+    Note: Compute length via byte scan. The loop terminates when a NUL byte
+    Note: is observed; structuring as a While with an explicit sentinel state
+    Note: keeps the open/close tokens matched per Runa formal grammar
+    Note: (while_loop ::= "While" expression ':' block "End" "While").
+    Let length be 0
+    Let scanning be 1
+    While scanning is equal to 1:
+        Let byte be memory_get_byte(cstr, length)
+        If byte is equal to 0:
+            Set scanning to 0
+        Otherwise:
+            Set length to length plus 1
+        End If
+    End While
+
+    Note: Allocate Runa string (header + data)
+    Let str_obj be allocate(16)
+    If str_obj is equal to 0:
+        Return 0
+    End If
+
+    Let data_buf be allocate(length plus 1)
+    If data_buf is equal to 0:
+        deallocate(str_obj)
+        Return 0
+    End If
+
+    memory_copy(data_buf, cstr, length)
+    memory_set_byte(data_buf, length, 0)
+
+    memory_set_int64(str_obj, 0, length)
+    memory_set_int64(str_obj, 8, data_buf)
+
+    Return str_obj
+End Process
+
+Note: ============================================================================
+Note: Narrow integer marshaling
+Note: ============================================================================
+
+Process called "ffi_marshal_int_to_int32" takes value as Integer returns Integer:
+    Note: Returns the low 32 bits of a 64-bit integer for passing as C int32_t.
+    Note: The high 32 bits are truncated. For sign-extending back to int64_t,
+    Note: use ffi_marshal_int32_to_int_sext.
+    Return value bitwise and 4294967295
+End Process
+
+Process called "ffi_marshal_int32_to_int_sext" takes value as Integer returns Integer:
+    Note: Sign-extends a 32-bit value to 64-bit (preserves negative values).
+    Note: Used for marshaling C int32_t returns into Runa Integer.
+    Let masked be value bitwise and 4294967295
+    Note: Test the sign bit (bit 31). If set, OR in the upper 32 bits of -1.
+    Let sign_bit be masked bitwise and 2147483648
+    If sign_bit is equal to 0:
+        Return masked
+    End If
+    Note: Sign-extend: OR with 0xFFFFFFFF00000000
+    Let high_mask be 18446744069414584320
+    Return masked bitwise or high_mask
+End Process
+
+Process called "ffi_marshal_int_to_int16" takes value as Integer returns Integer:
+    Note: Returns the low 16 bits for passing as C int16_t/short.
+    Return value bitwise and 65535
+End Process
+
+Process called "ffi_marshal_int_to_int8" takes value as Integer returns Integer:
+    Note: Returns the low 8 bits for passing as C int8_t/char.
+    Return value bitwise and 255
+End Process

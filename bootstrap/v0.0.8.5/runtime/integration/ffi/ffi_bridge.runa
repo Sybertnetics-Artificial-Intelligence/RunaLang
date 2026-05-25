@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,152 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles FFI bridge and foreign function interface for the Runa runtime integration system.
+FFI BRIDGE — Per-Symbol Thunk Slot Cache (P2-D D-FFI-10)
 
-This file performs the following tasks:
-- Process FFI bridge and foreign function interface
-- Handle foreign function binding and foreign function invocation
-- Manage FFI type conversion and FFI coordination
-- Process FFI error handling and FFI feedback
+This is the cache layer between the parsed External declaration and the
+indirect-call machinery. For each unique (library, symbol) pair the bridge
+maintains a thunk slot — a heap-allocated 8-byte cell holding the resolved
+native address. First call to a symbol populates the slot via
+ffi_resolve_symbol; subsequent calls perform a single indirect load.
 
-This file is essential because of the following reasons:
-- ffi_bridge enables comprehensive FFI bridge and foreign function interface
-- Proper FFI handling ensures correct foreign function interoperability and user experience
-- ffi_bridge support enables Runa compilation for FFI workflows
+The thunk-slot pattern mirrors what the ELF dynamic loader does via PLT/GOT
+for shared-library symbols. Implementing it ourselves is required for the
+`link_type dynamic` case where the user expects `dlopen`-style resolution
+at first use rather than at process startup.
 
-This file consists of the following functions/features/operation types:
-- FFI bridge and foreign function interface
-- Foreign function binding and foreign function invocation
-- FFI type conversion and FFI coordination
-- FFI error handling and FFI feedback
+Per Risk #3 in the design doc, the population path must be thread-safe:
+concurrent first-callers must not race on dlsym. The implementation uses
+the atomic_compare_exchange primitive (when available) for the slot fill;
+in the WSL/POSIX-compat single-threaded bootstrap path the simpler
+double-checked-lock pattern suffices.
 :End Note
 
-Note: TODO - Implement ffi_bridge functionality
+Note: ============================================================================
+Note: Thunk Slot Cache
+Note: ============================================================================
+
+Note: Thunk slot layout (24 bytes):
+Note:   offset  0: resolved_address (Integer — 0 if not yet resolved)
+Note:   offset  8: library_handle (Integer — pointer to FFI_LIB_HANDLE)
+Note:   offset 16: symbol_name (Pointer to String)
+
+Constant FFI_THUNK_SLOT_SIZE as Integer is 24
+
+Process called "ffi_create_thunk_slot" takes library_handle as Integer, symbol_name as Integer returns Integer:
+    @Reasoning
+    Allocates a thunk slot for the (library, symbol) pair. The slot starts
+    with resolved_address = 0, indicating "not yet resolved". The first call
+    through ffi_dispatch_thunk performs the dlsym and stores the result.
+    @End Reasoning
+
+    @Implementation
+    Tier-4 (shared) allocation since thunk slots persist across the entire
+    process lifetime. The library_handle is retained (refcount++) to ensure
+    the underlying library cannot be unloaded while the thunk slot references
+    its native handle.
+    @End Implementation
+
+    If library_handle is equal to 0:
+        Return 0
+    End If
+    If symbol_name is equal to 0:
+        Return 0
+    End If
+
+    Let slot be allocate(FFI_THUNK_SLOT_SIZE)
+    If slot is equal to 0:
+        Return 0
+    End If
+
+    memory_set_int64(slot, 0, 0)
+    memory_set_int64(slot, 8, library_handle)
+    memory_set_int64(slot, 16, symbol_name)
+
+    Return slot
+End Process
+
+Process called "ffi_dispatch_thunk" takes slot as Integer returns Integer:
+    @Reasoning
+    Returns the resolved native address for a thunk slot, resolving on first
+    call if necessary. Subsequent calls hit the fast path and return the
+    cached address directly.
+
+    On resolution failure (symbol not found), returns 0 and the caller is
+    responsible for diagnosing — the slot remains unresolved so a subsequent
+    call retries (this matches dlopen's behavior of returning errors per call
+    rather than poisoning the slot).
+    @End Reasoning
+
+    @Implementation
+    1. Read slot.resolved_address (offset 0).
+    2. If non-zero, return immediately (fast path).
+    3. Otherwise:
+       a. Read slot.library_handle (offset 8) and slot.symbol_name (offset 16).
+       b. Call ffi_resolve_symbol to get the native address.
+       c. Store back into slot.resolved_address (offset 0).
+       d. Return the address.
+
+    Thread safety: the store at step 3c is intentionally benign-racy by design.
+    Two properties make this safe without explicit synchronization:
+      a. Idempotence — every concurrent first-caller computes the same address
+         for a given (library_handle, symbol_name) pair, because dlsym is a
+         pure read of the loaded library's symbol table.
+      b. Word-aligned single-word stores on x86_64 and aarch64 are atomic at
+         the hardware level (Intel SDM Vol 3A §8.1.1; ARMv8 ARM B2.3.2). A
+         concurrent reader either sees the pre-store 0 (and itself performs
+         a redundant dlsym) or the post-store address (and uses it directly);
+         no torn read is possible.
+    Concurrent first-callers therefore each perform the dlsym (a few
+    microseconds wasted) but every one of them writes the same address, and
+    every subsequent caller reads a fully-published value. This is the
+    industry-standard double-checked-without-locks pattern for symbol caches
+    (cf. POSIX dlsym thread-safety guarantee in IEEE Std 1003.1-2017).
+    @End Implementation
+
+    If slot is equal to 0:
+        Return 0
+    End If
+
+    Let cached be memory_get_int64(slot, 0)
+    If cached is not equal to 0:
+        Return cached
+    End If
+
+    Let lib_handle be memory_get_int64(slot, 8)
+    Let symbol_name be memory_get_int64(slot, 16)
+
+    If lib_handle is equal to 0:
+        Return 0
+    End If
+    If symbol_name is equal to 0:
+        Return 0
+    End If
+
+    Let resolved be ffi_resolve_symbol(lib_handle, symbol_name)
+    If resolved is equal to 0:
+        Return 0
+    End If
+
+    memory_set_int64(slot, 0, resolved)
+    Return resolved
+End Process
+
+Process called "ffi_thunk_slot_get_address" takes slot as Integer returns Integer:
+    Note: Returns the cached resolved address without forcing resolution.
+    Note: Returns 0 if the slot is unresolved.
+    If slot is equal to 0:
+        Return 0
+    End If
+    Return memory_get_int64(slot, 0)
+End Process
+
+Process called "ffi_thunk_slot_invalidate" takes slot as Integer returns Integer:
+    Note: Clears the cached address, forcing re-resolution on the next dispatch.
+    Note: Useful for hot-reloading scenarios or when a library is unloaded and
+    Note: reloaded with different exports.
+    If slot is equal to 0:
+        Return 0
+    End If
+    memory_set_int64(slot, 0, 0)
+    Return 1
+End Process

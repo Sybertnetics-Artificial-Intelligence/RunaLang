@@ -625,9 +625,17 @@ Process called "emit_function" that takes ctx as Integer, lir_func as Integer re
     Let func_name be __load(lir_func, 0)
     Let is_external be __load(lir_func, 112)
 
-    Note: Skip external (declaration-only) functions
+    Note: Skip external (declaration-only) functions.
+    Note: P2-D FFI: When an FFI alias_name is recorded (offset 152), emit .extern
+    Note: against the C-side symbol rather than the Runa-side name. This handles
+    Note: declarations like `External Process called "c_sqrt" ... aliased as "sqrt"`
+    Note: where the assembler/linker must see "sqrt" not "c_sqrt".
     If is_external is 1:
-        MachineCode.asm_add_external_symbol(output, func_name)
+        Let alias_name be __load(lir_func, 152)
+        If alias_name is 0:
+            Set alias_name to func_name
+        End If
+        MachineCode.asm_add_external_symbol(output, alias_name)
         Return 1
     End If
 
@@ -1583,13 +1591,92 @@ Process called "emit_conditional_jmp" that takes ctx as Integer, instr as Intege
 End Process
 
 Process called "emit_call" that takes ctx as Integer, instr as Integer returns Integer:
+    @Reasoning
+    Emits the x86_64 SysV machine instruction sequence for a LIR call,
+    dispatching the call symbol based on the LIR call's recorded calling
+    convention (offset 64). Per CEO Q3 amendment, objc-convention calls
+    are routed through _objc_msgSend@PLT; the parser already wrote the
+    Runa-side method-name identifier into the AST and the HIR/MIR/LIR
+    chain propagated it to the LIR call's operand-1 callee_name slot,
+    but for objc dispatch the symbol is replaced with the Objective-C
+    runtime entry point at codegen time. Receiver and selector argument
+    marshaling (rdi for `self`, rsi for `_cmd`) is performed earlier by
+    lower_call's SysV register assignment.
+
+    Convention dispatch table:
+      0 (c) / 1 (stdcall) / 2 (fastcall) / 3 (cdecl): standard
+        callq <callee_name>.
+      4 (syscall): the callee_name is the runtime syscall thunk for the
+        target arch (e.g., `syscall_write`); a standard callq emits the
+        right instruction since the thunk applies the syscall calling
+        convention internally.
+      5 (objc): emits `callq _objc_msgSend@PLT`. Non-Darwin targets are
+        rejected at link time by linker_driver_emit_objc_rejection.
+    @End Reasoning
+
+    @Implementation
+    Reads operand1 (offset 16 of the LIR call instruction) to find the
+    LIRValue whose offset-16 field carries the callee_name string. Reads
+    the calling_convention (offset 64) to choose the emission path.
+
+    Two distinct paths:
+      objc (convention_id == 5): emits the literal `\tcallq\t_objc_msgSend@PLT`
+        directive followed by a newline. The Runa-side method identifier
+        is intentionally discarded -- it is encoded as the selector in
+        rsi prior to the call site.
+      default: emits `\tcallq\t<callee_name>` followed by a newline,
+        where <callee_name> is the alias symbol (set by the External
+        declaration's `as "..."` clause, or the bare process name when
+        omitted). The label `\tcallq\t` is the GNU as syntax for a
+        64-bit relative-PLT call.
+
+    Failure modes: a null callee_name or null operand1 causes the
+    Process to silently skip emission, which would yield a malformed
+    text section but should not crash; upstream LIR construction
+    guarantees both fields are populated for non-indirect calls.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One pointer load (output stream), two field loads from the
+    instruction, one conditional branch, two string emits. Total
+    overhead is dominated by the asm_emit calls (~50 nanoseconds per
+    call). Called once per LIR call instruction; cumulative cost
+    proportional to call-site count in the program.
+    @End Performance_Hints
+
+    @Security_Scope
+    The emitted text is consumed by an external assembler (`as`) which
+    is the security boundary; this Process emits well-formed GNU as
+    syntax with no user-controlled data interpolated except the
+    alias_name from the External declaration. Aliases pass through
+    parser validation that restricts them to identifier-shaped strings,
+    so they cannot inject GAS directives or shell metacharacters. The
+    objc path emits a fixed literal symbol (`_objc_msgSend@PLT`) with
+    no user input on the codepath at all.
+    @End Security_Scope
+
     Let output be __load(ctx, 0)
     Let operand1 be __load(instr, 16)
+    Let convention_id be __load(instr, 64)
+
     If operand1 is not 0:
         Let callee_name be __load(operand1, 16)
         If callee_name is not 0:
-            MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t")
-            MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, callee_name)
+            If convention_id is 5:
+                Note: Q3 — Objective-C convention: emit objc_msgSend dispatch.
+                Note: Selector arg-2 is already in rsi per SysV argument-marshal
+                Note: in lower_call. The Runa-side name (e.g., "doSomething") is
+                Note: dropped in favor of the dispatcher symbol.
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t_objc_msgSend@PLT")
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, "")
+            Otherwise:
+                Note: Default path — direct call to the recorded symbol name.
+                Note: For convention syscall, the callee_name is itself a thunk
+                Note: function in primitives/assembly that wraps the syscall
+                Note: instruction; we emit the standard call to it.
+                MachineCode.asm_emit_to_section(output, MachineCode.SECTION_TEXT, "\tcallq\t")
+                MachineCode.asm_emit_line(output, MachineCode.SECTION_TEXT, callee_name)
+            End If
         End If
     End If
     Return 1

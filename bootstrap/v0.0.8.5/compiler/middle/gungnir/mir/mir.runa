@@ -273,21 +273,26 @@ and are marked with is_external flag.
 @End Reasoning
 
 Type called "MIRFunction":
-    name as Integer                Note: Pointer to function name string
-    cfg as Integer                 Note: Pointer to MIRCFG
-    parameters as Integer          Note: Pointer to List of parameter value IDs
-    parameter_count as Integer     Note: Number of parameters
-    return_type as Integer         Note: Pointer to HIRTypeInfo for return type
-    local_values as Integer        Note: Pointer to List of all SSA values in function
-    value_count as Integer         Note: Number of SSA values
-    next_value_id as Integer       Note: Counter for generating unique value IDs
-    value_to_instruction as Integer Note: Dictionary mapping value_id -> defining instruction pointer
-    is_external as Integer         Note: Boolean: 1 if external function, 0 if defined
-    hir_node as Integer            Note: Pointer to original HIR process definition
-    metadata as Integer            Note: Optional metadata pointer
+    name as Integer                Note: Offset 0  - Pointer to function name string
+    cfg as Integer                 Note: Offset 8  - Pointer to MIRCFG
+    parameters as Integer          Note: Offset 16 - Pointer to List of parameter value IDs
+    parameter_count as Integer     Note: Offset 24 - Number of parameters
+    return_type as Integer         Note: Offset 32 - Pointer to HIRTypeInfo for return type
+    local_values as Integer        Note: Offset 40 - Pointer to List of all SSA values in function
+    value_count as Integer         Note: Offset 48 - Number of SSA values
+    next_value_id as Integer       Note: Offset 56 - Counter for generating unique value IDs
+    value_to_instruction as Integer Note: Offset 64 - Dictionary mapping value_id -> defining instruction pointer
+    hir_node as Integer            Note: Offset 72 - Pointer to original HIR process definition
+    is_external as Integer         Note: Offset 80 - Boolean: 1 if external function, 0 if defined (authoritative offset)
+    metadata as Integer            Note: Offset 88 - Optional metadata pointer
+    library_name as Integer        Note: Offset 96 - P2-D FFI: Pointer to library name string (0 if not external)
+    alias_name as Integer          Note: Offset 104 - P2-D FFI: Pointer to C-side symbol name (0 if same as name)
+    convention_id as Integer       Note: Offset 112 - P2-D FFI: Calling convention ID (0=c, 1=stdcall, 2=fastcall, 3=cdecl, 4=syscall, 5=objc)
 End Type
 
-Note: Size: 12 fields * 8 bytes = 96 bytes per MIRFunction
+Note: Size: 15 fields * 8 bytes = 120 bytes per MIRFunction
+Note: P2-D extension: library_name (offset 96), alias_name (offset 104), convention_id (offset 112)
+Note: Authoritative is_external offset is 80 (matches all consumers: inlining, devirt, tail_call, lto, lir_builder).
 
 @Reasoning
 The top-level MIR program container owns all functions, global values, and
@@ -448,7 +453,7 @@ reference preserves connection to source for debugging and error reporting.
 @End Implementation
 
 Process called "create_mir_function" that takes name as Integer, return_type as Integer, hir_node as Integer returns Integer:
-    Let function_size be 96
+    Let function_size be 120
     Let function be proc allocate from Layout with function_size
 
     If function is equal to 0:
@@ -480,12 +485,66 @@ Process called "create_mir_function" that takes name as Integer, return_type as 
     Let value_map be proc create from Dictionary
     proc memory_set_int64 from Layout with function, 64, value_map
 
-    Note: is_external (offset 72), hir_node (offset 80), metadata (offset 88)
-    proc memory_set_int64 from Layout with function, 72, 0
-    proc memory_set_int64 from Layout with function, 80, hir_node
+    Note: hir_node (offset 72), is_external (offset 80), metadata (offset 88)
+    Note: Authoritative offset for is_external is 80 — all consumers (inlining, devirt,
+    Note: tail_call, lto, lir_builder) read at offset 80. The Type definition above
+    Note: declares is_external at offset 80 to match. New functions are non-external (=0).
+    proc memory_set_int64 from Layout with function, 72, hir_node
+    proc memory_set_int64 from Layout with function, 80, 0
     proc memory_set_int64 from Layout with function, 88, 0
 
+    Note: P2-D FFI extension fields:
+    Note:   library_name (offset 96), alias_name (offset 104), convention_id (offset 112)
+    proc memory_set_int64 from Layout with function, 96, 0
+    proc memory_set_int64 from Layout with function, 104, 0
+    proc memory_set_int64 from Layout with function, 112, 0
+
     Return function
+End Process
+
+Process called "mir_function_set_external" that takes function as Integer, library_name as Integer, alias_name as Integer, convention_id as Integer returns Integer:
+    Note: P2-D FFI: Mark a MIRFunction as external and record FFI metadata.
+    Note: Sets is_external=1 (at offset 80 per consumer-side convention) plus FFI fields.
+    If function is equal to 0:
+        Return 0
+    End If
+
+    Note: Set is_external = 1 at offset 80 (authoritative — matches Type definition
+    Note: and all consumers: inlining, devirt, tail_call, lto, lir_builder).
+    proc memory_set_int64 from Layout with function, 80, 1
+
+    Note: Set FFI metadata fields (offsets 96/104/112)
+    proc memory_set_int64 from Layout with function, 96, library_name
+    proc memory_set_int64 from Layout with function, 104, alias_name
+    proc memory_set_int64 from Layout with function, 112, convention_id
+
+    Return 1
+End Process
+
+Process called "mir_function_get_library_name" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with function, 96
+End Process
+
+Process called "mir_function_get_alias_name" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+    Let alias be proc memory_get_int64 from Layout with function, 104
+    If alias is equal to 0:
+        Note: Default alias is the function name (offset 0)
+        Return proc memory_get_int64 from Layout with function, 0
+    End If
+    Return alias
+End Process
+
+Process called "mir_function_get_convention_id" that takes function as Integer returns Integer:
+    If function is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with function, 112
 End Process
 
 @Implementation
@@ -1060,18 +1119,45 @@ Process called "set_mir_node_metadata" that takes node as Integer, metadata as I
 End Process
 
 Process called "get_mir_function_metadata" that takes function as Integer returns Integer:
+    Note: metadata field is at offset 88 per Type definition (P2-D offset audit 2026-05-24)
+    If function is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with function, 88
+End Process
+
+Process called "set_mir_function_metadata" that takes function as Integer, metadata as Integer returns Integer:
+    Note: metadata field is at offset 88 per Type definition (P2-D offset audit 2026-05-24)
+    If function is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with function, 88, metadata
+    Return 1
+End Process
+
+Process called "get_mir_function_hir_node" that takes function as Integer returns Integer:
+    Note: hir_node field is at offset 72 per Type definition (P2-D offset audit 2026-05-24)
+    If function is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with function, 72
+End Process
+
+Process called "set_mir_function_hir_node" that takes function as Integer, hir_node as Integer returns Integer:
+    Note: hir_node field is at offset 72 per Type definition (P2-D offset audit 2026-05-24)
+    If function is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with function, 72, hir_node
+    Return 1
+End Process
+
+Process called "is_external_function" that takes function as Integer returns Integer:
+    Note: Reads is_external at the authoritative offset 80.
     If function is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with function, 80
-End Process
-
-Process called "set_mir_function_metadata" that takes function as Integer, metadata as Integer returns Integer:
-    If function is equal to 0:
-        Return 0
-    End If
-    proc memory_set_int64 from Layout with function, 80, metadata
-    Return 1
 End Process
 
 Process called "get_mir_program_metadata" that takes program as Integer returns Integer:

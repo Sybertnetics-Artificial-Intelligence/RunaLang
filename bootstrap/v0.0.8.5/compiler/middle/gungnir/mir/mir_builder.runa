@@ -158,7 +158,106 @@ Process called "create_mir_builder_context" that returns Integer:
     Note: Initialize return type to null
     Layout.memory_set_int64(context_ptr, 72, 0)   Note: function_return_type
 
+    Note: P2-D FFI: externals registry (Dictionary: name_string -> convention_id+1).
+    Note: Stores +1 to distinguish "not registered" (0) from convention_id=0 (c).
+    Let externals_dict be Dictionary.create()
+    Layout.memory_set_int64(context_ptr, 80, externals_dict)
+
     Return context_ptr
+End Process
+
+Process called "mir_context_register_external" that takes context_ptr as Integer, name as Integer, convention_id as Integer returns Integer:
+    @Reasoning
+    Registers an external function name with its calling convention in the
+    MIR builder's per-context externals registry. The registry is consumed
+    by lower_hir_call_expression: when a call's callee identifier matches a
+    registered name, the MIR_CALL node receives the FFI metadata
+    (callee_is_external = 1, callee_convention_id = registered convention)
+    so LIR / codegen can dispatch through the correct calling convention.
+
+    Convention IDs are stored offset by +1 inside the dictionary so that
+    the natural "miss returns 0" semantic distinguishes "not registered"
+    from "registered with convention_id = 0 (FFI_CALLING_CONV_C)". Without
+    the offset, registering a C-convention external would be
+    indistinguishable from absence.
+    @End Reasoning
+
+    @Implementation
+    Lazily allocates the externals Dictionary at offset 80 of the MIR
+    builder context if not yet present (defensive against constructor
+    paths that may have failed to allocate it). Inserts (name,
+    convention_id + 1). Returns 1 on success, 0 on null inputs.
+    @End Implementation
+
+    @Performance_Hints
+    Amortized O(1) dictionary insert. Called once per External declaration
+    processed by lower_hir_external_declaration; cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The registry is private to the MIR builder context. Only the HIR-to-MIR
+    lowering for HIR_EXTERNAL_DECLARATION reaches this Process, and that
+    code path has already validated the External's library, alias, and
+    convention fields. User code cannot poison the registry.
+    @End Security_Scope
+
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let dict be Layout.memory_get_int64(context_ptr, 80)
+    If dict is equal to 0:
+        Set dict to Dictionary.create()
+        Layout.memory_set_int64(context_ptr, 80, dict)
+    End If
+    Dictionary.set(dict, name, convention_id plus 1)
+    Return 1
+End Process
+
+Process called "mir_context_lookup_external" that takes context_ptr as Integer, name as Integer returns Integer:
+    @Reasoning
+    Returns the registered convention_id + 1 for an external name, or 0 if
+    the name is not registered. Callers (notably lower_hir_call_expression)
+    subtract 1 from a nonzero return to recover the actual convention_id;
+    a 0 return signals that the callee is a non-FFI function and the
+    MIR_CALL node should not receive FFI metadata.
+    @End Reasoning
+
+    @Implementation
+    Single dictionary lookup against the externals registry at offset 80
+    of the MIR builder context. Returns 0 on null context, null name, or
+    unallocated registry. The +1 encoding is decoded by the caller (this
+    Process returns the raw stored value to preserve the "0 = miss"
+    contract).
+    @End Implementation
+
+    @Performance_Hints
+    Amortized O(1) dictionary lookup. Called once per HIR call expression
+    lowering. Branch-predictable: most call sites in real programs do not
+    target External Processes, so the miss path is the common case.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. A false negative (registered name reported as
+    not-registered) would cause the MIR_CALL to lower without FFI
+    metadata and degrade to the host calling convention, which is a
+    correctness issue but not a safety issue. The HIR string interning
+    used for identifier keys eliminates false negatives in practice.
+    @End Security_Scope
+
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+    If name is equal to 0:
+        Return 0
+    End If
+    Let dict be Layout.memory_get_int64(context_ptr, 80)
+    If dict is equal to 0:
+        Return 0
+    End If
+    Return Dictionary.get(dict, name)
 End Process
 
 Process called "destroy_mir_builder_context" that takes context_ptr as Integer returns Integer:
@@ -729,6 +828,10 @@ Process called "lower_hir_call_expression" that takes context_ptr as Integer, hi
     Note: Get arguments list (offset 40)
     Let args_list be Layout.memory_get_int64(hir_node_ptr, 40)
 
+    Note: Get return type (offset 48 in lower_hir_call_expression's HIR layout convention).
+    Note: Used to populate the MIR_CALL return_type field for downstream type-aware lowering.
+    Let return_type be Layout.memory_get_int64(hir_node_ptr, 48)
+
     Note: Lower all arguments
     Let mir_args be List.create()
 
@@ -743,11 +846,43 @@ Process called "lower_hir_call_expression" that takes context_ptr as Integer, hi
         Set i to i plus 1
     End While
 
+    Note: Compute the count of successfully lowered arguments. May be smaller
+    Note: than the HIR-level arg_count if any argument lowering failed (returned 0);
+    Note: in that case the lowered call carries only the successful subset, which
+    Note: matches the actual operand list emitted into mir_args.
+    Let lowered_arg_count be List.length(mir_args)
+
     Note: Allocate value for call result
     Let result_value be allocate_temp_value(context_ptr)
 
-    Note: Create MIR call instruction
-    Let call_inst be MIRNodes.create_mir_call(result_value, callee, mir_args)
+    Note: Create MIR call instruction.
+    Note: All 7 parameters of create_mir_call (post-P2-D FFI extension) are supplied:
+    Note:   result_value_id  -> the MIR value ID receiving the call's return value
+    Note:   callee           -> direct callee name string pointer (HIR-level identifier)
+    Note:   arguments        -> List of lowered MIR value IDs
+    Note:   argument_count   -> count of operands actually placed in `arguments`
+    Note:   return_type      -> HIR return-type pointer (0 if untyped)
+    Note:   is_indirect      -> 0 for direct calls (callee is a named function);
+    Note:                       indirect calls take a separate HIR path that sets this
+    Note:   is_tail_call     -> 0 by default; tail_call optimization pass sets this later
+    Note: FFI metadata (callee_is_external, callee_convention_id) is populated by
+    Note: mir_call_set_ffi_metadata below when the callee resolves to a registered
+    Note: external in the MIR builder context.
+    Let call_inst be MIRNodes.create_mir_call(result_value, callee, mir_args, lowered_arg_count, return_type, 0, 0)
+
+    Note: P2-D FFI: If the callee resolves to a registered external in the MIR
+    Note: builder context's externals registry, propagate its convention_id and
+    Note: mark callee_is_external=1 on the MIR_CALL node. This drives LIR call
+    Note: lowering through the proper calling-convention dispatch path (D-FFI-07/08).
+    If call_inst is not equal to 0:
+        If callee is not equal to 0:
+            Let external_marker be mir_context_lookup_external(context_ptr, callee)
+            If external_marker is not equal to 0:
+                Let resolved_convention be external_marker minus 1
+                MIRNodes.mir_call_set_ffi_metadata(call_inst, 1, resolved_convention)
+            End If
+        End If
+    End If
 
     Note: Emit instruction
     emit_instruction(context_ptr, call_inst)
@@ -2143,6 +2278,63 @@ Note: ==========================================================================
 Note: PHASE 2: MAIN ENTRY POINTS - Public API
 Note: ============================================================================
 
+Process called "lower_hir_external_declaration" that takes hir_external as Integer returns Integer:
+    @Reasoning
+    **HIR EXTERNAL DECLARATION → MIR LOWERING (P2-D FFI Foundation)**
+
+    Lowers a HIRExternalDeclaration to a declaration-only MIRFunction with:
+    - is_external = 1 (so codegen emits only the .extern directive)
+    - library_name, alias_name, convention_id propagated for codegen and linker driver
+
+    No CFG, no body, no parameters are lowered — the function signature alone
+    (name + return type) plus the FFI metadata is sufficient for the linker to
+    resolve the symbol and for codegen to emit a call site through the recorded
+    calling convention.
+    @End Reasoning
+
+    @Implementation
+    HIRExternalDeclaration layout (per hir.runa):
+      offset 104: name
+      offset 112: alias_name
+      offset 120: library_name
+      offset 144: return_type (HIRTypeInfo pointer)
+      offset 152: convention_id
+      offset 168: flags
+
+    Result MIRFunction (P2-D offset audit 2026-05-24):
+      name (offset 0): the Runa-side name
+      return_type (offset 32): the HIR type info
+      hir_node (offset 72): back-pointer to the HIR external declaration
+      is_external (offset 80): authoritative — set to 1 via mir_function_set_external
+      metadata (offset 88): optional metadata pointer
+      library_name (offset 96): for linker registration
+      alias_name (offset 104): for .extern emission
+      convention_id (offset 112): for per-call-site convention dispatch
+    @End Implementation
+
+    If hir_external is equal to 0:
+        Return 0
+    End If
+
+    Note: Read HIRExternalDeclaration fields
+    Let ext_name be Layout.memory_get_int64(hir_external, 104)
+    Let ext_alias be Layout.memory_get_int64(hir_external, 112)
+    Let ext_library be Layout.memory_get_int64(hir_external, 120)
+    Let ext_return_type be Layout.memory_get_int64(hir_external, 144)
+    Let ext_convention_id be Layout.memory_get_int64(hir_external, 152)
+
+    Note: Create MIRFunction (declaration only — no CFG body needed)
+    Let mir_function be MIR.create_mir_function(ext_name, ext_return_type, hir_external)
+    If mir_function is equal to 0:
+        Return 0
+    End If
+
+    Note: Mark as external and populate FFI metadata
+    proc mir_function_set_external from MIR with mir_function, ext_library, ext_alias, ext_convention_id
+
+    Return mir_function
+End Process
+
 Process called "build_mir_from_hir" that takes hir_program as Integer returns Integer:
     @Reasoning
     **MAIN ENTRY POINT FOR MIR CONSTRUCTION**
@@ -2225,6 +2417,31 @@ Process called "build_mir_from_hir" that takes hir_program as Integer returns In
             Note: Reset context for next function
             destroy_mir_builder_context(context)
             Set context to create_mir_builder_context()
+        End If
+
+        Note: P2-D FFI: Handle external declaration (HIR_EXTERNAL_DECLARATION = 12004).
+        Note: Creates a declaration-only MIRFunction with is_external=1 and full FFI metadata.
+        Note: Also registers the external in the MIR builder context so subsequent
+        Note: MIR_CALL nodes referencing this name pick up the FFI metadata (D-FFI-07/08).
+        If decl_type is equal to 12004:
+            Display "build_mir_from_hir: lowering external declaration " joined with i
+
+            Let mir_external be lower_hir_external_declaration(decl_hir)
+            If mir_external is not equal to 0:
+                MIRNodes.add_function_to_program(mir_program, mir_external)
+
+                Note: Register in context externals registry (FFI metadata propagation
+                Note: into call sites at lower_hir_call_expression time).
+                Let ext_runa_name be Layout.memory_get_int64(decl_hir, 104)
+                Let ext_convention be Layout.memory_get_int64(decl_hir, 152)
+                If ext_runa_name is not equal to 0:
+                    mir_context_register_external(context, ext_runa_name, ext_convention)
+                End If
+
+                Display "build_mir_from_hir: successfully lowered external"
+            Otherwise:
+                Display "build_mir_from_hir: failed to lower external declaration"
+            End If
         End If
 
         Set i to i plus 1

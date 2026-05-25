@@ -166,6 +166,406 @@ Note: File-local static cell for the active BuildContext pointer.
 Note: Set by set_active_build_context, read by get_active_opt_level.
 Let active_build_context_ptr be 0
 
+Note: ============================================================================
+Note: P2-D D-FFI-09 — FFI Library Collector
+Note: ============================================================================
+Note: Module-global list of unique library names discovered while compiling. Each
+Note: HIR_EXTERNAL_DECLARATION node carries a library_name field at offset 120
+Note: identifying the C-side library; the orchestrator scans these and appends
+Note: unique names to this list. The link step consumes the list and invokes
+Note: linker_driver_add_library for each, after platform-aware translation.
+Note: Per Q1 ratification, default link_type is dynamic. Per CEO no-defer
+Note: directive, the orchestrator collects libraries from EVERY External
+Note: declaration regardless of link_type — the runtime resolver handles
+Note: dynamic resolution, the static linker handles static.
+Let ffi_libraries_collected be 0
+Note: ffi_libraries_collected holds a List pointer once populated.
+Note: ffi_objc_present is 1 if any objc-convention External was seen.
+Let ffi_objc_present be 0
+Note: ffi_target_os_active is the active target OS during compile_program
+Note: (mirrored from get_target_os_from_config so link helpers can read it).
+Let ffi_target_os_active be 0
+Note: ffi_frameworks_collected holds a List pointer once populated. Mirrors
+Note: ffi_libraries_collected but for Darwin `from framework "Name"` declarations.
+Note: Frameworks are tracked separately from libraries because the linker
+Note: surface differs ("-framework Name" vs "-lname") and dedup is per-framework
+Note: rather than per-library — declaring an External Process from framework
+Note: "Foundation" and another from library "c" must produce both a -lc flag
+Note: and a -framework Foundation flag, not a merged single -l/-framework entry.
+Let ffi_frameworks_collected be 0
+
+Process called "ffi_get_collected_libraries" returns Integer:
+    @Reasoning
+    Public accessor for the module-global FFI library collector List.
+    Consumed by linker_driver_link to register every required library
+    against the LinkerContext before the link step runs. Returns 0
+    (rather than an empty List) when no FFI declarations have been
+    seen, which the consumer treats as "no FFI libraries to register".
+    @End Reasoning
+
+    @Implementation
+    Single read of the module-global pointer cell. Stateless.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One load. Called once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The returned List pointer is shared with the
+    linker driver; the linker driver only reads from it (uses size/get
+    only, never mutates) so concurrent collector population from
+    parallel compile workers is safe under the worker-completes-before-link
+    barrier the build system enforces.
+    @End Security_Scope
+
+    Return ffi_libraries_collected
+End Process
+
+Process called "ffi_has_objc_external" returns Integer:
+    @Reasoning
+    Public accessor for the objc-presence flag. Returns 1 if any
+    objc-convention External was encountered by ffi_scan_hir_program_for_externals
+    during the current compile, 0 otherwise. The linker driver uses this
+    to gate the Darwin-target validation per CEO Q3.
+    @End Reasoning
+
+    @Implementation
+    Single read of the module-global pointer cell. Stateless.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. A false negative (returning 0 when objc was
+    present) would bypass the Q3 platform check and let the linker
+    fail later with a less-informative unresolved-symbol error; the
+    setter ffi_mark_objc_present is the only mutator and is called
+    by the trusted HIR-scan path.
+    @End Security_Scope
+
+    Return ffi_objc_present
+End Process
+
+Process called "ffi_get_active_target_os" returns Integer:
+    @Reasoning
+    Public accessor for the active target OS captured during
+    compile_program's Phase 3a (FFI library collection). The linker
+    driver reads this to drive platform-aware library translation and
+    objc-target validation.
+    @End Reasoning
+
+    @Implementation
+    Single read of the module-global pointer cell. Returns the OS_*
+    identifier (mirror of MachineCode TARGET_OS_* values).
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The OS identifier flows from the trusted target
+    configuration; user FFI code cannot reach this surface.
+    @End Security_Scope
+
+    Return ffi_target_os_active
+End Process
+
+Process called "ffi_get_collected_frameworks" returns Integer:
+    @Reasoning
+    Public accessor for the module-global FFI framework collector List.
+    Consumed by linker_driver_link to register every required Darwin
+    framework against the LinkerContext before the link step runs.
+    Returns 0 (rather than an empty List) when no framework-bearing
+    External declarations have been seen, which the consumer treats as
+    "no FFI frameworks to register".
+    @End Reasoning
+
+    @Implementation
+    Single read of the module-global pointer cell. Stateless.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One load. Called once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The returned List pointer is shared with the
+    linker driver; the linker driver only reads from it (uses size/get
+    only, never mutates) so concurrent collector population from parallel
+    compile workers is safe under the worker-completes-before-link
+    barrier the build system enforces.
+    @End Security_Scope
+
+    Return ffi_frameworks_collected
+End Process
+
+Process called "ffi_register_framework" takes framework_name as Integer returns Integer:
+    @Reasoning
+    Appends a framework name to the FFI framework collector list with
+    deduplication. Called by ffi_scan_hir_program_for_externals for each
+    HIR_EXTERNAL_DECLARATION that carries a non-zero framework_name at
+    HIR offset 128. Deduplication is essential because Darwin programs
+    commonly declare many External Processes from the same framework
+    (Foundation, AppKit, UIKit) and the linker prefers one -framework
+    flag per framework even though duplicates are accepted.
+    @End Reasoning
+
+    @Implementation
+    Lazily allocates the collector list on first call. Walks the existing
+    entries with proc size and proc get from List, comparing each via
+    string_equals; on a match returns 0 to indicate the name was already
+    present (caller treats this as a no-op success). Otherwise appends
+    and returns 1. Returns 0 for a null framework_name.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) in the current collector size. For typical Darwin Runa programs
+    n is at most a handful (Foundation, CoreFoundation, AppKit), so each
+    call is at most a few hundred nanoseconds. Total cost per compile is
+    O(n * declarations) which is well-bounded.
+    @End Performance_Hints
+
+    @Security_Scope
+    Framework names flow from user source code through the parser and
+    HIR builder. The collector here does not sanitize; downstream
+    linker_driver_add_framework performs the security validation against
+    the linker's input grammar. String_equals compares contents, not
+    pointers, so the deduplication is correct even when separate parses
+    produce distinct string allocations for the same framework name.
+    @End Security_Scope
+
+    If framework_name is equal to 0:
+        Return 0
+    End If
+    If ffi_frameworks_collected is equal to 0:
+        Set ffi_frameworks_collected to proc create from List
+    End If
+    Let count be proc size from List with ffi_frameworks_collected
+    Let i be 0
+    While i is less than count:
+        Let existing be proc get from List with ffi_frameworks_collected, i
+        Let is_dup be proc string_equals from StringCore with existing, framework_name
+        If is_dup is equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    proc append from List with ffi_frameworks_collected, framework_name
+    Return 1
+End Process
+
+Process called "ffi_clear_collected_libraries" returns Integer:
+    @Reasoning
+    Resets the FFI library collector and related flags between builds.
+    Called at the start of each compile-and-link cycle so that
+    libraries / objc presence / target OS from the previous build do
+    not leak into the next. Essential for the parallel-compilation path
+    where a single process handles many compile jobs in sequence.
+    @End Reasoning
+
+    @Implementation
+    Four single-word stores: library collector list to 0 (the consumer's
+    "no FFI libraries" sentinel), framework collector list to 0 (same
+    sentinel for the framework consumer), objc-presence to 0, target_os
+    to 0. The collector list pointers are dropped rather than freed;
+    if the previous build's lists survive via shared reference (e.g.,
+    for debugging), they remain accessible to those holders. The next
+    ffi_register_library / ffi_register_framework call lazily allocates
+    a fresh list.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). Four stores. Cold path -- called once per build.
+    @End Performance_Hints
+
+    @Security_Scope
+    Reset semantics prevent stale state from one build (e.g., objc
+    presence, prior-target frameworks) from leaking into the next, which
+    is a correctness requirement for multi-target build orchestrators
+    that switch target OS between builds. No memory is freed; callers
+    that retain pointers to the previous lists assume responsibility for
+    their lifetime.
+    @End Security_Scope
+
+    Set ffi_libraries_collected to 0
+    Set ffi_frameworks_collected to 0
+    Set ffi_objc_present to 0
+    Set ffi_target_os_active to 0
+    Return 1
+End Process
+
+Process called "ffi_register_library" takes lib_name as Integer returns Integer:
+    @Reasoning
+    Appends a library name to the FFI collector list with deduplication.
+    Called by ffi_scan_hir_program_for_externals for each
+    HIR_EXTERNAL_DECLARATION encountered. Deduplication is essential
+    because most real programs declare many External Processes from
+    the same library (libc, pthread) and the linker tolerates duplicate
+    -l flags but the diagnostic output is cleaner without them.
+    @End Reasoning
+
+    @Implementation
+    Lazily allocates the collector list on first call. Walks the
+    existing entries with proc size + proc get from List, comparing
+    each via string_equals; on a match returns 0 to indicate the name
+    was already present (caller treats this as a no-op success).
+    Otherwise appends and returns 1. Returns 0 for a null lib_name.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) in the current collector size. For typical Runa programs
+    n <= 5, so each call is at most a few hundred nanoseconds. Total
+    cost per compile is O(n * declarations) which is well-bounded.
+    @End Performance_Hints
+
+    @Security_Scope
+    Library names flow from user source code through the parser and
+    HIR builder. The collector here does not sanitize; downstream
+    linker_driver_add_library performs the security validation against
+    the linker's input grammar. String_equals compares contents, not
+    pointers, so the deduplication is correct even when separate parses
+    produce distinct string allocations for the same library name.
+    @End Security_Scope
+
+    If lib_name is equal to 0:
+        Return 0
+    End If
+    If ffi_libraries_collected is equal to 0:
+        Set ffi_libraries_collected to proc create from List
+    End If
+    Let count be proc size from List with ffi_libraries_collected
+    Let i be 0
+    While i is less than count:
+        Let existing be proc get from List with ffi_libraries_collected, i
+        Let is_dup be proc string_equals from StringCore with existing, lib_name
+        If is_dup is equal to 1:
+            Return 0
+        End If
+        Set i to i plus 1
+    End While
+    proc append from List with ffi_libraries_collected, lib_name
+    Return 1
+End Process
+
+Process called "ffi_mark_objc_present" returns Integer:
+    @Reasoning
+    Sets the module-global flag indicating that at least one
+    objc-convention External was encountered during the current
+    compile. Called by ffi_scan_hir_program_for_externals when it sees
+    a convention_id == 5 at offset 152 of an HIR_EXTERNAL_DECLARATION
+    node. The linker driver reads the flag at link time to enforce the
+    Q3 Darwin-only target constraint.
+    @End Reasoning
+
+    @Implementation
+    Single store to 1. Idempotent -- subsequent calls are no-ops.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Setter for a security-relevant flag (drives Q3 platform check). Only
+    the trusted HIR-scan path invokes this Process; user code cannot
+    reach it directly.
+    @End Security_Scope
+
+    Set ffi_objc_present to 1
+    Return 1
+End Process
+
+Process called "ffi_scan_hir_program_for_externals" takes hir_program as Integer returns Integer:
+    @Reasoning
+    Walks the HIR program's top-level declarations and registers each
+    HIR_EXTERNAL_DECLARATION's library name and framework name with the
+    FFI library and framework collectors. Also detects objc-convention
+    externals for link-time platform validation.
+
+    Per D-FFI-09 (P2-D), this gives the linker driver a complete list of
+    libraries and frameworks to bind at link time without requiring
+    per-file boilerplate on the user side.
+
+    A1 amendment (subsystem audit follow-up): framework_name at HIR
+    offset 128 is now read and routed to ffi_register_framework so that
+    Darwin `from framework "Foundation"` declarations produce a real
+    `-framework Foundation` linker entry rather than being silently
+    dropped after parse.
+    @End Reasoning
+
+    @Implementation
+    Each HIR program node holds children at offset 24. Each child is
+    checked for node_type == HIR_EXTERNAL_DECLARATION (12004); if matched:
+      - library_name at offset 120 is registered via ffi_register_library
+        when non-zero.
+      - framework_name at offset 128 is registered via
+        ffi_register_framework when non-zero (Darwin path).
+      - convention_id at offset 152 == 5 (objc) sets the global
+        objc-presence flag via ffi_mark_objc_present.
+
+    Library and framework registration are independent: a single External
+    declaration may carry both a library_name and a framework_name (the
+    library form is used on POSIX targets while the framework form is
+    used on Darwin), and both must be tracked.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) over the declaration list with two list-walk lookups per
+    matching HIR_EXTERNAL_DECLARATION (one in ffi_register_library, one
+    in ffi_register_framework when framework_name is set). Typical
+    programs declare a small fixed number of externals; total scan cost
+    is on the order of microseconds even for large codebases.
+    @End Performance_Hints
+
+    @Security_Scope
+    Reads only from the HIR node memory layout via fixed offsets. All
+    consumed pointer values are passed to ffi_register_library /
+    ffi_register_framework / ffi_mark_objc_present which perform their
+    own null checks and deduplication. No user data reaches a security-
+    sensitive surface from this Process directly.
+    @End Security_Scope
+
+    If hir_program is equal to 0:
+        Return 0
+    End If
+
+    Let decls be __load(hir_program, 24)
+    If decls is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc size from List with decls
+    Let i be 0
+    While i is less than count:
+        Let decl be proc get from List with decls, i
+        If decl is not equal to 0:
+            Let decl_type be __load(decl, 0)
+            If decl_type is equal to 12004:
+                Note: HIR_EXTERNAL_DECLARATION
+                Let lib_name be __load(decl, 120)
+                If lib_name is not equal to 0:
+                    ffi_register_library(lib_name)
+                End If
+                Let framework_name be __load(decl, 128)
+                If framework_name is not equal to 0:
+                    ffi_register_framework(framework_name)
+                End If
+                Let conv_id be __load(decl, 152)
+                If conv_id is equal to 5:
+                    ffi_mark_objc_present()
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 1
+End Process
+
 Process called "set_active_build_context" that takes ctx as Integer returns Integer:
     @Reasoning
     Stores the supplied BuildContext pointer in the module-global slot
@@ -1136,6 +1536,13 @@ Process called "compile_program" that takes program as Integer, output_path as I
         arena_destroy(arena)
         Return 1
     End If
+
+    Note: Phase 3a -- FFI library collection (D-FFI-09).
+    Note: Walk the HIR program for HIR_EXTERNAL_DECLARATION nodes and register
+    Note: each library_name with the FFI library collector for link-time use.
+    Note: Also captures the active target OS for the link helpers below.
+    Set ffi_target_os_active to get_target_os_from_config()
+    ffi_scan_hir_program_for_externals(hir_program)
 
     Note: Phase 4 -- HIR to MIR lowering.
     Let mir_program be build_mir_from_hir(hir_program)

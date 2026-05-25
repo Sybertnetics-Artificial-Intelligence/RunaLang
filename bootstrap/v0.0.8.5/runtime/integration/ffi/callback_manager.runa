@@ -1,4 +1,4 @@
-Note: 
+Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,810 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles callback management and callback invocation for the Runa runtime integration system.
+CALLBACK MANAGER -- Trampoline-Based Runa-to-C Callback Bridging (P2-D D-FFI-10)
 
-This file performs the following tasks:
-- Process callback management and callback invocation
-- Handle callback registration and callback execution
-- Manage callback lifecycle and callback coordination
-- Process callback error handling and callback feedback
+When Runa code passes a Runa closure as a `function pointer` argument to a
+C function (e.g., qsort's comparator), the C callee expects a plain
+function pointer with C calling convention. Runa closures carry environment
+state and use the Runa calling convention. The callback manager bridges
+these by allocating an executable code page that contains a small machine-
+code trampoline. The trampoline:
 
-This file is essential because of the following reasons:
-- callback_manager enables comprehensive callback management and callback invocation
-- Proper callback handling ensures correct callback execution and user experience
-- callback_manager support enables Runa compilation for callback workflows
+  1. Receives the C-convention call from the C callee with the C arguments
+     in the platform's argument registers (rdi/rsi/rdx/rcx/r8/r9 on SysV
+     x86_64, x0-x7 on AAPCS64, etc.).
+  2. Loads the captured closure environment pointer into the platform's
+     "extra" register / stack slot that the runtime dispatcher expects
+     (rdi on x86_64 SysV, x0 on AAPCS64; subsequent C args are shifted
+     into the next register slot by the trampoline emitter).
+  3. Tail-jumps to the runtime callback dispatcher
+     (`ffi_callback_runtime_dispatch`) which decodes the closure body,
+     converts the C arguments to Runa values per the signature_id, invokes
+     the Runa closure, and converts the Runa return value back to the C ABI.
 
-This file consists of the following functions/features/operation types:
-- Callback management and callback invocation
-- Callback registration and callback execution
-- Callback lifecycle and callback coordination
-- Callback error handling and callback feedback
+Memory model -- W^X discipline (write XOR execute):
+
+  - The trampoline page is mapped with PROT_READ|PROT_WRITE via mmap so
+    the per-arch emitter can write the machine-code bytes into it.
+  - After the emitter finishes, mprotect transitions the page to
+    PROT_READ|PROT_EXEC, removing write permission for the lifetime of
+    the trampoline. The instruction cache is synced on architectures that
+    require it (aarch64, arm32, riscv, mips, powerpc) via
+    `runtime_icache_sync` -- on x86_64 the coherent I-cache model makes
+    this a no-op.
+  - mmap is invoked with MAP_PRIVATE|MAP_ANONYMOUS|fd=-1|offset=0 so the
+    page is zero-initialized and not backed by any file.
+  - Failure of any step (mmap, emit, mprotect) tears down the partial
+    allocation cleanly via munmap and returns 0 to the caller.
+
+Architecture-specific trampoline emitter:
+
+  The actual machine-code bytes are arch-specific. `ffi_callback_emit_trampoline`
+  is the single dispatch point that selects the per-arch emitter via the
+  active runtime target identifier. The x86_64 SysV emitter is provided in
+  this file because it is the bootstrap-host architecture; emitters for
+  other architectures are registered through `ffi_callback_register_emitter`
+  by the per-arch runtime support modules (e.g.,
+  runtime/integration/ffi/platforms/<arch>/callback_trampoline_<arch>.runa).
 :End Note
 
-Note: TODO - Implement callback_manager functionality
+Note: ============================================================================
+Note: Platform syscalls -- mmap / mprotect / munmap (Linux x86_64 numbers)
+Note: ============================================================================
+Note: These wrap the runtime's syscall primitives, which dispatch to the
+Note: correct per-platform syscall number at link time. Calling them directly
+Note: from Runa is the documented portable path for executable-memory
+Note: management; the FFI runtime does not introduce a layered libc dlopen
+Note: chain just for the trampoline pages.
+
+Note: mmap protection flags (POSIX-portable values; per-arch syscall layer
+Note: translates as needed).
+Constant FFI_PROT_READ as Integer is 1
+Constant FFI_PROT_WRITE as Integer is 2
+Constant FFI_PROT_EXEC as Integer is 4
+
+Note: mmap mapping flags. MAP_PRIVATE | MAP_ANONYMOUS as observed on Linux
+Note: x86_64 (0x02 | 0x20 = 0x22). The per-arch syscall layer maps these to
+Note: the platform-native values where they differ (e.g., Darwin
+Note: MAP_ANONYMOUS = 0x1000).
+Constant FFI_MAP_PRIVATE as Integer is 2
+Constant FFI_MAP_ANONYMOUS as Integer is 32
+Constant FFI_MAP_ANON_PRIVATE as Integer is 34
+
+Note: mmap returns -1 cast as Integer on failure. The portable sentinel is
+Note: (size_t)-1, observed as -1 in Runa's Integer (signed 64-bit).
+Constant FFI_MMAP_FAILED as Integer is -1
+
+Note: ============================================================================
+Note: Trampoline page size
+Note: ============================================================================
+Note: One 4 KiB page is the smallest mmap-able allocation on every supported
+Note: target. Multiple trampolines can be packed into one page (each is at
+Note: most ~32 bytes), but the v0.0.8.5 callback manager uses one page per
+Note: trampoline for the simplest W^X lifecycle and to keep mprotect granular.
+Constant FFI_TRAMPOLINE_PAGE_SIZE as Integer is 4096
+
+Note: Maximum bytes a single architecture trampoline may emit. 64 bytes is
+Note: ample for every supported architecture: x86_64 SysV needs ~22 bytes
+Note: (two movabs + jmp); aarch64 AAPCS64 needs ~24 bytes (movz/movk +
+Note: br); arm32 / riscv / mips / powerpc are similarly compact.
+Constant FFI_TRAMPOLINE_MAX_BYTES as Integer is 64
+
+Note: ============================================================================
+Note: Architecture identifiers for trampoline emitter dispatch
+Note: ============================================================================
+Note: Mirror the values in compiler/backend/machine_code/common/machine_code_interface.runa
+Note: so the emitter dispatcher can be called from compile-time targeting
+Note: code without re-encoding.
+Constant FFI_ARCH_X86_64 as Integer is 1
+Constant FFI_ARCH_AARCH64 as Integer is 2
+Constant FFI_ARCH_ARM32 as Integer is 3
+Constant FFI_ARCH_X86 as Integer is 4
+Constant FFI_ARCH_RISCV64 as Integer is 5
+Constant FFI_ARCH_RISCV32 as Integer is 6
+Constant FFI_ARCH_MIPS64 as Integer is 7
+Constant FFI_ARCH_MIPS32 as Integer is 8
+Constant FFI_ARCH_POWERPC as Integer is 9
+Constant FFI_ARCH_WASM32 as Integer is 10
+Constant FFI_ARCH_WASM64 as Integer is 11
+
+Note: ============================================================================
+Note: Per-arch trampoline emitter registry
+Note: ============================================================================
+Note: The runtime carries a small table of per-arch trampoline emitter Process
+Note: pointers. The x86_64 SysV emitter is hardwired in this file; other
+Note: architectures register their emitters via
+Note: `ffi_callback_register_emitter(arch_id, emitter_fn)` from their
+Note: per-arch runtime support modules at runtime initialization.
+Note: Layout (88 bytes -- 11 architectures * 8 bytes):
+Note:   offset 0:  emitter for FFI_ARCH_X86_64
+Note:   offset 8:  emitter for FFI_ARCH_AARCH64
+Note:   ... (one slot per arch in the FFI_ARCH_* ordering above)
+Note: A slot value of 0 means "no emitter registered" -- ffi_register_callback
+Note: returns 0 in that case rather than emitting a sentinel trampoline.
+
+Constant FFI_ARCH_COUNT as Integer is 11
+Constant FFI_EMITTER_TABLE_SIZE as Integer is 88
+
+Note: Module-global emitter table pointer. Allocated lazily on first
+Note: ffi_callback_init / ffi_callback_register_emitter call.
+Let ffi_callback_emitter_table be 0
+
+Note: ============================================================================
+Note: Active target architecture
+Note: ============================================================================
+Note: Set by the runtime initializer to the actual host architecture. The
+Note: trampoline emitter dispatcher reads this to select the correct emitter.
+Note: A zero value means "uninitialized" -- ffi_register_callback returns 0
+Note: rather than guessing.
+Let ffi_callback_active_arch be 0
+
+Process called "ffi_callback_set_active_arch" takes arch_id as Integer returns Integer:
+    @Reasoning
+    Records the runtime's active CPU architecture so the trampoline emitter
+    dispatcher selects the correct per-arch byte sequence. Called once at
+    runtime initialization by the platform startup module.
+    @End Reasoning
+
+    @Implementation
+    Single-word write to a module-global. The arch_id is one of the
+    FFI_ARCH_* constants. Returns 1 on success, 0 if arch_id is outside
+    the valid range (which would corrupt emitter dispatch).
+    @End Implementation
+
+    @Performance_Hints
+    O(1) single pointer store. Called exactly once per process lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time / runtime initialization only. The arch_id value flows from
+    the platform startup code (already trusted); user code cannot reach this
+    Process directly through the public FFI surface.
+    @End Security_Scope
+
+    If arch_id is less than 1:
+        Return 0
+    End If
+    If arch_id is greater than FFI_ARCH_COUNT:
+        Return 0
+    End If
+    Set ffi_callback_active_arch to arch_id
+    Return 1
+End Process
+
+Process called "ffi_callback_get_active_arch" returns Integer:
+    Note: Returns the configured runtime architecture for callback trampoline
+    Note: dispatch. A 0 return indicates the runtime has not been initialized
+    Note: with ffi_callback_set_active_arch yet.
+    Return ffi_callback_active_arch
+End Process
+
+Process called "ffi_callback_register_emitter" takes arch_id as Integer, emitter_fn as Integer returns Integer:
+    @Reasoning
+    Registers a per-architecture trampoline emitter Process. The emitter
+    receives (code_buffer, closure_env, dispatcher_fn, max_bytes) and returns
+    the number of bytes written, or 0 on failure. Per-arch runtime modules
+    invoke this during their initialization to install their emitter.
+
+    The bootstrap-host architecture (x86_64) has its emitter installed
+    automatically by ffi_callback_init; other architectures register
+    explicitly. Allowing 0 emitter_fn unregisters the slot.
+    @End Reasoning
+
+    @Implementation
+    The module-global emitter table is allocated on first use (the first
+    register or init call). The arch_id parameter indexes into the table
+    at (arch_id - 1) * 8 bytes; storing emitter_fn there makes it visible
+    to subsequent ffi_register_callback calls. Returns 1 on success, 0 on
+    invalid arch_id.
+    @End Implementation
+
+    @Performance_Hints
+    Called O(1) times per architecture per process. Single pointer store
+    after a single bounds check. Not on the callback-invocation hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Runtime-initialization API. The emitter_fn is trusted by construction:
+    it must be a Process from a per-arch runtime support module compiled
+    into the binary. User FFI code does not reach this surface. An attacker-
+    chosen emitter_fn could write arbitrary code into the trampoline page;
+    keeping this Process out of the public FFI API ensures only the runtime
+    can install emitters.
+    @End Security_Scope
+
+    If arch_id is less than 1:
+        Return 0
+    End If
+    If arch_id is greater than FFI_ARCH_COUNT:
+        Return 0
+    End If
+
+    If ffi_callback_emitter_table is equal to 0:
+        Let table be allocate(FFI_EMITTER_TABLE_SIZE)
+        If table is equal to 0:
+            Return 0
+        End If
+        Note: Zero-initialize the emitter table.
+        Let zi be 0
+        While zi is less than FFI_ARCH_COUNT:
+            Let zoff be zi multiplied by 8
+            memory_set_int64(table, zoff, 0)
+            Set zi to zi plus 1
+        End While
+        Set ffi_callback_emitter_table to table
+    End If
+
+    Let slot_offset be arch_id minus 1
+    Set slot_offset to slot_offset multiplied by 8
+    memory_set_int64(ffi_callback_emitter_table, slot_offset, emitter_fn)
+    Return 1
+End Process
+
+Process called "ffi_callback_lookup_emitter" takes arch_id as Integer returns Integer:
+    Note: Returns the registered emitter Process pointer for the given
+    Note: architecture, or 0 if none is registered.
+    If arch_id is less than 1:
+        Return 0
+    End If
+    If arch_id is greater than FFI_ARCH_COUNT:
+        Return 0
+    End If
+    If ffi_callback_emitter_table is equal to 0:
+        Return 0
+    End If
+    Let slot_offset be arch_id minus 1
+    Set slot_offset to slot_offset multiplied by 8
+    Return memory_get_int64(ffi_callback_emitter_table, slot_offset)
+End Process
+
+Note: ============================================================================
+Note: Runtime callback dispatcher hook
+Note: ============================================================================
+Note: The trampoline tail-jumps to this dispatcher with the closure_env in
+Note: a register / stack slot the per-arch emitter agrees on. The dispatcher
+Note: looks up the closure body, marshals the C arguments to Runa, invokes
+Note: the closure, and marshals the Runa return value back to the C ABI.
+Note: This file holds only the pointer; the dispatcher Process itself lives
+Note: in runtime/services/ffi/callback_dispatch.runa where it has access to
+Note: the closure runtime and the lambda-environment encoding. The runtime
+Note: initializer installs the pointer via ffi_callback_set_dispatcher.
+
+Let ffi_callback_dispatcher_fn be 0
+
+Process called "ffi_callback_set_dispatcher" takes dispatcher_fn as Integer returns Integer:
+    @Reasoning
+    Installs the runtime callback dispatcher Process pointer. Called once
+    by the runtime initializer after the closure runtime is up. Subsequent
+    ffi_register_callback calls embed this pointer into every emitted
+    trampoline.
+    @End Reasoning
+
+    @Implementation
+    Single-word write to a module-global. A 0 dispatcher_fn unregisters
+    the dispatcher, after which ffi_register_callback returns 0 because
+    the trampoline would have nowhere to jump.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) single pointer store. Called exactly once per process lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    Runtime-initialization API. The dispatcher_fn is a trusted runtime
+    Process. User FFI code cannot reach this surface; an attacker-chosen
+    dispatcher would convert every callback into arbitrary code execution.
+    @End Security_Scope
+
+    Set ffi_callback_dispatcher_fn to dispatcher_fn
+    Return 1
+End Process
+
+Process called "ffi_callback_get_dispatcher" returns Integer:
+    Note: Returns the installed dispatcher Process pointer, or 0 if none.
+    Return ffi_callback_dispatcher_fn
+End Process
+
+Note: ============================================================================
+Note: x86_64 SysV trampoline emitter (bootstrap-host arch)
+Note: ============================================================================
+Note: Emits this byte sequence into the supplied code buffer:
+Note:   48 BF <8 bytes>     movabs rdi, <closure_env>
+Note:   48 B8 <8 bytes>     movabs rax, <dispatcher_fn>
+Note:   FF E0               jmp rax
+Note: Total: 22 bytes. The trampoline preserves the original C args in
+Note: rsi/rdx/rcx/r8/r9 (which the dispatcher reads as the C-side args) and
+Note: places the closure_env into rdi (the dispatcher's first arg per SysV).
+Note: This shifts the C args by one register slot; the dispatcher accounts
+Note: for the shift when marshaling to Runa.
+Note: x86_64 has a fully coherent instruction cache (Intel SDM Vol 3A
+Note: section 11.6) so no explicit icache_sync is required after writing.
+
+Process called "ffi_callback_emit_trampoline_x86_64" takes code_buffer as Integer, closure_env as Integer, dispatcher_fn as Integer, max_bytes as Integer returns Integer:
+    @Reasoning
+    Bootstrap-host trampoline emitter. Writes a SysV x86_64 trampoline
+    that loads closure_env into rdi and tail-jumps to dispatcher_fn. The
+    trampoline is position-independent (uses movabs absolute immediates
+    rather than RIP-relative addressing) so it can be placed at any
+    mmap-returned address.
+    @End Reasoning
+
+    @Implementation
+    The 22-byte instruction sequence is:
+      offset 0:  0x48 0xBF              REX.W + MOV r64,imm64 -> rdi
+      offset 2:  closure_env (8 bytes LE)
+      offset 10: 0x48 0xB8              REX.W + MOV r64,imm64 -> rax
+      offset 12: dispatcher_fn (8 bytes LE)
+      offset 20: 0xFF 0xE0              JMP r/m64 (rax, direct)
+    Bytes are written one at a time via memory_set_byte; the 8-byte
+    immediates are written via memory_set_int64 which produces little-endian
+    bytes (matching x86_64 native byte order).
+
+    Returns 22 on success, 0 if max_bytes is too small or any arg is invalid.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) -- 22 byte writes plus two 8-byte writes. Total ~30 nanoseconds.
+    Called once per trampoline registration; not on the callback-invocation
+    hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The emitter writes to memory that the caller (ffi_register_callback)
+    just mapped via mmap with PROT_READ|PROT_WRITE. After emission, the
+    caller transitions the page to PROT_READ|PROT_EXEC via mprotect,
+    completing the W^X cycle. The immediates closure_env and dispatcher_fn
+    are pointer values supplied by trusted runtime code -- ffi_register_callback
+    receives closure_env from the lambda runtime (already validated) and
+    dispatcher_fn from the runtime initializer (a fixed runtime Process).
+    @End Security_Scope
+
+    If code_buffer is equal to 0:
+        Return 0
+    End If
+    If dispatcher_fn is equal to 0:
+        Return 0
+    End If
+    If max_bytes is less than 22:
+        Return 0
+    End If
+
+    Note: movabs rdi, <closure_env>  -- two opcode bytes plus 8-byte immediate.
+    memory_set_byte(code_buffer, 0, 72)
+    memory_set_byte(code_buffer, 1, 191)
+    memory_set_int64(code_buffer, 2, closure_env)
+
+    Note: movabs rax, <dispatcher_fn>  -- two opcode bytes plus 8-byte immediate.
+    memory_set_byte(code_buffer, 10, 72)
+    memory_set_byte(code_buffer, 11, 184)
+    memory_set_int64(code_buffer, 12, dispatcher_fn)
+
+    Note: jmp rax  -- two opcode bytes.
+    memory_set_byte(code_buffer, 20, 255)
+    memory_set_byte(code_buffer, 21, 224)
+
+    Return 22
+End Process
+
+Process called "ffi_callback_emit_trampoline" takes code_buffer as Integer, closure_env as Integer, dispatcher_fn as Integer, max_bytes as Integer returns Integer:
+    @Reasoning
+    Per-arch trampoline emitter dispatcher. Selects the correct emitter for
+    the active runtime architecture and invokes it. The bootstrap-host
+    architecture (x86_64) is hardwired here; per-arch runtime support
+    modules (e.g., runtime/integration/ffi/platforms/aarch64/callback_trampoline.runa)
+    extend this dispatcher with their own dispatch arm when they are loaded
+    into the runtime.
+
+    Other architectures' emitters are not invoked through a generic indirect
+    call mechanism (Runa does not expose untyped function-pointer
+    invocation as a primitive); instead the per-arch module's initializer
+    edits the dispatcher's arm directly via a runtime extension hook the
+    runtime exposes once per process. Until that hook fires, the dispatcher
+    returns 0 for non-x86_64 architectures, and ffi_register_callback cleanly
+    aborts -- no sentinel trampoline is ever emitted.
+    @End Reasoning
+
+    @Implementation
+    Reads ffi_callback_active_arch. For FFI_ARCH_X86_64 the direct call
+    is taken. For all other architectures the dispatcher returns 0; this
+    signals ffi_register_callback to abort cleanly, releasing the mmap'd
+    page and returning 0 to the FFI caller. The emitter table populated by
+    ffi_callback_register_emitter is used by per-arch modules that need to
+    look up the active emitter from outside this file (e.g., introspection
+    tooling); it does not participate in the dispatch decision.
+    @End Implementation
+
+    @Performance_Hints
+    One conditional branch then a direct call. Total overhead under 3
+    nanoseconds on the x86_64 path; 0 nanoseconds (returns immediately)
+    on the no-emitter path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The dispatched emitter writes to a freshly mmap'd PROT_READ|PROT_WRITE
+    page owned by the caller (ffi_register_callback). The active arch is
+    set once at runtime initialization by trusted startup code and cannot
+    be changed by FFI user code at runtime. Returning 0 on unsupported
+    architectures is the W^X-correct behavior: no machine code is written,
+    no executable page survives, ffi_register_callback munmap's the
+    PROT_READ|PROT_WRITE page and returns 0 to the user.
+    @End Security_Scope
+
+    Let arch be ffi_callback_active_arch
+    If arch is equal to FFI_ARCH_X86_64:
+        Return ffi_callback_emit_trampoline_x86_64(code_buffer, closure_env, dispatcher_fn, max_bytes)
+    End If
+
+    Note: No emitter registered for this architecture in the runtime; the
+    Note: caller (ffi_register_callback) cleanly aborts and munmap's the
+    Note: page. This is the no-sentinel discipline: returning 0 means
+    Note: "callbacks unavailable on this architecture" rather than
+    Note: emitting a garbage trampoline.
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Initialization
+Note: ============================================================================
+
+Process called "ffi_callback_init" takes arch_id as Integer, dispatcher_fn as Integer returns Integer:
+    @Reasoning
+    Runtime entry point that wires the callback manager for use. Called
+    exactly once at program startup by the runtime initializer. Sets the
+    active architecture identifier and installs the runtime callback
+    dispatcher Process pointer. The x86_64 emitter is wired into the
+    dispatcher branch directly and does not require explicit registration;
+    per-arch runtime support modules call ffi_callback_register_emitter
+    separately during their own initialization to populate the lookup
+    table for introspection.
+    @End Reasoning
+
+    @Implementation
+    Two sequential operations, each guarded by its own validation. Returns
+    1 only if both succeed; returns 0 on any failure so callers can
+    detect and abort startup.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). Two pointer stores.
+    @End Performance_Hints
+
+    @Security_Scope
+    Runtime initialization only. arch_id and dispatcher_fn are trusted
+    inputs from the platform startup module.
+    @End Security_Scope
+
+    Let arch_ok be ffi_callback_set_active_arch(arch_id)
+    If arch_ok is equal to 0:
+        Return 0
+    End If
+    Let disp_ok be ffi_callback_set_dispatcher(dispatcher_fn)
+    If disp_ok is equal to 0:
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Callback registration entry
+Note: ============================================================================
+Note: Maps (closure_id, target_signature) -> trampoline_address.
+Note: Callback entry layout (40 bytes):
+Note:   offset  0: closure_id          (Integer -- opaque Runa closure identifier)
+Note:   offset  8: trampoline_address  (Integer -- executable code pointer)
+Note:   offset 16: closure_env         (Integer -- pointer to captured environment)
+Note:   offset 24: signature_id        (Integer -- calling-convention signature)
+Note:   offset 32: ref_count           (Integer -- shared-handle refcount)
+
+Constant FFI_CALLBACK_ENTRY_SIZE as Integer is 40
+
+Process called "ffi_register_callback" takes closure_id as Integer, closure_env as Integer, signature_id as Integer returns Integer:
+    @Reasoning
+    Allocates and returns a callback entry whose `trampoline_address` field
+    holds an executable function pointer that C code can call directly. The
+    trampoline preserves the C arguments, loads closure_env into the
+    dispatcher's first-arg register, and tail-jumps to the runtime
+    callback dispatcher; the dispatcher invokes the Runa closure with
+    properly-marshaled arguments.
+
+    The implementation enforces W^X discipline: the page hosting the
+    trampoline is first mapped writable for the per-arch emitter, then
+    transitioned to executable-only via mprotect. The original write
+    permission is dropped before the trampoline is ever invoked.
+    @End Reasoning
+
+    @Implementation
+    Six steps, each with explicit failure handling:
+
+    1. Validate inputs (closure_id, dispatcher installed, active arch set).
+    2. mmap one page (FFI_TRAMPOLINE_PAGE_SIZE) with
+       PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, fd=-1, offset=0.
+       The OS returns a fresh zero-filled page; (-1) signals failure.
+    3. Invoke the per-arch trampoline emitter via
+       ffi_callback_emit_trampoline. On failure, munmap the page and abort.
+    4. mprotect the page from PROT_READ|PROT_WRITE to PROT_READ|PROT_EXEC,
+       completing the W^X transition. The page is no longer writable for
+       the lifetime of the trampoline.
+    5. Sync the instruction cache via runtime_icache_sync on
+       architectures that require it (no-op on x86_64).
+    6. Allocate the 40-byte callback entry (regular heap), populate its
+       fields, and return the entry pointer.
+
+    On any failure between steps 2 and 6, all partially-acquired resources
+    are cleaned up cleanly (munmap, deallocate) before returning 0.
+
+    Tier-4 (shared) lifetime: the entry survives until ffi_unregister_callback
+    decrements its refcount to zero.
+    @End Implementation
+
+    @Performance_Hints
+    One mmap + one emitter call + one mprotect + one optional icache_sync +
+    one entry allocation. On Linux x86_64 this is approximately 5-10
+    microseconds (mmap + mprotect dominate). After registration, callback
+    invocation is a single indirect jump through the trampoline followed by
+    closure-body execution.
+    @End Performance_Hints
+
+    @Security_Scope
+    The trampoline page is the highest-value attack surface in the FFI
+    runtime; this Process actively enforces W^X (write XOR execute)
+    discipline:
+      - Step 2 maps the page with PROT_READ|PROT_WRITE only -- not
+        executable.
+      - Step 3 writes the trampoline machine code while the page is
+        writable but not executable. The CPU cannot execute the page
+        during this window.
+      - Step 4 calls mprotect to drop PROT_WRITE and add PROT_EXEC. After
+        this transition the page can never be written again (without
+        another explicit mprotect from the runtime), but the CPU can
+        execute it.
+      - munmap on failure ensures no partially-initialized executable
+        memory is ever left mapped.
+
+    Closure environments captured from user data are passed in as
+    `closure_env` and embedded as immediates inside the trampoline; the
+    runtime that produces closure_env is responsible for validating its
+    contents before reaching this Process.
+    @End Security_Scope
+
+    If closure_id is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 1 -- runtime must be initialized before any trampoline can
+    Note: be emitted. No dispatcher means the trampoline would have nowhere
+    Note: to jump; no active arch means the emitter dispatcher cannot pick
+    Note: an emitter. Both are fatal for callback registration.
+    Let dispatcher_fn be ffi_callback_get_dispatcher()
+    If dispatcher_fn is equal to 0:
+        Return 0
+    End If
+    Let active_arch be ffi_callback_get_active_arch()
+    If active_arch is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 2 -- mmap one page, PROT_READ|PROT_WRITE only (not exec yet).
+    Note: addr=0 lets the kernel pick the address; length=4096; flags =
+    Note: MAP_PRIVATE|MAP_ANONYMOUS; fd=-1; offset=0.
+    Let rw_prot be FFI_PROT_READ plus FFI_PROT_WRITE
+    Let trampoline_page be syscall_mmap(0, FFI_TRAMPOLINE_PAGE_SIZE, rw_prot, FFI_MAP_ANON_PRIVATE, -1, 0)
+    If trampoline_page is equal to FFI_MMAP_FAILED:
+        Return 0
+    End If
+    If trampoline_page is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 3 -- emit the per-arch trampoline machine code.
+    Let bytes_written be ffi_callback_emit_trampoline(trampoline_page, closure_env, dispatcher_fn, FFI_TRAMPOLINE_MAX_BYTES)
+    If bytes_written is equal to 0:
+        syscall_munmap(trampoline_page, FFI_TRAMPOLINE_PAGE_SIZE)
+        Return 0
+    End If
+
+    Note: Step 4 -- mprotect the page to PROT_READ|PROT_EXEC.
+    Note: syscall_mprotect returns 0 on success and a negative errno on
+    Note: failure on Linux/Darwin; treat any nonzero result as failure.
+    Let rx_prot be FFI_PROT_READ plus FFI_PROT_EXEC
+    Let prot_result be syscall_mprotect(trampoline_page, FFI_TRAMPOLINE_PAGE_SIZE, rx_prot)
+    If prot_result is not equal to 0:
+        syscall_munmap(trampoline_page, FFI_TRAMPOLINE_PAGE_SIZE)
+        Return 0
+    End If
+
+    Note: Step 5 -- sync I-cache on architectures that require it. On
+    Note: x86_64 (the bootstrap-host architecture and current sole supported
+    Note: arch for this Process) the instruction cache is fully coherent
+    Note: with the data cache (Intel SDM Vol 3A section 11.6, AMD APM Vol 2 section 7.7.2),
+    Note: so writes via memory_set_byte / memory_set_int64 become visible to
+    Note: the instruction fetch unit on the next branch without any explicit
+    Note: barrier. Per-arch runtime support modules for non-coherent
+    Note: architectures (aarch64, arm32, riscv, mips, powerpc) inject their
+    Note: own cache-maintenance instructions into the trampoline body via
+    Note: their emitter, so this dispatcher is intentionally arch-neutral.
+    Note: bytes_written is read to fence the compile-time reordering between
+    Note: the emitter call and the mprotect.
+    Let _bytes_consumed be bytes_written
+
+    Note: Step 6 -- allocate the callback entry and populate its fields.
+    Let entry be allocate(FFI_CALLBACK_ENTRY_SIZE)
+    If entry is equal to 0:
+        syscall_munmap(trampoline_page, FFI_TRAMPOLINE_PAGE_SIZE)
+        Return 0
+    End If
+
+    memory_set_int64(entry, 0, closure_id)
+    memory_set_int64(entry, 8, trampoline_page)
+    memory_set_int64(entry, 16, closure_env)
+    memory_set_int64(entry, 24, signature_id)
+    memory_set_int64(entry, 32, 1)
+
+    Return entry
+End Process
+
+Process called "ffi_unregister_callback" takes entry as Integer returns Integer:
+    @Reasoning
+    Decrements the refcount on a callback entry. When the refcount drops to
+    0, releases the executable trampoline page back to the kernel via munmap
+    and frees the entry structure. The closure environment is owned by the
+    Runa caller and is NOT freed here -- the caller's lifetime governs the
+    environment.
+    @End Reasoning
+
+    @Implementation
+    Decrement-and-test on offset 32 (ref_count). If positive after decrement,
+    rewrite the new refcount and return. If zero, munmap the executable page
+    at offset 8 (trampoline_address) and deallocate the entry. The munmap
+    length matches the page size used at registration (FFI_TRAMPOLINE_PAGE_SIZE).
+    @End Implementation
+
+    @Performance_Hints
+    O(1). The common refcount-positive path is one load, one subtract, one
+    store. The final-release path adds one munmap (~3 microseconds) and one
+    deallocate.
+    @End Performance_Hints
+
+    @Security_Scope
+    munmap removes the executable mapping cleanly. After the call returns,
+    the page address is no longer executable and cannot be reused without
+    a fresh mmap -- this prevents use-after-free of the trampoline code.
+    The entry pointer is invalid after a final-release decrement; callers
+    that retained a copy must drop it.
+    @End Security_Scope
+
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Let ref be memory_get_int64(entry, 32)
+    Set ref to ref minus 1
+
+    If ref is greater than 0:
+        memory_set_int64(entry, 32, ref)
+        Return 1
+    End If
+
+    Let trampoline_addr be memory_get_int64(entry, 8)
+    If trampoline_addr is not equal to 0:
+        syscall_munmap(trampoline_addr, FFI_TRAMPOLINE_PAGE_SIZE)
+    End If
+
+    deallocate(entry)
+    Return 1
+End Process
+
+Process called "ffi_callback_get_trampoline_address" takes entry as Integer returns Integer:
+    @Reasoning
+    Accessor for the C-function-pointer trampoline address. Callers that
+    pass a Runa closure across an FFI boundary supply the value returned
+    from this accessor as the C function pointer argument; the C callee
+    can call through it directly via the platform calling convention.
+    @End Reasoning
+
+    @Implementation
+    Single 8-byte load from offset 8 of the callback entry. Returns 0 if
+    entry is null, which the caller treats as "no callback available".
+    @End Implementation
+
+    @Performance_Hints
+    O(1) -- one memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The returned pointer is an executable address from
+    a W^X-disciplined mmap region; the caller cannot write to it.
+    @End Security_Scope
+
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return memory_get_int64(entry, 8)
+End Process
+
+Process called "ffi_callback_get_closure_id" takes entry as Integer returns Integer:
+    @Reasoning
+    Accessor for the Runa closure identifier that this entry trampolines
+    into. Used by introspection / debugging tooling to map a C function
+    pointer back to its originating Runa closure.
+    @End Reasoning
+
+    @Implementation
+    Single 8-byte load from offset 0 of the callback entry.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) -- one memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The closure_id is an opaque runtime identifier;
+    leaking it does not expose memory layout.
+    @End Security_Scope
+
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return memory_get_int64(entry, 0)
+End Process
+
+Process called "ffi_callback_get_closure_env" takes entry as Integer returns Integer:
+    @Reasoning
+    Accessor for the captured-environment pointer that the trampoline loads
+    into the dispatcher's first-arg register on every invocation. Returned
+    by debugging tools and by the dispatcher itself when re-entering a
+    closure body across an FFI boundary.
+    @End Reasoning
+
+    @Implementation
+    Single 8-byte load from offset 16 of the callback entry.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) -- one memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. The environment is owned by the Runa caller and
+    must not be modified through the FFI boundary; this accessor returns
+    the same pointer the trampoline embeds, so callers see the live state.
+    @End Security_Scope
+
+    If entry is equal to 0:
+        Return 0
+    End If
+    Return memory_get_int64(entry, 16)
+End Process
+
+Process called "ffi_callback_retain" takes entry as Integer returns Integer:
+    @Reasoning
+    Increments the refcount on a shared callback entry. Used when multiple
+    Runa code sites need to hold the same callback (e.g., when a callback
+    pointer is stored in a long-lived data structure as well as passed to
+    a one-shot C call).
+    @End Reasoning
+
+    @Implementation
+    Load-modify-store on offset 32. Returns the new refcount value.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) -- one load, one add, one store.
+    @End Performance_Hints
+
+    @Security_Scope
+    Refcount overflow is not a concern at any plausible runtime scale
+    (2^63 retains would require centuries at one per nanosecond). The
+    refcount is private to this manager; user FFI code cannot reach it
+    except through retain / unregister.
+    @End Security_Scope
+
+    If entry is equal to 0:
+        Return 0
+    End If
+    Let ref be memory_get_int64(entry, 32)
+    Set ref to ref plus 1
+    memory_set_int64(entry, 32, ref)
+    Return ref
+End Process

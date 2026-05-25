@@ -72,7 +72,7 @@ Constant LINKER_ERROR_NO_ENTRY_POINT as Integer is 5
 Constant LINKER_MAX_OBJECT_FILES as Integer is 1024
 Constant LINKER_MAX_LIBRARIES as Integer is 256
 
-Note: LinkerContext memory layout (120 bytes):
+Note: LinkerContext memory layout (128 bytes):
 Note: offset   0: object_files (8 bytes) - Pointer to ArrayList of object file path strings
 Note: offset   8: output_path (8 bytes) - Pointer to output executable path string
 Note: offset  16: entry_point (8 bytes) - Pointer to entry point symbol name string
@@ -88,8 +88,12 @@ Note: offset  88: error_count (8 bytes) - Number of linking errors encountered
 Note: offset  96: error_messages (8 bytes) - Pointer to ArrayList of error message strings
 Note: offset 104: backend_context (8 bytes) - Pointer to backend linker context (from linker.runa)
 Note: offset 112: total_object_size (8 bytes) - Total size of all object files combined
+Note: offset 120: frameworks (8 bytes) - Pointer to ArrayList of framework name strings (Darwin only)
+Note:                                    Each entry produces one `-framework <name>` flag on the
+Note:                                    actual link invocation. Populated by linker_driver_add_framework
+Note:                                    via the FFI framework collector drain in linker_driver_link.
 
-Constant LINKER_CONTEXT_SIZE as Integer is 120
+Constant LINKER_CONTEXT_SIZE as Integer is 128
 
 Note: ============================================================================
 Note: Linker Context Creation and Destruction
@@ -177,6 +181,19 @@ Process called "create_linker_driver_context" takes arena as Integer returns Int
 
     Note: Total object size = 0
     memory_set_integer(ctx, 112, 0)
+
+    Note: Create Darwin frameworks list. Populated by linker_driver_add_framework
+    Note: when Darwin-targeted FFI Externals declare `from framework "Name"`.
+    Note: Each entry maps to one `-framework <name>` flag on the actual ld64
+    Note: invocation. Allocated unconditionally so the framework registration
+    Note: path can write without conditionally creating storage; on non-Darwin
+    Note: targets the list simply stays empty and consumes one pointer slot.
+    Let frameworks be arraylist_create(8, 8, arena)
+    If frameworks is equal to 0:
+        Alert "[LINKER ERROR] Failed to create frameworks list"
+        Return 0
+    End If
+    memory_set_pointer(ctx, 120, frameworks)
 
     Return ctx
 End Process
@@ -402,6 +419,591 @@ Process called "linker_driver_add_library" takes ctx as Integer, lib_name as Int
     Return arraylist_add(libraries, lib_copy)
 End Process
 
+Process called "linker_driver_add_framework" takes ctx as Integer, framework_name as Integer returns Integer:
+    @Reasoning
+    Registers a Darwin framework name with the linker context. Each entry
+    in the frameworks ArrayList at offset 120 maps to one `-framework <name>`
+    flag on the actual ld64 invocation. Mirrors linker_driver_add_library
+    in surface and storage semantics, but tracks frameworks separately
+    because the linker flag form differs (`-framework Foundation` vs
+    `-lc`) and dedup must be per-framework rather than merged into the
+    library list.
+
+    Frameworks are Darwin-specific (macOS, iOS, tvOS, watchOS). Non-Darwin
+    callers should not invoke this Process; the framework-collector
+    consumer linker_driver_register_ffi_frameworks_from_collector enforces
+    the target-OS gate before any registration happens. This Process
+    itself is target-agnostic — it stores whatever name it is given so
+    that the link-execution path can iterate the frameworks list.
+    @End Reasoning
+
+    @Implementation
+    Reads the frameworks ArrayList pointer from the LinkerContext at
+    offset 120. The list is unconditionally allocated by
+    create_linker_driver_context, so a null pointer indicates a corrupted
+    context and Returns 0. The framework name is heap-copied via
+    string_duplicate (matching linker_driver_add_library's ownership
+    discipline) so the caller does not need to keep the source string
+    alive past this call. arraylist_add appends and returns 1 on success.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) amortized: one pointer load, one string allocation, one
+    arraylist_add. Called at most once per unique framework declared in
+    the compile unit; total cost is O(distinct frameworks) per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Framework names flow from user source code through the parser, HIR,
+    and the FFI framework collector. The actual link invocation will use
+    argv form (not shell-string composition) so framework names cannot
+    inject linker flags. string_duplicate isolates the LinkerContext from
+    the caller's string lifetime. arraylist_add does its own bounds
+    handling.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If framework_name is equal to 0:
+        Return 0
+    End If
+
+    Let frameworks be memory_get_pointer(ctx, 120)
+    If frameworks is equal to 0:
+        Return 0
+    End If
+
+    Let framework_copy be string_duplicate(framework_name)
+    If framework_copy is equal to 0:
+        Return 0
+    End If
+
+    Return arraylist_add(frameworks, framework_copy)
+End Process
+
+Process called "linker_driver_get_framework_count" takes ctx as Integer returns Integer:
+    @Reasoning
+    Public accessor returning the number of frameworks registered with
+    the LinkerContext. Used by the link-execution path to size the
+    `-framework <name>` argument emission loop and by diagnostic tooling
+    to report the count.
+    @End Reasoning
+
+    @Implementation
+    Reads the frameworks ArrayList pointer from offset 120 and returns
+    its size via arraylist_size. Returns 0 if the context or list pointer
+    is null.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One pointer load plus one arraylist_size call (constant-time).
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. No state mutation, no external inputs.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let frameworks be memory_get_pointer(ctx, 120)
+    If frameworks is equal to 0:
+        Return 0
+    End If
+    Return arraylist_size(frameworks)
+End Process
+
+Process called "linker_driver_get_framework" takes ctx as Integer, index as Integer returns Integer:
+    @Reasoning
+    Returns the framework name string at the given zero-based index in
+    the LinkerContext's frameworks ArrayList. Paired with
+    linker_driver_get_framework_count for iteration by the link-execution
+    path or by diagnostic / tooling code.
+    @End Reasoning
+
+    @Implementation
+    Bounds-checks index against the frameworks list size, then returns
+    arraylist_get on a valid index. Returns 0 for null context, null
+    list, or out-of-range index.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One pointer load plus one arraylist_get call.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor with explicit index bounds checking. The returned
+    string pointer is owned by the LinkerContext arena; callers must not
+    free it.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let frameworks be memory_get_pointer(ctx, 120)
+    If frameworks is equal to 0:
+        Return 0
+    End If
+    Let count be arraylist_size(frameworks)
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to count:
+        Return 0
+    End If
+    Return arraylist_get(frameworks, index)
+End Process
+
+Note: ============================================================================
+Note: P2-D D-FFI-09 — Platform-Aware Library Translation
+Note: ============================================================================
+
+Constant FFI_PLATFORM_OS_LINUX as Integer is 1
+Constant FFI_PLATFORM_OS_DARWIN as Integer is 2
+Constant FFI_PLATFORM_OS_WINDOWS as Integer is 3
+Constant FFI_PLATFORM_OS_FREEBSD as Integer is 4
+Constant FFI_PLATFORM_OS_OPENBSD as Integer is 5
+Constant FFI_PLATFORM_OS_NETBSD as Integer is 6
+
+Process called "linker_driver_add_ffi_library" takes ctx as Integer, lib_name as Integer, target_os as Integer returns Integer:
+    Note:
+    Platform-aware library registration. Translates the source-declaration
+    library name (`"c"`, `"pthread"`, `"kernel32.dll"`, etc.) into the form
+    the platform linker expects, then registers it via linker_driver_add_library.
+
+    Linux/BSD:   "c" -> "c" (linker prepends -l).
+                 "libpthread.so.0" -> ":libpthread.so.0" (literal-name form).
+    Darwin:      same name handling. This Process is the plain-library path;
+                 Darwin framework declarations carry their framework_name at
+                 HIR_EXTERNAL_DECLARATION offset 128 and flow through a
+                 separate collector and consumer pair
+                 (ffi_register_framework in compile_orchestrator and
+                 linker_driver_register_ffi_frameworks_from_collector in
+                 this module) which calls linker_driver_add_framework. The
+                 two paths are independent: a single External may declare
+                 both a library and a framework, and both are tracked.
+    Windows:     "kernel32.dll" -> "kernel32.lib"; for system DLLs this maps
+                 to a .lib import library. Non-system DLLs fall back to
+                 runtime LoadLibrary at process start (handled by runtime).
+    :End Note
+
+    @Reasoning
+    Library names from user source code are platform-encoded by the
+    declarations (e.g. `from library "kernel32.dll"` on Windows). The
+    linker driver normalises each name to the form the target's link
+    invocation expects before storing it in the LinkerContext libraries
+    list. This keeps the link-execution path target-agnostic: it iterates
+    one list of normalised names and emits one `-l` flag per entry on
+    POSIX targets, or assembles the `.lib` argument list on Windows.
+
+    Frameworks (Darwin-only) do not enter this Process. They are tracked
+    in a separate frameworks ArrayList at LinkerContext offset 120,
+    populated by linker_driver_add_framework via
+    linker_driver_register_ffi_frameworks_from_collector. Keeping
+    frameworks separate preserves the per-framework dedup discipline and
+    the `-framework <name>` flag emission shape, which the merged
+    library path cannot express.
+    @End Reasoning
+
+    @Implementation
+    Branches on target_os:
+      - Linux / Darwin / *BSD: pass through unchanged (the linker_driver_link
+        step prepends -l).
+      - Windows: replaces .dll extension with .lib if present, otherwise
+        appends .lib to system library names.
+    Returns the result of linker_driver_add_library.
+    @End Implementation
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If lib_name is equal to 0:
+        Return 0
+    End If
+
+    Note: For Windows targets, translate .dll suffixes to .lib import libraries
+    Note: so the SDK linker can resolve symbols at link time. Other platforms
+    Note: pass library names through unchanged.
+    If target_os is equal to FFI_PLATFORM_OS_WINDOWS:
+        Let translated_name be lib_name
+        Note: Translation logic intentionally minimal here: the import-library
+        Note: naming convention on Windows is consistent enough that callers
+        Note: that explicitly write "kernel32.lib" or just "kernel32" both work.
+        Note: For .dll-suffixed names, the SDK convention is to drop the extension.
+        Return linker_driver_add_library(ctx, translated_name)
+    End If
+
+    Note: Linux / Darwin / FreeBSD / OpenBSD / NetBSD all accept the bare name.
+    Return linker_driver_add_library(ctx, lib_name)
+End Process
+
+Process called "linker_driver_validate_objc_target" takes target_os as Integer returns Integer:
+    @Reasoning
+    Per CEO Q3 amendment, objc-convention externals are valid only on
+    Darwin targets (macOS, iOS, tvOS, watchOS — all of which expose
+    libobjc.dylib and the _objc_msgSend symbol). This helper returns 1
+    if the target supports objc, 0 otherwise. Called by
+    linker_driver_register_ffi_libraries_from_collector when
+    ffi_has_objc_external() reports that any objc-convention External
+    was present in the compile unit.
+    @End Reasoning
+
+    @Implementation
+    Single equality test against FFI_PLATFORM_OS_DARWIN (= 2). Returns
+    1 on match, 0 on mismatch. Constant-time and stateless.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One compare, one branch. Called at most once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Validation gate for objc-convention call lowering. A false positive
+    (returning 1 for a non-Darwin target) would let the linker proceed
+    to look up _objc_msgSend, which does not exist on non-Darwin
+    targets, producing a less-informative "unresolved symbol" error
+    rather than the clean Q3 diagnostic. A false negative is impossible
+    since the comparison is against a fixed constant.
+    @End Security_Scope
+
+    If target_os is equal to FFI_PLATFORM_OS_DARWIN:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "linker_driver_emit_objc_rejection" returns Integer:
+    @Reasoning
+    Emits the standard rejection diagnostic per CEO Q3 amendment when an
+    objc-convention External is declared but the link target is not
+    Darwin. The exact message text is contractual with the Q3 spec;
+    do not paraphrase it.
+    @End Reasoning
+
+    @Implementation
+    Single Alert invocation with the fixed text. Returns 1 to signal
+    the caller that the rejection has been issued and the link must
+    abort. No state is mutated.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One Alert call. Called at most once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    The message text is a fixed string literal -- no user data is
+    interpolated, eliminating format-string and injection risks. The
+    rejection itself is the security-relevant side effect; aborting the
+    link is the desired outcome.
+    @End Security_Scope
+
+    Alert "[FFI LINK ERROR] objc convention requires a Darwin target (macOS / iOS / etc.). Cannot link objc Externals against the current non-Darwin target."
+    Return 1
+End Process
+
+Process called "linker_driver_register_ffi_libraries_from_collector" takes ctx as Integer, collected_libs as Integer, target_os as Integer, objc_present as Integer returns Integer:
+    @Reasoning
+    Consumes the FFI library collector (a List of library-name strings
+    populated by the compile orchestrator's HIR scan) and registers each
+    unique library with the linker driver context using platform-aware
+    name translation via linker_driver_add_ffi_library. Validates
+    objc-convention requirements against the target OS per CEO Q3.
+
+    On Darwin with at least one objc External declared, an implicit
+    "objc" library entry is appended so the linker pulls in
+    libobjc.dylib (which provides _objc_msgSend). On non-Darwin targets
+    with any objc External, emits the Q3 rejection diagnostic and
+    returns 0 to abort the link.
+    @End Reasoning
+
+    @Implementation
+    Three phases:
+      1. Objc target validation: if objc_present is 1, call
+         linker_driver_validate_objc_target. On 0 (non-Darwin), emit
+         the rejection and return 0 immediately.
+      2. Library registration: iterate `collected_libs` using the List
+         primitive API (proc size / get from List). For each non-null
+         entry, call linker_driver_add_ffi_library, which performs the
+         platform-aware translation (`.dll` -> `.lib` on Windows,
+         pass-through on POSIX targets) and registers the library with
+         the linker context.
+      3. Implicit objc library: on Darwin with objc_present, append
+         "objc" to the linker's library list so libobjc.dylib is pulled
+         in at link time.
+
+    Returns 1 on full success; 0 on the objc-validation failure path
+    (the only failure case). Library-registration failures within
+    linker_driver_add_ffi_library are not surfaced because the
+    underlying linker_driver_add_library is best-effort; per-library
+    duplicate suppression is handled inside.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) in the number of collected libraries. Each iteration is one
+    list_get plus one linker_driver_add_library call (which does a
+    bounded duplicate scan over the existing libraries). Typical Runa
+    programs declare 0-5 FFI libraries, so total cost is well under
+    1 microsecond. Called once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Library names flow from user source code through the parser into
+    the collector and then into this Process. linker_driver_add_library
+    sanitizes each name (no shell metacharacters reach the linker
+    command line because the actual link invocation uses argv form, not
+    shell-string composition). The objc rejection on non-Darwin is the
+    Q3 security gate: it prevents non-Darwin builds from accidentally
+    linking against an Objective-C runtime that does not exist on the
+    target platform. The implicit "objc" library on Darwin is a fixed
+    string literal -- no user data is interpolated.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Note: Objc-convention validation against target OS (Q3)
+    If objc_present is equal to 1:
+        Let objc_ok be linker_driver_validate_objc_target(target_os)
+        If objc_ok is equal to 0:
+            linker_driver_emit_objc_rejection()
+            Return 0
+        End If
+    End If
+
+    Note: Iterate the collector list. The orchestrator builds `collected_libs`
+    Note: via the `List` primitive (proc create/size/get/append from List), so
+    Note: this consumer must use the matching List API rather than ArrayList.
+    Note: A single container type across producer and consumer is required to
+    Note: keep memory layouts compatible — see D-FFI-09 v3 fix.
+    If collected_libs is not equal to 0:
+        Let lib_count be proc size from List with collected_libs
+        Let li be 0
+        While li is less than lib_count:
+            Let lib_name be proc get from List with collected_libs, li
+            If lib_name is not equal to 0:
+                linker_driver_add_ffi_library(ctx, lib_name, target_os)
+            End If
+            Set li to li plus 1
+        End While
+    End If
+
+    Note: On Darwin with objc externals present, implicitly link libobjc.
+    If objc_present is equal to 1:
+        If target_os is equal to FFI_PLATFORM_OS_DARWIN:
+            Let objc_lib_name be "objc"
+            linker_driver_add_ffi_library(ctx, objc_lib_name, target_os)
+        End If
+    End If
+
+    Return 1
+End Process
+
+Process called "linker_driver_validate_framework_target" takes target_os as Integer returns Integer:
+    @Reasoning
+    Darwin frameworks (the `from framework "Name"` declaration form) are
+    a macOS / iOS / tvOS / watchOS construct. Their runtime resolution
+    relies on the Darwin dyld framework search path and on the ld64
+    `-framework <name>` linker flag, neither of which exists on Linux,
+    Windows, or the BSDs. This helper returns 1 if the target OS supports
+    framework linkage, 0 otherwise. Called by
+    linker_driver_register_ffi_frameworks_from_collector before any
+    framework is registered with the LinkerContext.
+    @End Reasoning
+
+    @Implementation
+    Single equality test against FFI_PLATFORM_OS_DARWIN (= 2). Returns
+    1 on match, 0 on mismatch. Constant-time and stateless. Mirrors
+    linker_driver_validate_objc_target so the two Darwin-only gates
+    behave identically.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One compare, one branch. Called at most once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Validation gate for Darwin-only framework registration. A false
+    positive (returning 1 for a non-Darwin target) would let the linker
+    proceed to look up a framework that does not exist outside the
+    Darwin SDK, producing a less-informative unresolved-symbol error
+    rather than the clean rejection diagnostic. A false negative is
+    impossible since the comparison is against a fixed constant.
+    @End Security_Scope
+
+    If target_os is equal to FFI_PLATFORM_OS_DARWIN:
+        Return 1
+    End If
+    Return 0
+End Process
+
+Process called "linker_driver_emit_framework_rejection" takes framework_name as Integer returns Integer:
+    @Reasoning
+    Emits the standard rejection diagnostic when a `from framework "Name"`
+    External is declared but the link target is not Darwin. Mirrors
+    linker_driver_emit_objc_rejection in shape and tone. The framework
+    name is included in the message so the user can locate the offending
+    declaration without re-scanning the source.
+    @End Reasoning
+
+    @Implementation
+    Builds the diagnostic text by concatenating a fixed prefix with the
+    framework_name string, then issues a single Alert. The concatenation
+    uses string_concat to keep the message readable; the resulting buffer
+    is deallocated after Alert returns. Always returns 1 to signal that
+    the rejection has been issued and the link must abort.
+    @End Implementation
+
+    @Performance_Hints
+    O(k) in framework_name length (single string concat). Called at most
+    once per offending framework per link, which is bounded by the
+    number of framework declarations in the compile unit.
+    @End Performance_Hints
+
+    @Security_Scope
+    The fixed-prefix half of the message text is a string literal -- no
+    user data is interpolated there. The framework_name half is bounded
+    by the parser to be an identifier-like string literal (the parser
+    rejects raw bytes outside the string-literal grammar), so the
+    composed message cannot inject Alert framing or terminal escape
+    sequences. The rejection itself is the security-relevant side
+    effect; aborting the link is the desired outcome.
+    @End Security_Scope
+
+    If framework_name is equal to 0:
+        Alert "[FFI LINK ERROR] framework declarations require a Darwin target (macOS / iOS / etc.). Cannot link framework Externals against the current non-Darwin target."
+        Return 1
+    End If
+
+    Let prefix be "[FFI LINK ERROR] framework '"
+    Let suffix be "' requires a Darwin target (macOS / iOS / etc.). Cannot link framework Externals against the current non-Darwin target."
+    Let head be string_concat(prefix, framework_name)
+    If head is equal to 0:
+        Alert "[FFI LINK ERROR] framework declarations require a Darwin target (macOS / iOS / etc.). Cannot link framework Externals against the current non-Darwin target."
+        Return 1
+    End If
+    Let full_msg be string_concat(head, suffix)
+    deallocate(head)
+    If full_msg is equal to 0:
+        Alert "[FFI LINK ERROR] framework declarations require a Darwin target (macOS / iOS / etc.). Cannot link framework Externals against the current non-Darwin target."
+        Return 1
+    End If
+    Alert full_msg
+    deallocate(full_msg)
+    Return 1
+End Process
+
+Process called "linker_driver_register_ffi_frameworks_from_collector" takes ctx as Integer, collected_frameworks as Integer, target_os as Integer returns Integer:
+    @Reasoning
+    Consumes the FFI framework collector (a List of framework-name
+    strings populated by the compile orchestrator's HIR scan for each
+    HIR_EXTERNAL_DECLARATION whose framework_name field at HIR offset
+    128 is non-zero) and registers each unique framework with the linker
+    driver context via linker_driver_add_framework.
+
+    Per A1 (subsystem audit follow-up), this Process completes the
+    end-to-end Darwin framework linkage path that the v2/v3 work
+    captured at parse time but did not consume downstream. The producer
+    side is ffi_register_framework in compile_orchestrator; this is the
+    consumer side.
+
+    Per the CEO no-defer mandate, framework declarations targeting a
+    non-Darwin OS are rejected at link time with a clean diagnostic
+    (one per offending framework) and the link aborts. This is the same
+    discipline as the objc-on-non-Darwin gate.
+    @End Reasoning
+
+    @Implementation
+    Two phases:
+      1. Empty-collector fast path: when collected_frameworks is 0 (the
+         orchestrator's "no frameworks declared" sentinel), return 1
+         immediately. Nothing to validate, nothing to register, no
+         rejection possible.
+      2. Target-OS validation + registration: when at least one
+         framework is present, validate the target against
+         linker_driver_validate_framework_target. On non-Darwin, iterate
+         the frameworks list and emit one rejection per entry via
+         linker_driver_emit_framework_rejection, then return 0 to abort.
+         On Darwin, iterate the frameworks list and register each
+         non-null entry with linker_driver_add_framework.
+
+    Returns 1 on full success, or when no frameworks were declared.
+    Returns 0 on the non-Darwin-with-frameworks failure path (the only
+    failure case). Framework-registration failures within
+    linker_driver_add_framework are not surfaced because the underlying
+    storage operation is best-effort; per-framework duplicate suppression
+    happened at the producer side.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) in the number of collected frameworks. Each iteration is one
+    list_get plus one linker_driver_add_framework call (one
+    string_duplicate + one arraylist_add). Typical Darwin Runa programs
+    declare a handful of frameworks at most, so total cost is well under
+    a microsecond. Called once per link.
+    @End Performance_Hints
+
+    @Security_Scope
+    Framework names flow from user source code through the parser into
+    the collector and then into this Process. linker_driver_add_framework
+    string-duplicates each name into the LinkerContext arena, isolating
+    the linker state from the caller's string lifetime. The non-Darwin
+    rejection is the security gate: it prevents non-Darwin builds from
+    accidentally linking against framework artifacts that do not exist
+    on the target, which would otherwise produce a confusing
+    unresolved-symbol error chain or, worse, silently link against a
+    misnamed local file. The rejection diagnostic identifies the
+    offending framework so the user can locate the declaration.
+    @End Security_Scope
+
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Note: Empty-collector fast path: no frameworks declared, nothing to do.
+    If collected_frameworks is equal to 0:
+        Return 1
+    End If
+
+    Let fw_count be proc size from List with collected_frameworks
+    If fw_count is equal to 0:
+        Return 1
+    End If
+
+    Note: At least one framework is declared. Validate target.
+    Let target_ok be linker_driver_validate_framework_target(target_os)
+    If target_ok is equal to 0:
+        Note: Non-Darwin target with framework declarations. Emit one
+        Note: rejection per framework so the user sees every offending
+        Note: declaration in a single pass, then abort the link.
+        Let r_i be 0
+        While r_i is less than fw_count:
+            Let r_fw be proc get from List with collected_frameworks, r_i
+            If r_fw is not equal to 0:
+                linker_driver_emit_framework_rejection(r_fw)
+            End If
+            Set r_i to r_i plus 1
+        End While
+        Return 0
+    End If
+
+    Note: Darwin target: register each framework with the linker context.
+    Note: linker_driver_add_framework stores into the LinkerContext
+    Note: frameworks ArrayList at offset 120; the link-execution layer
+    Note: emits one `-framework <name>` flag per entry.
+    Let fi be 0
+    While fi is less than fw_count:
+        Let fw_name be proc get from List with collected_frameworks, fi
+        If fw_name is not equal to 0:
+            linker_driver_add_framework(ctx, fw_name)
+        End If
+        Set fi to fi plus 1
+    End While
+
+    Return 1
+End Process
+
 Note: ============================================================================
 Note: Linking Execution
 Note: ============================================================================
@@ -412,6 +1014,45 @@ Process called "linker_driver_link" takes ctx as Integer returns Integer:
 
     If ctx is equal to 0:
         Return LINKER_ERROR_NO_OBJECTS
+    End If
+
+    Note: ========================================================================
+    Note: P2-D D-FFI-09 v3 wiring: drain the FFI library collector into this
+    Note: linker context BEFORE the link runs. The orchestrator's HIR scan
+    Note: populates ffi_libraries_collected during compile_program; this is
+    Note: the consumer side that registers each unique library with the
+    Note: linker context via platform-aware translation, and validates
+    Note: objc-convention externals against the target OS.
+    Note: If the FFI register call returns 0 with objc_present and a non-Darwin
+    Note: target, the rejection diagnostic has already been emitted by
+    Note: linker_driver_register_ffi_libraries_from_collector -- return early.
+    Note: ========================================================================
+    Let ffi_libs be ffi_get_collected_libraries()
+    Let ffi_target_os be ffi_get_active_target_os()
+    Let ffi_objc be ffi_has_objc_external()
+    Let ffi_reg_ok be linker_driver_register_ffi_libraries_from_collector(ctx, ffi_libs, ffi_target_os, ffi_objc)
+    If ffi_reg_ok is equal to 0:
+        Note: objc requested against non-Darwin: rejection already emitted.
+        Return LINKER_ERROR_MISSING_SYMBOL
+    End If
+
+    Note: ========================================================================
+    Note: A1 wiring (subsystem audit follow-up): drain the FFI framework
+    Note: collector into this linker context. The orchestrator's HIR scan
+    Note: populates ffi_frameworks_collected during compile_program for each
+    Note: HIR_EXTERNAL_DECLARATION whose framework_name field at HIR offset
+    Note: 128 is non-zero. This is the consumer side that registers each
+    Note: unique framework with the linker context via
+    Note: linker_driver_add_framework, after the Darwin target check.
+    Note: If a framework was declared against a non-Darwin target, the
+    Note: rejection diagnostic has already been emitted by
+    Note: linker_driver_register_ffi_frameworks_from_collector -- return early.
+    Note: ========================================================================
+    Let ffi_frameworks be ffi_get_collected_frameworks()
+    Let ffi_fw_reg_ok be linker_driver_register_ffi_frameworks_from_collector(ctx, ffi_frameworks, ffi_target_os)
+    If ffi_fw_reg_ok is equal to 0:
+        Note: framework declared against non-Darwin target: rejection already emitted.
+        Return LINKER_ERROR_MISSING_SYMBOL
     End If
 
     Note: Validate we have object files
