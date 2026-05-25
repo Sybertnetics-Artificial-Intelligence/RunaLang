@@ -1,0 +1,992 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+COMPILE ORCHESTRATOR - Per-File Compile Pipeline (Layer 3 of P1-E v3)
+
+This file authors the program-level compile orchestrator that the
+v0.0.8.5 driver layer assumes exists. It consumes the imports-merged
+AST root and emits a target assembly file via the full
+AST -> HIR -> MIR -> optimize_program -> LIR -> machine_code pipeline.
+
+Authored in the same commit as the WPA work (Layer 1) and the
+optimize_program glue (Layer 2) per CEO directive against orphan-code
+shipment: compile_program is what wires the entire P1-E pipeline into
+real builds.
+
+Three callers existed prior to this file at:
+- compiler/driver/compiler_driver.runa:220
+- compiler/driver/build_system.runa:570
+- compiler/driver/parallel_compilation.runa:524
+all of which invoke compile_program(program, output_path) and expect the
+0=success / nonzero=failure return convention. This file satisfies that
+contract.
+
+Public surface:
+- compile_program(program, output_path) -> Integer
+- set_active_build_context(ctx) -> Integer
+- get_active_opt_level() -> Integer
+- dispatch_codegen_by_arch(arch, lir_module, config) -> Integer
+- get_target_os_from_config() -> Integer
+- get_target_arch_from_config() -> Integer
+- map_tm_os_to_machine_code_os(tm_os) -> Integer
+- map_tm_arch_to_machine_code_arch(tm_arch) -> Integer
+:End Note
+
+Note: ============================================================================
+Note: Optimization Level Constants
+Note: ============================================================================
+
+Note: BUILD_OPT_BASIC = O1. This is the ratified Q3 default for the
+Note: legacy single-file driver path (compiler_driver.runa) which does
+Note: not instantiate a BuildContext. Matches optimize_function's
+Note: interpretation of opt_level=1 = "O1 basic optimizations".
+Constant BUILD_OPT_NONE_LOCAL as Integer is 0
+Constant BUILD_OPT_BASIC as Integer is 1
+Constant BUILD_OPT_STANDARD as Integer is 2
+Constant BUILD_OPT_AGGRESSIVE_LOCAL as Integer is 3
+
+Note: ============================================================================
+Note: Target Architecture Constants (mirror MachineCode module values)
+Note: ============================================================================
+
+Note: These mirror compiler/backend/machine_code/common/machine_code_interface.runa
+Note: to keep dispatcher branches readable without per-call Module.X loads.
+Constant ARCH_X86_64 as Integer is 1
+Constant ARCH_AARCH64 as Integer is 2
+Constant ARCH_ARM32 as Integer is 3
+Constant ARCH_X86 as Integer is 4
+Constant ARCH_RISCV64 as Integer is 5
+Constant ARCH_RISCV32 as Integer is 6
+Constant ARCH_MIPS64 as Integer is 7
+Constant ARCH_MIPS32 as Integer is 8
+Constant ARCH_POWERPC as Integer is 9
+Constant ARCH_WASM32 as Integer is 10
+Constant ARCH_WASM64 as Integer is 11
+
+Note: OS_* values mirror the MachineCode TARGET_OS_* constants exposed
+Note: by compiler/backend/machine_code/common/machine_code_interface.runa
+Note: (TARGET_OS_LINUX=1, TARGET_OS_DARWIN=2, TARGET_OS_WINDOWS=3,
+Note: TARGET_OS_FREEBSD=4, TARGET_OS_OPENBSD=5, TARGET_OS_NETBSD=6,
+Note: TARGET_OS_WASI=7, TARGET_OS_BARE_METAL=8). These are what
+Note: create_backend_config consumes.
+Constant OS_LINUX as Integer is 1
+Constant OS_DARWIN as Integer is 2
+Constant OS_WINDOWS as Integer is 3
+Constant OS_FREEBSD as Integer is 4
+Constant OS_OPENBSD as Integer is 5
+Constant OS_NETBSD as Integer is 6
+Constant OS_WASI as Integer is 7
+Constant OS_BARE_METAL as Integer is 8
+
+Note: TargetManager's parse output uses a different integer encoding
+Note: than MachineCode. See compiler/driver/target_manager.runa
+Note: lines 56-94. These constants name the TargetManager values so
+Note: the mapping helpers below stay readable.
+Constant TM_ARCH_X86_64 as Integer is 1
+Constant TM_ARCH_AARCH64 as Integer is 2
+Constant TM_ARCH_ARM32 as Integer is 3
+Constant TM_ARCH_RISCV64 as Integer is 4
+Constant TM_ARCH_RISCV32 as Integer is 5
+Constant TM_ARCH_MIPS64 as Integer is 6
+Constant TM_ARCH_MIPS32 as Integer is 7
+Constant TM_ARCH_POWERPC64 as Integer is 8
+Constant TM_ARCH_POWERPC32 as Integer is 9
+Constant TM_ARCH_WASM32 as Integer is 10
+Constant TM_ARCH_WASM64 as Integer is 11
+
+Constant TM_OS_LINUX as Integer is 1
+Constant TM_OS_WINDOWS as Integer is 2
+Constant TM_OS_MACOS as Integer is 3
+Constant TM_OS_FREEBSD as Integer is 4
+Constant TM_OS_OPENBSD as Integer is 5
+Constant TM_OS_NETBSD as Integer is 6
+Constant TM_OS_DRAGONFLY as Integer is 7
+Constant TM_OS_IOS as Integer is 8
+Constant TM_OS_ANDROID as Integer is 9
+Constant TM_OS_FUCHSIA as Integer is 10
+Constant TM_OS_HAIKU as Integer is 11
+Constant TM_OS_SERENITY as Integer is 12
+Constant TM_OS_REDOX as Integer is 13
+Constant TM_OS_NONE as Integer is 14
+
+Note: ============================================================================
+Note: Default Arena Sizing
+Note: ============================================================================
+
+Note: Per-compile-job arena starting size. 64 KB is enough for HIR/MIR/LIR
+Note: temporaries on a small program; the arena_create primitive grows
+Note: on demand up to ARENA_MAX_CAPACITY (1 GB).
+Constant COMPILE_JOB_ARENA_INITIAL as Integer is 65536
+
+Note: ============================================================================
+Note: BuildContext Layout (mirrors build_system.runa)
+Note: ============================================================================
+
+Note: BuildContext field offsets used by this module. Authoritative
+Note: layout lives in build_system.runa lines 73-97 (192-byte struct).
+Note: optimization_level: Integer at offset 16 (BUILD_OPT_* values).
+Note: target_triple: String pointer at offset 24 (e.g. "x86_64-linux-gnu").
+Note: arena: Pointer at offset 56 (owns the BuildContext and its children).
+Constant BUILDCTX_OPTIMIZATION_LEVEL_OFFSET as Integer is 16
+Constant BUILDCTX_TARGET_TRIPLE_OFFSET as Integer is 24
+Constant BUILDCTX_ARENA_OFFSET as Integer is 56
+
+Note: ============================================================================
+Note: Module-Global: Active BuildContext
+Note: ============================================================================
+
+@Reasoning
+Shared module-global storing the active BuildContext pointer for the
+duration of a compile_program invocation. Per design v3 section 19.6
+option 3 (CEO-ratified): every worker in a parallel build sets this
+to the same shared pool BuildContext pointer, so the write is
+idempotent and concurrent worker writes are benign.
+
+The bootstrap compiler's verified working module-global idiom is a
+top-level `Let X be 0` directly followed by Processes that read/write
+it. This mirrors the existing `global_compiler_context_ptr` pattern in
+whole_program_analysis.runa lines 4198-4200.
+@End Reasoning
+
+Note: File-local static cell for the active BuildContext pointer.
+Note: Set by set_active_build_context, read by get_active_opt_level.
+Let active_build_context_ptr be 0
+
+Process called "set_active_build_context" that takes ctx as Integer returns Integer:
+    @Reasoning
+    Stores the supplied BuildContext pointer in the module-global slot
+    so subsequent compile_program calls within the same build can read
+    opt_level (and any future BuildContext-derived knobs) without
+    threading the context through the call chain. Every caller in the
+    driver layer (build_system, parallel_compilation) invokes this
+    once before its compile_program call. The shared-cell write is
+    idempotent across workers in a build because every worker writes
+    the same pointer value (Q1 option 3).
+    @End Reasoning
+
+    @Implementation
+    Single-word write to the module-global cell. The bootstrap
+    compiler treats the top-level `Let active_build_context_ptr be 0`
+    as a static-storage cell; Set writes through to it. Returns 1
+    unconditionally to indicate the write was performed.
+    @End Implementation
+
+    @Performance_Hints
+    Single pointer store. Inlined by the optimizer at -O2.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Stored pointer is opaque to this module; only
+    the field at BUILDCTX_OPTIMIZATION_LEVEL_OFFSET is read back.
+    @End Security_Scope
+
+    Set active_build_context_ptr to ctx
+    Return 1
+End Process
+
+Process called "get_active_opt_level" returns Integer:
+    @Reasoning
+    Resolves the active optimization level for the current
+    compile_program invocation. If a BuildContext was set via
+    set_active_build_context, reads
+    BUILDCTX_OPTIMIZATION_LEVEL_OFFSET from it. Otherwise returns
+    BUILD_OPT_BASIC (=O1), the Q3-ratified default for the legacy
+    single-file driver path that has no BuildContext.
+    @End Reasoning
+
+    @Implementation
+    Read the module-global pointer. If null, return BUILD_OPT_BASIC.
+    Otherwise dereference at offset 16. Clamp the result so a
+    corrupted BuildContext cannot push the backend into an undefined
+    opt_level branch.
+    @End Implementation
+
+    @Performance_Hints
+    Two pointer dereferences on the BuildContext path; one constant
+    return on the default path. Inlined by the optimizer at -O2.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Read-only access to the BuildContext field.
+    @End Security_Scope
+
+    If active_build_context_ptr is equal to 0:
+        Return BUILD_OPT_BASIC
+    End If
+    Let level be __load(active_build_context_ptr, BUILDCTX_OPTIMIZATION_LEVEL_OFFSET)
+    Note: Clamp to valid range so a corrupted context cannot push the
+    Note: backend into an undefined opt_level branch.
+    If level is less than BUILD_OPT_NONE_LOCAL:
+        Return BUILD_OPT_BASIC
+    End If
+    If level is greater than BUILD_OPT_AGGRESSIVE_LOCAL:
+        Return BUILD_OPT_AGGRESSIVE_LOCAL
+    End If
+    Return level
+End Process
+
+Note: ============================================================================
+Note: Target Resolution Helpers
+Note: ============================================================================
+
+Process called "map_tm_os_to_machine_code_os" that takes tm_os as Integer returns Integer:
+    @Reasoning
+    The TargetManager parser emits OS identifiers in its own encoding
+    (target_manager.runa lines 70-84) which differs from the MachineCode
+    TARGET_OS_* encoding consumed by create_backend_config and
+    create_convention_for_target. This helper performs the lossless
+    mapping from TargetManager values to MachineCode values for the
+    OS dimensions that have machine_code support.
+
+    OSes that TargetManager recognises but MachineCode cannot target
+    (Dragonfly, iOS, Android, Fuchsia, Haiku, Serenity, Redox, bare
+    none) map to OS_LINUX so codegen still produces a well-formed
+    System V ELF object. This is the conservative behavior: the
+    backend is correct for unsupported targets even though the host
+    platform identity may not match.
+    @End Reasoning
+
+    @Implementation
+    Branch on the TargetManager OS value. Direct mapping for the seven
+    supported OSes (Linux, Windows, macOS->Darwin, FreeBSD, OpenBSD,
+    NetBSD, none->bare-metal). All other values fall through to the
+    conservative Linux default.
+    @End Implementation
+
+    @Performance_Hints
+    Pure value-to-value mapping; no allocations. Inlined at O2.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. No external inputs.
+    @End Security_Scope
+
+    If tm_os is equal to TM_OS_LINUX:
+        Return OS_LINUX
+    End If
+    If tm_os is equal to TM_OS_WINDOWS:
+        Return OS_WINDOWS
+    End If
+    If tm_os is equal to TM_OS_MACOS:
+        Return OS_DARWIN
+    End If
+    If tm_os is equal to TM_OS_FREEBSD:
+        Return OS_FREEBSD
+    End If
+    If tm_os is equal to TM_OS_OPENBSD:
+        Return OS_OPENBSD
+    End If
+    If tm_os is equal to TM_OS_NETBSD:
+        Return OS_NETBSD
+    End If
+    If tm_os is equal to TM_OS_NONE:
+        Return OS_BARE_METAL
+    End If
+    Return OS_LINUX
+End Process
+
+Process called "map_tm_arch_to_machine_code_arch" that takes tm_arch as Integer returns Integer:
+    @Reasoning
+    Mirrors map_tm_os_to_machine_code_os for the architecture dimension.
+    TargetManager (target_manager.runa lines 56-67) and MachineCode
+    (machine_code_interface.runa lines 43-53) disagree on the integer
+    encoding for several architectures (notably MIPS slots and the
+    POWERPC unification). This helper performs the precise mapping.
+
+    Both encoders cover the same arch set, so this mapping is total:
+    every TargetManager arch resolves to a MachineCode arch. The
+    POWERPC32/POWERPC64 split on the TargetManager side collapses to
+    a single ARCH_POWERPC on the MachineCode side (the backend uses
+    pointer-size to disambiguate).
+    @End Reasoning
+
+    @Implementation
+    Branch on the TargetManager arch value. The eleven arches map
+    directly except: TM POWERPC64 and TM POWERPC32 both collapse to
+    MachineCode ARCH_POWERPC (backend disambiguates via config bits).
+    Unknown values fall through to ARCH_X86_64 as the conservative
+    host-platform default for v0.0.8.5 (Linux x86_64 production).
+    @End Implementation
+
+    @Performance_Hints
+    Pure value-to-value mapping; no allocations. Inlined at O2.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. No external inputs.
+    @End Security_Scope
+
+    If tm_arch is equal to TM_ARCH_X86_64:
+        Return ARCH_X86_64
+    End If
+    If tm_arch is equal to TM_ARCH_AARCH64:
+        Return ARCH_AARCH64
+    End If
+    If tm_arch is equal to TM_ARCH_ARM32:
+        Return ARCH_ARM32
+    End If
+    If tm_arch is equal to TM_ARCH_RISCV64:
+        Return ARCH_RISCV64
+    End If
+    If tm_arch is equal to TM_ARCH_RISCV32:
+        Return ARCH_RISCV32
+    End If
+    If tm_arch is equal to TM_ARCH_MIPS64:
+        Return ARCH_MIPS64
+    End If
+    If tm_arch is equal to TM_ARCH_MIPS32:
+        Return ARCH_MIPS32
+    End If
+    If tm_arch is equal to TM_ARCH_POWERPC64:
+        Return ARCH_POWERPC
+    End If
+    If tm_arch is equal to TM_ARCH_POWERPC32:
+        Return ARCH_POWERPC
+    End If
+    If tm_arch is equal to TM_ARCH_WASM32:
+        Return ARCH_WASM32
+    End If
+    If tm_arch is equal to TM_ARCH_WASM64:
+        Return ARCH_WASM64
+    End If
+    Return ARCH_X86_64
+End Process
+
+Process called "get_target_os_from_config" returns Integer:
+    @Reasoning
+    Resolves the target OS for codegen from the active BuildContext.
+    BuildContext stores the user-supplied target as a triple string
+    (e.g. "x86_64-linux-gnu") at offset BUILDCTX_TARGET_TRIPLE_OFFSET;
+    the orchestrator parses that string via TargetManager and converts
+    the resulting OS identifier into the MachineCode TARGET_OS_*
+    encoding that create_backend_config and
+    create_convention_for_target consume.
+
+    The no-context path and the empty-triple path both fall back to
+    OS_LINUX, which matches get_default_target's host-platform answer
+    on the v0.0.8.5 production Linux host. The unknown-OS path also
+    falls back to OS_LINUX so an unparseable triple still produces a
+    well-formed Linux build instead of failing codegen.
+    @End Reasoning
+
+    @Implementation
+    Three-tier resolution:
+      1. No active BuildContext -> OS_LINUX (host default).
+      2. BuildContext present but target_triple field is 0 (empty,
+         the create_build_context default per build_system.runa:137)
+         -> OS_LINUX.
+      3. target_triple present -> parse via TargetManager using the
+         BuildContext's own arena (offset BUILDCTX_ARENA_OFFSET) for
+         the transient TargetTriple struct, extract os via
+         get_target_os, then translate from TargetManager's OS
+         encoding to the MachineCode TARGET_OS_* encoding via
+         map_tm_os_to_machine_code_os.
+
+    The transient TargetTriple lives in the BuildContext's arena and
+    is reclaimed when the build's arena_destroy fires; no per-call
+    teardown required.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path on multi-file builds: called once per compile_program
+    invocation. Triple parsing is O(triple_length) and allocates a
+    72-byte TargetTriple in the build arena. For repeated
+    invocations against the same triple, the cost is dominated by
+    arena_allocate; inlining at O2 collapses the dispatch overhead.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Reads from a build-supplied target_triple
+    string; parser validates the format and rejects malformed input
+    via OS_UNKNOWN, which the mapper folds to OS_LINUX.
+    @End Security_Scope
+
+    If active_build_context_ptr is equal to 0:
+        Return OS_LINUX
+    End If
+    Let triple_string be memory_get_pointer(active_build_context_ptr, BUILDCTX_TARGET_TRIPLE_OFFSET)
+    If triple_string is equal to 0:
+        Return OS_LINUX
+    End If
+    Let arena be memory_get_pointer(active_build_context_ptr, BUILDCTX_ARENA_OFFSET)
+    If arena is equal to 0:
+        Return OS_LINUX
+    End If
+    Let triple be parse_target_triple(arena, triple_string)
+    If triple is equal to 0:
+        Return OS_LINUX
+    End If
+    Let tm_os be get_target_os(triple)
+    Return map_tm_os_to_machine_code_os(tm_os)
+End Process
+
+Process called "get_target_arch_from_config" returns Integer:
+    @Reasoning
+    Resolves the target architecture for codegen from the active
+    BuildContext. Same resolution shape as get_target_os_from_config:
+    parse the BuildContext's target_triple string via TargetManager,
+    extract the arch identifier, then translate from TargetManager's
+    arch encoding to the MachineCode TARGET_ARCH_* encoding that
+    create_backend_config and dispatch_codegen_by_arch consume.
+
+    Both functions resolve from the same BuildContext field, so on
+    builds where compile_program calls both helpers consecutively the
+    second call re-parses the triple. parse_target_triple is cheap
+    (sub-microsecond, single arena alloc) so the duplication is
+    acceptable in exchange for keeping the two helpers independent
+    and stateless.
+    @End Reasoning
+
+    @Implementation
+    Three-tier resolution mirrored from get_target_os_from_config:
+      1. No active BuildContext -> ARCH_X86_64 (host default).
+      2. target_triple field is 0 -> ARCH_X86_64.
+      3. Otherwise parse the triple, call get_target_arch, and run
+         the result through map_tm_arch_to_machine_code_arch to
+         produce a MachineCode TARGET_ARCH_* value.
+    @End Implementation
+
+    @Performance_Hints
+    Same cost profile as get_target_os_from_config. Inlining at O2
+    fuses the two helpers' parses when both are called in the same
+    invocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Parser rejects malformed triples via
+    ARCH_UNKNOWN, which the mapper folds to ARCH_X86_64.
+    @End Security_Scope
+
+    If active_build_context_ptr is equal to 0:
+        Return ARCH_X86_64
+    End If
+    Let triple_string be memory_get_pointer(active_build_context_ptr, BUILDCTX_TARGET_TRIPLE_OFFSET)
+    If triple_string is equal to 0:
+        Return ARCH_X86_64
+    End If
+    Let arena be memory_get_pointer(active_build_context_ptr, BUILDCTX_ARENA_OFFSET)
+    If arena is equal to 0:
+        Return ARCH_X86_64
+    End If
+    Let triple be parse_target_triple(arena, triple_string)
+    If triple is equal to 0:
+        Return ARCH_X86_64
+    End If
+    Let tm_arch be get_target_arch(triple)
+    Return map_tm_arch_to_machine_code_arch(tm_arch)
+End Process
+
+Note: ============================================================================
+Note: AST Source-File Tagging
+Note: ============================================================================
+
+Process called "derive_input_name_from_output" that takes output_path as Integer, arena as Integer returns Integer:
+    @Reasoning
+    The merged-AST source-file tagging step needs the input filename
+    so codegen can disambiguate same-named structs from different
+    source files. Convention: output paths produced by the v0.0.8.5
+    driver substitute ".s" for ".runa". This helper reverses that
+    transformation. If the output path does not end in ".s" we return
+    the output path unchanged so callers can still tag functions with
+    a stable, non-null source-file pointer.
+    @End Reasoning
+
+    @Implementation
+    Compute the length of output_path; allocate a buffer of equal
+    capacity in the per-job arena; copy bytes, then strip ".s" suffix
+    if present and append ".runa". The arena owns the returned
+    buffer so no manual deallocation is required.
+    @End Implementation
+
+    @Performance_Hints
+    Called once per compile_program invocation. O(n) in path length.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Pure transformation; no filesystem touch.
+    @End Security_Scope
+
+    If output_path is equal to 0:
+        Return 0
+    End If
+
+    Note: Compute string length via the runtime string_length helper.
+    Let path_len be string_length(output_path)
+    If path_len is less than 1:
+        Return output_path
+    End If
+
+    Note: Allocate destination buffer in the per-job arena. Use the
+    Note: layout arena_allocate primitive if available, falling back
+    Note: to the runtime allocator if arena is 0.
+    Let buf_size be path_len plus 8
+    Let buf be 0
+    If arena is not equal to 0:
+        Set buf to arena_allocate(arena, buf_size, 1)
+    End If
+    If buf is equal to 0:
+        Set buf to allocate(buf_size)
+    End If
+    If buf is equal to 0:
+        Return output_path
+    End If
+
+    Note: Detect ".s" suffix.
+    Let copy_len be path_len
+    Let has_s_suffix be 0
+    If path_len is greater than or equal to 2:
+        Let suffix_a be __load_byte(output_path, path_len minus 2)
+        Let suffix_b be __load_byte(output_path, path_len minus 1)
+        If suffix_a is equal to 46:
+            If suffix_b is equal to 115:
+                Set has_s_suffix to 1
+                Set copy_len to path_len minus 2
+            End If
+        End If
+    End If
+
+    Note: Copy the prefix.
+    Let i be 0
+    While i is less than copy_len:
+        Let b be __load_byte(output_path, i)
+        __store_byte(buf, i, b)
+        Set i to i plus 1
+    End While
+
+    Note: Append ".runa" then NUL.
+    If has_s_suffix is equal to 1:
+        __store_byte(buf, copy_len, 46)
+        __store_byte(buf, copy_len plus 1, 114)
+        __store_byte(buf, copy_len plus 2, 117)
+        __store_byte(buf, copy_len plus 3, 110)
+        __store_byte(buf, copy_len plus 4, 97)
+        __store_byte(buf, copy_len plus 5, 0)
+    Otherwise:
+        __store_byte(buf, copy_len, 0)
+    End If
+
+    Return buf
+End Process
+
+Process called "tag_source_files_in_program" that takes program as Integer, source_name as Integer returns Integer:
+    @Reasoning
+    The caller's process_imports path merges imported functions/types
+    into the main AST and tags each with its origin source file. The
+    main program's own functions/types may have been left with a null
+    source_file pointer (the v0.0.8.4.5 parser does not set it
+    eagerly). This helper walks the merged AST and re-stamps any
+    function or type whose source_file is null, using the
+    output-path-derived input filename. This mirrors the safety net
+    in v0.0.8.4.5.3.5 main.runa lines 319-350.
+    @End Reasoning
+
+    @Implementation
+    Read function_count at PROGRAM offset 8 and functions array at
+    offset 0. Iterate; for each function whose source_file
+    (function_get_source_file) is null, call
+    function_set_source_file(func, source_name). Repeat for types at
+    offsets 40 (types pointer) and 32 (count). The
+    function_set_source_file and function_get_source_file Processes
+    are exported by the v0.0.8.4.5 parser linked into the same
+    binary.
+    @End Implementation
+
+    @Performance_Hints
+    O(F + T) where F = function count, T = type count in the
+    program. Called once per compile_program invocation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Writes pointers into AST nodes; no external
+    data accessed.
+    @End Security_Scope
+
+    If program is equal to 0:
+        Return 0
+    End If
+    If source_name is equal to 0:
+        Return 0
+    End If
+
+    Note: Functions.
+    Let func_count be memory_get_int32(program, 8)
+    Let funcs_array be memory_get_pointer(program, 0)
+    If funcs_array is not equal to 0:
+        Let fi be 0
+        While fi is less than func_count:
+            Let func_off be fi multiplied by 8
+            Let func_ptr be funcs_array plus func_off
+            Let func be memory_get_pointer(func_ptr, 0)
+            If func is not equal to 0:
+                Let existing be function_get_source_file(func)
+                If existing is equal to 0:
+                    function_set_source_file(func, source_name)
+                End If
+            End If
+            Set fi to fi plus 1
+        End While
+    End If
+
+    Note: Types.
+    Let type_count be memory_get_int32(program, 32)
+    Let types_array be memory_get_pointer(program, 40)
+    If types_array is not equal to 0:
+        Let ti be 0
+        While ti is less than type_count:
+            Let type_off be ti multiplied by 8
+            Let type_ptr be types_array plus type_off
+            Let type_def be memory_get_pointer(type_ptr, 0)
+            If type_def is not equal to 0:
+                Let existing_t be type_definition_get_source_file(type_def)
+                If existing_t is equal to 0:
+                    type_definition_set_source_file(type_def, source_name)
+                End If
+            End If
+            Set ti to ti plus 1
+        End While
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Per-Architecture Codegen Dispatcher
+Note: ============================================================================
+
+Process called "dispatch_codegen_by_arch" that takes target_arch as Integer, lir_module as Integer, backend_config as Integer returns Integer:
+    @Reasoning
+    Wires the LIR module to one of the seven v0.0.8.5 architecture
+    backends. Per CEO directive (Q4 of design v3), every existing
+    arch generator is wired here -- no "fallback raises error" branch
+    is permitted because such a fallback renders the un-wired generators
+    orphans. Two calling-convention shapes are handled:
+
+    1. Direct shape (lir_module, config) -> AssemblyOutput*
+       x86_64, aarch64, arm32, riscv64, riscv32
+
+    2. Context shape (ctx, lir_module) -> Integer where
+       ctx = create_<arch>_asm_context(output, config)
+       mips64, mips32, powerpc, wasm32, wasm64
+
+    For the context-shape backends, the dispatcher creates the
+    AssemblyOutput and per-arch context here so the generator can be
+    invoked uniformly. Both paths return an AssemblyOutput pointer
+    that asm_finalize then converts to text.
+    @End Reasoning
+
+    @Implementation
+    Branch on target_arch. For direct-shape backends, forward to the
+    arch entry point. For context-shape backends, allocate a fresh
+    AssemblyOutput via create_assembly_output, build the per-arch
+    context, run the generator, then return the AssemblyOutput
+    pointer. The arena pointer threaded into create_assembly_output
+    is the per-job arena passed in via the backend_config's
+    underlying state; if no arena is reachable we fall back to the
+    runtime allocator.
+    @End Implementation
+
+    @Performance_Hints
+    Eleven-way branch on a single integer. The architect-recommended
+    branch order places x86_64 first (the production path) to
+    minimize branch overhead in the common case.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. The dispatcher does not validate the
+    lir_module shape; that is the LIR builder's responsibility.
+    @End Security_Scope
+
+    If lir_module is equal to 0:
+        Return 0
+    End If
+    If backend_config is equal to 0:
+        Return 0
+    End If
+
+    Note: Direct-shape: x86_64 (production primary).
+    If target_arch is equal to ARCH_X86_64:
+        Return generate_x86_64_assembly(lir_module, backend_config)
+    End If
+
+    Note: Direct-shape: aarch64.
+    If target_arch is equal to ARCH_AARCH64:
+        Return generate_aarch64_assembly(lir_module, backend_config)
+    End If
+
+    Note: Direct-shape: arm32.
+    If target_arch is equal to ARCH_ARM32:
+        Return generate_arm32_assembly(lir_module, backend_config)
+    End If
+
+    Note: Direct-shape: riscv (both 64- and 32-bit go through the
+    Note: same generator; the backend_config carries the bit-width).
+    If target_arch is equal to ARCH_RISCV64:
+        Return generate_riscv_assembly(lir_module, backend_config)
+    End If
+    If target_arch is equal to ARCH_RISCV32:
+        Return generate_riscv_assembly(lir_module, backend_config)
+    End If
+
+    Note: Context-shape backends below all need an AssemblyOutput
+    Note: allocated up-front. Use the runtime allocator since these
+    Note: are top-level emit buffers that need to outlive the
+    Note: context-shape generators' internal lifetimes.
+    Let asm_output be create_assembly_output(0)
+    If asm_output is equal to 0:
+        Return 0
+    End If
+
+    Note: Context-shape: mips (mips64 and mips32 share the entry).
+    If target_arch is equal to ARCH_MIPS64:
+        Let mips_ctx be create_mips_asm_context(asm_output, backend_config)
+        If mips_ctx is equal to 0:
+            Return 0
+        End If
+        Let mips_rc be generate_mips_assembly(mips_ctx, lir_module)
+        If mips_rc is equal to 0:
+            Return 0
+        End If
+        Return asm_output
+    End If
+    If target_arch is equal to ARCH_MIPS32:
+        Let mips32_ctx be create_mips_asm_context(asm_output, backend_config)
+        If mips32_ctx is equal to 0:
+            Return 0
+        End If
+        Let mips32_rc be generate_mips_assembly(mips32_ctx, lir_module)
+        If mips32_rc is equal to 0:
+            Return 0
+        End If
+        Return asm_output
+    End If
+
+    Note: Context-shape: powerpc.
+    If target_arch is equal to ARCH_POWERPC:
+        Let ppc_ctx be create_ppc_asm_context(asm_output, backend_config)
+        If ppc_ctx is equal to 0:
+            Return 0
+        End If
+        Let ppc_rc be generate_ppc_assembly(ppc_ctx, lir_module)
+        If ppc_rc is equal to 0:
+            Return 0
+        End If
+        Return asm_output
+    End If
+
+    Note: Context-shape: wasm (wasm32 and wasm64 share the entry).
+    If target_arch is equal to ARCH_WASM32:
+        Let wasm_ctx be create_wasm_asm_context(asm_output, backend_config)
+        If wasm_ctx is equal to 0:
+            Return 0
+        End If
+        Let wasm_rc be generate_wasm_text(wasm_ctx, lir_module)
+        If wasm_rc is equal to 0:
+            Return 0
+        End If
+        Return asm_output
+    End If
+    If target_arch is equal to ARCH_WASM64:
+        Let wasm64_ctx be create_wasm_asm_context(asm_output, backend_config)
+        If wasm64_ctx is equal to 0:
+            Return 0
+        End If
+        Let wasm64_rc be generate_wasm_text(wasm64_ctx, lir_module)
+        If wasm64_rc is equal to 0:
+            Return 0
+        End If
+        Return asm_output
+    End If
+
+    Note: Unknown architecture: defensive zero return. The validator
+    Note: catches this by exit-code regression, but the function does
+    Note: NOT alert here because the dispatcher is called inside
+    Note: compile_program which has its own Phase 8 error path.
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: compile_program -- THE 11-PHASE PIPELINE
+Note: ============================================================================
+
+Process called "compile_program" that takes program as Integer, output_path as Integer returns Integer:
+    @Reasoning
+    Per-file compile orchestrator. Consumes the imports-merged AST
+    and emits a target assembly file at output_path. P1-E v3 authors
+    this body in the same commit as Layer 1 (WPA internals) and
+    Layer 2 (optimize_program glue) per CEO directive against orphan
+    code shipment.
+
+    Pipeline:
+        AST -> HIR -> MIR -> optimize_program(WPA + per-function)
+            -> LIR -> instruction_select -> register_allocate
+            -> peephole -> generate_{arch}_assembly -> asm_finalize
+            -> write_file
+
+    Returns 0 on success, nonzero on hard error.
+    @End Reasoning
+
+    @Implementation
+    Eleven phases, each with single failure exit. Per-job arena owns
+    transient IRs and codegen workspace; arena_destroy at end
+    releases them all in O(1). Optimization level read from
+    BuildContext via get_active_opt_level with BUILD_OPT_BASIC
+    fallback for the legacy single-file driver path.
+    @End Implementation
+
+    @Performance_Hints
+    Critical-path Process; called once per source file across full
+    builds. Arena allocation pattern keeps per-compile-job allocator
+    cost amortized across thousands of small temps. WPA pipeline
+    gated to >= O2 inside optimize_program.
+    @End Performance_Hints
+
+    @Security_Scope
+    Compile-time only. Reads source-derived AST, emits assembly text
+    to a caller-supplied path. write_file's path validation is the
+    security boundary; this Process does not touch network,
+    environment, or processes.
+    @End Security_Scope
+
+    Note: Phase 0 -- argument validation.
+    If program is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: null program AST"
+        Return 1
+    End If
+    If output_path is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: null output_path"
+        Return 1
+    End If
+
+    Note: Phase 1 -- arena bootstrap + opt_level resolution.
+    Let arena be arena_create(COMPILE_JOB_ARENA_INITIAL)
+    If arena is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: arena allocation failed"
+        Return 1
+    End If
+    Let opt_level be get_active_opt_level()
+
+    Note: Phase 2 -- source-file tagging.
+    Let main_input_name be derive_input_name_from_output(output_path, arena)
+    If main_input_name is not equal to 0:
+        tag_source_files_in_program(program, main_input_name)
+    End If
+
+    Note: Phase 3 -- AST to HIR lowering.
+    Let hir_program be lower_ast_to_hir(program)
+    If hir_program is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: HIR lowering failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Note: Phase 4 -- HIR to MIR lowering.
+    Let mir_program be build_mir_from_hir(hir_program)
+    If mir_program is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: MIR construction failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Note: Phase 5 -- optimize_program (the P1-E hook).
+    Note: Layer 2 contract: returns 0 on success, nonzero on failure.
+    Note: At opt_level=0 (O0) the call is a no-op fast path.
+    Let opt_result be optimize_program(mir_program, opt_level)
+    If opt_result is not equal to 0:
+        Alert "[COMPILE ERROR] compile_program: optimize_program failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Note: Phase 6 -- MIR to LIR lowering.
+    Let target_os be get_target_os_from_config()
+    Let target_arch be get_target_arch_from_config()
+    Let calling_convention be create_convention_for_target(target_os)
+    If calling_convention is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: calling convention creation failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+    Let lir_module be build_lir_module_from_mir(mir_program, calling_convention)
+    If lir_module is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: LIR lowering failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Note: Phase 7 -- per-LIR-function passes.
+    Note: 7a: instruction selection.
+    Note: 7b: register allocation (build interference graph then allocate).
+    Note: 7c: peephole optimizations (gated >= BUILD_OPT_BASIC).
+    Note: External (declaration-only) functions skip all three passes.
+    Let lir_func_count be list_length(lir_module)
+    Let fi be 0
+    While fi is less than lir_func_count:
+        Let lir_func be list_get(lir_module, fi)
+        If lir_func is not equal to 0:
+            Let is_external be __load(lir_func, 112)
+            If is_external is equal to 0:
+                select_instructions(lir_func)
+                Let ig be build_interference_graph(lir_func)
+                If ig is not equal to 0:
+                    allocate_registers(lir_func, ig)
+                End If
+                If opt_level is greater than or equal to BUILD_OPT_BASIC:
+                    optimize_peephole(lir_func)
+                End If
+            End If
+        End If
+        Set fi to fi plus 1
+    End While
+
+    Note: Phase 8 -- LIR to assembly text.
+    Let backend_config be create_backend_config(target_arch, target_os, opt_level)
+    If backend_config is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: backend config creation failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Let asm_output be dispatch_codegen_by_arch(target_arch, lir_module, backend_config)
+    If asm_output is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: codegen failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Let assembly_text be asm_finalize(asm_output, backend_config)
+    If assembly_text is equal to 0:
+        Alert "[COMPILE ERROR] compile_program: assembly finalization failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Note: Phase 9 -- write assembly to output_path.
+    Note: write_file C-convention: 0 on success, nonzero on failure.
+    Let write_result be write_file(output_path, assembly_text)
+    If write_result is not equal to 0:
+        Alert "[COMPILE ERROR] compile_program: write_file failed"
+        arena_destroy(arena)
+        Return 1
+    End If
+
+    Note: Phase 10 -- teardown.
+    Note: Arena bulk release: HIR module + MIR module + LIR module
+    Note: + calling_convention + backend_config + asm_output text are
+    Note: all released in O(1).
+    arena_destroy(arena)
+    Return 0
+End Process

@@ -54,9 +54,12 @@ Import "compiler/middle/analysis/control_flow.runa" as ControlFlow
 Import "compiler/middle/analysis/call_graph.runa" as CallGraph
 Import "compiler/middle/analysis/profile_guided.runa" as ProfileGuided
 Import "compiler/middle/analysis/alias_analysis.runa" as AliasAnalysis
+Import "compiler/middle/lto/whole_program_analysis.runa" as WholeProgramAnalysis
+Import "compiler/middle/lto/cross_module_optimization.runa" as CrossModuleOptimization
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
+Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/io/display.runa" as Display
 
@@ -693,6 +696,191 @@ Process called "optimize_function" that takes mir_func as Integer, opt_level as 
     print_optimization_statistics(ctx)
 
     Return global_changed
+End Process
+
+Note: ============================================================================
+Note: optimize_program - Program-level (LTO) optimization orchestrator
+Note: ============================================================================
+
+@Reasoning
+optimize_program is the program-level peer of optimize_function. It is the
+single P1-E entry point that compile_program invokes after MIR construction
+and before backend lowering. It drives the full LTO pipeline:
+
+Phase A - Whole-program analysis (WPA): build the WPA workspace from the
+program-level MIR. WPA records reachability, type hierarchy, escape /
+side-effect / purity info, devirtualization candidates (filtered + normalized
+per E1), the DCE plan, and cross-bucket priorities.
+
+Phase B - WPA-derived program-level passes (CMO): apply the cross-module
+optimizations whose inputs were produced by WPA. At O2 the pipeline runs in
+fixed order (inlining -> CP -> DCE, then devirt + specialization + tail-call
++ IPA via apply_all_optimizations). At O3 the pipeline runs in priority order
+driven by wpa.optimization_priorities (the bucket-tagged Dict from
+compute_optimization_priorities).
+
+Phase C - Per-function passes on the surviving function set. Functions whose
+function_id appears in wpa.unreachable_functions are skipped (they will be
+removed by sweep_dead_functions in CMO's DCE pass; running optimize_function
+on a dead function is wasted work). All surviving functions get the standard
+optimize_function pipeline at the requested opt_level.
+
+Phase D - Tear down WPA + CMO workspaces (Tier 3 ownership ends in this
+Process's stack frame). The deep-clean destroyer is owned by Layer 1 (WPA)
+and Layer 2 (this file modifies cross_module_optimization.runa to add
+destroy_cross_module_optimizer).
+
+Opt-level gating (per design v2 section 3.7):
+- O0: return 0 immediately. No LTO, no per-function opts. Used for
+  fastest-possible compilation.
+- O1: per-function only. WPA does not run (its cost is not justified for
+  unoptimized builds; per-function passes already give good codegen).
+- O2: WPA + CMO fixed-order pipeline + per-function on survivors.
+- O3: WPA + CMO priority-driven pipeline + per-function on survivors.
+@End Reasoning
+
+@Implementation
+Four-phase pipeline with single failure exits at each allocation boundary.
+The WPA pointer is owned by this stack frame (not stored on
+OptimizationContext, not global, not on the MIR program). It is passed to
+CMO via create_cross_module_optimizer(wpa, mir). The CMO struct stores wpa
+at its offset 0 so all CMO passes can read it.
+
+Surviving-function check at Phase C uses Set.contains on
+wpa.unreachable_functions (offset 32 of WPA). MIR function records carry
+function_id at offset 0 (verified pattern, lines 596 and 1620 of
+cross_module_optimization.runa).
+
+optimize_function's contract is "returns 1 if changed, 0 if not, never
+fails", so its return value is not inspected for failure. CMO entry points
+return non-zero counts on success (their existing contract); we treat them
+as best-effort and proceed regardless. The hard-failure cases are: WPA
+construction failure, WPA initialization failure, CMO construction failure.
+
+Return value: 0 on success (entire pipeline ran cleanly), 1 on hard error
+(WPA or CMO allocation failed). This matches compile_program's expectation
+(driver checks for 0 == success).
+@End Implementation
+
+@Performance_Hints
+Called once per source file at LTO time. WPA cost is O(|MIR|) with small
+constants - sub-50ms for 10k-function programs (per design section 11.1).
+The O2 fixed-order path runs CMO passes in declared order; the O3
+priority-driven path adds an O(n log n) sort of the priority Dict (sub-ms
+for realistic n=hundreds). Per-function pass cost scales linearly in
+|surviving functions|; the unreachable-function skip at Phase C is a
+constant-time Set.contains check per function and saves O(|MIR|) work on
+dead code.
+
+The WPA workspace adds ~168 bytes of header plus per-candidate storage
+(typically O(|MIR| / 100) candidates). The deep-clean destroyer releases
+all owned collections in Tier 3 before this Process returns.
+@End Performance_Hints
+
+@Security_Scope
+LTO is purely a compile-time transform. No runtime security boundary. The
+trust assumption is that WPA's analysis results are sound (reachability is
+conservative, devirt candidates are verified, DCE only removes truly dead
+code). If WPA over-prunes reachable functions, the resulting binary would
+fail at runtime - this is a soundness bug at the WPA level and is gated by
+the v0.0.8.5 self-host fixed-point convergence requirement (every commit
+must produce bit-identical compiler output across iterations N and N+1).
+
+The priority-driven O3 path applies optimizations in a different order than
+O2. Both must produce correct programs; order affects codegen quality, not
+semantics. The eight apply_*_candidate wrappers in
+cross_module_optimization.runa each delegate to existing CMO machinery
+whose security properties are inherited.
+@End Security_Scope
+
+Process called "optimize_program" that takes mir as Integer, opt_level as Integer returns Integer:
+    Note: Phase 0 - validate arguments
+    If mir is equal to 0:
+        Return 1
+    End If
+
+    Note: O0 fast path - no work at all
+    If opt_level is equal to 0:
+        Return 0
+    End If
+
+    Note: O1 - per-function only, no WPA cost
+    If opt_level is equal to 1:
+        Let functions be proc memory_get_int64 from Layout with mir, 0
+        Let function_count be proc memory_get_int64 from Layout with mir, 8
+        Let i be 0
+        While i is less than function_count:
+            Let mir_func be proc get from List with functions, i
+            If mir_func is not equal to 0:
+                optimize_function(mir_func, opt_level)
+            End If
+            Set i to i plus 1
+        End While
+        Return 0
+    End If
+
+    Note: Phase A - Whole-program analysis (O2 and O3)
+    Let wpa be proc create_whole_program_analysis from WholeProgramAnalysis with mir
+    If wpa is equal to 0:
+        Return 1
+    End If
+
+    Let init_ok be proc initialize_wpa_from_mir from WholeProgramAnalysis with wpa, mir
+    If init_ok is equal to 0:
+        proc destroy_whole_program_analysis from WholeProgramAnalysis with wpa
+        Return 1
+    End If
+
+    Note: Phase B - WPA-derived CMO passes
+    Let cmo be proc create_cross_module_optimizer from CrossModuleOptimization with wpa, mir
+    If cmo is equal to 0:
+        proc destroy_whole_program_analysis from WholeProgramAnalysis with wpa
+        Return 1
+    End If
+
+    Note: Initialize CMO from WPA (selects inlining candidates, prepares environment)
+    proc initialize_cmo_from_wpa from CrossModuleOptimization with cmo
+
+    Note: O2 - fixed-order CMO pipeline
+    If opt_level is equal to 2:
+        Note: optimize_merged_program: inlining -> CP -> DCE
+        proc optimize_merged_program from CrossModuleOptimization with cmo
+
+        Note: apply_all_optimizations: devirt + specialization + tail-call + IPA + verify
+        proc apply_all_optimizations from CrossModuleOptimization with cmo
+    End If
+
+    Note: O3 - priority-driven CMO pipeline
+    If opt_level is greater than or equal to 3:
+        proc optimize_merged_program_prioritized from CrossModuleOptimization with cmo
+    End If
+
+    Note: Phase C - Per-function intra-function passes on surviving functions
+    Let unreachable_set be proc memory_get_int64 from Layout with wpa, 32
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+
+    Let fi be 0
+    While fi is less than function_count:
+        Let mir_func be proc get from List with functions, fi
+        If mir_func is not equal to 0:
+            Let func_id be proc memory_get_int64 from Layout with mir_func, 0
+            Let is_unreachable be 0
+            If unreachable_set is not equal to 0:
+                Set is_unreachable to proc contains from Set with unreachable_set, func_id
+            End If
+            If is_unreachable is equal to 0:
+                optimize_function(mir_func, opt_level)
+            End If
+        End If
+        Set fi to fi plus 1
+    End While
+
+    Note: Phase D - Tear down (Tier 3 ownership transfer ends here)
+    proc destroy_cross_module_optimizer from CrossModuleOptimization with cmo
+    proc destroy_whole_program_analysis from WholeProgramAnalysis with wpa
+
+    Return 0
 End Process
 
 Note: ============================================================================

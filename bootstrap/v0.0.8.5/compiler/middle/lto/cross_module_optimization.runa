@@ -2814,3 +2814,1145 @@ Process called "finalize_optimized_program" that takes cmo as Integer returns In
 
     Return is_valid
 End Process
+
+Note: ============================================================================
+Note: Priority bucket constants (per design v2 section 3.5.3)
+Note: ============================================================================
+Note: Encoded in priority Dict keys: high 16 bits = bucket, low 48 bits = index.
+
+Constant BUCKET_INLINING as Integer is 1            Note: 0x0001
+Constant BUCKET_DEVIRT_EXACT as Integer is 2        Note: 0x0002
+Constant BUCKET_DEVIRT_SPECULATIVE as Integer is 3  Note: 0x0003
+Constant BUCKET_DCE_DEAD_FUNCTION as Integer is 4   Note: 0x0004
+Constant BUCKET_DCE_DEAD_GLOBAL as Integer is 5     Note: 0x0005
+Constant BUCKET_DCE_DEAD_TYPE as Integer is 6       Note: 0x0006
+Constant BUCKET_CONSTANT_PROPAGATION as Integer is 7 Note: 0x0007
+Constant BUCKET_SPECIALIZATION as Integer is 8      Note: 0x0008
+
+Note: Bucket-key mask constants. Bucket sits in high 16 bits at bit offset 48.
+Note: BUCKET_SHIFT = 48, INDEX_MASK = (1 shifted left 48) minus 1 = 0xFFFFFFFFFFFF.
+Constant BUCKET_SHIFT as Integer is 48
+Constant INDEX_MASK as Integer is 281474976710655
+Constant BUCKET_MASK as Integer is 65535
+
+Note: MIR opcode constants used by the per-candidate apply wrappers.
+Constant MIR_OPCODE_CALL as Integer is 20304
+Constant MIR_OPCODE_CALL_INDIRECT as Integer is 20305
+
+Note: ============================================================================
+Note: destroy_cross_module_optimizer - Deep-clean teardown
+Note: ============================================================================
+
+@Reasoning
+destroy_cross_module_optimizer releases every collection owned by the CMO
+struct and then deallocates the struct itself. The deep-clean policy was
+ratified by the CEO during P1-E v2 review: every collection allocated by
+create_cross_module_optimizer is destroyed here in matching order.
+
+The CMO struct (104 bytes) owns:
+- inline_candidates  (offset 72): List of CrossModuleInlineCandidate pointers
+- value_map          (offset 80): Dictionary
+- function_clones    (offset 88): Dictionary
+- optimization_stats (offset 96): Dictionary
+
+The wpa pointer at offset 0 is borrowed (owned by optimize_program's stack
+frame, destroyed separately by destroy_whole_program_analysis). The mir
+pointer at offset 8 is also borrowed (owned by compile_program's arena).
+
+Per-candidate allocations inside inline_candidates are 80-byte
+CrossModuleInlineCandidate structs allocated by select_inlining_candidates.
+Each is freed before the parent list is destroyed.
+@End Reasoning
+
+@Implementation
+Idempotent for cmo == 0 (returns 0 without crashing). Defensive null checks
+on every contained pointer because create_cross_module_optimizer can succeed
+with some collections initialized and others not (allocator pressure case).
+
+Free order is the reverse of allocation order: Dictionary handles first
+(no contained pointers we own), then per-candidate structs, then the
+candidates List, then the CMO struct itself.
+@End Implementation
+
+@Performance_Hints
+Called exactly once per compile job at end of Phase D of optimize_program.
+Cost is O(|inline_candidates|) for the per-candidate free loop, plus
+constant-time Dictionary destruction. Negligible compared to optimization
+cost.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Releases owned heap memory; does not touch borrowed
+WPA or MIR pointers. Misuse (calling twice on the same cmo) is guarded by
+the cmo == 0 early-out.
+@End Security_Scope
+
+Process called "destroy_cross_module_optimizer" that takes cmo as Integer returns Integer:
+    If cmo is equal to 0:
+        Return 0
+    End If
+
+    Note: Free per-candidate inline structs before destroying the parent List
+    Let inline_candidates be proc memory_get_int64 from Layout with cmo, 72
+    If inline_candidates is not equal to 0:
+        Let candidate_count be proc length from List with inline_candidates
+        Let i be 0
+        While i is less than candidate_count:
+            Let candidate be proc get from List with inline_candidates, i
+            If candidate is not equal to 0:
+                proc memory_free from Layout with candidate
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with inline_candidates
+    End If
+
+    Note: Destroy Dictionary handles owned by CMO
+    Let value_map be proc memory_get_int64 from Layout with cmo, 80
+    If value_map is not equal to 0:
+        proc destroy from Dictionary with value_map
+    End If
+
+    Let function_clones be proc memory_get_int64 from Layout with cmo, 88
+    If function_clones is not equal to 0:
+        proc destroy from Dictionary with function_clones
+    End If
+
+    Let optimization_stats be proc memory_get_int64 from Layout with cmo, 96
+    If optimization_stats is not equal to 0:
+        proc destroy from Dictionary with optimization_stats
+    End If
+
+    Note: Finally free the CMO struct itself
+    proc memory_free from Layout with cmo
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Priority-driven optimization (O3 path)
+Note: ============================================================================
+
+@Reasoning
+sort_priority_dict_descending sorts the bucket-tagged keys of the priority
+Dictionary by their associated priority scores in descending order. The
+resulting List contains op_id values (bucket-tagged keys); the consumer
+decodes bucket+index per the design's encoding.
+
+This is a stable merge sort over O(n) entries where n is the total number
+of optimization candidates across all buckets - typically O(|MIR| / 100)
+for realistic programs. Mirrors the merge-sort pattern in
+rank_optimization_candidates (whole_program_analysis.runa) which sorts
+within a single bucket.
+
+Algorithm: extract keys list from the Dict, then run a top-down merge sort
+keyed by the priority score (Dict.get(priorities, key)). Stable means
+equal scores preserve insertion order, giving deterministic output across
+runs.
+@End Reasoning
+
+@Implementation
+Returns a freshly allocated List of op_ids sorted by score descending.
+The original priorities Dict is not mutated. Uses iterative bottom-up
+merge sort to avoid stack recursion limits on large candidate sets.
+
+Stability: when two op_ids have equal scores, the one that came earlier
+in the keys list wins. This is the standard "less-than (not less-or-equal)
+keeps left" merge predicate.
+@End Implementation
+
+@Performance_Hints
+O(n log n) where n = candidate count. For n=500, ~4500 comparisons - well
+under one millisecond. Allocates one auxiliary List of size n for the
+merge pass.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Reads the priority Dict (does not mutate). The returned
+List is owned by the caller (typically the priority-driven dispatcher,
+which iterates it and then lets it go out of scope).
+@End Security_Scope
+
+Process called "sort_priority_dict_descending" that takes priorities as Integer returns Integer:
+    If priorities is equal to 0:
+        Return proc create from List
+    End If
+
+    Note: Extract keys list (ownership: keys list is freshly allocated by Dictionary.keys)
+    Let keys be proc keys from Dictionary with priorities
+    If keys is equal to 0:
+        Return proc create from List
+    End If
+
+    Let n be proc length from List with keys
+    If n is less than 2:
+        Return keys
+    End If
+
+    Note: Bottom-up merge sort. width doubles each pass; merge adjacent runs.
+    Let aux be proc create from List
+    Let aux_i be 0
+    While aux_i is less than n:
+        proc append from List with aux, 0
+        Set aux_i to aux_i plus 1
+    End While
+
+    Let width be 1
+    While width is less than n:
+        Let i be 0
+        While i is less than n:
+            Note: Merge runs [i, i+width) and [i+width, i+2*width)
+            Let left_end be i plus width
+            If left_end is greater than n:
+                Set left_end to n
+            End If
+            Let right_end be i plus (width plus width)
+            If right_end is greater than n:
+                Set right_end to n
+            End If
+
+            Let left_pos be i
+            Let right_pos be left_end
+            Let out_pos be i
+
+            While out_pos is less than right_end:
+                Let take_left be 0
+                If left_pos is less than left_end:
+                    If right_pos is greater than or equal to right_end:
+                        Set take_left to 1
+                    Otherwise:
+                        Let lk be proc get from List with keys, left_pos
+                        Let rk be proc get from List with keys, right_pos
+                        Let ls be proc get from Dictionary with priorities, lk
+                        Let rs be proc get from Dictionary with priorities, rk
+                        Note: Descending: left wins when ls >= rs (stable)
+                        If ls is greater than or equal to rs:
+                            Set take_left to 1
+                        End If
+                    End If
+                End If
+
+                If take_left is equal to 1:
+                    Let lk2 be proc get from List with keys, left_pos
+                    proc set from List with aux, out_pos, lk2
+                    Set left_pos to left_pos plus 1
+                Otherwise:
+                    Let rk2 be proc get from List with keys, right_pos
+                    proc set from List with aux, out_pos, rk2
+                    Set right_pos to right_pos plus 1
+                End If
+
+                Set out_pos to out_pos plus 1
+            End While
+
+            Set i to i plus (width plus width)
+        End While
+
+        Note: Copy aux back to keys for next pass
+        Let c be 0
+        While c is less than n:
+            Let val be proc get from List with aux, c
+            proc set from List with keys, c, val
+            Set c to c plus 1
+        End While
+
+        Set width to width plus width
+    End While
+
+    proc destroy from List with aux
+
+    Return keys
+End Process
+
+@Reasoning
+apply_inlining_candidate applies a single cross-module inlining transform
+identified by index into wpa.inlining_candidates.
+
+This is the priority-bucket dispatch wrapper for bucket 0x0001. It is the
+per-candidate counterpart to perform_cross_module_inlining (which applies
+all candidates in bulk). The priority-driven path needs per-candidate
+granularity so the priority ordering can interleave inlining with other
+buckets (devirt, DCE, etc.).
+@End Reasoning
+
+@Implementation
+Reads candidate from wpa.inlining_candidates (offset 112 of WPA) at the
+given index. The WPA candidate format is (caller_id, callee_id, benefit)
+- a 24-byte tuple (verified at lines 511-513 of select_inlining_candidates).
+
+A transient CrossModuleInlineCandidate is built from the WPA tuple and
+passed to inline_function_into_caller (the existing single-candidate
+worker, line 580). The transient struct is freed after the call.
+
+If the index is out of range or the candidate pointer is null, returns 0
+(no-op). If the inlining transform fails (e.g. caller no longer reachable
+post earlier DCE), returns 0. Returns 1 on successful inlining.
+@End Implementation
+
+@Performance_Hints
+O(1) lookup plus the underlying inline_function_into_caller cost (which is
+bounded by callee function body size). Allocates one 80-byte transient
+struct per call.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Delegates safety/legality checks to
+validate_inline_candidate (called by inline_function_into_caller).
+@End Security_Scope
+
+Process called "apply_inlining_candidate" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let wpa_candidates be proc memory_get_int64 from Layout with wpa, 112
+    If wpa_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let candidate_count be proc length from List with wpa_candidates
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to candidate_count:
+        Return 0
+    End If
+
+    Let wpa_candidate be proc get from List with wpa_candidates, index
+    If wpa_candidate is equal to 0:
+        Return 0
+    End If
+
+    Note: Build transient CrossModuleInlineCandidate from WPA tuple
+    Let caller_id be proc memory_get_int64 from Layout with wpa_candidate, 0
+    Let callee_id be proc memory_get_int64 from Layout with wpa_candidate, 8
+    Let benefit be proc memory_get_int64 from Layout with wpa_candidate, 16
+
+    Let cmo_candidate be proc memory_allocate from Layout with 80
+    If cmo_candidate is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with cmo_candidate, 0, caller_id
+    proc memory_set_int64 from Layout with cmo_candidate, 8, callee_id
+    proc memory_set_int64 from Layout with cmo_candidate, 16, 0
+    proc memory_set_int64 from Layout with cmo_candidate, 24, 0
+    proc memory_set_int64 from Layout with cmo_candidate, 32, 0
+    proc memory_set_int64 from Layout with cmo_candidate, 40, benefit
+    proc memory_set_int64 from Layout with cmo_candidate, 48, 0
+    proc memory_set_int64 from Layout with cmo_candidate, 56, 1
+    proc memory_set_int64 from Layout with cmo_candidate, 64, 0
+    proc memory_set_int64 from Layout with cmo_candidate, 72, 0
+
+    Note: Validate then inline. validate_inline_candidate may reject if a
+    Note: prior bucket invalidated this opportunity (e.g. DCE removed caller).
+    Let is_valid be validate_inline_candidate(cmo, cmo_candidate)
+    Let result be 0
+    If is_valid is equal to 1:
+        Set result to inline_function_into_caller(cmo, cmo_candidate)
+    End If
+
+    proc memory_free from Layout with cmo_candidate
+    Return result
+End Process
+
+@Reasoning
+apply_devirt_candidate_exact applies a single exact devirtualization
+transform identified by index into wpa.devirtualization_candidates.
+
+Bucket 0x0002 dispatches here when the candidate's confidence/is_speculative
+flag indicates exact devirtualization (a unique implementation was proven).
+Replaces a CALL_INDIRECT (opcode 20305) with a direct CALL (opcode 20304)
+to the proven target function.
+@End Reasoning
+
+@Implementation
+Reads candidate from wpa.devirtualization_candidates (offset 104 of WPA)
+at the given index. Per E1 normalization, the candidate is the canonical
+40-byte form: call_site(0), target_function(8), confidence(16),
+verified(24), is_speculative(32).
+
+For exact devirt (is_speculative == 0 / confidence == 1): rewrite the call
+site instruction's opcode from CALL_INDIRECT to CALL and overwrite operand
+0 with target_function. Mirrors lines 2437-2447 of apply_devirtualization.
+
+Returns 1 on successful rewrite, 0 on no-op (index out of range, null
+candidate, wrong opcode, or speculative flag set).
+@End Implementation
+
+@Performance_Hints
+O(1). One List index lookup, three memory_set_int64 writes. Sub-microsecond.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Soundness depends on identify_virtual_call_elimination
+having correctly verified the candidate (the `verified` field). This
+wrapper trusts the WPA filter; over-aggressive devirt is a type-confusion
+risk at runtime, but the trust boundary is at WPA, not here.
+@End Security_Scope
+
+Process called "apply_devirt_candidate_exact" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let devirt_candidates be proc memory_get_int64 from Layout with wpa, 104
+    If devirt_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let candidate_count be proc length from List with devirt_candidates
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to candidate_count:
+        Return 0
+    End If
+
+    Let candidate be proc get from List with devirt_candidates, index
+    If candidate is equal to 0:
+        Return 0
+    End If
+
+    Let call_site be proc memory_get_int64 from Layout with candidate, 0
+    Let target_function be proc memory_get_int64 from Layout with candidate, 8
+    Let confidence be proc memory_get_int64 from Layout with candidate, 16
+
+    If call_site is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc memory_get_int64 from Layout with call_site, 0
+    If opcode is not equal to MIR_OPCODE_CALL_INDIRECT:
+        Return 0
+    End If
+
+    Note: Exact devirt requires confidence == 1
+    If confidence is not equal to 1:
+        Return 0
+    End If
+
+    Note: Rewrite CALL_INDIRECT -> CALL with proven target
+    proc memory_set_int64 from Layout with call_site, 0, MIR_OPCODE_CALL
+    proc memory_set_int64 from Layout with call_site, 16, target_function
+
+    Note: Bump CMO devirtualized_count
+    Let devirt_count be proc memory_get_int64 from Layout with cmo, 32
+    Set devirt_count to devirt_count plus 1
+    proc memory_set_int64 from Layout with cmo, 32, devirt_count
+
+    Note: Mark OPT_DEVIRT applied
+    Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+    Set opts_applied to opts_applied bitwise_or OPT_DEVIRT
+    proc memory_set_int64 from Layout with cmo, 64, opts_applied
+
+    Return 1
+End Process
+
+@Reasoning
+apply_devirt_candidate_speculative applies a single speculative
+devirtualization transform identified by index into
+wpa.devirtualization_candidates.
+
+Bucket 0x0003 dispatches here when the candidate is speculative (a
+dominant target exists but not a unique implementation). A guarded
+direct-call sequence is inserted: runtime type check + branch to direct
+call or fallback to indirect call. For codegen this is tracked as
+"potential devirtualization" - the actual CFG splice happens in a later
+pass that has block-level CFG mutation primitives.
+@End Reasoning
+
+@Implementation
+Same lookup as apply_devirt_candidate_exact, but the candidate is required
+to be speculative (confidence == 0). Per the design and the existing
+apply_devirtualization comment block, the CFG transformation is staged
+(the original opcode is left as CALL_INDIRECT; a flag at instruction
+offset 24 is set to mark it for guarded-call expansion later, with the
+target_function stored at instruction offset 32 as the speculative
+target).
+
+Returns 1 on successful marking, 0 on no-op.
+@End Implementation
+
+@Performance_Hints
+O(1). Same cost profile as the exact variant.
+@End Performance_Hints
+
+@Security_Scope
+Speculative devirt is sound only if the runtime guard is preserved through
+codegen. If the guard is dropped, the resulting binary may call a wrong
+target. The marking here delegates correctness to the downstream guard
+expansion pass.
+@End Security_Scope
+
+Process called "apply_devirt_candidate_speculative" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let devirt_candidates be proc memory_get_int64 from Layout with wpa, 104
+    If devirt_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let candidate_count be proc length from List with devirt_candidates
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to candidate_count:
+        Return 0
+    End If
+
+    Let candidate be proc get from List with devirt_candidates, index
+    If candidate is equal to 0:
+        Return 0
+    End If
+
+    Let call_site be proc memory_get_int64 from Layout with candidate, 0
+    Let target_function be proc memory_get_int64 from Layout with candidate, 8
+    Let confidence be proc memory_get_int64 from Layout with candidate, 16
+
+    If call_site is equal to 0:
+        Return 0
+    End If
+
+    Let opcode be proc memory_get_int64 from Layout with call_site, 0
+    If opcode is not equal to MIR_OPCODE_CALL_INDIRECT:
+        Return 0
+    End If
+
+    Note: Speculative devirt requires confidence == 0
+    If confidence is not equal to 0:
+        Return 0
+    End If
+
+    Note: Mark for guarded-call expansion: leave opcode as CALL_INDIRECT,
+    Note: set offset 24 = 1 (speculative-pending), offset 32 = speculative target.
+    proc memory_set_int64 from Layout with call_site, 24, 1
+    proc memory_set_int64 from Layout with call_site, 32, target_function
+
+    Note: Bump CMO devirtualized_count
+    Let devirt_count be proc memory_get_int64 from Layout with cmo, 32
+    Set devirt_count to devirt_count plus 1
+    proc memory_set_int64 from Layout with cmo, 32, devirt_count
+
+    Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+    Set opts_applied to opts_applied bitwise_or OPT_DEVIRT
+    proc memory_set_int64 from Layout with cmo, 64, opts_applied
+
+    Return 1
+End Process
+
+@Reasoning
+apply_dce_dead_function removes a single function identified by index into
+the dead-functions list of wpa.dce_plan.
+
+Bucket 0x0004 dispatches here. The DCEPlan struct's offset 0 is
+dead_functions (a List of function IDs). For a single-candidate apply,
+we look up the function ID, then iterate mir.functions to find and remove
+it.
+@End Reasoning
+
+@Implementation
+Reads wpa.dce_plan at WPA offset 128 (added by Layer 1 per design section
+9). The dce_plan struct's offset 0 is dead_functions: a List of function
+IDs. At the given index, retrieves the function ID, then removes the
+matching function from mir.functions (offset 0, List).
+
+Returns 1 on successful removal, 0 on no-op (index out of range, function
+already removed, dce_plan not yet initialized).
+
+Mirrors the per-function removal pattern from sweep_dead_functions
+(line 1672 onward); the difference is that sweep_dead_functions iterates
+the entire dead set, while this wrapper applies a single index from the
+priority order.
+@End Implementation
+
+@Performance_Hints
+O(|mir.functions|) due to the linear scan to find the function ID.
+Acceptable because priority-driven DCE typically processes a small number
+of candidates (usually < 100 dead functions in a realistic build).
+@End Performance_Hints
+
+@Security_Scope
+Removing a function that is actually reachable would produce a binary
+with dangling call references. Soundness is guaranteed by WPA's reachability
+analysis (per E3 hardening). This wrapper trusts the wpa.dce_plan input;
+if the input is unsound, the output binary is unsound.
+@End Security_Scope
+
+Process called "apply_dce_dead_function" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    Let mir be proc memory_get_int64 from Layout with cmo, 8
+    If wpa is equal to 0:
+        Return 0
+    End If
+    If mir is equal to 0:
+        Return 0
+    End If
+
+    Let dce_plan be proc memory_get_int64 from Layout with wpa, 128
+    If dce_plan is equal to 0:
+        Return 0
+    End If
+
+    Let dead_funcs be proc memory_get_int64 from Layout with dce_plan, 0
+    If dead_funcs is equal to 0:
+        Return 0
+    End If
+
+    Let dead_count be proc length from List with dead_funcs
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to dead_count:
+        Return 0
+    End If
+
+    Let target_func_id be proc get from List with dead_funcs, index
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Let function_count be proc length from List with functions
+    Let i be 0
+    While i is less than function_count:
+        Let func be proc get from List with functions, i
+        If func is not equal to 0:
+            Let fid be proc memory_get_int64 from Layout with func, 0
+            If fid is equal to target_func_id:
+                proc remove from List with functions, i
+                Note: Bump CMO dead_functions_removed counter
+                Let removed_count be proc memory_get_int64 from Layout with cmo, 48
+                Set removed_count to removed_count plus 1
+                proc memory_set_int64 from Layout with cmo, 48, removed_count
+                Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+                Set opts_applied to opts_applied bitwise_or OPT_DCE
+                proc memory_set_int64 from Layout with cmo, 64, opts_applied
+                Return 1
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning
+apply_dce_dead_global removes a single global identified by index into the
+dead-globals list of wpa.dce_plan.
+
+Bucket 0x0005 dispatches here. dce_plan offset 16 is dead_globals (List of
+global IDs). Global removal is more delicate than function removal because
+the MIR's globals collection may be a Dictionary, a List, or another shape
+- we use the conservative approach of marking the global as dead in the
+CMO's optimization_stats Dict and letting sweep_dead_globals handle the
+actual MIR mutation in a single bulk pass at the end.
+@End Reasoning
+
+@Implementation
+Reads wpa.dce_plan at WPA offset 128, then dead_globals at DCEPlan offset
+16. At the given index, retrieves the global ID. Records it in CMO's
+optimization_stats with key "dead_global_<id>" semantics (we use the global
+ID directly as the Dict key, value = 1).
+
+The actual global removal from MIR is the responsibility of
+sweep_dead_globals which is called at finalize_optimized_program time. The
+priority-driven path's role is to record which globals to sweep, in priority
+order, so any cascading optimizations (e.g. constant propagation that
+depended on a now-dead global) see the order-of-operations correctly.
+
+Returns 1 if the global ID was recorded, 0 if the index was out of range
+or the dce_plan was not initialized.
+@End Implementation
+
+@Performance_Hints
+O(1) Dictionary write. Sub-microsecond.
+@End Performance_Hints
+
+@Security_Scope
+Same as apply_dce_dead_function: removing a referenced global produces
+dangling references. Soundness is delegated to WPA.
+@End Security_Scope
+
+Process called "apply_dce_dead_global" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let dce_plan be proc memory_get_int64 from Layout with wpa, 128
+    If dce_plan is equal to 0:
+        Return 0
+    End If
+
+    Let dead_globals be proc memory_get_int64 from Layout with dce_plan, 16
+    If dead_globals is equal to 0:
+        Return 0
+    End If
+
+    Let dead_count be proc length from List with dead_globals
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to dead_count:
+        Return 0
+    End If
+
+    Let global_id be proc get from List with dead_globals, index
+
+    Note: Record dead-global decision in CMO stats Dict. The bulk sweep
+    Note: at finalize time consumes this record. Key = global_id, value = 1.
+    Let stats be proc memory_get_int64 from Layout with cmo, 96
+    If stats is not equal to 0:
+        proc set from Dictionary with stats, global_id, 1
+    End If
+
+    Let removed_count be proc memory_get_int64 from Layout with cmo, 56
+    Set removed_count to removed_count plus 1
+    proc memory_set_int64 from Layout with cmo, 56, removed_count
+
+    Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+    Set opts_applied to opts_applied bitwise_or OPT_DCE
+    proc memory_set_int64 from Layout with cmo, 64, opts_applied
+
+    Return 1
+End Process
+
+@Reasoning
+apply_dce_dead_type removes a single type identified by index into the
+dead-types list of wpa.dce_plan.
+
+Bucket 0x0006 dispatches here. dce_plan offset 32 is dead_types (List of
+type IDs). Type removal does not directly mutate MIR (types are referenced
+by metadata; removing a type means dropping it from the type table at
+codegen time).
+@End Reasoning
+
+@Implementation
+Reads wpa.dce_plan at WPA offset 128, then dead_types at DCEPlan offset 32.
+At the given index, retrieves the type ID. Records it in CMO's
+optimization_stats Dict for the type-table-pruning step at codegen time.
+
+Returns 1 if recorded, 0 on no-op.
+@End Implementation
+
+@Performance_Hints
+O(1) Dictionary write.
+@End Performance_Hints
+
+@Security_Scope
+A type used by reachable code but marked dead would cause type-table
+lookup failures at codegen. Soundness is WPA's responsibility.
+@End Security_Scope
+
+Process called "apply_dce_dead_type" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let dce_plan be proc memory_get_int64 from Layout with wpa, 128
+    If dce_plan is equal to 0:
+        Return 0
+    End If
+
+    Let dead_types be proc memory_get_int64 from Layout with dce_plan, 32
+    If dead_types is equal to 0:
+        Return 0
+    End If
+
+    Let dead_count be proc length from List with dead_types
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to dead_count:
+        Return 0
+    End If
+
+    Let type_id be proc get from List with dead_types, index
+
+    Let stats be proc memory_get_int64 from Layout with cmo, 96
+    If stats is not equal to 0:
+        Note: Negate key to distinguish from dead-global records in the same Dict.
+        Note: Type IDs and global IDs share a numeric namespace; flipping sign
+        Note: gives us a collision-free 2-channel record in one Dict.
+        Let type_key be 0 minus type_id
+        proc set from Dictionary with stats, type_key, 1
+    End If
+
+    Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+    Set opts_applied to opts_applied bitwise_or OPT_DCE
+    proc memory_set_int64 from Layout with cmo, 64, opts_applied
+
+    Return 1
+End Process
+
+@Reasoning
+apply_constant_propagation_candidate applies a single constant propagation
+identified by index into wpa.constant_prop_candidates.
+
+Bucket 0x0007 dispatches here. The candidate format is the 24-byte CP
+candidate struct from design section 7: value_id(0), constant_value(8),
+context_function(16). Replaces all uses of value_id in context_function
+with constant_value.
+@End Reasoning
+
+@Implementation
+Reads wpa.constant_prop_candidates at WPA offset 152 (added by Layer 1).
+At the given index, retrieves the candidate struct. Then calls the
+existing replace_constant_uses machinery on a single (value_id,
+constant_value) tuple within the context function.
+
+Returns 1 if at least one use was replaced, 0 if no uses found or index
+out of range.
+
+We do not have a one-shot per-tuple replace_constant_uses; the existing
+implementation walks every function. For per-candidate dispatch we
+narrow the scan to the candidate's context_function via a local loop.
+@End Implementation
+
+@Performance_Hints
+O(|context_function_instructions|) per candidate. Each use replacement
+is a single memory_set_int64.
+@End Performance_Hints
+
+@Security_Scope
+Substituting a non-constant value would break SSA correctness. WPA's
+constant identification is the trust boundary; this wrapper just performs
+the mechanical substitution.
+@End Security_Scope
+
+Process called "apply_constant_propagation_candidate" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    Let mir be proc memory_get_int64 from Layout with cmo, 8
+    If wpa is equal to 0:
+        Return 0
+    End If
+    If mir is equal to 0:
+        Return 0
+    End If
+
+    Let cp_candidates be proc memory_get_int64 from Layout with wpa, 152
+    If cp_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let candidate_count be proc length from List with cp_candidates
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to candidate_count:
+        Return 0
+    End If
+
+    Let candidate be proc get from List with cp_candidates, index
+    If candidate is equal to 0:
+        Return 0
+    End If
+
+    Let value_id be proc memory_get_int64 from Layout with candidate, 0
+    Let constant_value be proc memory_get_int64 from Layout with candidate, 8
+    Let context_function_id be proc memory_get_int64 from Layout with candidate, 16
+
+    Note: Locate context function in mir.functions
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Let function_count be proc length from List with functions
+    Let target_func be 0
+    Let fi be 0
+    While fi is less than function_count:
+        Let func be proc get from List with functions, fi
+        If func is not equal to 0:
+            Let fid be proc memory_get_int64 from Layout with func, 0
+            If fid is equal to context_function_id:
+                Set target_func to func
+                Set fi to function_count
+            End If
+        End If
+        Set fi to fi plus 1
+    End While
+
+    If target_func is equal to 0:
+        Return 0
+    End If
+
+    Note: Walk the target function's instructions and replace uses of value_id
+    Let cfg be proc memory_get_int64 from Layout with target_func, 8
+    If cfg is equal to 0:
+        Return 0
+    End If
+
+    Let blocks be proc memory_get_int64 from Layout with cfg, 16
+    Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+    Let replaced_count be 0
+    Let b be 0
+    While b is less than block_count:
+        Let block be proc get from List with blocks, b
+        If block is not equal to 0:
+            Let instructions be proc memory_get_int64 from Layout with block, 16
+            Let inst_count be proc memory_get_int64 from Layout with block, 24
+            Let ii be 0
+            While ii is less than inst_count:
+                Let inst be proc get from List with instructions, ii
+                If inst is not equal to 0:
+                    Note: Instructions store operands at offsets 16, 24, 32.
+                    Note: Check each and substitute value_id -> constant_value.
+                    Let op0 be proc memory_get_int64 from Layout with inst, 16
+                    If op0 is equal to value_id:
+                        proc memory_set_int64 from Layout with inst, 16, constant_value
+                        Set replaced_count to replaced_count plus 1
+                    End If
+                    Let op1 be proc memory_get_int64 from Layout with inst, 24
+                    If op1 is equal to value_id:
+                        proc memory_set_int64 from Layout with inst, 24, constant_value
+                        Set replaced_count to replaced_count plus 1
+                    End If
+                    Let op2 be proc memory_get_int64 from Layout with inst, 32
+                    If op2 is equal to value_id:
+                        proc memory_set_int64 from Layout with inst, 32, constant_value
+                        Set replaced_count to replaced_count plus 1
+                    End If
+                End If
+                Set ii to ii plus 1
+            End While
+        End If
+        Set b to b plus 1
+    End While
+
+    If replaced_count is greater than 0:
+        Let prop_count be proc memory_get_int64 from Layout with cmo, 40
+        Set prop_count to prop_count plus replaced_count
+        proc memory_set_int64 from Layout with cmo, 40, prop_count
+
+        Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+        Set opts_applied to opts_applied bitwise_or OPT_CONST_PROP
+        proc memory_set_int64 from Layout with cmo, 64, opts_applied
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+apply_specialization_candidate applies a single specialization identified
+by index into wpa.specialization_candidates.
+
+Bucket 0x0008 dispatches here. The candidate format is the 32-byte
+SpecCandidate struct from design section 7: callee_id(0),
+const_args_pattern(8), call_frequency(16), benefit_score(24). Creates a
+specialized clone of callee_id parameterized on const_args_pattern.
+@End Reasoning
+
+@Implementation
+Reads wpa.specialization_candidates at WPA offset 160 (added by Layer 1).
+At the given index, retrieves the candidate. Calls the existing
+create_specialized_functions machinery wrapped for a single candidate.
+
+For the bootstrap-phase implementation, we build a single-entry Dictionary
+from (callee_id -> const_args_pattern) and pass it to
+create_specialized_functions; the returned count tells us whether
+specialization actually happened.
+
+Returns 1 on successful specialization, 0 on no-op.
+@End Implementation
+
+@Performance_Hints
+Specialization cost is bounded by callee function body size (one clone
+plus parameter rewriting). For per-candidate dispatch, allocates a
+transient single-entry Dictionary which is destroyed at the end.
+@End Performance_Hints
+
+@Security_Scope
+Specialized clones must preserve callee semantics for the specialized
+argument pattern. WPA's analysis identified the pattern; this wrapper
+trusts the analysis.
+@End Security_Scope
+
+Process called "apply_specialization_candidate" that takes cmo as Integer, index as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    Let mir be proc memory_get_int64 from Layout with cmo, 8
+    If wpa is equal to 0:
+        Return 0
+    End If
+    If mir is equal to 0:
+        Return 0
+    End If
+
+    Let spec_candidates be proc memory_get_int64 from Layout with wpa, 160
+    If spec_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let candidate_count be proc length from List with spec_candidates
+    If index is less than 0:
+        Return 0
+    End If
+    If index is greater than or equal to candidate_count:
+        Return 0
+    End If
+
+    Let candidate be proc get from List with spec_candidates, index
+    If candidate is equal to 0:
+        Return 0
+    End If
+
+    Let callee_id be proc memory_get_int64 from Layout with candidate, 0
+    Let const_args_pattern be proc memory_get_int64 from Layout with candidate, 8
+
+    Note: Build single-entry Dict for create_specialized_functions consumption.
+    Let single_entry be proc create from Dictionary
+    If single_entry is equal to 0:
+        Return 0
+    End If
+    proc set from Dictionary with single_entry, callee_id, const_args_pattern
+
+    Let specialized_count be create_specialized_functions(mir, single_entry)
+    proc destroy from Dictionary with single_entry
+
+    If specialized_count is greater than 0:
+        Let opts_applied be proc memory_get_int64 from Layout with cmo, 64
+        Set opts_applied to opts_applied bitwise_or OPT_SPECIALIZE
+        proc memory_set_int64 from Layout with cmo, 64, opts_applied
+        Return 1
+    End If
+
+    Return 0
+End Process
+
+@Reasoning
+optimize_merged_program_prioritized is the O3 priority-driven dispatcher.
+Replaces the fixed-order CMO pipeline (optimize_merged_program +
+apply_all_optimizations) with a priority-ordered traversal of
+wpa.optimization_priorities.
+
+Per design section 3.5.3: keys in the priority Dict are bucket-tagged
+op_ids (high 16 bits = bucket, low 48 bits = candidate index). Each entry
+is dispatched to the appropriate per-bucket apply wrapper. The order
+matters: applying specialization before DCE can leave dead clones, etc.,
+so the WPA-computed priority order is treated as authoritative.
+
+This replaces section 3.5.3's pseudo-code Match statement with the
+expanded If/Otherwise chain (the v0.0.8.5 bootstrap stage1 parser does
+not yet accept Match with integer literal patterns reliably).
+@End Reasoning
+
+@Implementation
+Reads wpa.optimization_priorities (WPA offset 136). Calls
+sort_priority_dict_descending to get a sorted List of op_ids. Iterates,
+decoding bucket and index, dispatches to the appropriate apply wrapper.
+
+If priorities is null or empty (Layer 1 has not populated it yet for any
+of the buckets), this Process falls back to the fixed-order O2 pipeline
+so that O3 builds do not silently skip all LTO. This is a defensive
+behavior; once Layer 1 ships, the fallback should never trigger.
+
+Returns the total number of candidates that returned 1 from their dispatch.
+@End Implementation
+
+@Performance_Hints
+Sort cost is O(n log n) where n is total candidate count. Dispatch is
+O(n) with per-candidate cost dominated by the underlying apply wrapper.
+For a 10k-function program with ~100 candidates total, total dispatch
+cost is well under 10ms.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. The priority order influences codegen quality but
+not correctness; every per-bucket wrapper has the same soundness
+guarantee as in the fixed-order path.
+@End Security_Scope
+
+Process called "optimize_merged_program_prioritized" that takes cmo as Integer returns Integer:
+    Let wpa be proc memory_get_int64 from Layout with cmo, 0
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let priorities be proc memory_get_int64 from Layout with wpa, 136
+
+    Note: If priorities is unpopulated, fall back to O2 fixed-order pipeline.
+    Note: This keeps O3 builds correct in the window between Layer 2 landing
+    Note: and Layer 1 finishing compute_optimization_priorities population.
+    If priorities is equal to 0:
+        optimize_merged_program(cmo)
+        apply_all_optimizations(cmo)
+        Return 1
+    End If
+
+    Let priority_size be proc size from Dictionary with priorities
+    If priority_size is equal to 0:
+        optimize_merged_program(cmo)
+        apply_all_optimizations(cmo)
+        Return 1
+    End If
+
+    Let sorted_ops be sort_priority_dict_descending(priorities)
+    If sorted_ops is equal to 0:
+        Return 0
+    End If
+
+    Let n be proc length from List with sorted_ops
+    Let applied_total be 0
+    Let i be 0
+    While i is less than n:
+        Let op_id be proc get from List with sorted_ops, i
+        Let bucket be (op_id shifted right by BUCKET_SHIFT) bitwise and BUCKET_MASK
+        Let index be op_id bitwise and INDEX_MASK
+
+        Let applied_one be 0
+        If bucket is equal to BUCKET_INLINING:
+            Set applied_one to apply_inlining_candidate(cmo, index)
+        End If
+        If bucket is equal to BUCKET_DEVIRT_EXACT:
+            Set applied_one to apply_devirt_candidate_exact(cmo, index)
+        End If
+        If bucket is equal to BUCKET_DEVIRT_SPECULATIVE:
+            Set applied_one to apply_devirt_candidate_speculative(cmo, index)
+        End If
+        If bucket is equal to BUCKET_DCE_DEAD_FUNCTION:
+            Set applied_one to apply_dce_dead_function(cmo, index)
+        End If
+        If bucket is equal to BUCKET_DCE_DEAD_GLOBAL:
+            Set applied_one to apply_dce_dead_global(cmo, index)
+        End If
+        If bucket is equal to BUCKET_DCE_DEAD_TYPE:
+            Set applied_one to apply_dce_dead_type(cmo, index)
+        End If
+        If bucket is equal to BUCKET_CONSTANT_PROPAGATION:
+            Set applied_one to apply_constant_propagation_candidate(cmo, index)
+        End If
+        If bucket is equal to BUCKET_SPECIALIZATION:
+            Set applied_one to apply_specialization_candidate(cmo, index)
+        End If
+
+        If applied_one is equal to 1:
+            Set applied_total to applied_total plus 1
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: After priority-driven candidate apply, run the bulk sweep / verify /
+    Note: measure / finalize phases that apply_all_optimizations would run.
+    Note: These are idempotent on already-applied candidates.
+    Let is_correct be verify_optimization_correctness(cmo)
+    If is_correct is equal to 0:
+        rollback_unsafe_optimizations(cmo)
+    End If
+    measure_optimization_impact(cmo)
+    finalize_optimized_program(cmo)
+
+    proc destroy from List with sorted_ops
+
+    Return applied_total
+End Process

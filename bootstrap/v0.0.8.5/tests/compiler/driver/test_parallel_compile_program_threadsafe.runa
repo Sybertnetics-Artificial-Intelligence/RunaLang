@@ -1,0 +1,129 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+Licensed under Apache 2.0
+:End Note
+
+Note:
+P1-E v3 Layer 3 thread-safety test. The orchestrator's
+set_active_build_context / get_active_opt_level pair uses a shared
+module-global cell per design v3 section 19.6 option 3 (CEO-ratified).
+The contract is: every worker in the same build writes the SAME
+pointer to the cell, so concurrent writes are idempotent and benign.
+
+This test simulates that workflow in a single-threaded harness by:
+  1. Pinning a fake BuildContext.
+  2. Pinning it again (simulating a second worker writing the same
+     pointer).
+  3. Confirming the read returns the configured opt_level.
+  4. Re-pinning to 0 (simulating tear-down).
+  5. Confirming the read falls back to BUILD_OPT_BASIC.
+  6. Re-pinning multiple times in a loop to confirm the cell never
+     reaches an undefined state.
+
+Full multi-threaded execution is part of the parallel-compilation
+integration harness; this test verifies the per-thread contract holds
+in the single-threaded case, which is the foundation the
+multi-threaded case builds on. The same cell semantics apply to both.
+
+Exit codes:
+  0   = all checks passed
+  1-N = check N failed
+:End Note
+
+Import "compiler/driver/compile_orchestrator.runa" as CompileOrch
+
+Process called "main" returns Integer:
+    Note: Allocate two fake BuildContexts, each writing a different
+    Note: opt_level so we can confirm the cell tracks whichever pointer
+    Note: was written last.
+    Let ctx_a be allocate(32)
+    If ctx_a is equal to 0:
+        Return 1
+    End If
+    Let ctx_b be allocate(32)
+    If ctx_b is equal to 0:
+        Return 2
+    End If
+
+    Note: ctx_a: opt_level = 2 (BUILD_OPT_STANDARD).
+    __store(ctx_a, 0, 0)
+    __store(ctx_a, 8, 0)
+    __store(ctx_a, 16, 2)
+    __store(ctx_a, 24, 0)
+
+    Note: ctx_b: opt_level = 3 (BUILD_OPT_AGGRESSIVE).
+    __store(ctx_b, 0, 0)
+    __store(ctx_b, 8, 0)
+    __store(ctx_b, 16, 3)
+    __store(ctx_b, 24, 0)
+
+    Note: Check 3 -- pin ctx_a, read opt_level returns 2.
+    proc set_active_build_context from CompileOrch with ctx_a
+    Let read_a be proc get_active_opt_level from CompileOrch
+    If read_a is not equal to 2:
+        Return 3
+    End If
+
+    Note: Check 4 -- "worker 2" pins the SAME ctx_a (idempotent write
+    Note: case). Read still returns 2.
+    proc set_active_build_context from CompileOrch with ctx_a
+    Let read_a2 be proc get_active_opt_level from CompileOrch
+    If read_a2 is not equal to 2:
+        Return 4
+    End If
+
+    Note: Check 5 -- switching to ctx_b changes the observed value
+    Note: (this is the "different BuildContext per build" scenario;
+    Note: within a single build all workers use the same context, but
+    Note: across consecutive builds the pinned pointer changes).
+    proc set_active_build_context from CompileOrch with ctx_b
+    Let read_b be proc get_active_opt_level from CompileOrch
+    If read_b is not equal to 3:
+        Return 5
+    End If
+
+    Note: Check 6 -- pin loop: repeatedly write the same pointer
+    Note: confirms the cell never desynchronizes.
+    Let i be 0
+    While i is less than 16:
+        proc set_active_build_context from CompileOrch with ctx_b
+        Let li be proc get_active_opt_level from CompileOrch
+        If li is not equal to 3:
+            Return 6
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Check 7 -- re-pin to 0 returns the default fallback.
+    proc set_active_build_context from CompileOrch with 0
+    Let read_zero be proc get_active_opt_level from CompileOrch
+    If read_zero is not equal to 1:
+        Return 7
+    End If
+
+    Note: Check 8 -- alternating pins across contexts; each read
+    Note: tracks the most recent write.
+    Let j be 0
+    While j is less than 8:
+        proc set_active_build_context from CompileOrch with ctx_a
+        Let la be proc get_active_opt_level from CompileOrch
+        If la is not equal to 2:
+            Return 8
+        End If
+        proc set_active_build_context from CompileOrch with ctx_b
+        Let lb be proc get_active_opt_level from CompileOrch
+        If lb is not equal to 3:
+            Return 8
+        End If
+        Set j to j plus 1
+    End While
+
+    Note: Cleanup: re-pin to 0 before exit so subsequent tests start
+    Note: from a clean slate.
+    proc set_active_build_context from CompileOrch with 0
+    deallocate(ctx_a)
+    deallocate(ctx_b)
+
+    Note: All idempotent-write and re-pin checks passed.
+    Return 0
+End Process

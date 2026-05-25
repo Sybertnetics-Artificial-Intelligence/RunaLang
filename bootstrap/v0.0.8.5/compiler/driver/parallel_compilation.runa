@@ -52,6 +52,9 @@ Import "runtime/core/memory/chained_arena.runa" as ChainedArena
 Import "compiler/internal/collections.runa" as Collections
 Import "compiler/internal/thread_utils.runa" as ThreadUtils
 Import "compiler/internal/time_utils.runa" as TimeUtils
+Note: Per P1-E v3 Layer 3: import the compile orchestrator so the
+Note: parallel worker's compile_program call resolves through it.
+Import "compiler/driver/compile_orchestrator.runa" as CompileOrchestrator
 
 Note: ============================================================================
 Note: Parallel Compilation Constants
@@ -79,7 +82,7 @@ Note: offset 56: dependency_count (8 bytes) - Number of unresolved dependencies
 
 Constant COMPILATION_UNIT_SIZE as Integer is 64
 
-Note: CompilationPool memory layout (112 bytes):
+Note: CompilationPool memory layout (120 bytes):
 Note: offset   0: thread_count (8 bytes) - Number of worker threads
 Note: offset   8: threads (8 bytes) - Pointer to ArrayList of thread handles
 Note: offset  16: work_queue (8 bytes) - Pointer to ArrayList of CompilationUnit pointers (pending)
@@ -94,8 +97,10 @@ Note: offset  80: result_channel (8 bytes) - Pointer to channel for collecting r
 Note: offset  88: is_running (8 bytes) - Boolean: 1 if pool is accepting work
 Note: offset  96: is_shutdown (8 bytes) - Boolean: 1 if pool is shutting down
 Note: offset 104: total_compilation_time_ms (8 bytes) - Total wall-clock compilation time
+Note: offset 112: build_context (8 bytes) - Pointer to active BuildContext (P1-E v3 Layer 3)
 
-Constant COMPILATION_POOL_SIZE as Integer is 112
+Constant COMPILATION_POOL_SIZE as Integer is 120
+Constant COMPILATION_POOL_BUILD_CONTEXT_OFFSET as Integer is 112
 
 Note: ============================================================================
 Note: Compilation Unit Creation
@@ -156,9 +161,14 @@ Note: ==========================================================================
 Note: Compilation Pool Creation and Destruction
 Note: ============================================================================
 
-Process called "create_compilation_pool" takes arena as Integer, thread_count as Integer returns Integer:
+Process called "create_compilation_pool" takes arena as Integer, thread_count as Integer, build_context as Integer returns Integer:
     Note: Create a new CompilationPool with the specified number of worker threads
     Note: Returns pointer to pool, or 0 on failure
+    Note: Per P1-E v3 Layer 3, build_context is stored at offset 112 so
+    Note: that worker threads can pull it via pool_get_build_context and
+    Note: pin it on the compile orchestrator's module-global before
+    Note: invoking compile_program. Passing 0 is valid and signals the
+    Note: orchestrator to fall back to BUILD_OPT_BASIC.
 
     If arena is equal to 0:
         Alert "[PARALLEL ERROR] Cannot create pool: arena is null"
@@ -248,6 +258,12 @@ Process called "create_compilation_pool" takes arena as Integer, thread_count as
     Note: Total compilation time = 0
     memory_set_integer(pool, 104, 0)
 
+    Note: Store active BuildContext (P1-E v3 Layer 3).
+    Note: All workers will write this same pointer to the orchestrator's
+    Note: module-global before invoking compile_program, so concurrent
+    Note: writes are idempotent and benign.
+    memory_set_pointer(pool, COMPILATION_POOL_BUILD_CONTEXT_OFFSET, build_context)
+
     Note: Start worker threads
     Let i be 0
     While i is less than actual_threads:
@@ -261,6 +277,19 @@ Process called "create_compilation_pool" takes arena as Integer, thread_count as
     End While
 
     Return pool
+End Process
+
+Process called "pool_get_build_context" takes pool as Integer returns Integer:
+    Note: Accessor: read the BuildContext pointer stored in the pool at
+    Note: offset 112. Returns 0 if the pool itself is null or no
+    Note: BuildContext was supplied to create_compilation_pool.
+    Note: Used by parallel_compile_unit (workers) to pin the orchestrator
+    Note: module-global before each compile_program call.
+
+    If pool is equal to 0:
+        Return 0
+    End If
+    Return memory_get_pointer(pool, COMPILATION_POOL_BUILD_CONTEXT_OFFSET)
 End Process
 
 Process called "destroy_pool" takes pool as Integer returns Nothing:
@@ -521,6 +550,12 @@ Process called "parallel_compile_unit" takes pool as Integer, unit as Integer re
                     Let program be parser_parse_program(parser)
                     If program is not equal to 0:
                         If output_path is not equal to 0:
+                            Note: Per P1-E v3 Layer 3: pin the pool's
+                            Note: BuildContext on the orchestrator's
+                            Note: module-global so Phase 1 picks up the
+                            Note: configured opt_level. The shared write
+                            Note: is idempotent across workers.
+                            set_active_build_context(pool_get_build_context(pool))
                             Let result be compile_program(program, output_path)
                             If result is equal to 0:
                                 Set compile_success to 1

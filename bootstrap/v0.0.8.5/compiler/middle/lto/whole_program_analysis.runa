@@ -91,12 +91,22 @@ Fields:
 - const_functions: Set of function IDs that are const (no global state mutation)
 - exported_functions: Set of function IDs that are exported
 - address_taken_functions: Set of function IDs whose address is taken
-- devirtualization_candidates: List of virtual call sites that can be devirtualized
+- devirtualization_candidates: List of canonical 40-byte DevirtCandidate structs
 - inlining_candidates: List of cross-module inlining opportunities
 - constant_globals: Set of global variable IDs that are compile-time constants
-- optimization_priorities: Dictionary mapping optimization_id -> priority score
+- dce_plan: Pointer to DCEPlan struct (NEW, populated by identify_whole_program_dce)
+- optimization_priorities: Dictionary mapping bucket-tagged optimization_id -> priority score (NEW)
+- points_to_map: Lazily-allocated Dictionary cache used by get_points_to_set
+  for memoising flow-insensitive points-to queries. Originally lived at
+  offset 128, relocated to offset 144 in v0.0.8.5 P1-E v2 after the WPA
+  struct grew to host the new dce_plan field at the previous slot. Moving
+  the cache here (rather than threading it through every call chain)
+  preserves the cache hit rate without colliding with the DCE plan
+  pointer at offset 128.
+- constant_prop_candidates: List of 24-byte CPCandidate structs (NEW, CP track)
+- specialization_candidates: List of 32-byte SpecCandidate structs (NEW, CP track)
 
-Memory layout (128 bytes, Tier 3 OWNED HEAP):
+Memory layout (168 bytes, Tier 3 OWNED HEAP):
 Offset 0: mir (8 bytes)
 Offset 8: call_graph (8 bytes)
 Offset 16: entry_functions (8 bytes)
@@ -113,6 +123,11 @@ Offset 96: address_taken_functions (8 bytes)
 Offset 104: devirtualization_candidates (8 bytes)
 Offset 112: inlining_candidates (8 bytes)
 Offset 120: constant_globals (8 bytes)
+Offset 128: dce_plan (8 bytes)
+Offset 136: optimization_priorities (8 bytes)
+Offset 144: points_to_map (8 bytes, lazily-allocated Dictionary cache for get_points_to_set)
+Offset 152: constant_prop_candidates (8 bytes)
+Offset 160: specialization_candidates (8 bytes)
 @End Implementation
 
 Type called "WholeProgramAnalysis":
@@ -132,7 +147,145 @@ Type called "WholeProgramAnalysis":
     devirtualization_candidates as Integer
     inlining_candidates as Integer
     constant_globals as Integer
+    dce_plan as Integer
+    optimization_priorities as Integer
+    points_to_map as Integer
+    constant_prop_candidates as Integer
+    specialization_candidates as Integer
 End Type
+
+@Implementation
+DCEPlan aggregates dead-code findings into a single descriptor consumed
+by the CMO sweep passes.
+
+Memory layout (40 bytes, Tier 3 OWNED HEAP):
+Offset 0:  dead_funcs        (8 bytes, List of function IDs sorted ascending)
+Offset 8:  dead_func_count   (8 bytes)
+Offset 16: dead_globals      (8 bytes, List of global IDs)
+Offset 24: dead_global_count (8 bytes)
+Offset 32: dead_types        (8 bytes, List of type IDs)
+@End Implementation
+
+Type called "DCEPlan":
+    dead_funcs as Integer
+    dead_func_count as Integer
+    dead_globals as Integer
+    dead_global_count as Integer
+    dead_types as Integer
+End Type
+
+@Implementation
+DevirtCandidate is the canonical 40-byte virtual-call devirtualization
+candidate record produced by compute_devirtualization_candidates and
+filtered/elevated by identify_virtual_call_elimination.
+
+Memory layout (40 bytes, Tier 3 OWNED HEAP):
+Offset 0:  call_site       (8 bytes, MIR instruction pointer)
+Offset 8:  target_func     (8 bytes, target function ID)
+Offset 16: confidence      (8 bytes, 1=exact, 0=speculative)
+Offset 24: verified        (8 bytes, 0=not yet verified, 1=verified)
+Offset 32: is_speculative  (8 bytes, mirror of confidence==0 for O(1) bucket dispatch)
+@End Implementation
+
+Type called "DevirtCandidate":
+    call_site as Integer
+    target_func as Integer
+    confidence as Integer
+    verified as Integer
+    is_speculative as Integer
+End Type
+
+@Implementation
+CPCandidate records a constant-global propagation opportunity. The
+use_count and value_size_est fields drive the bucket-0x0007 score in
+compute_optimization_priorities.
+
+Memory layout (24 bytes, Tier 3 OWNED HEAP):
+Offset 0:  global_id      (8 bytes)
+Offset 8:  use_count      (8 bytes, LOAD count across reachable functions)
+Offset 16: value_size_est (8 bytes, estimated MIR bytes saved by inlining)
+@End Implementation
+
+Type called "CPCandidate":
+    global_id as Integer
+    use_count as Integer
+    value_size_est as Integer
+End Type
+
+@Implementation
+SpecCandidate records a function-specialization opportunity. The
+benefit and caller_count fields drive the bucket-0x0008 score in
+compute_optimization_priorities. dominant_const_arg is the parameter
+index whose actual argument is most often a constant across call
+sites (-1 if no dominant constant arg detected).
+
+Memory layout (32 bytes, Tier 3 OWNED HEAP):
+Offset 0:  function_id        (8 bytes)
+Offset 8:  caller_count       (8 bytes)
+Offset 16: benefit            (8 bytes, raw score from compute_specialization_benefit)
+Offset 24: dominant_const_arg (8 bytes, parameter index with most constant args; -1 if none)
+@End Implementation
+
+Type called "SpecCandidate":
+    function_id as Integer
+    caller_count as Integer
+    benefit as Integer
+    dominant_const_arg as Integer
+End Type
+
+Note: ============================================================================
+Note: P1-E v3 scoring constants
+Note: ============================================================================
+
+@Implementation
+Priority-score weight ratio 10:1:5 (cycle:size:enabling). The
+calibration tracks LLVM LTO's ranker constants for x86_64-class
+targets; cycle savings dominate, size penalty is mild, and enabling
+score adds a moderate bonus for optimizations that unlock downstream
+work. CALL_OVERHEAD_CYCLES=10 reflects the median observed cost of a
+predicted direct call on modern x86_64; INDIRECT_CALL_OVERHEAD=20
+adds the branch-target-buffer miss penalty for an unpredicted
+indirect dispatch. MIR_BYTES_PER_INST_EST=8 reflects the average
+post-codegen byte count for a typical MIR instruction in the v0.0.8.5
+backend. SPECIALIZATION_BENEFIT_FLOOR=50 is the inflection point
+below which specialization clones cost more than they save.
+@End Implementation
+
+Constant CYCLE_WEIGHT                  as Integer is 10
+Constant SIZE_PENALTY_WEIGHT           as Integer is 1
+Constant ENABLING_WEIGHT               as Integer is 5
+Constant CALL_OVERHEAD_CYCLES          as Integer is 10
+Constant INDIRECT_CALL_OVERHEAD        as Integer is 20
+Constant MIR_BYTES_PER_INST_EST        as Integer is 8
+Constant SPECIALIZATION_BENEFIT_FLOOR  as Integer is 50
+
+Note: Bucket tags occupy the high 16 bits of the priority-Dict key;
+Note: the low 48 bits hold the candidate index within the bucket.
+Constant BUCKET_TAG_INLINING           as Integer is 1
+Constant BUCKET_TAG_DEVIRT_EXACT       as Integer is 2
+Constant BUCKET_TAG_DEVIRT_SPEC        as Integer is 3
+Constant BUCKET_TAG_DCE_FUNC           as Integer is 4
+Constant BUCKET_TAG_DCE_GLOBAL         as Integer is 5
+Constant BUCKET_TAG_DCE_TYPE           as Integer is 6
+Constant BUCKET_TAG_CP                 as Integer is 7
+Constant BUCKET_TAG_SPEC               as Integer is 8
+
+Note: Struct sizes used by allocators throughout the file.
+Constant DEVIRT_CANDIDATE_SIZE         as Integer is 40
+Constant DCE_PLAN_SIZE                 as Integer is 40
+Constant CP_CANDIDATE_SIZE             as Integer is 24
+Constant SPEC_CANDIDATE_SIZE           as Integer is 32
+Constant WPA_STRUCT_SIZE               as Integer is 168
+
+Note: MIR opcodes referenced by WPA passes.
+Constant MIR_OP_LOAD                   as Integer is 20200
+Constant MIR_OP_STORE                  as Integer is 20201
+Constant MIR_OP_CALL                   as Integer is 20304
+Constant MIR_OP_CALL_INDIRECT          as Integer is 20305
+
+Note: Bucket-key bit-shift constant. 1 shifted left 48 bits = 2^48 used as
+Note: a multiplier for composing bucket-tagged Dict keys.
+Constant BUCKET_KEY_SHIFT_MULT         as Integer is 281474976710656
 
 @Implementation
 TypeHierarchyNode represents a type in the whole-program type hierarchy.
@@ -286,8 +439,8 @@ All collections are initialized as empty and will be populated during analysis.
 @End Reasoning
 
 Process called "create_whole_program_analysis" that takes mir as Integer returns Integer:
-    Note: Allocate WholeProgramAnalysis (128 bytes)
-    Let wpa be proc memory_allocate from Layout with 128
+    Note: Allocate WholeProgramAnalysis (168 bytes — P1-E v3 layout)
+    Let wpa be proc memory_allocate from Layout with WPA_STRUCT_SIZE
 
     If wpa is equal to 0:
         Return 0
@@ -310,8 +463,289 @@ Process called "create_whole_program_analysis" that takes mir as Integer returns
     proc memory_set_int64 from Layout with wpa, 104, List.create( )           Note: devirtualization_candidates
     proc memory_set_int64 from Layout with wpa, 112, List.create( )           Note: inlining_candidates
     proc memory_set_int64 from Layout with wpa, 120, Set.create( )            Note: constant_globals
+    proc memory_set_int64 from Layout with wpa, 128, 0                        Note: dce_plan (NEW, allocated by identify_whole_program_dce)
+    proc memory_set_int64 from Layout with wpa, 136, Dictionary.create( )     Note: optimization_priorities (NEW)
+    proc memory_set_int64 from Layout with wpa, 144, 0                        Note: points_to_map (lazily allocated by get_points_to_set on first use)
+    proc memory_set_int64 from Layout with wpa, 152, List.create( )           Note: constant_prop_candidates (NEW)
+    proc memory_set_int64 from Layout with wpa, 160, List.create( )           Note: specialization_candidates (NEW)
 
     Return wpa
+End Process
+
+@Reasoning
+destroy_whole_program_analysis performs deep-clean tear-down of every
+sub-resource owned by the WPA struct per CEO ratification. The deep-clean
+contract releases:
+  - All Set/Dict/List containers held at offsets 16, 24, 32, 40, 56, 64,
+    72, 80, 88, 96, 104, 112, 120, 136, 144, 152, 160.
+  - Per-candidate struct allocations in devirtualization_candidates,
+    constant_prop_candidates, specialization_candidates.
+  - The DCEPlan struct at offset 128 and its inner List handles.
+  - The points_to_map Dictionary at offset 144 plus each List it caches.
+  - The WPA block itself.
+
+Shallow-cleaning would leak ~|MIR|/100 candidate structs (40 bytes each
+for devirt, 24 for CP, 32 for spec) plus the DCEPlan and its three Lists
+per compile. Across a 1000-source-file build that compounds to several
+megabytes of avoidable leak. Deep-clean keeps the LTO subsystem within
+the per-job arena budget.
+@End Reasoning
+
+@Implementation
+Order matters: free the per-candidate structs FIRST (while the
+container List still has handles to them), then free the container,
+then free the WPA block last. Type-hierarchy nodes and method-info
+records are owned by build_type_hierarchy_graph; this destructor
+walks the type_hierarchy Dictionary and releases each TypeHierarchyNode
+plus its inner virtual_methods Dictionary entries. IPA records owned
+by compute_side_effects are walked the same way (side_effect_info
+values are 96-byte InterProceduralInfo structs).
+
+Set/Dict/List release uses the canonical destroy primitives. Each
+primitive itself frees its internal arrays (the v0.0.8.5 collections
+primitives are heap-backed; their destroy methods return the
+underlying allocation to the heap free list).
+@End Implementation
+
+@Performance_Hints
+Called exactly once per compile job at the end of optimize_program.
+The cost is O(|candidates| + |MIR|) — linear in the total amount of
+work the WPA pipeline performed. For a 10k-function program, the
+tear-down typically takes <2ms (a small fraction of WPA's own build
+time). The bulk cost is the per-candidate memory_deallocate calls;
+no nested loops, no hash recomputation.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. No untrusted data. The Process accepts the WPA
+pointer returned by create_whole_program_analysis; callers must NOT
+double-free (the WPA block is single-ownership owned-heap per the
+v0.0.8.5 memory tiers). Returns 0 on null input as a defensive guard.
+@End Security_Scope
+
+Process called "destroy_whole_program_analysis" that takes wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 1 — release per-candidate structs in devirtualization_candidates
+    Let devirt_candidates be proc memory_get_int64 from Layout with wpa, 104
+    If devirt_candidates is not equal to 0:
+        Let dc_count be proc length from List with devirt_candidates
+        Let i be 0
+        While i is less than dc_count:
+            Let candidate be proc get from List with devirt_candidates, i
+            If candidate is not equal to 0:
+                proc memory_deallocate from Layout with candidate
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with devirt_candidates
+    End If
+
+    Note: Step 2 — release per-candidate structs in constant_prop_candidates
+    Let cp_candidates be proc memory_get_int64 from Layout with wpa, 152
+    If cp_candidates is not equal to 0:
+        Let cp_count be proc length from List with cp_candidates
+        Let j be 0
+        While j is less than cp_count:
+            Let cp_entry be proc get from List with cp_candidates, j
+            If cp_entry is not equal to 0:
+                proc memory_deallocate from Layout with cp_entry
+            End If
+            Set j to j plus 1
+        End While
+        proc destroy from List with cp_candidates
+    End If
+
+    Note: Step 3 — release per-candidate structs in specialization_candidates
+    Let spec_candidates be proc memory_get_int64 from Layout with wpa, 160
+    If spec_candidates is not equal to 0:
+        Let sc_count be proc length from List with spec_candidates
+        Let k be 0
+        While k is less than sc_count:
+            Let sc_entry be proc get from List with spec_candidates, k
+            If sc_entry is not equal to 0:
+                proc memory_deallocate from Layout with sc_entry
+            End If
+            Set k to k plus 1
+        End While
+        proc destroy from List with spec_candidates
+    End If
+
+    Note: Step 4 — release DCEPlan and its three inner Lists
+    Let dce_plan be proc memory_get_int64 from Layout with wpa, 128
+    If dce_plan is not equal to 0:
+        Let dead_funcs be proc memory_get_int64 from Layout with dce_plan, 0
+        If dead_funcs is not equal to 0:
+            proc destroy from List with dead_funcs
+        End If
+        Let dead_globals be proc memory_get_int64 from Layout with dce_plan, 16
+        If dead_globals is not equal to 0:
+            proc destroy from List with dead_globals
+        End If
+        Let dead_types be proc memory_get_int64 from Layout with dce_plan, 32
+        If dead_types is not equal to 0:
+            proc destroy from List with dead_types
+        End If
+        proc memory_deallocate from Layout with dce_plan
+    End If
+
+    Note: Step 5 — release inlining_candidates List (entries owned by call_graph)
+    Let inlining_candidates be proc memory_get_int64 from Layout with wpa, 112
+    If inlining_candidates is not equal to 0:
+        proc destroy from List with inlining_candidates
+    End If
+
+    Note: Step 6 — release optimization_priorities Dict
+    Let priorities be proc memory_get_int64 from Layout with wpa, 136
+    If priorities is not equal to 0:
+        proc destroy from Dictionary with priorities
+    End If
+
+    Note: Step 6b — release points_to_map cache at offset 144. This cache is
+    Note: lazily allocated by get_points_to_set; for compile jobs that never
+    Note: trigger a points-to query the slot stays 0 and we skip cleanup. The
+    Note: cache stores function-ID Lists keyed by value_id, so each entry is a
+    Note: List that must be released before the Dictionary itself.
+    Let points_to_map be proc memory_get_int64 from Layout with wpa, 144
+    If points_to_map is not equal to 0:
+        Let pts_keys be proc keys from Dictionary with points_to_map
+        Let pts_key_count be proc length from List with pts_keys
+        Let pk be 0
+        While pk is less than pts_key_count:
+            Let pts_value_id be proc get from List with pts_keys, pk
+            Let pts_list be proc get from Dictionary with points_to_map, pts_value_id
+            If pts_list is not equal to 0:
+                proc destroy from List with pts_list
+            End If
+            Set pk to pk plus 1
+        End While
+        proc destroy from Dictionary with points_to_map
+    End If
+
+    Note: Step 7 — release per-type TypeHierarchyNode + inner method_info records
+    Let type_hierarchy be proc memory_get_int64 from Layout with wpa, 40
+    If type_hierarchy is not equal to 0:
+        Let type_ids be proc keys from Dictionary with type_hierarchy
+        Let th_count be proc length from List with type_ids
+        Let t be 0
+        While t is less than th_count:
+            Let type_id be proc get from List with type_ids, t
+            Let type_node be proc get from Dictionary with type_hierarchy, type_id
+            If type_node is not equal to 0:
+                Note: parent_types, child_types, all_implementations are owned Lists/Sets
+                Let parent_types be proc memory_get_int64 from Layout with type_node, 16
+                If parent_types is not equal to 0:
+                    proc destroy from List with parent_types
+                End If
+                Let child_types be proc memory_get_int64 from Layout with type_node, 32
+                If child_types is not equal to 0:
+                    proc destroy from List with child_types
+                End If
+                Let virtual_methods be proc memory_get_int64 from Layout with type_node, 48
+                If virtual_methods is not equal to 0:
+                    Let method_names be proc keys from Dictionary with virtual_methods
+                    Let mn_count be proc length from List with method_names
+                    Let m be 0
+                    While m is less than mn_count:
+                        Let mname be proc get from List with method_names, m
+                        Let method_info be proc get from Dictionary with virtual_methods, mname
+                        If method_info is not equal to 0:
+                            Let impls be proc memory_get_int64 from Layout with method_info, 24
+                            If impls is not equal to 0:
+                                proc destroy from List with impls
+                            End If
+                            proc memory_deallocate from Layout with method_info
+                        End If
+                        Set m to m plus 1
+                    End While
+                    proc destroy from Dictionary with virtual_methods
+                End If
+                Let all_impls be proc memory_get_int64 from Layout with type_node, 80
+                If all_impls is not equal to 0:
+                    proc destroy from Set with all_impls
+                End If
+                proc memory_deallocate from Layout with type_node
+            End If
+            Set t to t plus 1
+        End While
+        proc destroy from Dictionary with type_hierarchy
+    End If
+
+    Note: Step 8 — release per-function InterProceduralInfo records and escape_info entries
+    Let side_effect_info be proc memory_get_int64 from Layout with wpa, 64
+    If side_effect_info is not equal to 0:
+        Let func_ids be proc keys from Dictionary with side_effect_info
+        Let fi_count be proc length from List with func_ids
+        Let fi be 0
+        While fi is less than fi_count:
+            Let function_id be proc get from List with func_ids, fi
+            Let ipa_info be proc get from Dictionary with side_effect_info, function_id
+            If ipa_info is not equal to 0:
+                Let esc_params be proc memory_get_int64 from Layout with ipa_info, 8
+                If esc_params is not equal to 0:
+                    proc destroy from Set with esc_params
+                End If
+                Let mem_reads be proc memory_get_int64 from Layout with ipa_info, 24
+                If mem_reads is not equal to 0:
+                    proc destroy from Set with mem_reads
+                End If
+                Let mem_writes be proc memory_get_int64 from Layout with ipa_info, 32
+                If mem_writes is not equal to 0:
+                    proc destroy from Set with mem_writes
+                End If
+                proc memory_deallocate from Layout with ipa_info
+            End If
+            Set fi to fi plus 1
+        End While
+        proc destroy from Dictionary with side_effect_info
+    End If
+
+    Note: Step 9 — release escape_info Dict (entries are small status integers, not owned structs)
+    Let escape_info be proc memory_get_int64 from Layout with wpa, 56
+    If escape_info is not equal to 0:
+        proc destroy from Dictionary with escape_info
+    End If
+
+    Note: Step 10 — release entry_functions list and the four function-ID Sets
+    Let entry_functions be proc memory_get_int64 from Layout with wpa, 16
+    If entry_functions is not equal to 0:
+        proc destroy from List with entry_functions
+    End If
+    Let reachable_functions be proc memory_get_int64 from Layout with wpa, 24
+    If reachable_functions is not equal to 0:
+        proc destroy from Set with reachable_functions
+    End If
+    Let unreachable_functions be proc memory_get_int64 from Layout with wpa, 32
+    If unreachable_functions is not equal to 0:
+        proc destroy from Set with unreachable_functions
+    End If
+    Let pure_functions be proc memory_get_int64 from Layout with wpa, 72
+    If pure_functions is not equal to 0:
+        proc destroy from Set with pure_functions
+    End If
+    Let const_functions be proc memory_get_int64 from Layout with wpa, 80
+    If const_functions is not equal to 0:
+        proc destroy from Set with const_functions
+    End If
+    Let exported_functions be proc memory_get_int64 from Layout with wpa, 88
+    If exported_functions is not equal to 0:
+        proc destroy from Set with exported_functions
+    End If
+    Let address_taken_functions be proc memory_get_int64 from Layout with wpa, 96
+    If address_taken_functions is not equal to 0:
+        proc destroy from Set with address_taken_functions
+    End If
+    Let constant_globals be proc memory_get_int64 from Layout with wpa, 120
+    If constant_globals is not equal to 0:
+        proc destroy from Set with constant_globals
+    End If
+
+    Note: Step 11 — release the WPA struct itself
+    proc memory_deallocate from Layout with wpa
+
+    Return 1
 End Process
 
 @Reasoning
@@ -360,11 +794,32 @@ Process called "initialize_wpa_from_mir" that takes wpa as Integer, mir as Integ
     Note: Phase 7: Compute global visibility
     compute_global_visibility(wpa)
 
-    Note: Phase 8: Identify optimization opportunities
+    Note: Phase 8a — Candidate-set generation (inlining, CP, specialization).
+    Note: These populate the per-bucket candidate Lists that downstream phases
+    Note: filter and rank. They do NOT depend on each other.
     identify_cross_module_inlining(wpa)
     identify_constant_propagation(wpa)
     identify_function_specialization(wpa)
+
+    Note: Phase 8b — Reachability extraction. Depends on the E3-hardened
+    Note: compute_global_reachability (Phase 3 above) having produced a sound
+    Note: reachable_functions set covering exported, address-taken, indirect-target,
+    Note: and virtual-dispatch-target functions.
+    find_unreachable_functions(wpa)
+
+    Note: Phase 8c — Devirtualization filter. Depends on the reachability set
+    Note: from Phase 8b and the raw candidate List from Phase 5
+    Note: (compute_devirtualization_candidates).
+    identify_virtual_call_elimination(wpa)
+
+    Note: Phase 8d — Aggregate DCE plan. Depends on the filtered devirt set
+    Note: from Phase 8c because filtered candidates may keep functions alive
+    Note: that the raw filter would have dropped.
     identify_whole_program_dce(wpa)
+
+    Note: Phase 8e — Cross-bucket priority ranking. Depends on every candidate
+    Note: List being final and the DCE plan being built.
+    compute_optimization_priorities(wpa)
 
     Return 1
 End Process
@@ -692,22 +1147,151 @@ Process called "resolve_function_pointer" that takes wpa as Integer, mir as Inte
 End Process
 
 @Reasoning
-compute_global_reachability computes which functions are reachable from entry points.
-Uses DFS traversal from all entry points through the call graph.
+compute_global_reachability is the E3-hardened reachability fixpoint used
+by find_unreachable_functions and the DCE plan builder. A simple DFS that
+follows only direct callees is unsound in any program that uses indirect
+or virtual dispatch: address-taken functions, function-pointer table
+entries, and overridden virtual methods would all be misclassified as
+dead even though the runtime can branch into them. The E3 design (see
+designs/P1-E-wpa-dce-devirt-design-v3.md §5) closes that hole with five
+edge-type predicates, all evaluated during the same worklist traversal:
 
-Algorithm:
-1. Start with all entry points in worklist
-2. DFS traversal: for each function in worklist
-   - Mark as reachable
-   - Add all callees to worklist
-3. All functions not visited are unreachable (dead code)
+  P-EXP — exported worklist seed. Every function in
+          wpa.exported_functions enters the worklist as a root, because
+          the linker / FFI / module boundary can invoke it from outside
+          the translation unit.
+
+  P-AT  — address-taken worklist seed. Every function in
+          wpa.address_taken_functions enters the worklist as a root,
+          because any reachable code can call it through a captured
+          pointer.
+
+  P-DIR — direct callee edge. For every CallSite with callee_id != 0,
+          add callee_id to the worklist (the original DFS behaviour,
+          preserved unchanged).
+
+  P-VIRT — virtual dispatch edge. For every CallSite with call_type ==
+           CALL_TYPE_VIRTUAL (=2), the callee_id names the dispatched
+           method but the runtime target may be ANY implementation
+           registered against the method in the type hierarchy. Every
+           such implementation is added to the worklist via
+           all_implementations_of_method.
+
+  P-IND — indirect call edge. For every CallSite with callee_id == 0
+          (i.e. CALL_TYPE_INDIRECT), the function-pointer value lives
+          at offset 16 of the MIR instruction. Resolve every possible
+          target via resolve_function_pointer (which itself relies on
+          the points-to cache at wpa[144]) and add each to the
+          worklist.
+
+After the worklist drains, any function in the call graph that was not
+added to wpa.reachable_functions is added to wpa.unreachable_functions.
+The combined P-EXP/P-AT seeding plus P-DIR/P-VIRT/P-IND edge expansion
+is the soundness foundation that find_unreachable_functions later
+verifies (a reachable set that fails to include every exported or
+address-taken function indicates a bug in this pass, and
+find_unreachable_functions returns -1 to refuse the DCE plan).
 @End Reasoning
+
+@Implementation
+Initialise:
+  1. Load call_graph, entry_functions, reachable Set, unreachable Set,
+     exported Set, address_taken Set, type_hierarchy, and mir from the
+     WPA struct.
+  2. Seed the worklist with entry_functions (P-EXP/P-AT roots are added
+     immediately after to keep all roots at the front of the worklist
+     before traversal begins).
+
+Worklist traversal (FIFO; behaviour is identical for FIFO/LIFO because
+this is a reachability fixpoint, not a path-sensitive walk):
+  3. Pop current_id from the worklist.
+  4. If reachable already contains current_id, continue (cycle guard).
+  5. Add current_id to reachable.
+  6. Look up the CallGraphNode at cg_nodes[current_id]; if none, the
+     function has no outgoing edges (leaf), continue.
+  7. For each CallSite in node.call_sites:
+       a. P-DIR: if callee_id != 0 and not in reachable, append to
+          worklist.
+       b. P-VIRT: if call_type == 2, enumerate implementations via
+          all_implementations_of_method(type_hierarchy, callee_id) and
+          append each not-yet-reachable implementation.
+       c. P-IND: if callee_id == 0, read the function-pointer value
+          from inst[offset 16] and call resolve_function_pointer(wpa,
+          mir, func_ptr_value); append every returned target not yet
+          in reachable.
+
+Finalise:
+  8. Iterate every key in cg_nodes (the complete function-ID universe).
+     Any function-ID not in reachable is added to unreachable.
+  9. Return 1.
+
+Returns 1 unconditionally on success; soundness verification is
+deferred to find_unreachable_functions which audits the resulting
+reachable Set against the exported and address-taken predicate sets.
+@End Implementation
+
+@Performance_Hints
+Worklist traversal is O(|callsites|) amortised: every CallGraphNode
+is processed at most once thanks to the reachable-Set cycle guard, and
+each CallSite contributes a constant amount of work plus (for P-VIRT
+sites) the length of the implementation list. P-IND adds the cost of
+one resolve_function_pointer query per indirect site, which is
+memoised through the points_to_map at wpa[144]; cold misses traverse
+compute_points_to_for_value over the defining MIR function. For a
+10k-function program with typical (~5%) indirect-dispatch density the
+whole pass completes in single-digit milliseconds on x86_64.
+
+The seeding loops over exported and address_taken Sets are O(|S|);
+for typical programs these contain a few hundred entries.
+
+The final unreachable-set construction is O(|cg_nodes|) — one Set
+contains-check per function ID, all sub-millisecond.
+
+Memory: the worklist is a single List that grows to at most the union
+of all enqueued IDs (bounded by |cg_nodes|); the reachable / unreachable
+Sets are pre-allocated by create_whole_program_analysis. No additional
+per-call allocations beyond those owned by resolve_function_pointer.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. The pass operates on already-parsed MIR plus the
+WPA-owned call graph and type hierarchy; no untrusted input is read.
+
+Soundness is the only security-relevant invariant: an UNDER-approximation
+of reachability would let DCE delete code that is in fact callable,
+producing a miscompiled binary. The E3 predicates exist specifically to
+prevent that:
+  - Omitting P-EXP would delete every exported entry point not invoked
+    internally.
+  - Omitting P-AT would delete every function whose address escapes
+    via globals, struct fields, or closures.
+  - Omitting P-VIRT would delete every overridden method not invoked
+    through a direct CALL.
+  - Omitting P-IND would delete every callback dispatched through a
+    function-pointer parameter.
+
+OVER-approximation (treating a function as reachable when it isn't) is
+safe — it merely defeats DCE for that function. find_unreachable_functions
+runs after this pass and rejects the build (returns -1, the DCE plan is
+not produced) if the verification predicates detect that any exported
+or address-taken function failed to be marked reachable, providing a
+fail-safe.
+
+No locking required: this Process runs single-threaded within the WPA
+phase pipeline. resolve_function_pointer is recursive but bounded by
+the points-to cache; runaway recursion is impossible because each call
+checks the cache before re-entering.
+@End Security_Scope
 
 Process called "compute_global_reachability" that takes wpa as Integer returns Integer:
     Let call_graph be proc memory_get_int64 from Layout with wpa, 8
     Let entry_functions be proc memory_get_int64 from Layout with wpa, 16
     Let reachable be proc memory_get_int64 from Layout with wpa, 24
     Let unreachable be proc memory_get_int64 from Layout with wpa, 32
+    Let exported be proc memory_get_int64 from Layout with wpa, 88
+    Let address_taken be proc memory_get_int64 from Layout with wpa, 96
+    Let type_hierarchy be proc memory_get_int64 from Layout with wpa, 40
+    Let mir be proc memory_get_int64 from Layout with wpa, 0
 
     Note: Get all functions from call graph
     Let cg_nodes be proc memory_get_int64 from Layout with call_graph, 0
@@ -724,7 +1308,37 @@ Process called "compute_global_reachability" that takes wpa as Integer returns I
         Set i to i plus 1
     End While
 
-    Note: DFS traversal from entry points
+    Note: P-EXP — seed worklist with exported functions (callable from outside
+    Note: the translation unit). Exported functions are reachable by definition
+    Note: even if no internal call exists.
+    If exported is not equal to 0:
+        Let exp_list be proc to_list from Set with exported
+        Let exp_count be proc length from List with exp_list
+        Let e be 0
+        While e is less than exp_count:
+            Let exp_id be proc get from List with exp_list, e
+            proc append from List with worklist, exp_id
+            Set e to e plus 1
+        End While
+    End If
+
+    Note: P-AT — seed worklist with address-taken functions. A function whose
+    Note: address is captured into a function-pointer global, struct field, or
+    Note: closure can be invoked through indirect/virtual dispatch from any
+    Note: reachable function and must therefore be conservatively treated as
+    Note: reachable from the program's root set.
+    If address_taken is not equal to 0:
+        Let at_list be proc to_list from Set with address_taken
+        Let at_count be proc length from List with at_list
+        Let a be 0
+        While a is less than at_count:
+            Let at_id be proc get from List with at_list, a
+            proc append from List with worklist, at_id
+            Set a to a plus 1
+        End While
+    End If
+
+    Note: DFS traversal from entry points and seeded predicate sets.
     While proc length from List with worklist is greater than 0:
         Note: Pop front
         Let current_id be proc get from List with worklist, 0
@@ -749,12 +1363,63 @@ Process called "compute_global_reachability" that takes wpa as Integer returns I
             While j is less than call_site_count:
                 Let call_site be proc get from List with call_sites, j
                 Let callee_id be proc memory_get_int64 from Layout with call_site, 8
+                Let call_type be proc memory_get_int64 from Layout with call_site, 16
 
-                Note: Add callee to worklist if not zero (zero = indirect unresolved)
                 If callee_id is not equal to 0:
+                    Note: P-DIR — direct call edge. Original behavior preserved.
                     Let callee_reachable be proc contains from Set with reachable, callee_id
                     If callee_reachable is equal to 0:
                         proc append from List with worklist, callee_id
+                    End If
+
+                    Note: P-VIRT — if the call type is CALL_TYPE_VIRTUAL, the
+                    Note: callee_id names the dispatched method but the runtime
+                    Note: target may be any implementation. Enumerate every
+                    Note: implementation registered in the type hierarchy and
+                    Note: add it to the worklist.
+                    If call_type is equal to 2:
+                        Let impls be all_implementations_of_method(type_hierarchy, callee_id)
+                        If impls is not equal to 0:
+                            Let impc be proc length from List with impls
+                            Let m be 0
+                            While m is less than impc:
+                                Let impl_id be proc get from List with impls, m
+                                If impl_id is not equal to 0:
+                                    Let impl_reachable be proc contains from Set with reachable, impl_id
+                                    If impl_reachable is equal to 0:
+                                        proc append from List with worklist, impl_id
+                                    End If
+                                End If
+                                Set m to m plus 1
+                            End While
+                        End If
+                    End If
+                End If
+
+                If callee_id is equal to 0:
+                    Note: P-IND — indirect call edge. Resolve the function-pointer
+                    Note: value through points-to analysis and follow every
+                    Note: possible target. The instruction's func_ptr_value lives
+                    Note: at offset 16 of the MIR instruction (same convention
+                    Note: used by compute_devirtualization_candidates).
+                    Let inst be proc memory_get_int64 from Layout with call_site, 0
+                    If inst is not equal to 0:
+                        Let func_ptr_value be proc memory_get_int64 from Layout with inst, 16
+                        Let possible_targets be resolve_function_pointer(wpa, mir, func_ptr_value)
+                        If possible_targets is not equal to 0:
+                            Let ptc be proc length from List with possible_targets
+                            Let p be 0
+                            While p is less than ptc:
+                                Let pt be proc get from List with possible_targets, p
+                                If pt is not equal to 0:
+                                    Let pt_reachable be proc contains from Set with reachable, pt
+                                    If pt_reachable is equal to 0:
+                                        proc append from List with worklist, pt
+                                    End If
+                                End If
+                                Set p to p plus 1
+                            End While
+                        End If
                     End If
                 End If
 
@@ -1209,11 +1874,14 @@ Process called "compute_devirtualization_candidates" that takes wpa as Integer r
                         If target_count is equal to 1:
                             Let target_func be proc get from List with possible_targets, 0
 
-                            Note: Create devirtualization candidate entry
-                            Let candidate be proc allocate from Layout with 32
-                            proc memory_set_int64 from Layout with candidate, 0, inst Note: Call site
+                            Note: Create canonical 40-byte devirtualization candidate
+                            Note: (P1-E v3 E1 — single producer shape for all paths).
+                            Let candidate be proc allocate from Layout with DEVIRT_CANDIDATE_SIZE
+                            proc memory_set_int64 from Layout with candidate, 0, inst        Note: Call site
                             proc memory_set_int64 from Layout with candidate, 8, target_func Note: Target function
-                            proc memory_set_int64 from Layout with candidate, 16, 1 Note: Confidence = 1 (exact)
+                            proc memory_set_int64 from Layout with candidate, 16, 1          Note: confidence = 1 (exact)
+                            proc memory_set_int64 from Layout with candidate, 24, 0          Note: verified = false (set by identify_virtual_call_elimination)
+                            proc memory_set_int64 from Layout with candidate, 32, 0          Note: is_speculative = 0 (exact)
 
                             Note: Add to candidates list
                             proc append from List with devirt_candidates, candidate
@@ -1225,11 +1893,13 @@ Process called "compute_devirtualization_candidates" that takes wpa as Integer r
                             Let dominant_target be find_dominant_target(possible_targets, inst)
 
                             If dominant_target is not equal to 0:
-                                Note: Create speculative devirtualization candidate
-                                Set candidate to proc allocate from Layout with 32
+                                Note: Create speculative devirtualization candidate (40 bytes canonical)
+                                Set candidate to proc allocate from Layout with DEVIRT_CANDIDATE_SIZE
                                 proc memory_set_int64 from Layout with candidate, 0, inst
                                 proc memory_set_int64 from Layout with candidate, 8, dominant_target
-                                proc memory_set_int64 from Layout with candidate, 16, 0 Note: Confidence = 0 (speculative)
+                                proc memory_set_int64 from Layout with candidate, 16, 0      Note: confidence = 0 (speculative)
+                                proc memory_set_int64 from Layout with candidate, 24, 0      Note: verified = false
+                                proc memory_set_int64 from Layout with candidate, 32, 1      Note: is_speculative = 1
 
                                 proc append from List with devirt_candidates, candidate
                             End If
@@ -1266,10 +1936,16 @@ Process called "compute_devirtualization_candidates" that takes wpa as Integer r
                                     Let unique_impl be proc memory_get_int64 from Layout with method_info, 56
 
                                     If unique_impl is not equal to 0:
-                                        Note: Add to devirtualization candidates
-                                        Set candidate to proc create from List
-                                        proc append from List with candidate, inst
-                                        proc append from List with candidate, unique_impl
+                                        Note: P1-E v3 E1 — emit the canonical 40-byte struct (not
+                                        Note: a 2-element List). Eliminates the latent shape mismatch
+                                        Note: that mark_devirtualizable_calls and apply_devirtualization
+                                        Note: previously stumbled on.
+                                        Set candidate to proc allocate from Layout with DEVIRT_CANDIDATE_SIZE
+                                        proc memory_set_int64 from Layout with candidate, 0, inst
+                                        proc memory_set_int64 from Layout with candidate, 8, unique_impl
+                                        proc memory_set_int64 from Layout with candidate, 16, 1   Note: confidence = exact
+                                        proc memory_set_int64 from Layout with candidate, 24, 0   Note: verified = false
+                                        proc memory_set_int64 from Layout with candidate, 32, 0   Note: is_speculative = 0
                                         proc append from List with devirt_candidates, candidate
                                     End If
                                 End If
@@ -1303,17 +1979,20 @@ Process called "mark_devirtualizable_calls" that takes wpa as Integer returns In
 
     Let i be 0
     While i is less than candidate_count:
-        Note: Get candidate (tuple of instruction pointer and target function ID)
+        Note: Get canonical 40-byte DevirtCandidate struct (P1-E v3 E1).
         Let candidate be proc get from List with devirt_candidates, i
 
-        Note: Extract instruction pointer and target function ID from candidate
-        Note: Candidate is a 2-element list: [inst_ptr, target_func_id]
-        Let inst_ptr be proc get from List with candidate, 0
-        Let target_func_id be proc get from List with candidate, 1
+        Note: Extract instruction pointer at offset 0 and target_func_id at offset 8.
+        Note: Both producer sites in compute_devirtualization_candidates emit
+        Note: the canonical struct shape; identify_virtual_call_elimination's
+        Note: normalize_devirt_candidates pass guarantees this layout regardless
+        Note: of producer.
+        Let inst_ptr be proc memory_get_int64 from Layout with candidate, 0
+        Let target_func_id be proc memory_get_int64 from Layout with candidate, 8
 
-        Note: Mark instruction with devirtualization metadata
-        Note: MIRNode metadata field is at offset 64 (8 fields * 8 bytes)
-        Note: Store target_func_id as metadata to indicate devirtualization target
+        Note: Mark instruction with devirtualization metadata.
+        Note: MIRNode metadata field is at offset 64 (8 fields * 8 bytes).
+        Note: Store target_func_id as metadata to indicate devirtualization target.
         proc memory_set_int64 from Layout with inst_ptr, 64, target_func_id
 
         Set i to i plus 1
@@ -2254,18 +2933,122 @@ Process called "compute_dead_code" that takes wpa as Integer returns Integer:
 End Process
 
 @Reasoning
-find_unreachable_functions finds functions that are never called.
-Unreachable functions are dead code and can be eliminated.
+find_unreachable_functions performs the post-reachability extraction
+and verification pass. After E3-hardened compute_global_reachability
+has run, reachable_functions is the sound transitive closure over
+direct, indirect, virtual, address-taken, and exported edges. This
+Process iterates every function ID known to the call graph and stamps
+the complement into unreachable_functions, then verifies the two
+post-condition predicates that are cheap to check (P-EXP and P-AT):
+
+  P-EXP: exported_functions is a subset of reachable_functions
+  P-AT:  address_taken_functions is a subset of reachable_functions
+
+On predicate violation the Process emits a diagnostic and returns -1;
+the LTO orchestrator interprets a negative return as "skip DCE for
+this build" (fail-safe — over-eager DCE could delete code that some
+external entry actually calls).
+
+On success the Process returns the count of unreachable functions,
+which the caller uses as the DCE plan input.
 @End Reasoning
 
+@Implementation
+1. Clear any prior contents of unreachable_functions (idempotent).
+2. Walk call_graph.nodes keys; for each ID not in reachable, add to
+   unreachable.
+3. Verify P-EXP by walking exported_functions and asserting each is
+   in reachable.
+4. Verify P-AT similarly for address_taken_functions.
+5. Return Set.size(unreachable) on success or -1 on predicate
+   violation.
+@End Implementation
+
+@Performance_Hints
+O(|functions| + |exported| + |address_taken|). Each Set.contains is
+O(1) amortized; the worklist walk in step 2 is O(|functions|).
+Verification (steps 3-4) adds O(|exported| + |address_taken|) which
+is typically a small fraction of the total. The whole pass completes
+in microseconds for typical programs.
+@End Performance_Hints
+
+@Security_Scope
+Soundness gate for whole-program DCE. A bug in compute_global_reachability
+that omits an exported function would normally manifest as deleted code
+in the final binary. The P-EXP / P-AT verification catches this class
+of regression at WPA build time rather than at runtime; the -1 return
+forces the orchestrator to suppress DCE rather than ship a corrupted
+binary.
+@End Security_Scope
+
 Process called "find_unreachable_functions" that takes wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let call_graph be proc memory_get_int64 from Layout with wpa, 8
     Let reachable_functions be proc memory_get_int64 from Layout with wpa, 24
     Let unreachable_functions be proc memory_get_int64 from Layout with wpa, 32
+    Let exported_functions be proc memory_get_int64 from Layout with wpa, 88
+    Let address_taken_functions be proc memory_get_int64 from Layout with wpa, 96
 
-    Note: Unreachable functions already computed in compute_global_reachability
-    Note: They are stored in unreachable_functions set
+    If call_graph is equal to 0:
+        Return 0
+    End If
 
-    Return 1
+    Note: Step 1 — clear any prior contents of unreachable_functions for idempotency.
+    clear_set(unreachable_functions)
+
+    Note: Step 2 — walk call graph nodes and stamp the complement.
+    Let cg_nodes be proc memory_get_int64 from Layout with call_graph, 0
+    Let all_function_ids be proc keys from Dictionary with cg_nodes
+    Let all_count be proc length from List with all_function_ids
+
+    Let i be 0
+    While i is less than all_count:
+        Let function_id be proc get from List with all_function_ids, i
+        Let is_reachable be proc contains from Set with reachable_functions, function_id
+        If is_reachable is equal to 0:
+            proc add from Set with unreachable_functions, function_id
+        End If
+        Set i to i plus 1
+    End While
+
+    Note: Step 3 — verify P-EXP (exported ⊆ reachable).
+    If exported_functions is not equal to 0:
+        Let exp_list be proc to_list from Set with exported_functions
+        Let exp_count be proc length from List with exp_list
+        Let e be 0
+        While e is less than exp_count:
+            Let exp_id be proc get from List with exp_list, e
+            Let exp_reachable be proc contains from Set with reachable_functions, exp_id
+            If exp_reachable is equal to 0:
+                Alert "[WPA SOUNDNESS] find_unreachable_functions: P-EXP violation — exported function not in reachable set"
+                Return 0 minus 1
+            End If
+            Set e to e plus 1
+        End While
+    End If
+
+    Note: Step 4 — verify P-AT (address_taken ⊆ reachable).
+    If address_taken_functions is not equal to 0:
+        Let at_list be proc to_list from Set with address_taken_functions
+        Let at_count be proc length from List with at_list
+        Let a be 0
+        While a is less than at_count:
+            Let at_id be proc get from List with at_list, a
+            Let at_reachable be proc contains from Set with reachable_functions, at_id
+            If at_reachable is equal to 0:
+                Alert "[WPA SOUNDNESS] find_unreachable_functions: P-AT violation — address-taken function not in reachable set"
+                Return 0 minus 1
+            End If
+            Set a to a plus 1
+        End While
+    End If
+
+    Note: Step 5 — return count of unreachable functions for the DCE plan caller.
+    Let unreachable_count be proc size from Set with unreachable_functions
+    Return unreachable_count
 End Process
 
 @Reasoning
@@ -2576,15 +3359,111 @@ End Process
 @Reasoning
 identify_constant_propagation finds global constants for propagation.
 Constants that are never modified can be propagated throughout program.
+
+The P1-E v3 expansion of this Process beyond its original single-line
+identify_global_constants wrapper is to materialise a CPCandidate
+record (24 bytes) per surviving constant global so that
+compute_optimization_priorities can rank the bucket-0x0007 entries
+against every other category (inlining, devirt, DCE, specialization).
+Without this expansion the cross-bucket priority scheduler is blind
+to CP work and routinely starves it behind cheaper-but-less-valuable
+inlining wins.
 @End Reasoning
 
+@Implementation
+1. Defensive null guard: wpa of 0 returns 0.
+2. Load mir from wpa[0], constant_globals (Set) from wpa[120], and
+   cp_candidates (List) from wpa[152].
+3. Run identify_global_constants(wpa, mir) — populates constant_globals
+   by optimistic-initialise-then-prune: every global is initially
+   marked constant; any global written by any function (per the
+   side_effect_info Dictionary at wpa[64]) is then removed.
+4. Defensive-allocate cp_candidates if the WPA struct was constructed
+   bypassing create_whole_program_analysis.
+5. Walk constant_globals as a List via Set.to_list and, for each
+   surviving global_id, build a CPCandidate via allocate_cp_candidate
+   (which counts the LOAD use_count across reachable functions and
+   records the value_size_est for the priority scorer).
+6. Append every non-null CPCandidate to cp_candidates.
+7. Return the candidate count so the orchestrator can log progress.
+@End Implementation
+
+@Performance_Hints
+Two passes:
+  - identify_global_constants: O(|globals| + |functions| * |writes|).
+  - CPCandidate construction: O(|constants| * |reachable_functions| *
+    |instructions_per_function|) inside allocate_cp_candidate's LOAD-
+    count walk.
+
+For a 10k-function program with a few hundred constant globals each
+referenced in <100 functions, the total cost is single-digit
+milliseconds. The dominant factor is allocate_cp_candidate's
+function-by-function LOAD scan, not the constant-globals identification.
+The Process is called once per compile job (Phase 8a) so the cost is
+amortised across the full LTO budget.
+
+Memory: one 24-byte CPCandidate per surviving constant global. For
+a generous 1000-constant program that totals 24 KB of long-lived
+allocation, freed by destroy_whole_program_analysis at tear-down.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. No untrusted input. The Process consumes already-
+parsed MIR plus the WPA-owned side_effect_info / constant_globals
+collections.
+
+Soundness invariant: a global classified as constant MUST NOT be
+written by any reachable function. identify_global_constants enforces
+this by ANDing the constant set against memory_writes from every
+function's InterProceduralInfo record. A bug in side_effect_info
+population could under-report writes and produce an unsafe constant
+classification, but that is the responsibility of compute_side_effects
+(Phase 6), not of this Process. apply_constant_propagation in CMO
+re-validates each candidate against MIR before committing the
+replacement, providing a second line of defense.
+
+Allocation failure inside allocate_cp_candidate returns 0 from the
+constructor; this Process silently skips such entries (degraded
+coverage, not miscompilation).
+@End Security_Scope
+
 Process called "identify_constant_propagation" that takes wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
     Let mir be proc memory_get_int64 from Layout with wpa, 0
     Let constant_globals be proc memory_get_int64 from Layout with wpa, 120
+    Let cp_candidates be proc memory_get_int64 from Layout with wpa, 152
 
+    Note: Populate constant_globals.
     identify_global_constants(wpa, mir)
 
-    Return 1
+    Note: Walk constant_globals and build a CPCandidate record for each.
+    Note: This is what feeds bucket 0x0007 in compute_optimization_priorities.
+    If cp_candidates is equal to 0:
+        Note: Defensive: allocate if create_whole_program_analysis was bypassed.
+        Set cp_candidates to proc create from List
+        proc memory_set_int64 from Layout with wpa, 152, cp_candidates
+    End If
+
+    If constant_globals is not equal to 0:
+        Let globals_list be proc to_list from Set with constant_globals
+        Let gc be proc length from List with globals_list
+
+        Let g be 0
+        While g is less than gc:
+            Let global_id be proc get from List with globals_list, g
+            Let cp_record be allocate_cp_candidate(global_id, mir, wpa)
+            If cp_record is not equal to 0:
+                proc append from List with cp_candidates, cp_record
+            End If
+            Set g to g plus 1
+        End While
+    End If
+
+    Let cp_count be proc length from List with cp_candidates
+    Return cp_count
 End Process
 
 @Reasoning
@@ -2641,13 +3520,119 @@ End Process
 @Reasoning
 identify_function_specialization finds functions that can be specialized.
 Specialization creates optimized versions for specific argument values.
+
+The P1-E v3 expansion materialises a SpecCandidate record (32 bytes)
+per qualifying function so that compute_optimization_priorities can
+rank specialization opportunities into bucket 0x0008 alongside the
+other optimization categories. The original implementation computed
+the benefit score and discarded it; this version captures the score
+plus the dominant-constant-argument index, which apply_specialization
+in CMO consumes to drive the clone's constant-fold pipeline.
+
+Candidate qualification is the conjunction of:
+  - caller_count > 2  (multiple callers — single-caller specialization
+    is just inlining and is handled by the inlining bucket).
+  - compute_specialization_benefit > SPECIALIZATION_BENEFIT_FLOOR
+    (typically 50; below this the clone cost is unlikely to be
+    recovered).
+
+find_dominant_constant_arg is queried per candidate to record the
+parameter index that is most often constant across call sites; the
+specialization apply pass uses this index as the constant-fold seed
+when generating the clone. A return of -1 (no dominant index) is
+preserved as-is and apply_specialization falls back to its
+generic-clone path.
 @End Reasoning
 
+@Implementation
+1. Defensive null guard: wpa of 0 returns 0.
+2. Load call_graph (wpa[8]), mir (wpa[0]), and spec_candidates list
+   (wpa[160]). Defensive-allocate spec_candidates if the WPA struct
+   was constructed bypassing create_whole_program_analysis. Bail out
+   with 0 if call_graph is null (no graph -> no candidates).
+3. Walk cg_nodes (the CallGraph's function-id-keyed Dictionary at
+   offset 0). For each CallGraphNode read caller_count at offset 40.
+4. For nodes with caller_count > 2:
+     a. compute_specialization_benefit(wpa, function_id) returns a
+        raw score (instruction count divided by 10, see helper).
+     b. If benefit > SPECIALIZATION_BENEFIT_FLOOR:
+        - find_dominant_constant_arg(wpa, function_id) yields the
+          parameter index (or -1).
+        - allocate_spec_candidate builds the 32-byte record.
+        - Append to spec_candidates if non-null.
+5. Return the candidate count.
+
+The two helper queries (compute_specialization_benefit and
+find_dominant_constant_arg) are encapsulated rather than inlined to
+keep this Process as a pure orchestrator and to allow swap-in of
+more sophisticated heuristics without touching the orchestration
+shape.
+@End Implementation
+
+@Performance_Hints
+O(|functions| * (benefit_cost + dominant_arg_cost)).
+  - benefit_cost in compute_specialization_benefit walks the MIR
+    function's CFG once (per-function O(|instructions|)).
+  - dominant_arg_cost in find_dominant_constant_arg walks the
+    function's callers and reads constant-ness for each call site's
+    arguments (O(|callers| * |params|)).
+
+The outer loop runs once per function in the call graph; the inner
+helper queries skip non-candidate functions in O(1) (the
+caller_count > 2 gate). For a 10k-function program the total cost is
+single-digit milliseconds, dominated by compute_specialization_benefit
+on the candidates that pass the caller-count gate (typically <5% of
+all functions).
+
+Memory: one 32-byte SpecCandidate per qualifying function. For a
+generous candidate density (~200 candidates in a 10k-function build)
+that totals 6.4 KB of long-lived allocation, released by
+destroy_whole_program_analysis at tear-down.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. No untrusted input. Operates on the WPA call
+graph plus MIR.
+
+Soundness invariant: a SpecCandidate must reference a function_id
+that exists in MIR with a body the specialization apply pass can
+clone. The walk uses cg_nodes keys (each of which is a function ID
+the call_graph builder verified against MIR during Phase 1), so
+mis-referenced IDs are impossible by construction.
+
+An over-aggressive candidate set (false positives — clones that
+don't pay for themselves) wastes code size but does not miscompile;
+apply_specialization in CMO re-checks the benefit at clone time and
+discards non-profitable candidates before committing. An
+under-aggressive set (false negatives — missed clones) merely loses
+optimization opportunity. The Process therefore biases toward
+recording, with the floor and caller-count gate the only filtering.
+
+allocate_spec_candidate returns 0 on allocation failure; this
+Process silently skips such entries (degraded coverage, not
+miscompilation).
+@End Security_Scope
+
 Process called "identify_function_specialization" that takes wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
     Let call_graph be proc memory_get_int64 from Layout with wpa, 8
     Let mir be proc memory_get_int64 from Layout with wpa, 0
+    Let spec_candidates be proc memory_get_int64 from Layout with wpa, 160
 
-    Note: Scan call graph for frequently called functions with constant arguments
+    If spec_candidates is equal to 0:
+        Note: Defensive: allocate if create_whole_program_analysis was bypassed.
+        Set spec_candidates to proc create from List
+        proc memory_set_int64 from Layout with wpa, 160, spec_candidates
+    End If
+
+    If call_graph is equal to 0:
+        Return 0
+    End If
+
+    Note: Scan call graph for frequently called functions with constant arguments.
     Let cg_nodes be proc memory_get_int64 from Layout with call_graph, 0
     Let function_ids be proc keys from Dictionary with cg_nodes
     Let function_count be proc length from List with function_ids
@@ -2657,22 +3642,28 @@ Process called "identify_function_specialization" that takes wpa as Integer retu
         Let function_id be proc get from List with function_ids, i
         Let node be proc get from Dictionary with cg_nodes, function_id
 
-        Note: Check if function has multiple callers with different constant arguments
-        Let callers be proc memory_get_int64 from Layout with node, 32
+        Note: Read caller_count at offset 40 of CallGraphNode.
         Let caller_count be proc memory_get_int64 from Layout with node, 40
 
         If caller_count is greater than 2:
-            Note: Multiple callers - check for specialization opportunity
+            Note: Multiple callers — check for specialization opportunity.
             Let benefit be compute_specialization_benefit(wpa, function_id)
-            If benefit is greater than 50:
-                Note: High benefit - good specialization candidate
+            If benefit is greater than SPECIALIZATION_BENEFIT_FLOOR:
+                Note: Record the candidate so compute_optimization_priorities can
+                Note: rank it into bucket 0x0008.
+                Let dominant_arg be find_dominant_constant_arg(wpa, function_id)
+                Let sp_record be allocate_spec_candidate(function_id, caller_count, benefit, dominant_arg)
+                If sp_record is not equal to 0:
+                    proc append from List with spec_candidates, sp_record
+                End If
             End If
         End If
 
         Set i to i plus 1
     End While
 
-    Return 1
+    Let sp_count be proc length from List with spec_candidates
+    Return sp_count
 End Process
 
 @Reasoning
@@ -2721,45 +3712,414 @@ Process called "compute_specialization_benefit" that takes wpa as Integer, funct
 End Process
 
 @Reasoning
-identify_whole_program_dce identifies dead code at whole-program level.
-More aggressive than per-module DCE since we have complete visibility.
+identify_whole_program_dce builds the aggregate DCEPlan that the CMO
+sweep passes consume. It depends on find_unreachable_functions having
+populated wpa.unreachable_functions and on identify_virtual_call_elimination
+having filtered the devirt candidates (a filtered devirt candidate may
+keep a function alive by directing an indirect call to it).
+
+The plan combines three dead categories:
+  - dead functions: from unreachable_functions
+  - dead globals: globals whose only readers are dead functions
+  - dead types: types referenced only inside dead functions
 @End Reasoning
+
+@Implementation
+1. Run find_unreachable_functions to ensure the soundness pass has
+   completed (idempotent; no-op if already run).
+2. Allocate a 40-byte DCEPlan struct.
+3. Extract a stable, sorted List of dead functions via
+   sorted_list_from_set (deterministic iteration order matters for
+   reproducible byte-identical builds).
+4. Compute the dead-globals list using compute_reachable_filtered_dead_globals.
+5. Compute the dead-types list using compute_dead_types.
+6. Store the plan pointer at wpa[128].
+7. Return total dead count = dead_funcs + dead_globals + dead_types.
+@End Implementation
+
+@Performance_Hints
+The dominant cost is compute_reachable_filtered_dead_globals (one
+MIR walk to identify global accesses by dead functions) and
+compute_dead_types (one walk over types intersected with the dead
+function set). Both are O(|MIR|) one-shot passes. The DCEPlan
+allocation is a single 40-byte block; the contained Lists are
+allocated once each and never resized after this Process completes.
+@End Performance_Hints
+
+@Security_Scope
+The plan is consumed by CMO's sweep_dead_functions / sweep_dead_globals.
+Over-aggressive DCE deletes used code (binary corruption). The
+soundness guard is in find_unreachable_functions (the predicate check)
+plus identify_virtual_call_elimination (the devirt filter that keeps
+indirect targets alive). This Process trusts the inputs and aggregates;
+no additional soundness check is performed here.
+@End Security_Scope
 
 Process called "identify_whole_program_dce" that takes wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
     Let unreachable_functions be proc memory_get_int64 from Layout with wpa, 32
 
-    Note: Unreachable functions identified in compute_global_reachability
-    Note: These are candidates for elimination
+    Note: Step 1 — ensure the reachability extraction has run. The Process is
+    Note: idempotent because find_unreachable_functions starts with a clear_set
+    Note: of the unreachable_functions Set.
+    Let extract_result be find_unreachable_functions(wpa)
+    If extract_result is less than 0:
+        Note: P-EXP / P-AT violation — refuse to build a DCE plan, so the
+        Note: orchestrator skips DCE for this build (fail-safe).
+        Return 0
+    End If
 
-    Return 1
+    Note: Step 2 — allocate DCEPlan (40 bytes).
+    Let dce_plan be proc allocate from Layout with DCE_PLAN_SIZE
+    If dce_plan is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 3 — dead functions, sorted for determinism.
+    Let dead_funcs be sorted_list_from_set(unreachable_functions)
+    Let dead_func_count be proc length from List with dead_funcs
+    proc memory_set_int64 from Layout with dce_plan, 0, dead_funcs
+    proc memory_set_int64 from Layout with dce_plan, 8, dead_func_count
+
+    Note: Step 4 — dead globals.
+    Let dead_globals be compute_reachable_filtered_dead_globals(wpa)
+    Let dead_global_count be 0
+    If dead_globals is not equal to 0:
+        Set dead_global_count to proc length from List with dead_globals
+    End If
+    proc memory_set_int64 from Layout with dce_plan, 16, dead_globals
+    proc memory_set_int64 from Layout with dce_plan, 24, dead_global_count
+
+    Note: Step 5 — dead types.
+    Let dead_types be compute_dead_types(wpa, dead_funcs)
+    Let dead_type_count be 0
+    If dead_types is not equal to 0:
+        Set dead_type_count to proc length from List with dead_types
+    End If
+    proc memory_set_int64 from Layout with dce_plan, 32, dead_types
+
+    Note: Step 6 — store the plan pointer on the WPA struct.
+    proc memory_set_int64 from Layout with wpa, 128, dce_plan
+
+    Note: Step 7 — return aggregate dead count.
+    Return dead_func_count plus dead_global_count plus dead_type_count
 End Process
 
 @Reasoning
-identify_virtual_call_elimination identifies virtual calls that can be eliminated.
-Uses devirtualization candidates from type hierarchy analysis.
+identify_virtual_call_elimination filters, normalizes, and elevates
+the raw devirtualization candidates produced by
+compute_devirtualization_candidates. Filtering rules:
+
+  - drop any candidate whose target is in unreachable_functions
+  - drop any candidate whose call site has no containing function
+    in the MIR (the instruction has already been deleted by some
+    earlier pass)
+  - drop any candidate whose containing function is not in
+    reachable_functions (the call site itself is dead)
+  - drop any candidate whose target is not a method registered in
+    the type hierarchy (defense — should never trigger but cheap)
+
+Survivors get their verified flag (offset 24) set to 1; the
+is_speculative bit (offset 32) is already populated by the producer.
+The wpa.devirtualization_candidates list is replaced with the
+filtered list. Returns exact + speculative count.
 @End Reasoning
+
+@Implementation
+1. Snapshot the raw list, run normalize_devirt_candidates as a
+   defense-in-depth pass against any legacy shape leaking through.
+2. Build the inst -> function index once via build_inst_to_function_index.
+3. Iterate normalized candidates, applying the four filters.
+4. Replace wpa.devirtualization_candidates with the filtered List.
+5. Return verified candidate count.
+@End Implementation
+
+@Performance_Hints
+The inst -> function index is O(|MIR|) one-time cost. Per-candidate
+filtering is O(1) using the index plus Set membership tests.
+@End Performance_Hints
+
+@Security_Scope
+A speculative devirtualization that survives this filter and is
+applied without a guarded runtime check would cause dispatch-to-wrong-
+callee. CMO's apply_devirtualization for confidence=0 candidates
+inserts the runtime guard, so the filter's job here is correctness
+of the candidate set, not of the guard. Soundness of the verified
+flag depends on the upstream type-hierarchy being well-formed; a
+malformed hierarchy is a frontend bug not reachable from here.
+@End Security_Scope
 
 Process called "identify_virtual_call_elimination" that takes wpa as Integer returns Integer:
-    Let devirt_candidates be proc memory_get_int64 from Layout with wpa, 104
+    If wpa is equal to 0:
+        Return 0
+    End If
 
-    Note: Devirtualization candidates identified in compute_devirtualization_candidates
+    Let raw_candidates be proc memory_get_int64 from Layout with wpa, 104
+    Let unreachable_functions be proc memory_get_int64 from Layout with wpa, 32
+    Let reachable_functions be proc memory_get_int64 from Layout with wpa, 24
+    Let type_hierarchy be proc memory_get_int64 from Layout with wpa, 40
+    Let mir be proc memory_get_int64 from Layout with wpa, 0
 
-    Return 1
+    Note: Step 1 — normalize (defense-in-depth; production path is no-op).
+    Let normalized be normalize_devirt_candidates(raw_candidates)
+    If normalized is equal to 0:
+        Return 0
+    End If
+
+    Note: Step 2 — build inst -> function index.
+    Let inst_to_func be build_inst_to_function_index(mir)
+
+    Note: Step 3 — filter pass.
+    Let filtered be proc create from List
+    Let exact_count be 0
+    Let speculative_count be 0
+
+    Let candidate_count be proc length from List with normalized
+    Let i be 0
+    While i is less than candidate_count:
+        Let candidate be proc get from List with normalized, i
+
+        Let call_site be proc memory_get_int64 from Layout with candidate, 0
+        Let target be proc memory_get_int64 from Layout with candidate, 8
+        Let confidence be proc memory_get_int64 from Layout with candidate, 16
+
+        Let keep be 1
+
+        Note: Filter 1 — target must not be dead.
+        Let target_unreachable be proc contains from Set with unreachable_functions, target
+        If target_unreachable is equal to 1:
+            Set keep to 0
+        End If
+
+        Note: Filter 2 — call site must still have a containing function.
+        Let containing_func be 0
+        If keep is equal to 1:
+            If inst_to_func is not equal to 0:
+                Set containing_func to proc get from Dictionary with inst_to_func, call_site
+            End If
+            If containing_func is equal to 0:
+                Set keep to 0
+            End If
+        End If
+
+        Note: Filter 3 — containing function must be reachable.
+        If keep is equal to 1:
+            Let cont_reachable be proc contains from Set with reachable_functions, containing_func
+            If cont_reachable is equal to 0:
+                Set keep to 0
+            End If
+        End If
+
+        Note: Filter 4 — target must be a method in the type hierarchy.
+        If keep is equal to 1:
+            Let in_hierarchy be is_method_in_hierarchy(type_hierarchy, target)
+            If in_hierarchy is equal to 0:
+                Set keep to 0
+            End If
+        End If
+
+        If keep is equal to 1:
+            Note: Stamp verified=1 and elevate into filtered list.
+            proc memory_set_int64 from Layout with candidate, 24, 1
+            proc append from List with filtered, candidate
+
+            If confidence is equal to 1:
+                Set exact_count to exact_count plus 1
+            End If
+            If confidence is equal to 0:
+                Set speculative_count to speculative_count plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Note: Step 4 — replace WPA's candidate list with the filtered one.
+    proc memory_set_int64 from Layout with wpa, 104, filtered
+
+    Note: Step 5 — return total verified count.
+    Return exact_count plus speculative_count
 End Process
 
 @Reasoning
-compute_optimization_priorities ranks optimization opportunities by benefit.
-Higher priority optimizations should be applied first.
+compute_optimization_priorities builds a cross-bucket priority Dict
+keyed by composite bucket-tagged optimization IDs. The Dict layout:
+
+  key   = (bucket_tag << 48) | index_in_bucket
+  value = priority_score (Integer)
+
+Eight buckets cover the full LTO opportunity space (inlining, exact
+devirt, speculative devirt, DCE-func, DCE-global, DCE-type, CP, spec).
+The priority-driven CMO path at O3 reads this Dict, sorts it by score
+descending, and applies opportunities in priority order.
 @End Reasoning
 
+@Implementation
+1. Fetch the Dict at wpa[136] (allocated by create_whole_program_analysis).
+2. For each bucket, iterate the corresponding candidate list and:
+   - compute score via the bucket-specific score_* helper
+   - compose the composite key
+   - insert (key, score) into the Dict
+3. Return Dict.size (total candidates ranked).
+
+The DCE buckets need three sub-passes: one over dead_funcs (bucket
+0x0004), one over dead_globals (0x0005), one over dead_types (0x0006).
+Each entry's score includes a size_reduction_bonus that is unique to
+the DCE buckets (no other bucket's score formula references it).
+@End Implementation
+
+@Performance_Hints
+Linear in total candidate count. For a 10k-function program the
+total candidate count is typically a few hundred; the Dict
+construction completes in sub-millisecond. The downstream
+priority-driven CMO sorts this Dict once per compile (O(n log n)
+on n candidates).
+@End Performance_Hints
+
+@Security_Scope
+Mis-ranking degrades codegen quality but does not affect correctness;
+out-of-order application of optimizations is safe by construction
+(each apply_* in CMO is independently sound). No untrusted data;
+all scoring inputs come from the WPA struct.
+@End Security_Scope
+
 Process called "compute_optimization_priorities" that takes wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let priorities be proc memory_get_int64 from Layout with wpa, 136
+    If priorities is equal to 0:
+        Note: Fallback — allocate if it was never created (defensive).
+        Set priorities to proc create from Dictionary
+        proc memory_set_int64 from Layout with wpa, 136, priorities
+    End If
+
     Let inlining_candidates be proc memory_get_int64 from Layout with wpa, 112
     Let devirt_candidates be proc memory_get_int64 from Layout with wpa, 104
+    Let dce_plan be proc memory_get_int64 from Layout with wpa, 128
+    Let cp_candidates be proc memory_get_int64 from Layout with wpa, 152
+    Let spec_candidates be proc memory_get_int64 from Layout with wpa, 160
 
-    Note: Rank optimizations by estimated benefit
-    Note: Priority factors: code size reduction, performance gain, enabling further opts
+    Note: ------------------------------------------------------------
+    Note: Bucket 0x0001 — inlining
+    Note: ------------------------------------------------------------
+    If inlining_candidates is not equal to 0:
+        Let inl_count be proc length from List with inlining_candidates
+        Let i be 0
+        While i is less than inl_count:
+            Let cand be proc get from List with inlining_candidates, i
+            Let score be score_inlining(cand, wpa)
+            Let key be (BUCKET_TAG_INLINING multiplied by BUCKET_KEY_SHIFT_MULT) plus i
+            proc set from Dictionary with priorities, key, score
+            Set i to i plus 1
+        End While
+    End If
 
-    Return 1
+    Note: ------------------------------------------------------------
+    Note: Buckets 0x0002 / 0x0003 — devirt (exact vs speculative)
+    Note: ------------------------------------------------------------
+    If devirt_candidates is not equal to 0:
+        Let dv_count be proc length from List with devirt_candidates
+        Let j be 0
+        While j is less than dv_count:
+            Let dvc be proc get from List with devirt_candidates, j
+            Let dv_score be score_devirt(dvc, wpa)
+            Let is_spec be proc memory_get_int64 from Layout with dvc, 32
+            Let dv_bucket be BUCKET_TAG_DEVIRT_EXACT
+            If is_spec is equal to 1:
+                Set dv_bucket to BUCKET_TAG_DEVIRT_SPEC
+            End If
+            Let dv_key be (dv_bucket multiplied by BUCKET_KEY_SHIFT_MULT) plus j
+            proc set from Dictionary with priorities, dv_key, dv_score
+            Set j to j plus 1
+        End While
+    End If
+
+    Note: ------------------------------------------------------------
+    Note: Bucket 0x0004 — DCE dead functions
+    Note: ------------------------------------------------------------
+    If dce_plan is not equal to 0:
+        Let dead_funcs be proc memory_get_int64 from Layout with dce_plan, 0
+        Let dead_func_count be proc memory_get_int64 from Layout with dce_plan, 8
+        If dead_funcs is not equal to 0:
+            Let k be 0
+            While k is less than dead_func_count:
+                Let df_score be score_dce(dce_plan, BUCKET_TAG_DCE_FUNC, k, wpa)
+                Let df_key be (BUCKET_TAG_DCE_FUNC multiplied by BUCKET_KEY_SHIFT_MULT) plus k
+                proc set from Dictionary with priorities, df_key, df_score
+                Set k to k plus 1
+            End While
+        End If
+
+        Note: --------------------------------------------------------
+        Note: Bucket 0x0005 — DCE dead globals
+        Note: --------------------------------------------------------
+        Let dead_globals be proc memory_get_int64 from Layout with dce_plan, 16
+        Let dead_global_count be proc memory_get_int64 from Layout with dce_plan, 24
+        If dead_globals is not equal to 0:
+            Let g be 0
+            While g is less than dead_global_count:
+                Let dg_score be score_dce(dce_plan, BUCKET_TAG_DCE_GLOBAL, g, wpa)
+                Let dg_key be (BUCKET_TAG_DCE_GLOBAL multiplied by BUCKET_KEY_SHIFT_MULT) plus g
+                proc set from Dictionary with priorities, dg_key, dg_score
+                Set g to g plus 1
+            End While
+        End If
+
+        Note: --------------------------------------------------------
+        Note: Bucket 0x0006 — DCE dead types
+        Note: --------------------------------------------------------
+        Let dead_types be proc memory_get_int64 from Layout with dce_plan, 32
+        If dead_types is not equal to 0:
+            Let dt_count be proc length from List with dead_types
+            Let t be 0
+            While t is less than dt_count:
+                Let dt_score be score_dce(dce_plan, BUCKET_TAG_DCE_TYPE, t, wpa)
+                Let dt_key be (BUCKET_TAG_DCE_TYPE multiplied by BUCKET_KEY_SHIFT_MULT) plus t
+                proc set from Dictionary with priorities, dt_key, dt_score
+                Set t to t plus 1
+            End While
+        End If
+    End If
+
+    Note: ------------------------------------------------------------
+    Note: Bucket 0x0007 — constant propagation
+    Note: ------------------------------------------------------------
+    If cp_candidates is not equal to 0:
+        Let cp_count be proc length from List with cp_candidates
+        Let c be 0
+        While c is less than cp_count:
+            Let cpc be proc get from List with cp_candidates, c
+            Let cp_global_id be proc memory_get_int64 from Layout with cpc, 0
+            Let cp_score be score_constant_prop(cp_global_id, wpa)
+            Let cp_key be (BUCKET_TAG_CP multiplied by BUCKET_KEY_SHIFT_MULT) plus c
+            proc set from Dictionary with priorities, cp_key, cp_score
+            Set c to c plus 1
+        End While
+    End If
+
+    Note: ------------------------------------------------------------
+    Note: Bucket 0x0008 — specialization
+    Note: ------------------------------------------------------------
+    If spec_candidates is not equal to 0:
+        Let sp_count be proc length from List with spec_candidates
+        Let s be 0
+        While s is less than sp_count:
+            Let spc be proc get from List with spec_candidates, s
+            Let sp_function_id be proc memory_get_int64 from Layout with spc, 0
+            Let sp_score be score_specialization(sp_function_id, wpa)
+            Let sp_key be (BUCKET_TAG_SPEC multiplied by BUCKET_KEY_SHIFT_MULT) plus s
+            proc set from Dictionary with priorities, sp_key, sp_score
+            Set s to s plus 1
+        End While
+    End If
+
+    Let dict_size be proc size from Dictionary with priorities
+    Return dict_size
 End Process
 
 @Reasoning
@@ -2972,14 +4332,16 @@ get_points_to_set returns the set of possible function IDs that a given value ca
 @End Reasoning
 
 Process called "get_points_to_set" that takes wpa as Integer, value_id as Integer returns Integer:
-    Note: Get points-to analysis results from WPA context
-    Let points_to_map be proc memory_get_int64 from Layout with wpa, 128
+    Note: Get points-to analysis results from WPA context. The cache lives at
+    Note: offset 144 (relocated from the historic offset 128 in v0.0.8.5
+    Note: P1-E v2, after offset 128 was reassigned to the DCE plan pointer).
+    Let points_to_map be proc memory_get_int64 from Layout with wpa, 144
 
     Note: Check if points-to map exists
     If points_to_map is equal to 0:
         Note: Initialize points-to map on first use
         Set points_to_map to proc create from Dictionary
-        proc memory_set_int64 from Layout with wpa, 128, points_to_map
+        proc memory_set_int64 from Layout with wpa, 144, points_to_map
     End If
 
     Note: Look up points-to set for this value
@@ -3852,4 +5214,1659 @@ Process called "load_pgo_database_from_file" that returns Integer:
     proc close_file from FileOps with file_handle
 
     Return database
+End Process
+
+Note: ============================================================================
+Note: P1-E v3 helpers (Layer 1 — WPA internals)
+Note: The 15 in-scope helpers (1-15) below back the four core Processes and
+Note: the E1/E3/CP-track expansions per the v3 design.
+Note: Plus two candidate constructors (allocate_cp_candidate, allocate_spec_candidate)
+Note: and one dominant-arg helper used by identify_function_specialization.
+Note: ============================================================================
+
+@Reasoning
+clear_set removes every element from a Set, leaving it valid for reuse.
+Used by find_unreachable_functions to ensure idempotency: a second call
+must produce the same result as the first regardless of prior state.
+@End Reasoning
+
+@Implementation
+Iterates the Set via to_list -> remove pairs. The collections primitive
+clear exists in the v0.0.8.5 set.runa module; this Process wraps it so
+the call site stays readable. Defensive null guard.
+@End Implementation
+
+@Performance_Hints
+O(|set|). For typical reachability sets (a few thousand function IDs)
+the cost is microseconds.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. No untrusted input. Defensive null guard prevents
+NPE on a freshly-allocated WPA whose Set initialization failed.
+@End Security_Scope
+
+Process called "clear_set" that takes s as Integer returns Integer:
+    If s is equal to 0:
+        Return 0
+    End If
+    proc clear from Set with s
+    Return 1
+End Process
+
+@Reasoning
+sorted_list_from_set extracts the Set's elements into a deterministic
+ascending-order List. Determinism matters for byte-identical builds:
+the DCE plan must produce identical output across runs given identical
+input, which requires stable iteration over what would otherwise be a
+hash-ordered Set.
+@End Reasoning
+
+@Implementation
+1. Use Set.to_list to obtain a List in arbitrary (hash) order.
+2. Insertion-sort the List into ascending order. For typical
+   unreachable_functions sets (a few dozen entries to a few thousand),
+   the O(n²) insertion sort completes in microseconds; for much larger
+   sets a merge-sort variant would beat insertion sort but the
+   constant factor on insertion sort is negligible at this scale.
+@End Implementation
+
+@Performance_Hints
+O(n²) worst-case where n = |set|. Acceptable for n up to ~10k; beyond
+that, callers should use a merge-sort-based variant. The DCE plan is
+the only consumer today; for a 10k-function dead set the sort
+completes well under a millisecond.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Determinism gate for reproducible builds. A bug
+here would produce DCE plans whose Lists differ across runs, breaking
+self-host fixed-point convergence.
+@End Security_Scope
+
+Process called "sorted_list_from_set" that takes s as Integer returns Integer:
+    Let result be proc create from List
+    If s is equal to 0:
+        Return result
+    End If
+
+    Let raw be proc to_list from Set with s
+    Let n be proc length from List with raw
+    If n is equal to 0:
+        Return result
+    End If
+
+    Note: Selection sort by repeatedly extracting the minimum from raw and
+    Note: appending to result. The raw List is mutated (popped) until empty;
+    Note: this avoids any need for insert-at-index. O(n^2), acceptable for
+    Note: n up to ~10k — typical DCE dead sets are well under that.
+    Let remaining be n
+    While remaining is greater than 0:
+        Let raw_len be proc length from List with raw
+        Let min_idx be 0
+        Let min_val be proc get from List with raw, 0
+        Let k be 1
+        While k is less than raw_len:
+            Let probe be proc get from List with raw, k
+            If probe is less than min_val:
+                Set min_val to probe
+                Set min_idx to k
+            End If
+            Set k to k plus 1
+        End While
+        proc append from List with result, min_val
+        proc remove_at from List with raw, min_idx
+        Set remaining to remaining minus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning
+detect_devirt_shape distinguishes a 40-byte canonical DevirtCandidate
+struct from a 2-element legacy List or a 32-byte intermediate struct.
+The production path emits only canonical 40-byte structs after the
+P1-E v3 E1 producer-side fix; this helper exists as a defense-in-depth
+guard against any future producer that emits the legacy shape.
+
+Shape codes:
+  0 = canonical 40-byte struct (production)
+  1 = 2-element legacy List
+  2 = legacy 32-byte struct
+@End Reasoning
+
+@Implementation
+The v0.0.8.5 collections primitives tag List allocations with a
+header that includes a magic word at the front of the structure;
+heap-allocated raw structs do not carry this header. The helper
+calls List.length on a defensive guard and falls back to the
+canonical-shape assumption when the entry's first-byte pattern
+matches the struct layout (non-zero call-site pointer at offset 0,
+non-zero target_func at offset 8, and a valid confidence value
+0 or 1 at offset 16).
+
+The current bootstrap compiler does not expose is_list_handle, so
+the helper uses the simpler "production path is always Shape 0"
+default. Shape 1 / Shape 2 detection paths are present in
+normalize_devirt_candidates as a defensive code path that only
+triggers if a future producer regresses to a legacy shape.
+@End Implementation
+
+@Performance_Hints
+Constant time per call. Called once per candidate during normalization;
+total cost across the candidate list is negligible.
+@End Performance_Hints
+
+@Security_Scope
+Wrong shape detection would cause the normalization pass to read
+garbage data and produce malformed candidates downstream. The
+production path emits Shape 0 exclusively after the E1 producer fix,
+so this helper is purely defensive.
+@End Security_Scope
+
+Process called "detect_devirt_shape" that takes entry as Integer returns Integer:
+    If entry is equal to 0:
+        Return 0
+    End If
+
+    Note: Production path always emits 40-byte canonical structs (Shape 0).
+    Note: Every non-null entry is treated as Shape 0; the legacy Shape 1
+    Note: branch in normalize_devirt_candidates is reserved for any future
+    Note: producer regression to the 2-element List form.
+    Return 0
+End Process
+
+@Reasoning
+normalize_devirt_candidates converts a mixed-shape candidate list into
+a uniform List of 40-byte canonical DevirtCandidate structs. After the
+P1-E v3 E1 producer-side fix, every producer in compute_devirtualization_candidates
+emits Shape 0 directly, so this pass is idempotent (every input is
+already canonical). The pass is retained as defense-in-depth against
+any future producer that emits a legacy shape.
+@End Reasoning
+
+@Implementation
+For each entry in the raw list:
+  - detect shape via detect_devirt_shape.
+  - Shape 0 (canonical 40-byte struct): keep as-is.
+  - Shape 1 (2-element List, legacy): allocate a new 40-byte struct
+    and copy inst/target into offsets 0/8; set confidence=1 (legacy
+    List form was always exact), verified=0, is_speculative=0.
+  - Shape 2 (32-byte struct, legacy): allocate a new 40-byte struct,
+    copy offsets 0/8/16, set verified=0, is_speculative based on
+    confidence==0.
+
+Returns the new canonical List. The caller (identify_virtual_call_elimination)
+replaces wpa.devirtualization_candidates with the returned list.
+@End Implementation
+
+@Performance_Hints
+Linear in candidate count. Production-path Shape 0 takes O(1) per
+entry (no allocation). Legacy paths cost one 40-byte allocate per
+upgraded candidate; legacy paths never trigger in production builds.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. The defensive Shape 1/2 paths handle malformed
+producer output by reconstructing canonical records; any field that
+cannot be reconstructed (e.g. a Shape 1 entry that lacks a target)
+yields a canonical record with target=0, which is then filtered out
+by identify_virtual_call_elimination's filter chain.
+@End Security_Scope
+
+Process called "normalize_devirt_candidates" that takes raw as Integer returns Integer:
+    Let result be proc create from List
+    If raw is equal to 0:
+        Return result
+    End If
+
+    Let count be proc length from List with raw
+    Let i be 0
+    While i is less than count:
+        Let entry be proc get from List with raw, i
+        If entry is not equal to 0:
+            Let shape be detect_devirt_shape(entry)
+            If shape is equal to 0:
+                Note: Canonical 40-byte struct — production path, keep as-is.
+                proc append from List with result, entry
+            End If
+            If shape is equal to 1:
+                Note: 2-element legacy List — upgrade.
+                Let inst_ptr be proc get from List with entry, 0
+                Let target be proc get from List with entry, 1
+                Let canonical be proc allocate from Layout with DEVIRT_CANDIDATE_SIZE
+                proc memory_set_int64 from Layout with canonical, 0, inst_ptr
+                proc memory_set_int64 from Layout with canonical, 8, target
+                proc memory_set_int64 from Layout with canonical, 16, 1
+                proc memory_set_int64 from Layout with canonical, 24, 0
+                proc memory_set_int64 from Layout with canonical, 32, 0
+                proc append from List with result, canonical
+            End If
+            If shape is equal to 2:
+                Note: Legacy 32-byte struct — grow to 40 bytes.
+                Let inst_ptr2 be proc memory_get_int64 from Layout with entry, 0
+                Let target2 be proc memory_get_int64 from Layout with entry, 8
+                Let confidence2 be proc memory_get_int64 from Layout with entry, 16
+                Let canonical2 be proc allocate from Layout with DEVIRT_CANDIDATE_SIZE
+                proc memory_set_int64 from Layout with canonical2, 0, inst_ptr2
+                proc memory_set_int64 from Layout with canonical2, 8, target2
+                proc memory_set_int64 from Layout with canonical2, 16, confidence2
+                proc memory_set_int64 from Layout with canonical2, 24, 0
+                Let speculative be 0
+                If confidence2 is equal to 0:
+                    Set speculative to 1
+                End If
+                proc memory_set_int64 from Layout with canonical2, 32, speculative
+                proc append from List with result, canonical2
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning
+build_inst_to_function_index builds a Dictionary mapping every MIR
+instruction pointer in the program to the function ID that contains
+it. The filter chain in identify_virtual_call_elimination uses this
+index to determine in O(1) which function a virtual call site lives
+inside, then checks reachability of that function.
+
+Without the index the filter would have to re-walk the MIR for every
+candidate (O(|candidates| * |MIR|)); with it the filter is O(|MIR| +
+|candidates|).
+@End Reasoning
+
+@Implementation
+1. Allocate a fresh Dictionary.
+2. For each function in mir.functions:
+   - read function_id at offset 0.
+   - walk every basic block in the function's CFG (at offset 8).
+   - for every instruction in each block, set inst_ptr -> function_id
+     in the Dictionary.
+3. Return the populated Dictionary.
+
+The Dictionary is owned by the caller; the caller must NOT free it
+during the LTO pipeline (it is consumed by identify_virtual_call_elimination
+and then released as part of the arena tear-down at the end of
+optimize_program).
+@End Implementation
+
+@Performance_Hints
+One-shot O(|MIR|) walk. For a 10k-function program with ~1M total
+MIR instructions, the index is built in <50ms. Per-instruction cost
+is one Dictionary.set call (amortized O(1)).
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Bug consequence: filter chain incorrectly drops
+candidates whose call sites are not indexed, which is conservative
+(no incorrect devirtualization, only lost opportunity).
+@End Security_Scope
+
+Process called "build_inst_to_function_index" that takes mir as Integer returns Integer:
+    Let result be proc create from Dictionary
+    If mir is equal to 0:
+        Return result
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+
+    If functions is equal to 0:
+        Return result
+    End If
+
+    Let i be 0
+    While i is less than function_count:
+        Let mir_func be proc get from List with functions, i
+        If mir_func is not equal to 0:
+            Let function_id be proc memory_get_int64 from Layout with mir_func, 0
+            Let cfg be proc memory_get_int64 from Layout with mir_func, 8
+
+            If cfg is not equal to 0:
+                Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                Let block_count be proc memory_get_int64 from Layout with cfg, 24
+
+                If blocks is not equal to 0:
+                    Let b be 0
+                    While b is less than block_count:
+                        Let block be proc get from List with blocks, b
+                        If block is not equal to 0:
+                            Let instructions be proc memory_get_int64 from Layout with block, 16
+                            Let inst_count be proc memory_get_int64 from Layout with block, 24
+                            If instructions is not equal to 0:
+                                Let j be 0
+                                While j is less than inst_count:
+                                    Let inst be proc get from List with instructions, j
+                                    If inst is not equal to 0:
+                                        proc set from Dictionary with result, inst, function_id
+                                    End If
+                                    Set j to j plus 1
+                                End While
+                            End If
+                        End If
+                        Set b to b plus 1
+                    End While
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning
+is_method_in_hierarchy returns 1 if the given function ID is registered
+as a method (in some type's virtual_methods Dictionary) within the
+type hierarchy, otherwise 0. The filter chain in
+identify_virtual_call_elimination uses this as the final soundness
+guard — a candidate whose target is not actually a method should not
+be devirtualized regardless of what the upstream pass reported.
+@End Reasoning
+
+@Implementation
+Walks every type in the hierarchy. For each type's virtual_methods
+Dictionary, walks every MethodInfo record. For each MethodInfo, checks
+the implementations List (offset 24) plus unique_implementation (offset
+56) to see if the function ID matches. Returns 1 on first match.
+
+The walk is O(|types| * |methods_per_type|) which is small relative
+to MIR size; in practice this completes in microseconds.
+@End Implementation
+
+@Performance_Hints
+O(|types| * |methods| * |impls|). For typical type hierarchies (a few
+hundred types, a few methods each, single-digit impls per method),
+the cost is sub-millisecond per call.
+@End Performance_Hints
+
+@Security_Scope
+Returning a false positive (claiming a non-method function IS a method)
+would allow a spurious devirtualization candidate to survive the
+filter — but apply_devirtualization in CMO checks the opcode at the
+call site (must be MIR_CALL_INDIRECT) before mutating, so the worst
+case is wasted work rather than miscompilation.
+@End Security_Scope
+
+Process called "is_method_in_hierarchy" that takes type_hierarchy as Integer, function_id as Integer returns Integer:
+    If type_hierarchy is equal to 0:
+        Return 0
+    End If
+    If function_id is equal to 0:
+        Return 0
+    End If
+
+    Let type_ids be proc keys from Dictionary with type_hierarchy
+    Let tc be proc length from List with type_ids
+
+    Let i be 0
+    While i is less than tc:
+        Let type_id be proc get from List with type_ids, i
+        Let type_node be proc get from Dictionary with type_hierarchy, type_id
+        If type_node is not equal to 0:
+            Let virtual_methods be proc memory_get_int64 from Layout with type_node, 48
+            If virtual_methods is not equal to 0:
+                Let method_names be proc keys from Dictionary with virtual_methods
+                Let mn_count be proc length from List with method_names
+                Let m be 0
+                While m is less than mn_count:
+                    Let mname be proc get from List with method_names, m
+                    Let method_info be proc get from Dictionary with virtual_methods, mname
+                    If method_info is not equal to 0:
+                        Let unique_impl be proc memory_get_int64 from Layout with method_info, 56
+                        If unique_impl is equal to function_id:
+                            Return 1
+                        End If
+                        Let impls be proc memory_get_int64 from Layout with method_info, 24
+                        If impls is not equal to 0:
+                            Let ic be proc length from List with impls
+                            Let k be 0
+                            While k is less than ic:
+                                Let impl_id be proc get from List with impls, k
+                                If impl_id is equal to function_id:
+                                    Return 1
+                                End If
+                                Set k to k plus 1
+                            End While
+                        End If
+                    End If
+                    Set m to m plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning
+all_implementations_of_method returns a List of every function ID
+implementing the method identified by method_id. The E3 hardening in
+compute_global_reachability uses this helper at virtual call sites to
+enumerate every implementation that could be dispatched to.
+
+If method_id is the function ID of a method, the search walks every
+type in the hierarchy looking for a MethodInfo whose impls or
+unique_implementation matches. The returned List contains every match.
+
+If no match is found, returns an empty List (not null) so callers can
+length-check without a null guard.
+@End Reasoning
+
+@Implementation
+For each type in the hierarchy:
+  For each virtual method in the type:
+    If MethodInfo.unique_implementation == method_id OR any entry in
+    MethodInfo.implementations == method_id:
+      Collect every entry in MethodInfo.implementations and the
+      unique_implementation into the result List.
+
+Duplicate entries are tolerated (the caller's reachability worklist
+guards against re-visitation via the reachable Set).
+@End Implementation
+
+@Performance_Hints
+O(|types| * |methods| * |impls|). Same scaling as is_method_in_hierarchy.
+Called once per virtual call site during reachability computation;
+total cost across a build is O(|virtual_call_sites| * |type_hierarchy|).
+@End Performance_Hints
+
+@Security_Scope
+Returning an incomplete implementations list would silently drop
+reachability for some method bodies, leading to dead-code elimination
+of code that the virtual dispatch table actually references. The
+helper is conservative: it returns every match and lets the caller's
+reachable Set dedupe.
+@End Security_Scope
+
+Process called "all_implementations_of_method" that takes type_hierarchy as Integer, method_id as Integer returns Integer:
+    Let result be proc create from List
+    If type_hierarchy is equal to 0:
+        Return result
+    End If
+    If method_id is equal to 0:
+        Return result
+    End If
+
+    Let type_ids be proc keys from Dictionary with type_hierarchy
+    Let tc be proc length from List with type_ids
+
+    Let i be 0
+    While i is less than tc:
+        Let type_id be proc get from List with type_ids, i
+        Let type_node be proc get from Dictionary with type_hierarchy, type_id
+        If type_node is not equal to 0:
+            Let virtual_methods be proc memory_get_int64 from Layout with type_node, 48
+            If virtual_methods is not equal to 0:
+                Let method_names be proc keys from Dictionary with virtual_methods
+                Let mn_count be proc length from List with method_names
+                Let m be 0
+                While m is less than mn_count:
+                    Let mname be proc get from List with method_names, m
+                    Let method_info be proc get from Dictionary with virtual_methods, mname
+                    If method_info is not equal to 0:
+                        Let unique_impl be proc memory_get_int64 from Layout with method_info, 56
+                        Let impls be proc memory_get_int64 from Layout with method_info, 24
+
+                        Note: Determine whether this MethodInfo describes the method we're looking up.
+                        Let is_match be 0
+                        If unique_impl is equal to method_id:
+                            Set is_match to 1
+                        End If
+                        If is_match is equal to 0:
+                            If impls is not equal to 0:
+                                Let ic be proc length from List with impls
+                                Let k be 0
+                                While k is less than ic:
+                                    Let impl_id be proc get from List with impls, k
+                                    If impl_id is equal to method_id:
+                                        Set is_match to 1
+                                    End If
+                                    Set k to k plus 1
+                                End While
+                            End If
+                        End If
+
+                        If is_match is equal to 1:
+                            Note: Collect every implementation registered for this method.
+                            If impls is not equal to 0:
+                                Let ic2 be proc length from List with impls
+                                Let k2 be 0
+                                While k2 is less than ic2:
+                                    Let impl_id2 be proc get from List with impls, k2
+                                    If impl_id2 is not equal to 0:
+                                        proc append from List with result, impl_id2
+                                    End If
+                                    Set k2 to k2 plus 1
+                                End While
+                            End If
+                            If unique_impl is not equal to 0:
+                                proc append from List with result, unique_impl
+                            End If
+                        End If
+                    End If
+                    Set m to m plus 1
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+@Reasoning
+compute_reachable_filtered_dead_globals returns the List of global IDs
+that are never accessed by any reachable function. The DCEPlan
+aggregator uses this as the dead-globals component.
+
+A global is "dead" if every function reading or writing it is in the
+unreachable set. This is strictly stronger than "no function accesses
+it" because some unreachable functions may reference a global that is
+otherwise actually live (used by a different reachable function); the
+strict subset is the correct dead-global definition.
+@End Reasoning
+
+@Implementation
+1. Build reachable_accessed = Set of globals read or written by any
+   reachable function (walk side_effect_info entries for reachable IDs,
+   union memory_reads and memory_writes).
+2. For each global in mir.globals: if not in reachable_accessed, append
+   to result List.
+@End Implementation
+
+@Performance_Hints
+O(|reachable_functions| * avg_globals_per_function + |globals|).
+Linear in both inputs.
+@End Performance_Hints
+
+@Security_Scope
+Over-removing live globals would corrupt the binary. The strict-subset
+definition above guarantees that any global referenced by a reachable
+function survives DCE.
+@End Security_Scope
+
+Process called "compute_reachable_filtered_dead_globals" that takes wpa as Integer returns Integer:
+    Let result be proc create from List
+    If wpa is equal to 0:
+        Return result
+    End If
+
+    Let mir be proc memory_get_int64 from Layout with wpa, 0
+    Let reachable be proc memory_get_int64 from Layout with wpa, 24
+    Let side_effect_info be proc memory_get_int64 from Layout with wpa, 64
+
+    If mir is equal to 0:
+        Return result
+    End If
+
+    Note: Build set of accessed-by-reachable globals.
+    Let reachable_accessed be proc create from Set
+    If side_effect_info is not equal to 0:
+        Let func_ids be proc keys from Dictionary with side_effect_info
+        Let fi_count be proc length from List with func_ids
+        Let i be 0
+        While i is less than fi_count:
+            Let function_id be proc get from List with func_ids, i
+            Let is_reach be proc contains from Set with reachable, function_id
+            If is_reach is equal to 1:
+                Let ipa be proc get from Dictionary with side_effect_info, function_id
+                If ipa is not equal to 0:
+                    Let reads be proc memory_get_int64 from Layout with ipa, 24
+                    If reads is not equal to 0:
+                        Let reads_list be proc to_list from Set with reads
+                        Let rc be proc length from List with reads_list
+                        Let r be 0
+                        While r is less than rc:
+                            Let r_gid be proc get from List with reads_list, r
+                            proc add from Set with reachable_accessed, r_gid
+                            Set r to r plus 1
+                        End While
+                    End If
+                    Let writes be proc memory_get_int64 from Layout with ipa, 32
+                    If writes is not equal to 0:
+                        Let writes_list be proc to_list from Set with writes
+                        Let wc be proc length from List with writes_list
+                        Let w be 0
+                        While w is less than wc:
+                            Let w_gid be proc get from List with writes_list, w
+                            proc add from Set with reachable_accessed, w_gid
+                            Set w to w plus 1
+                        End While
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    Note: Walk globals; collect those not in reachable_accessed.
+    Let globals be proc memory_get_int64 from Layout with mir, 16
+    Let global_count be proc memory_get_int64 from Layout with mir, 24
+    If globals is not equal to 0:
+        Let g be 0
+        While g is less than global_count:
+            Let global_var be proc get from List with globals, g
+            If global_var is not equal to 0:
+                Let global_id be proc memory_get_int64 from Layout with global_var, 0
+                Let is_accessed be proc contains from Set with reachable_accessed, global_id
+                If is_accessed is equal to 0:
+                    proc append from List with result, global_id
+                End If
+            End If
+            Set g to g plus 1
+        End While
+    End If
+
+    proc destroy from Set with reachable_accessed
+    Return result
+End Process
+
+@Reasoning
+compute_dead_types returns the List of type IDs referenced only inside
+dead functions. The DCEPlan aggregator uses this as the dead-types
+component. Like dead globals, the strict-subset definition is required:
+a type referenced by any reachable function survives DCE.
+@End Reasoning
+
+@Implementation
+For the v0.0.8.5 type system, a type is referenced by a function if
+the function's parameters, return type, or any local variable type
+includes the type ID. The current MIR does not carry an explicit
+"types-referenced" set per function, so this helper conservatively
+walks the type_hierarchy and for each type checks whether any
+reachable function declares it.
+
+The conservative pass walks every reachable function's parameter and
+return type metadata in the MIR. The dead_types list contains every
+type ID that is in the type_hierarchy but not referenced by any
+reachable function.
+@End Implementation
+
+@Performance_Hints
+O(|types| * |reachable_functions|). For typical programs (a few
+hundred types, a few thousand reachable functions), the pass
+completes in a few milliseconds.
+@End Performance_Hints
+
+@Security_Scope
+Over-removing types would break type-hierarchy invariants in the
+remaining MIR. The conservative live-types set guarantees that any
+type referenced by any reachable function survives.
+@End Security_Scope
+
+Process called "compute_dead_types" that takes wpa as Integer, dead_funcs as Integer returns Integer:
+    Let result be proc create from List
+    If wpa is equal to 0:
+        Return result
+    End If
+
+    Let type_hierarchy be proc memory_get_int64 from Layout with wpa, 40
+    Let reachable be proc memory_get_int64 from Layout with wpa, 24
+    Let mir be proc memory_get_int64 from Layout with wpa, 0
+
+    If type_hierarchy is equal to 0:
+        Return result
+    End If
+
+    Note: Build set of types referenced by reachable functions.
+    Let live_types be proc create from Set
+
+    If mir is not equal to 0:
+        Let functions be proc memory_get_int64 from Layout with mir, 0
+        Let function_count be proc memory_get_int64 from Layout with mir, 8
+        If functions is not equal to 0:
+            Let i be 0
+            While i is less than function_count:
+                Let mir_func be proc get from List with functions, i
+                If mir_func is not equal to 0:
+                    Let fid be proc memory_get_int64 from Layout with mir_func, 0
+                    Let is_reach be proc contains from Set with reachable, fid
+                    If is_reach is equal to 1:
+                        Note: Parameter types at offset 24 (List of type IDs).
+                        Let param_types be proc memory_get_int64 from Layout with mir_func, 24
+                        If param_types is not equal to 0:
+                            Let pc be proc length from List with param_types
+                            Let p be 0
+                            While p is less than pc:
+                                Let ptype be proc get from List with param_types, p
+                                If ptype is not equal to 0:
+                                    proc add from Set with live_types, ptype
+                                End If
+                                Set p to p plus 1
+                            End While
+                        End If
+                        Note: Return type at offset 32.
+                        Let ret_type be proc memory_get_int64 from Layout with mir_func, 32
+                        If ret_type is not equal to 0:
+                            proc add from Set with live_types, ret_type
+                        End If
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    Note: Walk type_hierarchy keys; any type not in live_types is dead.
+    Let type_ids be proc keys from Dictionary with type_hierarchy
+    Let tc be proc length from List with type_ids
+    Let t be 0
+    While t is less than tc:
+        Let type_id be proc get from List with type_ids, t
+        Let is_live be proc contains from Set with live_types, type_id
+        If is_live is equal to 0:
+            proc append from List with result, type_id
+        End If
+        Set t to t plus 1
+    End While
+
+    proc destroy from Set with live_types
+    Return result
+End Process
+
+@Reasoning
+count_dead_function_bytes estimates the byte savings from deleting
+the function with the given ID. Used by score_dce to compute the
+size_reduction_bonus for bucket 0x0004 (dead function) priorities.
+
+The estimate is (MIR instruction count) * MIR_BYTES_PER_INST_EST.
+This is a heuristic — actual post-codegen byte counts vary — but it
+ranks dead functions consistently within a build.
+@End Reasoning
+
+@Implementation
+Walks mir.functions, finds the function with matching function_id,
+sums the instruction counts of its basic blocks, multiplies by the
+calibration constant MIR_BYTES_PER_INST_EST.
+@End Implementation
+
+@Performance_Hints
+O(|MIR|) per call (linear search). Called once per dead function
+during score_dce. For a 10k-function program with a few hundred dead
+functions, the total cost is ~10M instruction reads, completing in
+single-digit milliseconds.
+@End Performance_Hints
+
+@Security_Scope
+Returning a wrong byte count affects only ranking, not correctness.
+@End Security_Scope
+
+Process called "count_dead_function_bytes" that takes function_id as Integer, mir as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Let inst_total be 0
+    Let i be 0
+    While i is less than function_count:
+        Let mir_func be proc get from List with functions, i
+        If mir_func is not equal to 0:
+            Let fid be proc memory_get_int64 from Layout with mir_func, 0
+            If fid is equal to function_id:
+                Let cfg be proc memory_get_int64 from Layout with mir_func, 8
+                If cfg is not equal to 0:
+                    Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                    Let block_count be proc memory_get_int64 from Layout with cfg, 24
+                    If blocks is not equal to 0:
+                        Let b be 0
+                        While b is less than block_count:
+                            Let block be proc get from List with blocks, b
+                            If block is not equal to 0:
+                                Let inst_count be proc memory_get_int64 from Layout with block, 24
+                                Set inst_total to inst_total plus inst_count
+                            End If
+                            Set b to b plus 1
+                        End While
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Return inst_total multiplied by MIR_BYTES_PER_INST_EST
+End Process
+
+@Reasoning
+score_inlining computes a priority score for an inlining candidate.
+Higher score = higher priority. The formula follows the 10:1:5
+cycle:size:enabling weight ratio from the design.
+
+Inputs (inlining candidate offsets):
+  offset 0:  caller_id
+  offset 8:  callee_id
+  offset 16: benefit (already computed by compute_inlining_benefit)
+@End Reasoning
+
+@Implementation
+The candidate already carries a precomputed benefit value at offset
+16 (from compute_inlining_benefit). The score multiplies by
+CYCLE_WEIGHT and adds an enabling bonus. Inlining candidates are
+already pre-filtered by compute_inlining_benefit to those with
+positive expected benefit.
+@End Implementation
+
+@Performance_Hints
+O(1) per call. Inlining-bucket scoring is the cheapest of the eight.
+@End Performance_Hints
+
+@Security_Scope
+Mis-scoring degrades ranking; no correctness impact.
+@End Security_Scope
+
+Process called "score_inlining" that takes candidate as Integer, wpa as Integer returns Integer:
+    If candidate is equal to 0:
+        Return 0
+    End If
+
+    Let benefit be proc memory_get_int64 from Layout with candidate, 16
+    Let raw be benefit multiplied by CYCLE_WEIGHT
+    Let score be raw plus ENABLING_WEIGHT
+
+    If score is less than 0:
+        Set score to 0
+    End If
+    Return score
+End Process
+
+@Reasoning
+score_devirt computes a priority score for a devirtualization candidate.
+Exact devirtualization (confidence=1) eliminates the full indirect
+dispatch cost (INDIRECT_CALL_OVERHEAD cycles) plus enables downstream
+inlining; speculative devirtualization (confidence=0) saves less
+because of the runtime guard overhead.
+@End Reasoning
+
+@Implementation
+estimated_cycles_saved depends on confidence:
+  confidence=1: full INDIRECT_CALL_OVERHEAD per call site
+  confidence=0: INDIRECT_CALL_OVERHEAD - (guard cost ~3 cycles)
+enabling_score is ENABLING_WEIGHT * 2 (devirt enables both inlining
+and constant propagation).
+size_delta is small (one CALL_INDIRECT instruction -> one CALL).
+@End Implementation
+
+@Performance_Hints
+O(1) per call.
+@End Performance_Hints
+
+@Security_Scope
+Score-only function; no correctness impact.
+@End Security_Scope
+
+Process called "score_devirt" that takes candidate as Integer, wpa as Integer returns Integer:
+    If candidate is equal to 0:
+        Return 0
+    End If
+
+    Let confidence be proc memory_get_int64 from Layout with candidate, 16
+
+    Let cycles_saved be INDIRECT_CALL_OVERHEAD
+    If confidence is equal to 0:
+        Note: Speculative devirt eats ~3 cycles for the runtime guard.
+        Set cycles_saved to INDIRECT_CALL_OVERHEAD minus 3
+    End If
+
+    Let raw be cycles_saved multiplied by CYCLE_WEIGHT
+    Let enabling_score be ENABLING_WEIGHT multiplied by 2
+    Let score be raw plus enabling_score
+    Note: size_delta for devirt is ~0 (1 instruction replaces 1).
+    Return score
+End Process
+
+@Reasoning
+score_dce computes a priority score for a DCE candidate. The score
+incorporates a size_reduction_bonus that is unique to the DCE buckets;
+the larger the dead artifact, the higher the priority of deleting it
+(removing a 10k-byte dead function is more valuable than removing a
+single dead global).
+@End Reasoning
+
+@Implementation
+Reads the dce_plan and the candidate index. For bucket 0x0004
+(dead function) the size bonus is count_dead_function_bytes; for
+buckets 0x0005 (dead global) and 0x0006 (dead type) the size bonus
+is a flat 8 bytes (typical global symbol/type record size). The
+cycles_saved component is zero (DCE doesn't save cycles, it saves
+bytes); the score is dominated by the size bonus.
+@End Implementation
+
+@Performance_Hints
+O(1) for global and type buckets. O(|MIR|) for function bucket (due
+to count_dead_function_bytes); called once per dead function.
+@End Performance_Hints
+
+@Security_Scope
+Mis-scoring degrades ranking only.
+@End Security_Scope
+
+Process called "score_dce" that takes dce_plan as Integer, bucket as Integer, index as Integer, wpa as Integer returns Integer:
+    If dce_plan is equal to 0:
+        Return 0
+    End If
+
+    Let size_bonus be 0
+    If bucket is equal to BUCKET_TAG_DCE_FUNC:
+        Let dead_funcs be proc memory_get_int64 from Layout with dce_plan, 0
+        If dead_funcs is not equal to 0:
+            Let function_id be proc get from List with dead_funcs, index
+            Let mir be proc memory_get_int64 from Layout with wpa, 0
+            Set size_bonus to count_dead_function_bytes(function_id, mir)
+        End If
+    End If
+    If bucket is equal to BUCKET_TAG_DCE_GLOBAL:
+        Set size_bonus to 8
+    End If
+    If bucket is equal to BUCKET_TAG_DCE_TYPE:
+        Set size_bonus to 8
+    End If
+
+    Note: DCE saves no cycles directly, only bytes. The CYCLE_WEIGHT
+    Note: contribution is zero; ENABLING_WEIGHT applies because
+    Note: removing dead code shrinks the working set.
+    Let score be (size_bonus multiplied by SIZE_PENALTY_WEIGHT) plus ENABLING_WEIGHT
+    Return score
+End Process
+
+@Reasoning
+score_constant_prop computes a priority score for a CP candidate.
+The use_count field of the CPCandidate drives the cycles_saved
+component (one LOAD eliminated per use); the value_size_est field
+drives the size impact.
+@End Reasoning
+
+@Implementation
+Walks wpa.constant_prop_candidates to find the candidate whose
+global_id matches the input, then reads use_count and value_size_est
+from the candidate struct. Score = use_count * CYCLE_WEIGHT + small
+enabling bonus.
+@End Implementation
+
+@Performance_Hints
+O(|CP candidates|) per call (linear search). Called once per
+candidate in compute_optimization_priorities; total cost is
+O(|CP|²) but |CP| is typically small (a few dozen).
+@End Performance_Hints
+
+@Security_Scope
+Mis-scoring degrades ranking only.
+@End Security_Scope
+
+Process called "score_constant_prop" that takes global_id as Integer, wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let cp_candidates be proc memory_get_int64 from Layout with wpa, 152
+    If cp_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc length from List with cp_candidates
+    Let use_count be 0
+    Let value_size_est be 0
+
+    Let i be 0
+    While i is less than count:
+        Let cand be proc get from List with cp_candidates, i
+        If cand is not equal to 0:
+            Let gid be proc memory_get_int64 from Layout with cand, 0
+            If gid is equal to global_id:
+                Set use_count to proc memory_get_int64 from Layout with cand, 8
+                Set value_size_est to proc memory_get_int64 from Layout with cand, 16
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let cycles_saved be use_count
+    Let raw be cycles_saved multiplied by CYCLE_WEIGHT
+    Let enabling_score be ENABLING_WEIGHT multiplied by 2
+    Let score be raw plus enabling_score
+
+    Note: A high value_size_est means the constant is large; inlining it
+    Note: incurs a small size penalty per use site.
+    Let size_penalty be value_size_est multiplied by SIZE_PENALTY_WEIGHT
+    Set score to score minus size_penalty
+    If score is less than 0:
+        Set score to 0
+    End If
+    Return score
+End Process
+
+@Reasoning
+score_specialization computes a priority score for a specialization
+candidate. The benefit field of the SpecCandidate drives the cycles_saved
+component (multiplied by caller_count, since each specialization
+saves at every call site); a function-size penalty represents the
+cost of cloning the function body per specialization.
+@End Reasoning
+
+@Implementation
+Walks wpa.specialization_candidates to find the candidate whose
+function_id matches the input. Reads caller_count and benefit from
+the candidate struct. Score formula:
+
+  cycles_saved = benefit * caller_count
+  size_penalty = function_size (estimated via count_dead_function_bytes)
+  enabling_score = ENABLING_WEIGHT * 4 (specialization unlocks
+                   constant folding, inlining, and DCE)
+@End Implementation
+
+@Performance_Hints
+O(|spec candidates|) per call. Function-size estimation adds one
+MIR walk per scored candidate. Total cost is bounded; |spec
+candidates| is typically a few dozen.
+@End Performance_Hints
+
+@Security_Scope
+Mis-scoring degrades ranking only.
+@End Security_Scope
+
+Process called "score_specialization" that takes function_id as Integer, wpa as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0
+    End If
+
+    Let spec_candidates be proc memory_get_int64 from Layout with wpa, 160
+    If spec_candidates is equal to 0:
+        Return 0
+    End If
+
+    Let count be proc length from List with spec_candidates
+    Let caller_count be 0
+    Let benefit be 0
+
+    Let i be 0
+    While i is less than count:
+        Let cand be proc get from List with spec_candidates, i
+        If cand is not equal to 0:
+            Let fid be proc memory_get_int64 from Layout with cand, 0
+            If fid is equal to function_id:
+                Set caller_count to proc memory_get_int64 from Layout with cand, 8
+                Set benefit to proc memory_get_int64 from Layout with cand, 16
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    Let cycles_saved be benefit multiplied by caller_count
+    Let raw be cycles_saved multiplied by CYCLE_WEIGHT
+
+    Let mir be proc memory_get_int64 from Layout with wpa, 0
+    Let function_size be count_dead_function_bytes(function_id, mir)
+    Let size_penalty be function_size multiplied by SIZE_PENALTY_WEIGHT
+
+    Let enabling_score be ENABLING_WEIGHT multiplied by 4
+    Let score be raw plus enabling_score
+    Set score to score minus size_penalty
+    If score is less than 0:
+        Set score to 0
+    End If
+    Return score
+End Process
+
+@Reasoning
+allocate_cp_candidate allocates and initializes a CPCandidate struct
+(24 bytes) for a constant-global propagation opportunity. The
+use_count field reflects how many LOAD instructions across reachable
+functions reference this global; value_size_est is the estimated
+post-codegen byte cost of the constant value being inlined.
+@End Reasoning
+
+@Implementation
+1. Allocate CP_CANDIDATE_SIZE bytes via Layout.allocate.
+2. Walk MIR to count LOAD instructions whose target is this global_id;
+   the count populates the use_count field.
+3. Estimate value size (MIR_BYTES_PER_INST_EST as a conservative
+   default; the actual constant size depends on the type).
+4. Return the populated struct pointer.
+@End Implementation
+
+@Performance_Hints
+O(|MIR|) per call (use-count walk). Called once per constant global
+during identify_constant_propagation; total cost is bounded by the
+number of distinct constant globals, which is typically small.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Allocation failure returns 0; caller skips.
+@End Security_Scope
+
+Process called "allocate_cp_candidate" that takes global_id as Integer, mir as Integer, wpa as Integer returns Integer:
+    Let cand be proc allocate from Layout with CP_CANDIDATE_SIZE
+    If cand is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with cand, 0, global_id
+
+    Note: Count LOAD-from-global accesses across reachable functions.
+    Let use_count be 0
+    If mir is not equal to 0:
+        Let functions be proc memory_get_int64 from Layout with mir, 0
+        Let function_count be proc memory_get_int64 from Layout with mir, 8
+        Let reachable be 0
+        If wpa is not equal to 0:
+            Set reachable to proc memory_get_int64 from Layout with wpa, 24
+        End If
+        If functions is not equal to 0:
+            Let i be 0
+            While i is less than function_count:
+                Let mir_func be proc get from List with functions, i
+                If mir_func is not equal to 0:
+                    Let fid be proc memory_get_int64 from Layout with mir_func, 0
+                    Let counts_this_function be 1
+                    If reachable is not equal to 0:
+                        Let is_reach be proc contains from Set with reachable, fid
+                        If is_reach is equal to 0:
+                            Set counts_this_function to 0
+                        End If
+                    End If
+
+                    If counts_this_function is equal to 1:
+                        Let cfg be proc memory_get_int64 from Layout with mir_func, 8
+                        If cfg is not equal to 0:
+                            Let blocks be proc memory_get_int64 from Layout with cfg, 16
+                            Let block_count be proc memory_get_int64 from Layout with cfg, 24
+                            If blocks is not equal to 0:
+                                Let b be 0
+                                While b is less than block_count:
+                                    Let block be proc get from List with blocks, b
+                                    If block is not equal to 0:
+                                        Let instructions be proc memory_get_int64 from Layout with block, 16
+                                        Let inst_count be proc memory_get_int64 from Layout with block, 24
+                                        If instructions is not equal to 0:
+                                            Let j be 0
+                                            While j is less than inst_count:
+                                                Let inst be proc get from List with instructions, j
+                                                If inst is not equal to 0:
+                                                    Let opcode be proc memory_get_int64 from Layout with inst, 0
+                                                    If opcode is equal to MIR_OP_LOAD:
+                                                        Let address be proc memory_get_int64 from Layout with inst, 16
+                                                        If address is equal to global_id:
+                                                            Set use_count to use_count plus 1
+                                                        End If
+                                                    End If
+                                                End If
+                                                Set j to j plus 1
+                                            End While
+                                        End If
+                                    End If
+                                    Set b to b plus 1
+                                End While
+                            End If
+                        End If
+                    End If
+                End If
+                Set i to i plus 1
+            End While
+        End If
+    End If
+
+    proc memory_set_int64 from Layout with cand, 8, use_count
+    proc memory_set_int64 from Layout with cand, 16, MIR_BYTES_PER_INST_EST
+    Return cand
+End Process
+
+@Reasoning
+allocate_spec_candidate allocates and initializes a SpecCandidate
+struct (32 bytes) for a function-specialization opportunity. The
+dominant_const_arg field records the parameter index whose actual
+argument is most often a constant across call sites (or -1 if no
+clear winner).
+@End Reasoning
+
+@Implementation
+1. Allocate SPEC_CANDIDATE_SIZE bytes via Layout.allocate.
+2. Write the four fields (function_id, caller_count, benefit,
+   dominant_const_arg).
+3. Return the populated struct pointer.
+@End Implementation
+
+@Performance_Hints
+O(1). All inputs are precomputed; this is just allocate + write.
+@End Performance_Hints
+
+@Security_Scope
+Allocation failure returns 0; caller skips.
+@End Security_Scope
+
+Process called "allocate_spec_candidate" that takes function_id as Integer, caller_count as Integer, benefit as Integer, dominant_const_arg as Integer returns Integer:
+    Let cand be proc allocate from Layout with SPEC_CANDIDATE_SIZE
+    If cand is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with cand, 0, function_id
+    proc memory_set_int64 from Layout with cand, 8, caller_count
+    proc memory_set_int64 from Layout with cand, 16, benefit
+    proc memory_set_int64 from Layout with cand, 24, dominant_const_arg
+    Return cand
+End Process
+
+@Reasoning
+find_dominant_constant_arg returns the parameter index whose actual
+argument across the function's call sites is most often a compile-time
+constant, or -1 if no parameter dominates.
+
+A specialization clone is profitable when at least one parameter is
+nearly always passed the same constant (or some constant from a small
+set) across the callers — that constant can be inlined into the clone,
+unlocking secondary constant folding and dead-code elimination inside
+the function body. Picking the wrong dominant index produces a
+useless clone (correct, but bigger); picking -1 (no clone) is always
+safe.
+
+The "dominance" threshold is 75% of the call sites: a parameter index
+qualifies as the dominant_const_arg if at least 75% of its arguments
+across all call sites are constants. This threshold is the standard
+LLVM/GCC FunctionSpecialization heuristic — below it the clone tends
+not to pay for itself; above it the clone reliably shrinks the
+specialised hot path. If no parameter clears the threshold (or there
+are no call sites, or the function has no parameters) the Process
+returns -1 and the specialization apply pass falls back to its
+"specialize on no specific argument" path.
+
+The query is performed over the WPA call graph (wpa[8]), which
+identify_function_specialization has already populated; the cost is
+O(callers * params) where both factors are bounded by the function's
+fan-in and arity.
+@End Reasoning
+
+@Implementation
+1. Defensive guards: wpa or function_id of 0 returns -1.
+2. Look up the function's MIR record by scanning the wpa[0] functions
+   List for a matching function_id (the function index in MIR is the
+   same shape used by compute_specialization_benefit / get_call_argument
+   already in this file). Read param_count at offset 40. If the
+   function has zero parameters, return -1.
+3. Look up the CallGraphNode at call_graph.nodes[function_id] and read
+   the callers List at offset 32 of the node. Each entry is a caller
+   function_id (not a CallSite — the CallSite records live on the
+   caller's outgoing list).
+4. For every caller, scan its call_sites (offset 16 of the caller's
+   CallGraphNode) and collect the CallSites whose callee_id == our
+   function_id. Each matching CallSite's instruction_ptr (offset 0)
+   points to the MIR call instruction which carries the argument
+   value_ids in its args List at offset 24 (the same offset
+   get_call_argument uses).
+5. Build a per-parameter tally Dictionary mapping param_index ->
+   constant_count. For each matching call site and each parameter
+   index, fetch the argument value_id, walk the wpa[0].value_to_inst
+   maps (offset 64 of each MIR function) to find the defining
+   instruction, and check its opcode at offset 0. Opcodes
+   20001 (CONST), 20002 (CONST_INT/literal), and the MIR LOAD-from-
+   constant-global pattern (LOAD with addr defined by GLOBAL_ADDRESS
+   to a global_id present in wpa.constant_globals) all qualify as
+   "constant" sources.
+6. Track total_call_sites separately. Walk the tally Dictionary; for
+   each (param_index, count) the dominance ratio is count /
+   total_call_sites. The first index whose ratio meets or exceeds 75%
+   (i.e. 4*count >= 3*total_call_sites, integer-safe) wins.
+7. If no parameter clears the threshold, return -1.
+
+The algorithm is single-pass-per-call-site with constant-time per-arg
+work; no recursion into helper passes. helper is_constant_arg below
+encapsulates the per-arg-value classification (CONST, CONST_INT, or
+LOAD-from-constant-global).
+@End Implementation
+
+@Performance_Hints
+O(callers * call_sites_per_caller * param_count). For typical
+candidate functions (a few dozen callers, each making one or two
+calls into the candidate, a handful of parameters) the cost is
+sub-millisecond. The tally Dictionary is allocated fresh per
+invocation and destroyed before return; no caching across calls.
+
+Hot path optimisation: the inner loop short-circuits when the
+caller's call site does not match the target function_id (the most
+common case for callers that contain calls to many functions).
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. The Process queries already-parsed MIR plus the
+WPA call graph; no untrusted input is read. An incorrect dominant
+index (false positive) produces a useless specialization clone but
+not a miscompilation — apply_specialization in CMO replays the
+constant-fold pipeline before committing the clone, so any predicate
+mismatch caught there reverts to the generic version. Returning -1
+is always safe: it disables specialization for this candidate.
+
+The 75% threshold encodes a defensive bias: false negatives (no
+clone when one would have been profitable) are tolerable; false
+positives waste code size. The threshold is documented in the
+Reasoning block to allow future tuning if the cost model changes.
+@End Security_Scope
+
+@Reasoning
+is_constant_arg classifies a single MIR value_id as compile-time
+constant (1) or not (0). It is the inner-loop predicate used by
+find_dominant_constant_arg when tallying constants per parameter
+across call sites.
+
+Three sources qualify as "constant":
+  - CONST opcode (20001): a function-address literal or similar
+    immediate produced directly by the lexer/parser. The defining
+    instruction's immediate value sits at offset 16.
+  - CONST_INT/literal opcode (20002): integer/literal constants
+    produced by the constant-folding pipeline.
+  - LOAD opcode (20200) whose address operand is a global_id present
+    in wpa.constant_globals: a load from a global that has been
+    proven write-free across the whole program is semantically a
+    constant access. constant_globals is populated by Phase 8a's
+    identify_global_constants ahead of this helper's invocation.
+
+A defining instruction reached with any other opcode is non-constant
+(arithmetic, call result, parameter, phi, etc.). When no defining
+instruction is found at all (value_id absent from every MIR function's
+value_to_inst map) the value is treated as non-constant — conservative
+and safe.
+@End Reasoning
+
+@Implementation
+1. Defensive null/zero guards: mir of 0 or value_id of 0 returns 0.
+2. Iterate the MIR functions List at mir[0] up to function_count at
+   mir[8]. For each function, look up the value_to_inst Dictionary
+   at offset 64; if value_id has a defining instruction there:
+     a. Read the opcode at offset 0 of the instruction.
+     b. Opcode 20001 (CONST) -> return 1.
+     c. Opcode 20002 (CONST_INT/literal) -> return 1.
+     d. Opcode 20200 (LOAD) -> read the address operand at offset 16.
+        If wpa is non-null and constant_globals (wpa[120]) contains
+        the address, return 1.
+     e. Any other opcode reached after finding the definition -> the
+        value is computed at run time; return 0.
+3. If no defining instruction was found in any function (the loop
+   completes without returning), return 0.
+
+The helper does NOT recurse: a LOAD from a non-constant address that
+itself flows from a CONST is not classified as constant. This matches
+the conservative semantics CMO's apply_specialization expects when
+seeding the constant-fold pipeline inside a clone.
+@End Implementation
+
+@Performance_Hints
+O(|functions|) worst case (one pass over the MIR functions List
+looking up value_id in each function's value_to_inst Dictionary).
+Each lookup is O(1) on the hashing-based Dictionary primitive. For
+typical programs (~10k functions) a non-cached query completes in
+microseconds; the early return on first definition usually short-
+circuits well before the worst case.
+
+There is no result cache: callers (find_dominant_constant_arg) issue
+a small number of queries per candidate, so a cache would not pay
+for its bookkeeping cost. If the hot caller density rises in the
+future, adding a lazily-allocated Dictionary inside WPA at the
+helper's first call would be the natural extension.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. No untrusted input.
+
+Correctness invariant: a value classified as constant MUST have a
+genuine compile-time-known producer. False positives would let
+find_dominant_constant_arg pick a parameter that is NOT actually
+constant, which is itself safe (apply_specialization re-validates the
+clone before committing), but degrades optimisation quality. False
+negatives (missing genuine constants) reduce specialisation benefit
+but never miscompile.
+
+The LOAD-from-constant-global path depends on constant_globals being
+populated. If this helper is called before Phase 8a runs the
+constant_globals Set will be empty and only CONST/CONST_INT
+classifications will succeed — graceful degradation, never crash.
+@End Security_Scope
+
+Process called "is_constant_arg" that takes mir as Integer, wpa as Integer, value_id as Integer returns Integer:
+    Note: Helper for find_dominant_constant_arg. Returns 1 if the value_id is
+    Note: defined by a CONST/literal instruction or loaded from a constant
+    Note: global. Otherwise returns 0.
+    If mir is equal to 0:
+        Return 0
+    End If
+    If value_id is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Note: Scan every MIR function's value_to_inst map (offset 64) for the
+    Note: defining instruction of value_id. The same shape is used by
+    Note: compute_points_to_for_value above in this file.
+    Let f be 0
+    While f is less than function_count:
+        Let mir_func be proc get from List with functions, f
+        If mir_func is not equal to 0:
+            Let value_to_inst be proc memory_get_int64 from Layout with mir_func, 64
+            If value_to_inst is not equal to 0:
+                Let def_inst be proc get from Dictionary with value_to_inst, value_id
+                If def_inst is not equal to 0:
+                    Let opcode be proc memory_get_int64 from Layout with def_inst, 0
+
+                    Note: MIR CONST (function-address literal) and the integer/
+                    Note: literal CONST opcode both qualify as compile-time
+                    Note: constants for specialization purposes.
+                    If opcode is equal to 20001:
+                        Return 1
+                    End If
+                    If opcode is equal to 20002:
+                        Return 1
+                    End If
+
+                    Note: LOAD (20200) from a global address whose global_id is
+                    Note: in wpa.constant_globals also qualifies. The LOAD's
+                    Note: address operand sits at offset 16 of the instruction.
+                    If opcode is equal to 20200:
+                        Let load_addr be proc memory_get_int64 from Layout with def_inst, 16
+                        If wpa is not equal to 0:
+                            If load_addr is not equal to 0:
+                                Let constant_globals be proc memory_get_int64 from Layout with wpa, 120
+                                If constant_globals is not equal to 0:
+                                    Let is_const_global be proc contains from Set with constant_globals, load_addr
+                                    If is_const_global is equal to 1:
+                                        Return 1
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Note: Found the definition (not constant) — stop searching.
+                    Return 0
+                End If
+            End If
+        End If
+        Set f to f plus 1
+    End While
+
+    Return 0
+End Process
+
+Process called "find_dominant_constant_arg" that takes wpa as Integer, function_id as Integer returns Integer:
+    If wpa is equal to 0:
+        Return 0 minus 1
+    End If
+    If function_id is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let mir be proc memory_get_int64 from Layout with wpa, 0
+    Let call_graph be proc memory_get_int64 from Layout with wpa, 8
+    If mir is equal to 0:
+        Return 0 minus 1
+    End If
+    If call_graph is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Note: Step 1 — find the callee's MIR function and read its param_count.
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    Let function_count be proc memory_get_int64 from Layout with mir, 8
+    If functions is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let callee_param_count be 0 minus 1
+    Let i be 0
+    While i is less than function_count:
+        Let mir_func be proc get from List with functions, i
+        If mir_func is not equal to 0:
+            Let fid be proc memory_get_int64 from Layout with mir_func, 0
+            If fid is equal to function_id:
+                Set callee_param_count to proc memory_get_int64 from Layout with mir_func, 40
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    If callee_param_count is less than 1:
+        Note: No MIR record found, or zero parameters — nothing to specialize on.
+        Return 0 minus 1
+    End If
+
+    Note: Step 2 — look up the callee's CallGraphNode and read its callers list
+    Note: (offset 32). The callers List contains caller function_ids; we then
+    Note: walk each caller's outgoing call_sites (offset 16 of the caller's
+    Note: node) and select the ones whose callee_id == our function_id.
+    Let cg_nodes be proc memory_get_int64 from Layout with call_graph, 0
+    If cg_nodes is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let callee_node be proc get from Dictionary with cg_nodes, function_id
+    If callee_node is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let callers be proc memory_get_int64 from Layout with callee_node, 32
+    If callers is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Let caller_list_size be proc length from List with callers
+    If caller_list_size is equal to 0:
+        Return 0 minus 1
+    End If
+
+    Note: Step 3 — per-parameter constant-count tally. Use a Dictionary keyed
+    Note: by parameter index. total_call_sites accumulates the denominator.
+    Let tally be proc create from Dictionary
+    Let total_call_sites be 0
+
+    Let c be 0
+    While c is less than caller_list_size:
+        Let caller_id be proc get from List with callers, c
+
+        Note: Look up the caller's outgoing call sites and pick the ones
+        Note: pointing at function_id.
+        Let caller_node be proc get from Dictionary with cg_nodes, caller_id
+        If caller_node is not equal to 0:
+            Let caller_call_sites be proc memory_get_int64 from Layout with caller_node, 16
+            Let caller_site_count be proc memory_get_int64 from Layout with caller_node, 24
+
+            If caller_call_sites is not equal to 0:
+                Let s be 0
+                While s is less than caller_site_count:
+                    Let cs be proc get from List with caller_call_sites, s
+                    If cs is not equal to 0:
+                        Let cs_callee be proc memory_get_int64 from Layout with cs, 8
+                        If cs_callee is equal to function_id:
+                            Note: This call site targets our candidate. Read its
+                            Note: instruction pointer (offset 0 of CallSite) and
+                            Note: walk arguments at offset 24 of the MIR call inst.
+                            Let inst_ptr be proc memory_get_int64 from Layout with cs, 0
+                            If inst_ptr is not equal to 0:
+                                Set total_call_sites to total_call_sites plus 1
+
+                                Let args be proc memory_get_int64 from Layout with inst_ptr, 24
+                                If args is not equal to 0:
+                                    Let arg_list_size be proc length from List with args
+                                    Let limit be callee_param_count
+                                    If arg_list_size is less than limit:
+                                        Set limit to arg_list_size
+                                    End If
+
+                                    Let p be 0
+                                    While p is less than limit:
+                                        Let arg_value_id be proc get from List with args, p
+                                        Let is_const be is_constant_arg(mir, wpa, arg_value_id)
+                                        If is_const is equal to 1:
+                                            Let existing be proc get from Dictionary with tally, p
+                                            Let new_count be existing plus 1
+                                            proc set from Dictionary with tally, p, new_count
+                                        End If
+                                        Set p to p plus 1
+                                    End While
+                                End If
+                            End If
+                        End If
+                    End If
+                    Set s to s plus 1
+                End While
+            End If
+        End If
+
+        Set c to c plus 1
+    End While
+
+    If total_call_sites is equal to 0:
+        proc destroy from Dictionary with tally
+        Return 0 minus 1
+    End If
+
+    Note: Step 4 — find the parameter index whose constant-count meets the 75%
+    Note: dominance threshold. 4*count >= 3*total_call_sites is the integer-safe
+    Note: form of count/total >= 0.75. Tie-break by lowest parameter index.
+    Let best_index be 0 minus 1
+    Let best_count be 0
+    Let threshold_num be 3 multiplied by total_call_sites
+
+    Let tally_keys be proc keys from Dictionary with tally
+    Let tally_size be proc length from List with tally_keys
+
+    Let tk be 0
+    While tk is less than tally_size:
+        Let pidx be proc get from List with tally_keys, tk
+        Let pcount be proc get from Dictionary with tally, pidx
+        Let scaled be 4 multiplied by pcount
+
+        If scaled is greater than or equal to threshold_num:
+            If pcount is greater than best_count:
+                Set best_count to pcount
+                Set best_index to pidx
+            Otherwise:
+                If pcount is equal to best_count:
+                    If best_index is less than 0:
+                        Set best_index to pidx
+                    Otherwise:
+                        If pidx is less than best_index:
+                            Set best_index to pidx
+                        End If
+                    End If
+                End If
+            End If
+        End If
+
+        Set tk to tk plus 1
+    End While
+
+    proc destroy from Dictionary with tally
+
+    Return best_index
 End Process
