@@ -229,6 +229,181 @@ Process called "get_env_var" takes name as Integer returns Integer:
     Return getenv(name)
 End Process
 
+@Reasoning
+get_environment_string is the LTO/PGO subsystem's canonical name for reading
+an environment variable as a raw C-string pointer. The function is a
+semantic alias for getenv: the call sites in whole_program_analysis.runa
+(load_pgo_database_from_file) expect this exact name. Adding a third alias
+over getenv (alongside the existing get_env_var) is cheaper than churning
+every PGO call site to a different name, and it lets the LTO subsystem keep
+its naming convention isolated from the C-runtime-compat layer that gave
+getenv its original name.
+@End Reasoning
+
+@Implementation
+Single-line delegation to getenv. Behavior: returns a pointer that aliases
+into the process environ block (caller MUST NOT free, MUST NOT modify).
+Returns 0 when the variable is unset, name is null, or the environ block
+has not been initialized by startup. No allocation, no buffering, no
+caching - the underlying environ array IS the storage.
+@End Implementation
+
+@Performance_Hints
+O(N) over the environ array, identical to libc getenv. PGO and LTO call
+this once per compiler invocation per env var (e.g. RUNA_PGO_FILE,
+RUNA_PGO_ENABLED) so the scan cost is negligible relative to compilation
+time. No memoization needed.
+@End Performance_Hints
+
+@Security_Scope
+The returned pointer comes from untrusted process state (the environ
+block) and points into memory that the caller does not own. Callers MUST
+NOT write through the pointer (modifying environ is a documented memory
+hazard with libc-allocated entries). Callers using the value as a path
+(e.g. PGO file loading) MUST treat the string as untrusted input -
+validate length, character set, and path normalization before passing it
+to file I/O operations. The string length is not bounded by this
+function; for fixed-size buffer copies use a length-limited duplicator.
+@End Security_Scope
+
+Process called "get_environment_string" takes name as Integer returns Integer:
+    Return getenv(name)
+End Process
+
+@Reasoning
+get_environment_flag interprets an environment variable as a boolean
+toggle. The LTO/PGO subsystem uses this for feature gates like
+RUNA_PGO_ENABLED where the user typically writes "1" to turn the feature
+on. The function must accept the common truthy/falsy spellings users
+already expect from POSIX-shell convention:
+  - unset, "", "0", "false" (any case)  -> falsy (return 0)
+  - anything else                       -> truthy (return 1)
+
+This is more permissive than a strict 0/1 parser because shell users
+write RUNA_PGO_ENABLED=true or =yes or =on, and silently ignoring those
+spellings would be a UX regression. The choice to NOT recognize "no",
+"off", "n" as additional falsy values is deliberate: the C-runtime
+convention for env-var booleans treats "0" and "false" as the canonical
+disable spellings, and adding more synonyms expands the surface area for
+spelling drift between callers.
+@End Reasoning
+
+@Implementation
+Reads the env var via getenv. Returns 0 if:
+  - getenv returned 0 (variable unset)
+  - the value is the empty string (length 0)
+  - the value is the single character "0" (ASCII 48)
+  - the value is exactly 5 bytes and matches "false" case-insensitive
+Returns 1 otherwise. The case-insensitive "false" match compares each of
+the 5 bytes against both the lower-case (102, 97, 108, 115, 101) and
+upper-case (70, 65, 76, 83, 69) ASCII codes for f-a-l-s-e. Length-gated
+byte comparisons avoid any string concatenation or temporary allocation.
+@End Implementation
+
+@Performance_Hints
+One getenv call (O(N) over environ), one string_length call (O(L) over
+the value), at most five memory_get_byte calls. Total per-call cost is
+dominated by the environ scan. Called once per compiler invocation per
+feature gate, so amortized cost is irrelevant.
+@End Performance_Hints
+
+@Security_Scope
+The value scanned originates from untrusted process environment. This
+function only inspects up to the first 5 bytes for the falsy-match path,
+so it cannot be made to read out of bounds: the length check via
+string_length guards the byte reads. The boolean result is then consumed
+by feature-gate logic (enable/disable PGO etc.) - if an attacker controls
+the env var they can flip the feature gate, but that is the documented
+contract of the env-var API. Callers MUST NOT use this function for
+security-sensitive flags (authorization, sandboxing) - those should use
+a tamper-resistant config channel.
+@End Security_Scope
+
+Process called "get_environment_flag" takes name as Integer returns Integer:
+    Let value be getenv(name)
+    If value is equal to 0:
+        Return 0
+    End If
+
+    Let len be string_length from StringCore with value
+    If len is equal to 0:
+        Return 0
+    End If
+
+    Note: Single-character "0" check (ASCII 48).
+    If len is equal to 1:
+        Let b0 be memory_get_byte from Memory with value, 0
+        If b0 is equal to 48:
+            Return 0
+        End If
+    End If
+
+    Note: Five-character "false" check (case-insensitive). Compare each
+    Note: byte against both the lower and upper ASCII letter codes.
+    Note: 102='f' 70='F'  97='a' 65='A'  108='l' 76='L'  115='s' 83='S'  101='e' 69='E'
+    If len is equal to 5:
+        Let b0 be memory_get_byte from Memory with value, 0
+        Let b1 be memory_get_byte from Memory with value, 1
+        Let b2 be memory_get_byte from Memory with value, 2
+        Let b3 be memory_get_byte from Memory with value, 3
+        Let b4 be memory_get_byte from Memory with value, 4
+
+        Let m0 be 0
+        If b0 is equal to 102:
+            Set m0 to 1
+        End If
+        If b0 is equal to 70:
+            Set m0 to 1
+        End If
+
+        Let m1 be 0
+        If b1 is equal to 97:
+            Set m1 to 1
+        End If
+        If b1 is equal to 65:
+            Set m1 to 1
+        End If
+
+        Let m2 be 0
+        If b2 is equal to 108:
+            Set m2 to 1
+        End If
+        If b2 is equal to 76:
+            Set m2 to 1
+        End If
+
+        Let m3 be 0
+        If b3 is equal to 115:
+            Set m3 to 1
+        End If
+        If b3 is equal to 83:
+            Set m3 to 1
+        End If
+
+        Let m4 be 0
+        If b4 is equal to 101:
+            Set m4 to 1
+        End If
+        If b4 is equal to 69:
+            Set m4 to 1
+        End If
+
+        If m0 is equal to 1:
+            If m1 is equal to 1:
+                If m2 is equal to 1:
+                    If m3 is equal to 1:
+                        If m4 is equal to 1:
+                            Return 0
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Return 1
+End Process
+
 
 Note: ============================================================================
 Note: End of environment_manager.runa

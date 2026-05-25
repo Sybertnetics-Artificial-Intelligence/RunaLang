@@ -77,7 +77,7 @@ The OptimizationContext maintains all state needed during optimization:
 
 This allows optimization passes to share analysis results and avoid recomputation.
 
-Memory Layout (128 bytes, Tier 3: OWNED HEAP):
+Memory Layout (136 bytes, Tier 3: OWNED HEAP):
 Offset  Size  Field                    Description
 ------  ----  -----                    -----------
 0       8     mir_function             Pointer to MIR function being optimized
@@ -98,6 +98,9 @@ Offset  Size  Field                    Description
 112     4     instruction_count        Total instruction count
 116     4     basic_block_count        Total basic block count
 120     8     statistics               Pointer to optimization statistics
+128     8     pga                      Pointer to ProfileGuidedAnalysis (PGO workspace,
+                                       set by apply_profile_guided_optimizations,
+                                       0 when PGO has not run for this function)
 @End Reasoning
 
 Type called "OptimizationContext":
@@ -119,6 +122,7 @@ Type called "OptimizationContext":
     instruction_count as Integer
     basic_block_count as Integer
     statistics as Integer
+    pga as Integer
 End Type
 
 Note: ============================================================================
@@ -227,8 +231,9 @@ Runs necessary analyses and builds data structures for optimization passes.
 @End Reasoning
 
 Process called "create_optimization_context" that takes mir_func as Integer, opt_level as Integer returns Integer:
-    Note: Allocate OptimizationContext structure (128 bytes)
-    Let ctx be proc memory_allocate from Layout with 128
+    Note: Allocate OptimizationContext structure (136 bytes - was 128
+    Note: before the PGA field at offset 128 was added).
+    Let ctx be proc memory_allocate from Layout with 136
 
     Note: Initialize MIR function pointer
     proc memory_set_int64 from Layout with ctx, 0, mir_func
@@ -302,6 +307,10 @@ Process called "create_optimization_context" that takes mir_func as Integer, opt
     Note: Create statistics structure
     Let statistics be create_optimization_statistics()
     proc memory_set_int64 from Layout with ctx, 120, statistics
+
+    Note: Initialize PGA pointer to 0 (set later by
+    Note: apply_profile_guided_optimizations when profile data is present).
+    proc memory_set_int64 from Layout with ctx, 128, 0
 
     Return ctx
 End Process
@@ -2689,11 +2698,188 @@ Process called "apply_peephole_optimizations" that takes ctx as Integer returns 
     Return 0
 End Process
 
+@Reasoning
+apply_profile_guided_optimizations is the wiring function that drives
+the entire PGO pipeline for a single MIR function within an
+OptimizationContext. It is invoked from run_optimization_passes once at
+O3 when ctx.profile_data (offset 88) is non-null.
+
+The function builds a fresh ProfileGuidedAnalysis workspace, runs the
+five analysis passes in dependency order, applies the two transform
+passes (block layout + hot/cold/branch hints), and optionally merges
+profile-guided inline decisions into the OptimizationContext's
+inlining_candidates list when MIR-program access lets us cost callees
+accurately.
+
+The PGA workspace is retained on the OptimizationContext at offset 128
+(see CEO ratification, Architect Q3) so that subsequent passes -
+branch-prediction-aware codegen, hot/cold splitting, etc - can re-read
+the precomputed frequencies, hot/cold sets, and branch probabilities
+without recomputing them. The PGA's lifetime is bounded by the
+OptimizationContext's lifetime; the function that allocates ctx is
+responsible for freeing the chain (currently no eager free of the PGA;
+both ctx and its PGA are released together when the whole optimization
+pipeline tears down).
+
+Inline-decision merge path (per Architect Q2): we merge PGA's
+inline_candidates into ctx.inlining_candidates only when the MIR
+program is reachable from this context. Currently the OptimizationContext
+does not own a call-graph pointer, so the merge path runs unconditionally
+on the inline_candidates that compute_inline_decisions populates - which
+the PGA already gathered from the call instructions in this function's
+own CFG. The cross-module call graph integration is a follow-up once
+LTO ratifies a call-graph slot on OptimizationContext.
+@End Reasoning
+
+@Implementation
+1. Pull profile_data (offset 88), mir_function (offset 0). Defensive
+   guards: if either is null, return 0 (the caller's guard at line 675
+   should already prevent this, but defense in depth is cheap).
+2. Allocate a fresh PGA via create_profile_guided_analysis. Store it
+   into ctx at offset 128.
+3. Run the five analysis passes in dependency order:
+   - compute_block_frequencies (propagates frequencies through CFG)
+   - compute_branch_probabilities (consumes block frequencies)
+   - identify_hot_blocks (consumes block frequencies)
+   - identify_cold_blocks (consumes block frequencies)
+   - identify_hot_paths (consumes hot_blocks)
+4. compute_inline_decisions: signature now requires a 4th `mir` param
+   to cost callees properly. Derive the MIR program from the MIR
+   function via the metadata back-reference if present; if not
+   reachable, pass 0 and let get_function_instruction_count return 0
+   to trigger the conservative-default fallback. MIRFunction does not
+   currently carry a parent MIRProgram back-pointer, so this call
+   passes 0 and accepts the per-callee fallback cost of 100. When the
+   parent pointer is added to MIRFunction in a future change, this
+   call site is the only consumer that needs updating.
+5. Run the two transform passes:
+   - apply_pgo_hints (annotates blocks hot/cold, branch instructions
+     likely/unlikely)
+   - optimize_code_layout (reorders blocks: hot first, cold last)
+6. If any pass reported >0 changes, set ctx.changed (offset 80) to 1
+   and aggregate the return value.
+
+Return value: 1 if PGO produced any transformation, 0 if PGO ran but
+no transformations resulted (e.g. a function with no hot blocks and no
+inlineable call sites). Callers use this to update their own
+global_changed flag and to short-circuit the O3 fixed-point loop.
+@End Implementation
+
+@Performance_Hints
+The five analysis passes are linear in the function's block count and
+instruction count, so total cost is O(B + I) per call. The transform
+passes are also linear: apply_pgo_hints walks every block once,
+optimize_code_layout walks the blocks list three times to bucket
+hot/normal/cold then reassembles in order.
+
+The PGA allocation is 80 bytes plus the owned dictionaries/sets/lists,
+which dominate memory but are bounded by the function size: each set
+holds at most one entry per block, each dictionary at most one entry
+per instruction.
+@End Performance_Hints
+
+@Security_Scope
+The function operates entirely on compiler-controlled MIR + PGO
+structures. profile_data was previously validated upstream when the
+.pgo file was loaded (load_pgo_database_from_file checks magic).
+No syscalls, no user input crossings in this function.
+
+The retained PGA pointer on ctx is owned by this OptimizationContext;
+future passes reading from it must NOT free it themselves. If the
+context is destroyed without going through a coordinated teardown,
+the PGA leaks at the heap layer until process exit; the bootstrap
+compiler currently exits after each compilation so this is bounded.
+@End Security_Scope
+
 Process called "apply_profile_guided_optimizations" that takes ctx as Integer returns Integer:
-    Note: Profile-guided optimizations using runtime profiling data
-    Note: This would integrate with profile_guided module
-    Note: Includes: hot/cold splitting, block layout, branch prediction hints
-    Return 0
+    Let profile_data be proc memory_get_int64 from Layout with ctx, 88
+    If profile_data is equal to 0:
+        Return 0
+    End If
+
+    Let mir_function be proc memory_get_int64 from Layout with ctx, 0
+    If mir_function is equal to 0:
+        Return 0
+    End If
+
+    Note: Build the PGA workspace and stash it on the context so later
+    Note: passes can read frequencies/hot-blocks/branch-probs without
+    Note: recomputing them.
+    Let pga be proc create_profile_guided_analysis from ProfileGuided with mir_function, profile_data
+    If pga is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with ctx, 128, pga
+
+    Note: Stage 1 - frequency propagation through the CFG.
+    proc compute_block_frequencies from ProfileGuided with pga
+
+    Note: Stage 2 - branch probabilities derived from block frequencies.
+    proc compute_branch_probabilities from ProfileGuided with pga
+
+    Note: Stage 3 - hot/cold classification.
+    proc identify_hot_blocks from ProfileGuided with pga
+    proc identify_cold_blocks from ProfileGuided with pga
+
+    Note: Stage 4 - hot-path identification.
+    Note: 16 is the max paths to trace (matches the architect-recommended
+    Note: default; arbitrary single function rarely has more than a dozen
+    Note: hot paths worth tracking).
+    proc identify_hot_paths from ProfileGuided with pga, 16
+
+    Note: Stage 5 - inline decision computation. MIRFunction does not
+    Note: carry a back-pointer to its parent MIRProgram in the current
+    Note: schema; pass 0 as the mir parameter so callee instruction
+    Note: counts fall back to the conservative-100 default. When a
+    Note: parent-pointer field is added, populate it here.
+    Let cg be 0
+    Let inline_changed be 0
+    Let decision_count be proc compute_inline_decisions from ProfileGuided with pga, cg, 100, 0
+    If decision_count is greater than 0:
+        Set inline_changed to 1
+
+        Note: Merge PGA.inline_candidates into ctx.inlining_candidates so
+        Note: the next inline_functions pass in the optimizer loop
+        Note: consumes the PGO-guided decisions alongside its own
+        Note: heuristically-derived candidates.
+        Let pga_candidates be proc memory_get_int64 from Layout with pga, 56
+        Let ctx_candidates be proc memory_get_int64 from Layout with ctx, 96
+        If pga_candidates is not equal to 0:
+            If ctx_candidates is not equal to 0:
+                Let cand_count be proc length from List with pga_candidates
+                Let k be 0
+                While k is less than cand_count:
+                    Let cand be proc get from List with pga_candidates, k
+                    If cand is not equal to 0:
+                        proc append from List with ctx_candidates, cand
+                    End If
+                    Set k to k plus 1
+                End While
+            End If
+        End If
+    End If
+
+    Note: Transform passes.
+    Let hints_changed be proc apply_pgo_hints from ProfileGuided with pga
+    Let layout_changed be proc optimize_code_layout from ProfileGuided with pga
+
+    Note: Aggregate the changed flag.
+    Let changed be 0
+    If hints_changed is greater than 0:
+        Set changed to 1
+    End If
+    If layout_changed is greater than 0:
+        Set changed to 1
+    End If
+    If inline_changed is equal to 1:
+        Set changed to 1
+    End If
+
+    If changed is equal to 1:
+        proc memory_set_int32 from Layout with ctx, 80, 1
+    End If
+
+    Return changed
 End Process
 
 Note: ============================================================================

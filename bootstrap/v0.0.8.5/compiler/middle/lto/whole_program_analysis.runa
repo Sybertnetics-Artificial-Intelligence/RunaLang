@@ -45,6 +45,8 @@ Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/set.runa" as Set
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "runtime/io/filesystem/file_operations.runa" as FileOps
+Import "runtime/integration/system_interface/wrappers/environment_manager.runa" as Env
 
 @Reasoning
 Whole-program analysis (WPA) is the foundation of link-time optimization.
@@ -3541,26 +3543,146 @@ End Process
 @Reasoning
 PGO database management - loads and caches profile-guided optimization data.
 Data is loaded from .pgo files generated during instrumented runs.
+
+Compiler global state is held in a single file-local static pointer
+cell (global_compiler_context_ptr) which is lazily allocated on first
+access. The layout is a 144-byte block: offsets 0-128 are reserved for
+future compiler-state fields that subsequent LTO infrastructure will
+need (whole-program type table, link-time flag set, cross-module
+inlining cache, etc.), and offset 136 holds the PGO database pointer.
+
+This pattern mirrors the existing global_environ static cell in
+environment_manager.runa: a top-level mutable Integer initialized to 0
+that subsequent Processes write through on first use. The bootstrap
+compiler's `Let X be allocate(N)` top-level form is the verified working
+mechanism for this idiom (per the P1-A architect's empirical test).
+
+Single-threaded note: the current bootstrap compiler model is
+single-threaded per compilation. When parallel-module compilation is
+added in a later release, this cell will need either an atomic
+compare-and-swap on first-init or a per-thread variant; the consumers
+all read through get_static_compiler_context so the upgrade path is
+local to this file.
 @End Reasoning
 
-Process called "get_global_pgo_database" that returns Integer:
-    Note: Global PGO database cached at static location
-    Note: In production, this would be at a reserved memory address
-    Note: For now, use offset 136 in a global compiler context
+Note: File-local static cell for the compiler-global context pointer.
+Note: Initialized lazily by get_static_compiler_context on first call.
+Let global_compiler_context_ptr be 0
 
-    Note: Check if PGO database is already loaded
+@Reasoning
+get_static_compiler_context returns the per-compilation singleton
+compiler-state block, lazily allocating it on first call. Subsequent
+calls return the same pointer. The block is sized at 144 bytes:
+  - bytes 0-127:   reserved for future compiler-state fields
+  - bytes 128-135: alignment padding for the 8-byte offset-136 field
+  - bytes 136-143: PGO database pointer cache
+
+The function never returns 0 on success: if memory_allocate succeeds
+the cell is non-zero forever after. The only way to receive 0 is
+allocation failure, which the caller (get_compiler_global_context) maps
+to "no PGO available for this compilation".
+@End Reasoning
+
+@Implementation
+Reads the static cell. If zero, allocates 144 bytes via memory_allocate,
+zero-initializes them with explicit memory_set_int64 writes at every
+8-byte slot (so subsequent readers see clean zero values for every
+field including the PGO cache at offset 136), then stores the pointer
+back into the static cell.
+
+The zero-initialization loop writes 18 int64 slots (144 / 8 = 18).
+memory_allocate is the runtime's owned-heap allocator (Tier 3), which
+on the current implementation does NOT guarantee zero-initialized
+memory; the explicit zero loop here is required for correctness, not
+optional.
+@End Implementation
+
+@Performance_Hints
+First call: one memory_allocate(144) + 18 memory_set_int64 writes (one
+per 8-byte slot). Subsequent calls: a single load from the static
+cell. The PGO subsystem typically calls this once per compilation
+session, so amortized cost is negligible.
+@End Performance_Hints
+
+@Security_Scope
+The returned pointer owns a heap-allocated block managed entirely by
+this file. Callers must NOT free it (the cell outlives the caller; it
+is process-lifetime, not call-lifetime). Callers writing to offsets
+0-128 must coordinate with future compiler-state owners as those
+fields get claimed; the PGO subsystem itself only touches offset 136.
+@End Security_Scope
+
+Process called "get_static_compiler_context" that returns Integer:
+    If global_compiler_context_ptr is equal to 0:
+        Let ctx be proc memory_allocate from Layout with 144
+        If ctx is equal to 0:
+            Return 0
+        End If
+
+        Note: Zero-initialize all 18 int64 slots (144 / 8 = 18).
+        Let i be 0
+        While i is less than 144:
+            proc memory_set_int64 from Layout with ctx, i, 0
+            Set i to i plus 8
+        End While
+
+        Set global_compiler_context_ptr to ctx
+    End If
+
+    Return global_compiler_context_ptr
+End Process
+
+@Reasoning
+get_global_pgo_database returns the cached PGO database, loading it on
+first access from the file pointed to by the RUNA_PGO_FILE environment
+variable. The cache lives at offset 136 of the compiler-global context
+block so that subsequent calls in the same compilation session avoid
+re-parsing the file. Returns 0 when:
+  - PGO is not enabled for this compilation (no RUNA_PGO_ENABLED)
+  - The compiler-global context could not be allocated
+  - The PGO file could not be opened or had an invalid format
+@End Reasoning
+
+@Implementation
+1. Fetch the compiler-global context via get_compiler_global_context,
+   which guards on RUNA_PGO_ENABLED.
+2. Read the cached database pointer from offset 136.
+3. If null, call load_pgo_database_from_file, cache the result at
+   offset 136 (only if load succeeded), and return it.
+
+The cache write is gated on a non-zero load result so that a failed
+load does not poison the cache; the next call still attempts to
+load fresh.
+@End Implementation
+
+@Performance_Hints
+After the first call in a compilation session this is a single int64
+load. The first call performs a file-open + binary-parse pass over the
+.pgo file (typically a few hundred KB).
+@End Performance_Hints
+
+@Security_Scope
+PGO file content is untrusted. The cache holds a Dictionary keyed by
+addresses parsed from the file; callers MUST NOT dereference those
+keys as pointers. The keys are used as opaque identifiers for
+matching call sites; values are aggregated frequency counts.
+@End Security_Scope
+
+Process called "get_global_pgo_database" that returns Integer:
+    Note: Check if PGO database is already loaded.
     Let global_pgo_ptr be get_compiler_global_context()
     If global_pgo_ptr is equal to 0:
-        Return 0  Note: No compiler context available
+        Return 0
     End If
 
     Let pgo_database be proc memory_get_int64 from Layout with global_pgo_ptr, 136
 
-    Note: If not loaded, attempt to load from PGO file
+    Note: If not loaded, attempt to load from PGO file.
     If pgo_database is equal to 0:
         Set pgo_database to load_pgo_database_from_file()
 
-        Note: Cache loaded database
+        Note: Cache loaded database only on success so a failed load
+        Note: does not poison the cache for subsequent calls.
         If pgo_database is not equal to 0:
             proc memory_set_int64 from Layout with global_pgo_ptr, 136, pgo_database
         End If
@@ -3569,89 +3691,151 @@ Process called "get_global_pgo_database" that returns Integer:
     Return pgo_database
 End Process
 
+@Reasoning
+get_compiler_global_context returns the compiler-global context pointer
+if PGO is enabled for the current compilation, or 0 otherwise. The
+RUNA_PGO_ENABLED environment variable is the canonical feature gate:
+when unset, empty, "0", or "false" the function returns 0 and the
+caller (typically get_global_pgo_database) skips all PGO work.
+
+This is the single PGO-vs-no-PGO branch point. Non-PGO compilations
+never allocate the static-context block, so the cost of LTO in a
+PGO-disabled build is exactly one getenv call.
+@End Reasoning
+
+@Implementation
+Calls get_environment_flag on RUNA_PGO_ENABLED. Returns 0 if disabled.
+Otherwise calls get_static_compiler_context to allocate (lazily) and
+return the singleton state block.
+@End Implementation
+
+@Performance_Hints
+One getenv scan (microseconds) plus, on the first call only, one
+memory_allocate + zero loop. Cached for subsequent calls.
+@End Performance_Hints
+
+@Security_Scope
+The feature gate is checked against an environment variable, so an
+attacker with control over the process environment can enable PGO.
+The PGO subsystem itself only consumes profile data for optimization
+hints; enabling it does not grant any privilege beyond the normal
+compilation envelope. The path read from RUNA_PGO_FILE is subject to
+the file system's own access checks (file_exists and open_file
+enforce read permission).
+@End Security_Scope
+
 Process called "get_compiler_global_context" that returns Integer:
-    Note: Get global compiler context
-    Note: In production, this would be passed through compilation pipeline
-    Note: For LTO, stored in static location or passed via environment
-
-    Note: Attempt to get from environment variable or static location
-    Note: Return 0 if not available (non-PGO compilation)
-
-    Note: Check for PGO environment marker
-    Let pgo_enabled be get_environment_flag("RUNA_PGO_ENABLED")
+    Let pgo_enabled be proc get_environment_flag from Env with "RUNA_PGO_ENABLED"
 
     If pgo_enabled is equal to 0:
-        Return 0  Note: PGO not enabled for this compilation
+        Return 0
     End If
 
-    Note: Get global context pointer from compiler state
     Let global_ctx be get_static_compiler_context()
-
     Return global_ctx
 End Process
 
-Process called "load_pgo_database_from_file" that returns Integer:
-    Note: Load PGO database from .pgo file
-    Note: File format: binary database of call site → profile data mappings
+@Reasoning
+load_pgo_database_from_file parses the .pgo binary file at the path
+held in RUNA_PGO_FILE into an in-memory Dictionary keyed by call-site
+address. Returns 0 on any failure (no path, file missing, bad magic,
+malformed entries).
 
-    Note: Get PGO file path from environment or compiler flags
-    Let pgo_file_path be get_environment_string("RUNA_PGO_FILE")
+File format (little-endian, all fields are tightly packed):
+  Header:
+    8 bytes  magic       = 0x52554E41504F47 ("RUNAPGO" + padding byte)
+    4 bytes  version     = format version (currently 1)
+    4 bytes  entry_count = number of call-site entries to follow
+  Each entry:
+    8 bytes  call_site_addr  = the call instruction's address
+    4 bytes  target_count    = number of (target, frequency) pairs
+    target_count * 16 bytes  = (target_addr int64, frequency int64) pairs
+@End Reasoning
+
+@Implementation
+Sequential pass over the file using the new read_int32/read_int64
+primitives in FileOps. Each entry's targets are accumulated into a
+per-call-site Dictionary keyed by target_addr; that Dictionary plus a
+total_freq summary are stored in a 16-byte profile_data block per
+call site, then registered in the top-level database Dictionary keyed
+by call_site_addr.
+@End Implementation
+
+@Performance_Hints
+O(E + T) over the file where E = entries and T = total target records.
+Each read_int{32,64} call allocates and frees a small temp buffer; if
+this proves hot on very large .pgo files (millions of entries), the
+loop can be refactored to share a single 16-byte buffer.
+@End Performance_Hints
+
+@Security_Scope
+The .pgo file is untrusted input. The function validates:
+  - file exists before opening
+  - magic header matches (rejects non-PGO files / corrupt files early)
+  - target_count from the file is used as a bounded loop iteration count
+The function does NOT validate entry_count is sane (e.g. capped at
+some maximum). For a hardened release, add an upper bound on
+entry_count to avoid pathological inputs causing excessive memory
+pressure. The current threat model assumes the PGO file is owned by
+the same user as the compiler; any attacker with write access to the
+file has more direct attack vectors than corrupting profile data.
+@End Security_Scope
+
+Process called "load_pgo_database_from_file" that returns Integer:
+    Note: Get PGO file path from environment.
+    Let pgo_file_path be proc get_environment_string from Env with "RUNA_PGO_FILE"
 
     If pgo_file_path is equal to 0:
-        Return 0  Note: No PGO file specified
+        Return 0
     End If
 
-    Note: Check if file exists
-    Let file_exists be file_exists(pgo_file_path)
-    If file_exists is equal to 0:
-        Return 0  Note: PGO file not found
+    Note: Check if file exists. The local variable name is intentionally
+    Note: distinct from the file_exists Process name to avoid shadowing.
+    Let file_exists_result be proc file_exists from FileOps with pgo_file_path
+    If file_exists_result is equal to 0:
+        Return 0
     End If
 
-    Note: Create database dictionary
+    Note: Create database dictionary.
     Let database be proc create from Dictionary
 
-    Note: Open and parse PGO file
-    Note: File format:
-    Note: - Header: magic number (0x52554E41504F47 = "RUNAPGO"), version, entry count
-    Note: - Entries: call_site_addr (8 bytes), frequency_count (4 bytes), target entries
-    Note: - Target entry: target_addr (8 bytes), frequency (8 bytes)
-
-    Let file_handle be open_file(pgo_file_path, 0)  Note: Mode 0 = read
+    Note: Open and parse the PGO file (mode 0 = read).
+    Let file_handle be proc open_file from FileOps with pgo_file_path, 0
     If file_handle is equal to 0:
-        Return 0  Note: Failed to open file
+        Return 0
     End If
 
-    Note: Read header
-    Let magic be read_int64(file_handle)
-    Let expected_magic be 0x52554E41504F47  Note: "RUNAPGO"
+    Note: Read 8-byte magic header.
+    Let magic be proc read_int64 from FileOps with file_handle
+    Let expected_magic be 0x52554E41504F47
 
     If magic is not equal to expected_magic:
-        close_file(file_handle)
-        Return 0  Note: Invalid PGO file format
+        proc close_file from FileOps with file_handle
+        Return 0
     End If
 
-    Let version be read_int32(file_handle)
-    Let entry_count be read_int32(file_handle)
+    Let version be proc read_int32 from FileOps with file_handle
+    Let entry_count be proc read_int32 from FileOps with file_handle
 
-    Note: Read each call site entry
+    Note: Read each call site entry.
     Let i be 0
     While i is less than entry_count:
-        Let call_site_addr be read_int64(file_handle)
-        Let target_count be read_int32(file_handle)
+        Let call_site_addr be proc read_int64 from FileOps with file_handle
+        Let target_count be proc read_int32 from FileOps with file_handle
 
-        Note: Create profile data structure for this call site
-        Let profile_data be proc allocate from Layout with 16
-
-        Note: Create target frequency map
+        Note: Per-call-site profile_data block (16 bytes):
+        Note:   offset 0 = freq_map Dictionary pointer
+        Note:   offset 8 = total_freq summary
+        Let profile_data be proc memory_allocate from Layout with 16
         Let freq_map be proc create from Dictionary
         proc memory_set_int64 from Layout with profile_data, 0, freq_map
 
-        Note: Read target frequencies
+        Note: Read target frequencies.
         Let total_freq be 0
         Let j be 0
         While j is less than target_count:
-            Let target_addr be read_int64(file_handle)
-            Let frequency be read_int64(file_handle)
+            Let target_addr be proc read_int64 from FileOps with file_handle
+            Let frequency be proc read_int64 from FileOps with file_handle
 
             proc set from Dictionary with freq_map, target_addr, frequency
             Set total_freq to total_freq plus frequency
@@ -3659,16 +3843,13 @@ Process called "load_pgo_database_from_file" that returns Integer:
             Set j to j plus 1
         End While
 
-        Note: Store total frequency
         proc memory_set_int64 from Layout with profile_data, 8, total_freq
-
-        Note: Add to database
         proc set from Dictionary with database, call_site_addr, profile_data
 
         Set i to i plus 1
     End While
 
-    close_file(file_handle)
+    proc close_file from FileOps with file_handle
 
     Return database
 End Process

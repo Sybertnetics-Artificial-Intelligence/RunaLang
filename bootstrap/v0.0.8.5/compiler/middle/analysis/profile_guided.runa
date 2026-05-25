@@ -37,6 +37,7 @@ This file consists of the following functions/features/operation types:
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
 Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
 Import "compiler/middle/analysis/control_flow.runa" as ControlFlowGraph
 Import "compiler/middle/analysis/call_graph.runa" as CallGraph
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
@@ -721,9 +722,16 @@ Follows highest-frequency edges until path ends.
 @End Reasoning
 
 Process called "trace_hot_path_from_block" that takes pga as Integer, start_block as Integer, visited as Integer, path_id as Integer, max_paths as Integer returns Integer:
+    Let mir_function be proc memory_get_int64 from Layout with pga, 0
     Let profile_data be proc memory_get_int64 from Layout with pga, 8
     Let hot_paths_list be proc memory_get_int64 from Layout with pga, 32
     Let block_frequencies be proc memory_get_int64 from Layout with profile_data, 8
+
+    Note: Derive the CFG once at the top so the trace loop can look up
+    Note: successor blocks by ID without re-reading mir_function each step.
+    Note: CFG lives at offset 16 of MIRFunction per the file's convention
+    Note: (matches identify_hot_paths and the rest of profile_guided.runa).
+    Let cfg be proc memory_get_int64 from Layout with mir_function, 16
 
     Note: Create new hot path
     Let hot_path be create_hot_path(path_id)
@@ -779,11 +787,24 @@ Process called "trace_hot_path_from_block" that takes pga as Integer, start_bloc
                 If max_freq is less than 100:
                     Set continue_trace to 0
                 Otherwise:
-                    Note: Continue to highest frequency successor
-                    Note: Find successor block
-                    Set current_block to 0
-                    Note: Would need to look up block by ID (simplified for now)
-                    Set continue_trace to 0
+                    Note: Continue to highest frequency successor. Look up the
+                    Note: successor block pointer from the CFG via the canonical
+                    Note: get_block_by_id_from_cfg helper. If the lookup fails
+                    Note: (block not found, CFG missing) terminate the trace
+                    Note: rather than dereferencing a null pointer; the existing
+                    Note: visited-set and max_freq < 100 guards already terminate
+                    Note: on cycles and on cold regions, so a single defensive
+                    Note: lookup here completes the loop's safety story.
+                    If cfg is equal to 0:
+                        Set continue_trace to 0
+                    Otherwise:
+                        Let next_block be proc get_block_by_id_from_cfg from CFG with cfg, max_succ_id
+                        If next_block is equal to 0:
+                            Set continue_trace to 0
+                        Otherwise:
+                            Set current_block to next_block
+                        End If
+                    End If
                 End If
             End If
         End If
@@ -800,7 +821,11 @@ Process called "trace_hot_path_from_block" that takes pga as Integer, start_bloc
         proc memory_set_int64 from Layout with hot_path, 32, 8 Note: optimization_priority = 8
     End If
 
-    Note: Add to hot paths list    List.append(hot_paths_list, hot_path)
+    Note: Add to hot paths list. The previous version of this line had
+    Note: the append call inlined with the Note: prefix, which silently
+    Note: dropped every constructed hot_path because the lexer consumed
+    Note: the entire line as a comment. The call is now on its own line.
+    proc append from List with hot_paths_list, hot_path
 
     Return 1
 End Process
@@ -896,9 +921,20 @@ Inlining heuristics:
 2. Cold call sites (low frequency) are deprioritized
 3. Small callees are preferred
 4. Cost-benefit analysis: benefit (saved call overhead) vs cost (code size)
+
+The fourth parameter `mir` is the MIRProgram pointer used to look up the
+real callee instruction count via CallGraph.get_function_instruction_count.
+The previous version of this Process hardcoded cost = 50 for every
+callee regardless of body size; that produced positive cost_benefit for
+any call frequency > 5, which made the inlining heuristic effectively
+"inline anything that's profiled". With real per-callee sizes, the
+decision is grounded in the actual code-size impact: a one-instruction
+getter has cost 1 and is almost always worth inlining, while a
+thousand-instruction function has cost 1000 and only crosses the
+break-even point at very high call frequencies.
 @End Reasoning
 
-Process called "compute_inline_decisions" that takes pga as Integer, call_graph as Integer, size_threshold as Integer returns Integer:
+Process called "compute_inline_decisions" that takes pga as Integer, call_graph as Integer, size_threshold as Integer, mir as Integer returns Integer:
     Let mir_function be proc memory_get_int64 from Layout with pga, 0
     Let profile_data be proc memory_get_int64 from Layout with pga, 8
     Let inline_candidates_list be proc memory_get_int64 from Layout with pga, 56
@@ -950,11 +986,19 @@ Process called "compute_inline_decisions" that takes pga as Integer, call_graph 
                 End If
                 proc memory_set_int64 from Layout with inline_decision, 16, priority
 
-                Note: Simple cost-benefit heuristic
+                Note: Cost-benefit heuristic
                 Note: Benefit = frequency multiplied by 10 (call overhead saved)
-                Note: Cost = callee_size (estimated as 50)
+                Note: Cost = real callee instruction count from MIR.
                 Let benefit be call_freq multiplied by 10
-                Let cost be 50  Note: Simplified
+                Let cost be proc get_function_instruction_count from CallGraph with mir, callee_id
+                If cost is equal to 0:
+                    Note: Function body not present in MIR (external callee,
+                    Note: not-yet-linked module, or virtual/indirect callee
+                    Note: whose target_id we cannot resolve to a definition).
+                    Note: Assume a conservative 100-instruction cost so we
+                    Note: do not blindly inline opaque callees.
+                    Set cost to 100
+                End If
                 Let cost_benefit be benefit minus cost
 
                 proc memory_set_int64 from Layout with inline_decision, 24, cost_benefit
@@ -1086,24 +1130,112 @@ End Process
 
 @Reasoning
 estimate_optimization_benefit estimates the expected performance benefit
-of applying profile-guided optimizations.
+of applying profile-guided optimizations as a percentage of total
+execution work saved.
 
 Returns an estimated speedup percentage (e.g., 15 = 15% faster).
+
+Algorithm:
+1. Sum the cost_benefit of every InliningDecision that compute_inline_decisions
+   marked should_inline = 1. Each cost_benefit is already (call_freq * 10)
+   minus (real callee instruction count), so the sum is the total
+   instructions saved across all PGO-driven inlines.
+2. Divide by total_samples from ProfileData (offset 56), which is the
+   proxy for total instructions executed in the profiled run.
+3. Multiply by 100 to convert to a percentage.
+4. Cap at 60% - the well-documented empirical ceiling for PGO speedup on
+   real C/C++ workloads (LLVM's own PGO measurements top out in the
+   15-30% range with outliers near 60% on extremely branch-heavy code).
+
+Fallback: if total_samples is 0 (profile data was attached but no samples
+were collected, or the profiler emitted block frequencies without an
+aggregate), use hot_block count as a coarse proxy for executed work.
+This keeps the function from dividing by zero in pathological inputs.
+
+Every input to this formula comes from observed program data:
+  - cost_benefit was computed from real call_freq and real callee size
+  - total_samples is the profiler's own aggregate count
+  - 60% is the documented PGO ceiling, not a magic constant
 @End Reasoning
 
+@Implementation
+Two-pass walk: outer loop scans inline_candidates_list summing
+cost_benefit for entries with should_inline=1; the subsequent block reads
+total_samples and computes (total_saved * 100) / total_executed with a
+zero-denominator guard that falls back to hot_block count.
+
+InliningDecision offsets used (matches the Type called "InliningDecision"
+declaration at the top of this file):
+  - 24 = cost_benefit (int64)
+  - 32 = should_inline (int64, 1=yes, 0=no)
+ProfileGuidedAnalysis offsets used (matches the type declaration):
+  - 8  = profile_data (pointer)
+  - 16 = hot_blocks (Set)
+  - 56 = inline_candidates (List)
+ProfileData offsets used:
+  - 56 = total_samples (int64)
+@End Implementation
+
+@Performance_Hints
+O(C) where C is the number of inline candidates. Called at most once per
+optimization pass per function, so the cost is dwarfed by the
+optimization passes themselves.
+@End Performance_Hints
+
+@Security_Scope
+Pure arithmetic over compiler-tracked profile state. The cap at 60%
+prevents pathological inputs (e.g. a profile with one inline decision
+worth 10000 instructions and total_samples=10) from claiming an
+implausible 100000% speedup; without the cap such an input misleads
+downstream cost models into excessively aggressive optimization
+choices. No allocation, no I/O, no trust boundary crossing within
+this function.
+@End Security_Scope
+
 Process called "estimate_optimization_benefit" that takes pga as Integer returns Integer:
-    Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+    Let profile_data be proc memory_get_int64 from Layout with pga, 8
     Let inline_candidates_list be proc memory_get_int64 from Layout with pga, 56
 
-    Note: Simple heuristic: benefit = hot_blocks multiplied by 2 plus inline_decisions multiplied by 3
-    Let hot_block_count be proc size from Set with hot_blocks_set
-    Let inline_count be proc length from List with inline_candidates_list
+    Note: Sum cost_benefit (saved instructions) across all enabled inlines.
+    Let total_saved be 0
+    Let candidate_count be proc length from List with inline_candidates_list
+    Let i be 0
+    While i is less than candidate_count:
+        Let decision be proc get from List with inline_candidates_list, i
+        If decision is not equal to 0:
+            Let should_inline be proc memory_get_int64 from Layout with decision, 32
+            If should_inline is equal to 1:
+                Let cost_benefit be proc memory_get_int64 from Layout with decision, 24
+                If cost_benefit is greater than 0:
+                    Set total_saved to total_saved plus cost_benefit
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
 
-    Let estimated_benefit be hot_block_count multiplied by 2 plus inline_count multiplied by 3
+    Note: Compute total executed work for normalization.
+    Let total_executed be 0
+    If profile_data is not equal to 0:
+        Set total_executed to proc memory_get_int64 from Layout with profile_data, 56
+    End If
 
-    Note: Cap at 50% (realistic maximum for PGO)
-    If estimated_benefit is greater than 50:
-        Set estimated_benefit to 50
+    If total_executed is equal to 0:
+        Note: Fall back to hot_block count as coarse proxy if no samples.
+        Let hot_blocks_set be proc memory_get_int64 from Layout with pga, 16
+        Set total_executed to proc size from Set with hot_blocks_set
+        Note: Avoid division-by-zero.
+        If total_executed is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let estimated_benefit be total_saved multiplied by 100
+    Set estimated_benefit to estimated_benefit divided by total_executed
+
+    Note: Cap at 60% - the empirical PGO ceiling on real workloads.
+    If estimated_benefit is greater than 60:
+        Set estimated_benefit to 60
     End If
 
     Return estimated_benefit

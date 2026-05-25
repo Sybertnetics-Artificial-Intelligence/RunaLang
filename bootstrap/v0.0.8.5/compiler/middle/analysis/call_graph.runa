@@ -949,6 +949,134 @@ Process called "identify_inlining_candidates" that takes cg as Integer, mir as I
 End Process
 
 @Reasoning
+get_function_instruction_count counts the total MIR instructions across
+all basic blocks of a function identified by function_id. Returns 0 when
+the function ID is not found in the MIR program (for example external
+declarations, or callees whose definition lives in a different
+compilation unit and has not been linked in yet).
+
+This is the shared primitive that backs all "how big is this callee?"
+heuristics in the analysis layer:
+  - identify_inlining_candidates (call_graph.runa) used to inline this
+    same walk inside its caller loop; that pattern is now expressed via
+    this helper for consistency.
+  - compute_inline_decisions (profile_guided.runa) previously hardcoded
+    callee cost = 50; it now derives the real instruction count via this
+    helper.
+
+Centralizing the walk in a single Process eliminates the divergence risk
+between the two consumers (any future change to "what counts as an
+instruction" - e.g. ignoring debug-only opcodes - lands once and is
+picked up by both heuristics automatically).
+@End Reasoning
+
+@Implementation
+Two-level scan: outer loop walks every function in mir.functions (offset
+0 in MIRProgram, a List of MIRFunction pointers) and matches by
+function_id (offset 0 in MIRFunction). On match, the inner loop walks
+every basic block in the function's CFG (cfg at offset 16 in this
+file's MIRFunction view, matching the existing convention used by
+identify_inlining_candidates and the rest of profile_guided.runa), and
+sums the lengths of each block's instructions list (offset 16 in
+MIRBasicBlock).
+
+Returns 0 if:
+  - mir pointer is 0 (defensive guard)
+  - the function with the given ID is not present
+  - the matched function has no CFG (e.g. is_external = 1)
+
+The "no CFG" return value of 0 is the same as "not found", which is the
+correct semantics: a function with no body has no instructions, so
+callers using this for cost estimation will treat external callees as
+"cost zero, can't be sized" - and the callers (compute_inline_decisions)
+explicitly handle the zero-return case by substituting a conservative
+default cost.
+@End Implementation
+
+@Performance_Hints
+O(F + B + I) where F = number of functions, B = blocks in the target
+function, I = instructions in those blocks. Linear scan over functions
+list because MIR does not maintain a function_id -> function pointer
+index at the top level; for compilations with tens to hundreds of
+functions this is acceptable. If profiling later shows this is a hot
+path, the natural fix is to add a function_id -> MIRFunction Dictionary
+to MIRProgram (alongside the existing functions List) at MIR
+construction time; this Process drops to O(B + I) once that index
+exists.
+
+Under the current callers' usage (compute_inline_decisions iterating
+over call sites, each calling this once per callee) total cost is
+bounded at O(C * (F + B_max + I_max)) where C is the number of call
+sites in the profiled function. With C in the dozens and F in the
+hundreds, this resolves to microseconds per function being optimized.
+@End Performance_Hints
+
+@Security_Scope
+Pure read-only walk over compiler-controlled MIR structures. No
+allocation, no I/O, no syscalls. function_id is untrusted from this
+function's perspective (callers may have derived it from a call
+instruction's operand which itself came from user code), but the
+function only uses it as an equality key against fields the compiler
+itself wrote, so a bogus function_id triggers only the "return 0" path,
+never an out-of-bounds access.
+@End Security_Scope
+
+Process called "get_function_instruction_count" that takes mir as Integer, function_id as Integer returns Integer:
+    If mir is equal to 0:
+        Return 0
+    End If
+
+    Let functions be proc memory_get_int64 from Layout with mir, 0
+    If functions is equal to 0:
+        Return 0
+    End If
+
+    Let func_count be proc length from List with functions
+    Let i be 0
+    While i is less than func_count:
+        Let mir_func be proc get from List with functions, i
+        If mir_func is not equal to 0:
+            Let fid be proc memory_get_int64 from Layout with mir_func, 0
+            If fid is equal to function_id:
+                Note: Found the function - walk its CFG. The file-local
+                Note: convention in call_graph.runa and profile_guided.runa
+                Note: uses offset 16 for the cfg field of MIRFunction.
+                Let cfg be proc memory_get_int64 from Layout with mir_func, 16
+                If cfg is equal to 0:
+                    Return 0
+                End If
+
+                Let blocks be proc memory_get_int64 from Layout with cfg, 0
+                If blocks is equal to 0:
+                    Return 0
+                End If
+
+                Let block_count be proc length from List with blocks
+                Let total be 0
+                Let b be 0
+                While b is less than block_count:
+                    Let block be proc get from List with blocks, b
+                    If block is not equal to 0:
+                        Let instructions be proc memory_get_int64 from Layout with block, 16
+                        If instructions is not equal to 0:
+                            Let inst_count be proc length from List with instructions
+                            Set total to total plus inst_count
+                        End If
+                    End If
+                    Set b to b plus 1
+                End While
+
+                Return total
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return 0
+End Process
+
+@Reasoning
 identify_dead_functions identifies functions that are never called.
 These can be eliminated in a dead code elimination pass.
 

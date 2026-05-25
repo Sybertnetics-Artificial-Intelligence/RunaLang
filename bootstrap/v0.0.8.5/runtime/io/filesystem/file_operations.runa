@@ -210,6 +210,144 @@ Process called "file_lseek" takes fd as Integer, offset as Integer, whence as In
     Return fio_seek from FileIO with fd, offset, whence
 End Process
 
+@Reasoning
+read_int32 reads a little-endian 32-bit signed integer from an open file
+descriptor and advances the underlying file position by 4 bytes. The PGO
+file-loading code (whole_program_analysis.runa load_pgo_database_from_file)
+needs this exact primitive: the .pgo file format stores its version and
+entry-count fields as little-endian int32 values immediately after the
+8-byte magic header. The pattern (allocate temp buffer, file_read_fd,
+memory_get_int32, free buffer) is repeated 3+ times per call site entry
+in that loader; extracting it to a primitive keeps the loader readable
+and centralizes the EOF/short-read handling.
+
+The little-endian convention matches the x86-64 native byte order, which
+is what every supported v0.0.8.5 target uses for its on-disk profile
+format. If a big-endian target is added later, memory_get_int32 will
+need an endian-aware variant, but the read_int32 caller-facing contract
+("returns the int32 value at the current file position") is unchanged.
+@End Reasoning
+
+@Implementation
+Allocates a 4-byte heap buffer, calls file_read_fd to fill it, parses
+the buffer as a signed int32 via memory_get_int32, frees the buffer,
+returns the value. The buffer is allocated once per call (8 bytes of
+overhead at the heap layer plus the 4-byte payload). For tight inner
+loops over many call-site entries, the PGO loader can choose to allocate
+a single 16-byte reusable buffer once at the top of the loop and inline
+the memory_get_int32 pattern; this primitive favors correctness and
+clarity at the call site.
+
+EOF / short-read handling: file_read_fd returns the number of bytes
+actually read. If fewer than 4 bytes are available the function returns
+0 (the convention shared with read_int64). Callers that need to
+distinguish EOF from a legitimate 0 value must use file_length or
+file_lseek to check the remaining bytes before calling read_int32.
+@End Implementation
+
+@Performance_Hints
+One memory_allocate(4) + one file_read_fd(...,4) + one memory_get_int32
++ one memory_free per call. The allocate/free pair on the Tier 3 heap
+costs roughly 10-15 cycles in steady state; the syscall through
+file_read_fd dominates (microseconds, not cycles). For batched binary
+parsing this primitive is fine; for performance-critical hot loops use
+a pre-allocated buffer + inline memory_get_int32 instead.
+@End Performance_Hints
+
+@Security_Scope
+File content is untrusted input. Callers MUST validate the returned
+integer before using it for sizing (e.g. entry_count for a loop bound)
+or for memory layout (e.g. an offset into a buffer). The PGO loader
+applies these checks at the call site: a corrupt or attacker-controlled
+.pgo file can yield arbitrary int32 values from this primitive, and the
+loader's "less than" / "less than or equal to" guards are what prevent
+those values from triggering out-of-bounds writes or excessive
+allocations. This function itself reads only 4 bytes from the buffer it
+just allocated, so it cannot be made to read out of bounds regardless
+of file content.
+@End Security_Scope
+
+Process called "read_int32" takes fd as Integer returns Integer:
+    Let buffer be proc memory_allocate from Memory with 4
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_read be fio_read from FileIO with fd, buffer, 4
+    If bytes_read is less than 4:
+        Note: Short read or error. Free the buffer and signal failure.
+        proc memory_free from Memory with buffer
+        Return 0
+    End If
+
+    Let value be memory_get_int32 from Memory with buffer, 0
+    proc memory_free from Memory with buffer
+    Return value
+End Process
+
+@Reasoning
+read_int64 reads a little-endian 64-bit signed integer from an open file
+descriptor and advances the underlying file position by 8 bytes. The PGO
+file-loading code uses this for the magic header
+(0x52554E41504F47 = "RUNAPGO"), for call-site addresses, for target
+addresses, and for frequency counters. Each .pgo entry contains at least
+two int64 reads (call_site_addr, frequency); a binary with N call sites
+and M targets per site triggers (3 + 2*M) read_int64 calls plus
+(2 + N) read_int32 calls.
+
+Why a separate function from read_int32 (vs a single sized read): the
+buffer-size and memory_get_intN primitives differ between 32 and 64-bit
+loads, and keeping the two as separate primitives avoids parameterizing
+on width at every call site. This matches the existing convention in
+memory_core.runa, which exposes memory_get_int8 / int16 / int32 / int64
+as four distinct functions rather than a single sized read.
+@End Reasoning
+
+@Implementation
+Same shape as read_int32 but with an 8-byte buffer and memory_get_int64.
+Returns 0 on short read or allocation failure. The buffer is freed
+before return on both success and failure paths so the function leaks
+no heap memory regardless of outcome.
+@End Implementation
+
+@Performance_Hints
+One memory_allocate(8) + one file_read_fd(...,8) + one memory_get_int64
++ one memory_free per call. The 8-byte allocate is no more expensive
+than the 4-byte allocate (the Tier 3 heap has a minimum allocation
+granularity larger than both). For PGO files with thousands of entries,
+the dominant cost is still the file I/O, not the per-call allocation;
+the loader does not need a pre-allocated buffer unless it is reading
+millions of entries.
+@End Performance_Hints
+
+@Security_Scope
+Same untrusted-input contract as read_int32. The 8-byte read cannot
+exceed the bounds of the 8-byte allocation. Callers using the returned
+int64 as a pointer-sized value (e.g. PGO target_addr) MUST treat it as
+opaque data, NOT as a directly dereferenceable pointer: the .pgo file
+records addresses from a separate compilation, which are meaningless to
+dereference in the current process even when the file is well-formed.
+The PGO consumer uses these addresses as dictionary keys only, never as
+pointers, which is the correct posture.
+@End Security_Scope
+
+Process called "read_int64" takes fd as Integer returns Integer:
+    Let buffer be proc memory_allocate from Memory with 8
+    If buffer is equal to 0:
+        Return 0
+    End If
+
+    Let bytes_read be fio_read from FileIO with fd, buffer, 8
+    If bytes_read is less than 8:
+        proc memory_free from Memory with buffer
+        Return 0
+    End If
+
+    Let value be memory_get_int64 from Memory with buffer, 0
+    proc memory_free from Memory with buffer
+    Return value
+End Process
+
 Note: file_length - get the size of an open fd by seeking to end and back.
 Note: Returns size in bytes, or -1 on error. Preserves the current file
 Note: offset. For path-based size queries use get_file_size.
