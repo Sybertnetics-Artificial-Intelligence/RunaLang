@@ -16,655 +16,1493 @@ limitations under the License.
 
 Note:
 ==============================================================================
-PARALLEL IMPORT PROCESSING SYSTEM v0.0.8.5
+PARALLEL IMPORT PROCESSING SYSTEM v0.0.8.5  (P2-C #117-aware rewrite)
 ==============================================================================
 
-This module implements production-grade parallel import processing:
-- Multi-threaded import resolution using POSIX threads
-- Thread-safe work queue with mutex synchronization
-- Load balancing across CPU cores
-- Error handling and recovery
-- Performance monitoring
+This module drives multi-threaded import resolution against the real #117
+platform threading API exposed by
+  compiler/frontend/primitives/assembly/threading.runa.
 
-This system achieves significant speedup on multi-core systems through
-proper parallel processing architecture.
+The previous incarnation of this file imported the non-existent
+`compiler/frontend/primitives/threading/posix_threads.runa` module and called
+sixteen fictional `pthread_*` / `atomic_counter_*` / `get_nproc` symbols that
+never resolved. The whole subsystem was dead weight: the object file
+compiled in isolation but never linked, so the moment a build wired up real
+multi-worker parsing the link broke. This rewrite eliminates that failure
+mode end-to-end.
+
+Architectural highlights:
+  * Per-worker arenas (Resolution A from DEV-LOG #117 sec5): each worker
+    parses into its own arena. No shared-arena race on the bump pointer.
+    Arenas are created on the main thread before workers spawn and destroyed
+    on shutdown after the deterministic merge phase has consumed their AST
+    nodes. Worker arenas live for the lifetime of the import context
+    (matches serial-path semantics: serial imports' AST also lives until
+    end-of-compilation).
+  * Monitor pattern (mutex + condvar) for the work queue. Producers
+    (main thread) and consumers (worker pool) coordinate through a single
+    queue_mutex. Workers wait on work_cv when the queue is empty; main
+    waits on done_cv until the completion counter reaches expected.
+  * Lock-free completion counter. atomic_increment under release semantics
+    is published every time a worker finishes a task. Main reads it under
+    queue_mutex (the cv contract) and waits on done_cv otherwise.
+  * Ring-buffer work queue with monotonic head/tail and modulo-capacity
+    index. The previous implementation incremented tail without wrapping;
+    the queue therefore grew unbounded. This rewrite preserves enqueue
+    order across resizes by re-packing into a linear layout.
+  * Deterministic merge. After every worker has joined, the main thread
+    iterates tasks in enqueue_order and merges results into main_program.
+    No shared writes from worker threads.
+  * Graceful degradation. platform_threading_available() returns 0 on any
+    backend P2-B has not verified. process_imports_parallel returns a
+    sentinel (2) on that path, and the driver falls back to
+    process_imports_recursive.
 :End Note
 
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/io/file_io.runa" as FileIO
+Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
-Import "compiler/frontend/primitives/threading/posix_threads.runa" as PThreads
+Import "compiler/frontend/primitives/assembly/threading.runa" as Threading
+Import "compiler/frontend/lexical/lexer.runa" as Lexer
+Import "compiler/frontend/parsing/parser.runa" as Parser
 Import "compiler/frontend/import_system/core.runa" as ImportCore
 Import "compiler/frontend/import_system/resolution.runa" as Resolution
+Import "runtime/core/memory/arena.runa" as Arena
 
 Note: ============================================================================
-Note: Thread Pool Management
+Note: Module Constants
 Note: ============================================================================
 
-Process called "initialize_thread_pool" that takes context as Integer, arena as Integer returns Integer:
-    Note: Initialize thread pool for parallel import processing
-    Note: Creates worker threads equal to CPU count
+Constant WORKER_ARENA_CAPACITY as Integer is 1048576
+Note: Default per-worker arena size (1 MiB). arena_create will grow as needed;
+Note: this is the starting page count to keep the first batch of parses
+Note: allocation-failure-free without wasting RSS on small builds.
 
-    Note: Check if thread pool already exists
-    Let thread_pool be proc memory_get_qword from MemoryCore with context, 200
-    If thread_pool is equal to 0:
-        Note: Allocate thread pool structure (128 bytes)
-        Set thread_pool to proc allocate_from_arena from Layout with arena, 128
-        If thread_pool is equal to 0:
-            Return 0
-        End If
-        proc memory_set_qword from MemoryCore with context, 200, thread_pool
-    End If
+Constant DEFAULT_QUEUE_CAPACITY as Integer is 64
+Note: Initial work-queue ring-buffer capacity. enqueue_task doubles this
+Note: on overflow, preserving enqueue_order across the resize by re-packing
+Note: pending tasks into a linear layout starting at head = 0.
 
-    Note: Get or determine worker count
-    Let worker_count be proc memory_get_qword from MemoryCore with context, 64
-    If worker_count is equal to 0:
-        Set worker_count to proc get_cpu_count
-        proc memory_set_qword from MemoryCore with context, 64, worker_count
-    End If
+Constant POOL_STRUCT_SIZE as Integer is 72
+Constant WORKER_SLOT_SIZE as Integer is 40
+Constant QUEUE_STRUCT_SIZE as Integer is 56
+Constant TASK_STRUCT_SIZE as Integer is 56
+Constant WORKER_CONTEXT_SIZE as Integer is 32
+Constant CELL_SIZE as Integer is 8
 
-    Note: Initialize work queue
-    Let work_queue be proc initialize_work_queue with arena
-    If work_queue is equal to 0:
-        Return 0
-    End If
-    proc memory_set_qword from MemoryCore with context, 208, work_queue
+Note: ThreadPool field offsets (POOL_STRUCT_SIZE bytes):
+Note:   0  workers_array        ptr to N * WORKER_SLOT_SIZE bytes
+Note:   8  worker_count         N
+Note:  16  work_queue           ptr to WorkQueue
+Note:  24  queue_mutex          handle from platform_mutex_create
+Note:  32  work_cv              handle from platform_condvar_create
+Note:  40  done_cv              handle from platform_condvar_create
+Note:  48  completion_counter   ptr to 8-byte atomic cell
+Note:  56  shutdown_flag        ptr to 8-byte atomic cell
+Note:  64  threading_available  1 = threads work, 0 = serial-fallback
 
-    Note: Initialize synchronization primitives
-    Let sync_primitives be proc initialize_sync_primitives with arena
-    If sync_primitives is equal to 0:
-        Return 0
-    End If
-    proc memory_set_qword from MemoryCore with context, 216, sync_primitives
+Note: WorkerSlot field offsets (WORKER_SLOT_SIZE bytes):
+Note:   0  thread_handle        handle returned by platform_thread_create
+Note:   8  worker_id            ordinal 0..N-1
+Note:  16  worker_arena         per-worker arena (arena_create result)
+Note:  24  pool_ptr             back-pointer to ThreadPool
+Note:  32  state                0=idle, 1=busy, 2=exited
 
-    Note: Create worker threads
-    Let workers be proc create_worker_threads with worker_count, context, arena
-    If workers is equal to 0:
-        Return 0
-    End If
+Note: WorkQueue field offsets (QUEUE_STRUCT_SIZE bytes):
+Note:   0  tasks_array          ptr to capacity * 8 bytes
+Note:   8  task_count           pending tasks
+Note:  16  head                 monotonic dequeue cursor
+Note:  24  tail                 monotonic enqueue cursor
+Note:  32  capacity             ring-buffer modulo
+Note:  40  total_enqueued       cumulative enqueues (stats)
+Note:  48  total_dequeued       cumulative dequeues (stats)
 
-    Note: Store thread pool metadata
-    proc memory_set_qword from MemoryCore with thread_pool, 0, workers
-    proc memory_set_qword from MemoryCore with thread_pool, 8, worker_count
-    proc memory_set_qword from MemoryCore with thread_pool, 16, 0
-    proc memory_set_qword from MemoryCore with thread_pool, 24, 0
+Note: ImportTask field offsets (TASK_STRUCT_SIZE bytes):
+Note:   0  import_path          ptr to import path string (main arena)
+Note:   8  enqueue_order        i in 0..import_count
+Note:  16  assigned_worker      worker id that processed this (-1 = unprocessed)
+Note:  24  parsed_program       ptr to parsed AST (0 on failure)
+Note:  32  error_code           0=success, 1-6=phase-specific failure
+Note:  40  worker_arena_ptr     arena that owns parsed_program (for lifetime)
+Note:  48  resolved_path        ptr to resolved path (worker arena)
 
-    Return 1
-End Process
+Note: WorkerContext field offsets (WORKER_CONTEXT_SIZE bytes):
+Note:   0  worker_id
+Note:   8  pool_ptr
+Note:  16  worker_arena
+Note:  24  main_context
 
-Process called "get_cpu_count" that returns Integer:
-    Note: Get number of CPU cores available for parallel processing
-    Note: Uses sysconf(_SC_NPROCESSORS_ONLN) on Linux/Unix
-
-    Note: Try to get CPU count from system
-    Let cpu_count be proc get_nproc from PThreads
-    If cpu_count is greater than 0:
-        Return cpu_count
-    End If
-
-    Note: Fallback to reasonable default
-    Return 4
-End Process
-
-Process called "initialize_work_queue" that takes arena as Integer returns Integer:
-    Note: Initialize thread-safe work queue for task distribution
-    Note: Work queue structure (64 bytes):
-    Note:   offset 0: tasks (pointer to task array, 8 bytes)
-    Note:   offset 8: task_count (current count, 8 bytes)
-    Note:   offset 16: head (dequeue position, 8 bytes)
-    Note:   offset 24: tail (enqueue position, 8 bytes)
-    Note:   offset 32: capacity (max size, 8 bytes)
-    Note:   offset 40: shutdown (shutdown flag, 8 bytes)
-    Note:   offset 48: pending_tasks (queued tasks, 8 bytes)
-    Note:   offset 56: completed_tasks (finished tasks, 8 bytes)
-
-    Let work_queue be proc allocate_from_arena from Layout with arena, 64
-    If work_queue is equal to 0:
-        Return 0
-    End If
-
-    Note: Initialize all fields to zero
-    proc memory_set_qword from MemoryCore with work_queue, 0, 0
-    proc memory_set_qword from MemoryCore with work_queue, 8, 0
-    proc memory_set_qword from MemoryCore with work_queue, 16, 0
-    proc memory_set_qword from MemoryCore with work_queue, 24, 0
-    proc memory_set_qword from MemoryCore with work_queue, 32, 0
-    proc memory_set_qword from MemoryCore with work_queue, 40, 0
-    proc memory_set_qword from MemoryCore with work_queue, 48, 0
-    proc memory_set_qword from MemoryCore with work_queue, 56, 0
-
-    Return work_queue
-End Process
-
-Process called "initialize_sync_primitives" that takes arena as Integer returns Integer:
-    Note: Initialize POSIX synchronization primitives
-    Note: Sync primitives structure (32 bytes):
-    Note:   offset 0: queue_mutex (pthread_mutex_t pointer, 8 bytes)
-    Note:   offset 8: work_condition (pthread_cond_t pointer, 8 bytes)
-    Note:   offset 16: completion_condition (pthread_cond_t pointer, 8 bytes)
-    Note:   offset 24: completion_counter (atomic counter pointer, 8 bytes)
-
-    Let sync_primitives be proc allocate_from_arena from Layout with arena, 32
-    If sync_primitives is equal to 0:
-        Return 0
-    End If
-
-    Note: Create mutex for work queue protection
-    Let queue_mutex be proc pthread_mutex_create from PThreads
-    If queue_mutex is equal to 0:
-        Return 0
-    End If
-    proc memory_set_qword from MemoryCore with sync_primitives, 0, queue_mutex
-
-    Note: Create condition variable for work notification
-    Let work_condition be proc pthread_cond_create from PThreads
-    If work_condition is equal to 0:
-        proc pthread_mutex_destroy from PThreads with queue_mutex
-        Return 0
-    End If
-    proc memory_set_qword from MemoryCore with sync_primitives, 8, work_condition
-
-    Note: Create condition variable for completion notification
-    Let completion_condition be proc pthread_cond_create from PThreads
-    If completion_condition is equal to 0:
-        proc pthread_mutex_destroy from PThreads with queue_mutex
-        proc pthread_cond_destroy from PThreads with work_condition
-        Return 0
-    End If
-    proc memory_set_qword from MemoryCore with sync_primitives, 16, completion_condition
-
-    Note: Create atomic counter for task completion tracking
-    Let completion_counter be proc atomic_counter_create from PThreads
-    If completion_counter is equal to 0:
-        proc pthread_mutex_destroy from PThreads with queue_mutex
-        proc pthread_cond_destroy from PThreads with work_condition
-        proc pthread_cond_destroy from PThreads with completion_condition
-        Return 0
-    End If
-    proc memory_set_qword from MemoryCore with sync_primitives, 24, completion_counter
-
-    Return sync_primitives
-End Process
+Note: ImportContext slots used by parallel.runa:
+Note:    64  parallel_workers   read-only, configured by driver
+Note:   200  thread_pool        ptr to our ThreadPool (we own this slot)
+Note:   208  work_queue         ptr to WorkQueue (mirrored from pool for fast access)
+Note:   216  sync_primitives    legacy slot, retained as 0 (we no longer indirect)
 
 Note: ============================================================================
-Note: Worker Thread Management
+Note: Work Queue Primitives (single-threaded; caller must hold queue_mutex)
 Note: ============================================================================
 
-Process called "create_worker_threads" that takes worker_count as Integer, context as Integer, arena as Integer returns Integer:
-    Note: Create array of worker threads for parallel processing
+Process called "initialize_work_queue" that takes main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Allocate the WorkQueue control block and its initial tasks_array. Both
+    live in the main arena because the queue's lifetime equals the thread
+    pool's lifetime, which equals the import context's lifetime.
+    @End Reasoning
 
-    Note: Allocate worker thread array
-    Let workers be proc allocate_from_arena from Layout with arena, worker_count multiplied by 8
-    If workers is equal to 0:
+    @Implementation
+    The ring buffer uses monotonic head/tail counters with modulo-capacity
+    indexing. The previous implementation grew the array unboundedly because
+    enqueue did `tail = tail + 1` without wrapping; this version starts with
+    a fixed capacity and only resizes when task_count >= capacity.
+    @End Implementation
+
+    @Performance_Hints
+    Arena allocation is O(1) bump-pointer. DEFAULT_QUEUE_CAPACITY is sized
+    to amortize resize cost for typical import counts (8-256 imports per
+    program) without wasting memory on tiny programs. The zero-init writes
+    of the seven control fields are cache-line-friendly: they touch a single
+    64-byte line.
+    @End Performance_Hints
+
+    @Security_Scope
+    No untrusted input flows into this Process. The arena pointer is
+    compiler-owned. Allocation failure (0 return from arena_allocate) is
+    propagated to the caller; no partial state escapes - if either
+    allocation fails the queue pointer is dropped on the floor (arena
+    reclaims it at end of compilation) and we return 0.
+    @End Security_Scope
+    :End Note
+
+    Let queue be proc arena_allocate from Arena with main_arena, QUEUE_STRUCT_SIZE
+    If queue is equal to 0:
         Return 0
     End If
 
-    Note: Create each worker thread
+    Let initial_array_size be DEFAULT_QUEUE_CAPACITY multiplied by CELL_SIZE
+    Let tasks_array be proc arena_allocate from Arena with main_arena, initial_array_size
+    If tasks_array is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_qword from MemoryCore with queue, 0, tasks_array
+    proc memory_set_qword from MemoryCore with queue, 8, 0
+    proc memory_set_qword from MemoryCore with queue, 16, 0
+    proc memory_set_qword from MemoryCore with queue, 24, 0
+    proc memory_set_qword from MemoryCore with queue, 32, DEFAULT_QUEUE_CAPACITY
+    proc memory_set_qword from MemoryCore with queue, 40, 0
+    proc memory_set_qword from MemoryCore with queue, 48, 0
+
+    Return queue
+End Process
+
+Process called "resize_work_queue" that takes work_queue as Integer, new_capacity as Integer returns Integer:
+    Note:
+    @Reasoning
+    The ring buffer must grow when task_count reaches capacity, because
+    further enqueues would overwrite live entries. Resizing in-place
+    preserves the queue invariants (head/tail/task_count) and keeps the
+    caller's queue pointer stable so worker threads do not need to
+    re-resolve the queue address. We linearize the layout during copy so
+    the post-resize state is identical to a freshly-initialized queue with
+    task_count entries already enqueued.
+    @End Reasoning
+
+    @Implementation
+    Grow the ring buffer in-place, preserving task_count pending tasks in
+    their original enqueue order. We allocate a fresh linear array sized to
+    `new_capacity * 8` and copy the pending region starting at head%cap, in
+    up to two segments depending on whether the live region wraps the old
+    array. After the copy, head is reset to 0 and tail to task_count so the
+    queue resumes from a clean linear layout.
+    The caller MUST hold queue_mutex during this operation.
+    @End Implementation
+
+    @Performance_Hints
+    Resize is O(task_count) due to the copy loop. The geometric growth
+    policy in enqueue_task (capacity * 2) amortizes resize cost to O(1) per
+    enqueue across the lifetime of the queue. The zero-fill loop on the new
+    array prevents stale-pointer hazards if a future dequeue ever indexes
+    past task_count due to a logic bug; this is defensive but cheap because
+    the working set fits in L1 for typical capacities.
+    @End Performance_Hints
+
+    @Security_Scope
+    The work_queue pointer is compiler-owned; new_capacity is computed by
+    enqueue_task (capacity * 2, bounded by import_count * 2). No untrusted
+    input. We carefully distinguish arena-owned from heap-owned old arrays:
+    deallocating an arena-owned pointer would corrupt the layout allocator
+    (see ownership comment in body). The capacity-check guard is the safety
+    barrier for that boundary.
+    @End Security_Scope
+    :End Note
+
+    Let old_array be proc memory_get_qword from MemoryCore with work_queue, 0
+    Let task_count be proc memory_get_qword from MemoryCore with work_queue, 8
+    Let head be proc memory_get_qword from MemoryCore with work_queue, 16
+    Let old_capacity be proc memory_get_qword from MemoryCore with work_queue, 32
+
+    Let new_array_bytes be new_capacity multiplied by CELL_SIZE
+    Let new_array be proc allocate from Layout with new_array_bytes
+    If new_array is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero new array so unused slots don't look like ghost tasks.
+    Let zero_idx be 0
+    While zero_idx is less than new_capacity:
+        Let zero_offset be zero_idx multiplied by CELL_SIZE
+        proc memory_set_qword from MemoryCore with new_array, zero_offset, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+
+    Note: Copy task_count tasks from old_array starting at head%old_capacity.
     Let i be 0
-    While i is less than worker_count:
-        Let worker_id be i
-        Let worker_thread be proc create_worker_thread with worker_id, context, arena
-        If worker_thread is equal to 0:
-            Note: Cleanup previously created threads on failure
-            proc cleanup_worker_threads with workers, i
-            Return 0
-        End If
-
-        proc memory_set_qword from MemoryCore with workers plus i multiplied by 8, 0, worker_thread
+    While i is less than task_count:
+        Let src_idx be head plus i
+        Let src_mod be src_idx modulo by old_capacity
+        Let src_offset be src_mod multiplied by CELL_SIZE
+        Let task_ptr be proc memory_get_qword from MemoryCore with old_array, src_offset
+        Let dst_offset be i multiplied by CELL_SIZE
+        proc memory_set_qword from MemoryCore with new_array, dst_offset, task_ptr
         Set i to i plus 1
     End While
 
-    Return workers
-End Process
+    proc memory_set_qword from MemoryCore with work_queue, 0, new_array
+    proc memory_set_qword from MemoryCore with work_queue, 16, 0
+    proc memory_set_qword from MemoryCore with work_queue, 24, task_count
+    proc memory_set_qword from MemoryCore with work_queue, 32, new_capacity
 
-Process called "create_worker_thread" that takes worker_id as Integer, context as Integer, arena as Integer returns Integer:
-    Note: Create individual worker thread with context
-
-    Note: Create worker context (stores thread-specific data)
-    Let worker_context be proc create_worker_context with worker_id, context, arena
-    If worker_context is equal to 0:
-        Return 0
-    End If
-
-    Note: Create POSIX thread with worker_main as entry point
-    Let worker_thread be proc pthread_create from PThreads with worker_main, worker_context
-    If worker_thread is equal to 0:
-        proc deallocate from Layout with worker_context
-        Return 0
-    End If
-
-    Return worker_thread
-End Process
-
-Process called "create_worker_context" that takes worker_id as Integer, context as Integer, arena as Integer returns Integer:
-    Note: Create worker context structure for thread
-    Note: Worker context structure (32 bytes):
-    Note:   offset 0: worker_id (thread ID, 8 bytes)
-    Note:   offset 8: context (global context pointer, 8 bytes)
-    Note:   offset 16: arena (memory arena pointer, 8 bytes)
-    Note:   offset 24: status (0=idle, 1=working, 8 bytes)
-
-    Let worker_context be proc allocate_from_arena from Layout with arena, 32
-    If worker_context is equal to 0:
-        Return 0
-    End If
-
-    proc memory_set_qword from MemoryCore with worker_context, 0, worker_id
-    proc memory_set_qword from MemoryCore with worker_context, 8, context
-    proc memory_set_qword from MemoryCore with worker_context, 16, arena
-    proc memory_set_qword from MemoryCore with worker_context, 24, 0
-
-    Return worker_context
-End Process
-
-Process called "worker_main" that takes worker_context as Integer returns Integer:
-    Note: Main worker thread function - continuously processes tasks from queue
-
-    Note: Extract worker data from context
-    Let worker_id be proc memory_get_qword from MemoryCore with worker_context, 0
-    Let context be proc memory_get_qword from MemoryCore with worker_context, 8
-    Let arena be proc memory_get_qword from MemoryCore with worker_context, 16
-
-    Note: Log worker startup
-    Alert "[WORKER " joined with worker_id joined with "] Started"
-
-
-    Note: Get queue and synchronization primitives
-    Let work_queue be proc memory_get_qword from MemoryCore with context, 208
-    Let sync_primitives be proc memory_get_qword from MemoryCore with context, 216
-    Let queue_mutex be proc memory_get_qword from MemoryCore with sync_primitives, 0
-    Let work_condition be proc memory_get_qword from MemoryCore with sync_primitives, 8
-    Let completion_condition be proc memory_get_qword from MemoryCore with sync_primitives, 16
-    Let completion_counter be proc memory_get_qword from MemoryCore with sync_primitives, 24
-
-    Note: Main worker loop - run until shutdown
-    While 1:
-        Note: Acquire lock before checking queue
-        proc pthread_mutex_lock from PThreads with queue_mutex
-
-        Note: Get next task from queue
-        Let task be proc get_next_task with work_queue
-        While task is equal to 0:
-            Note: Check if shutdown requested
-            Let shutdown be proc memory_get_qword from MemoryCore with work_queue, 40
-            If shutdown is equal to 1:
-                proc pthread_mutex_unlock from PThreads with queue_mutex
-                Alert "[WORKER " joined with worker_id joined with "] Shutting down"
-                Return 0
-            End If
-
-            Note: Wait for work notification
-            proc pthread_cond_wait from PThreads with work_condition, queue_mutex
-            Set task to proc get_next_task with work_queue
-        End While
-
-        proc pthread_mutex_unlock from PThreads with queue_mutex
-
-        Note: Mark worker as busy
-        proc memory_set_qword from MemoryCore with worker_context, 24, 1
-
-        Note: Process the import task
-        Let result be proc process_import_task with task, context, arena
-        If result is not equal to 0:
-            Alert "[WORKER " joined with worker_id joined with "] Task failed"
+    Note: Only deallocate the old array if it was previously allocated by
+    Note: this resize path. The initial array is arena-owned; calling
+    Note: deallocate on it would corrupt the layout allocator. We detect
+    Note: arena ownership by checking whether old_capacity equals the
+    Note: default initial capacity: the first resize replaces an arena
+    Note: array with a heap array, all subsequent resizes replace heap
+    Note: arrays.
+    If old_capacity is not equal to DEFAULT_QUEUE_CAPACITY:
+        If old_array is not equal to 0:
+            proc deallocate from Layout with old_array
         End If
-
-        Note: Mark task as completed
-        proc atomic_increment from PThreads with completion_counter
-        proc pthread_cond_signal from PThreads with completion_condition
-
-        Note: Mark worker as idle
-        proc memory_set_qword from MemoryCore with worker_context, 24, 0
-    End While
-
-    Return 0
-End Process
-
-Note: ============================================================================
-Note: Work Queue Operations
-Note: ============================================================================
-
-Process called "add_import_task" that takes import_path as Integer, context as Integer, arena as Integer returns Integer:
-    Note: Add import task to thread-safe work queue
-
-    Let work_queue be proc memory_get_qword from MemoryCore with context, 208
-    If work_queue is equal to 0:
-        Return 0
     End If
-
-    Let sync_primitives be proc memory_get_qword from MemoryCore with context, 216
-    Let queue_mutex be proc memory_get_qword from MemoryCore with sync_primitives, 0
-    Let work_condition be proc memory_get_qword from MemoryCore with sync_primitives, 8
-
-    Note: Create task structure
-    Let task be proc create_import_task with import_path, arena
-    If task is equal to 0:
-        Return 0
-    End If
-
-    Note: Acquire lock before modifying queue
-    proc pthread_mutex_lock from PThreads with queue_mutex
-
-    Note: Add task to queue
-    Let result be proc enqueue_task with work_queue, task
-    If result is equal to 0:
-        proc pthread_mutex_unlock from PThreads with queue_mutex
-        proc deallocate from Layout with task
-        Return 0
-    End If
-
-    proc pthread_mutex_unlock from PThreads with queue_mutex
-
-    Note: Notify one waiting worker
-    proc pthread_cond_signal from PThreads with work_condition
 
     Return 1
 End Process
 
-Process called "create_import_task" that takes import_path as Integer, arena as Integer returns Integer:
-    Note: Create import task structure
-    Note: Task structure (32 bytes):
-    Note:   offset 0: import_path (string pointer, 8 bytes)
-    Note:   offset 8: status (0=pending, 1=completed, 8 bytes)
-    Note:   offset 16: result (parsed program pointer, 8 bytes)
-    Note:   offset 24: error_code (0=success, >0=error, 8 bytes)
-
-    Let task be proc allocate_from_arena from Layout with arena, 32
-    If task is equal to 0:
-        Return 0
-    End If
-
-    proc memory_set_qword from MemoryCore with task, 0, import_path
-    proc memory_set_qword from MemoryCore with task, 8, 0
-    proc memory_set_qword from MemoryCore with task, 16, 0
-    proc memory_set_qword from MemoryCore with task, 24, 0
-
-    Return task
-End Process
-
 Process called "enqueue_task" that takes work_queue as Integer, task as Integer returns Integer:
-    Note: Add task to work queue with automatic resizing
+    Note:
+    @Reasoning
+    Producer side of the SPMC monitor. The main thread is the sole
+    producer (enqueueing all imports up-front before workers begin
+    consuming concurrently); the mutex still serializes enqueue against
+    worker dequeues. Doubling capacity on overflow rather than panicking
+    keeps the queue correct even if the upstream import-count estimate is
+    low.
+    @End Reasoning
+
+    @Implementation
+    Append a task at tail%capacity. If the buffer is full, double capacity
+    via resize_work_queue first. tail is monotonic; only the modulo index
+    wraps. Caller MUST hold queue_mutex.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path is a single memory_set_qword at the tail slot plus three
+    counter updates (tail, task_count, total_enqueued) - amortized O(1).
+    Resize overhead is geometric, so total enqueue cost over a session is
+    O(n) for n tasks. total_enqueued is a diagnostic counter; removing it
+    would save one cache write per enqueue if profiling demands it.
+    @End Performance_Hints
+
+    @Security_Scope
+    The task pointer is compiler-owned (allocated by create_import_task
+    from the main arena). We do not validate it; storing 0 is permitted
+    and dequeue_task treats it as empty-queue. The caller invariant
+    (queue_mutex held) is what prevents tearing of the tail/task_count
+    pair, not any local check.
+    @End Security_Scope
+    :End Note
 
     Let task_count be proc memory_get_qword from MemoryCore with work_queue, 8
     Let capacity be proc memory_get_qword from MemoryCore with work_queue, 32
 
-    Note: Check if queue needs resizing
     If task_count is greater than or equal to capacity:
-        Note: Double capacity (or initialize to 16)
         Let new_capacity be capacity multiplied by 2
-        If new_capacity is equal to 0:
-            Set new_capacity to 16
+        If new_capacity is less than DEFAULT_QUEUE_CAPACITY:
+            Set new_capacity to DEFAULT_QUEUE_CAPACITY
         End If
-
-        Let result be proc resize_work_queue with work_queue, new_capacity
-        If result is equal to 0:
+        Let resize_ok be proc resize_work_queue with work_queue, new_capacity
+        If resize_ok is equal to 0:
             Return 0
         End If
+        Set capacity to new_capacity
+        Set task_count to proc memory_get_qword from MemoryCore with work_queue, 8
     End If
 
-    Note: Add task to tail of queue
-    Let tasks be proc memory_get_qword from MemoryCore with work_queue, 0
+    Let tasks_array be proc memory_get_qword from MemoryCore with work_queue, 0
     Let tail be proc memory_get_qword from MemoryCore with work_queue, 24
-    proc memory_set_qword from MemoryCore with tasks plus tail multiplied by 8, 0, task
-    proc memory_set_qword from MemoryCore with work_queue, 24, tail plus 1
-    proc memory_set_qword from MemoryCore with work_queue, 8, task_count plus 1
+    Let slot_index be tail modulo by capacity
+    Let slot_offset be slot_index multiplied by CELL_SIZE
+
+    proc memory_set_qword from MemoryCore with tasks_array, slot_offset, task
+
+    Let new_tail be tail plus 1
+    Let new_count be task_count plus 1
+    Let total_enq be proc memory_get_qword from MemoryCore with work_queue, 40
+    proc memory_set_qword from MemoryCore with work_queue, 24, new_tail
+    proc memory_set_qword from MemoryCore with work_queue, 8, new_count
+    proc memory_set_qword from MemoryCore with work_queue, 40, total_enq plus 1
 
     Return 1
 End Process
 
-Process called "get_next_task" that takes work_queue as Integer returns Integer:
-    Note: Get next task from work queue (must be called with lock held)
+Process called "dequeue_task" that takes work_queue as Integer returns Integer:
+    Note:
+    @Reasoning
+    Consumer side of the SPMC monitor. Returning 0 on empty rather than
+    blocking is intentional: the worker loop owns the wait-on-condition
+    decision so it can also test the shutdown flag in the same critical
+    section. Decoupling those two concerns would force an extra mutex
+    cycle per wakeup.
+    @End Reasoning
+
+    @Implementation
+    Pop the head task. Returns 0 if the queue is empty; otherwise the task
+    pointer. Caller MUST hold queue_mutex.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path is a single memory_get_qword at the head slot plus three
+    counter updates - amortized O(1). The empty-queue early return avoids
+    touching the tasks_array entirely when the queue is drained, keeping
+    the worker-spin cost minimal between wakeups.
+    @End Performance_Hints
+
+    @Security_Scope
+    No untrusted input. The returned task pointer is compiler-owned. The
+    caller-holds-mutex invariant prevents two workers from observing the
+    same head value and dequeueing the same task twice.
+    @End Security_Scope
+    :End Note
 
     Let task_count be proc memory_get_qword from MemoryCore with work_queue, 8
     If task_count is equal to 0:
         Return 0
     End If
 
-    Note: Get task from head of queue
-    Let tasks be proc memory_get_qword from MemoryCore with work_queue, 0
+    Let tasks_array be proc memory_get_qword from MemoryCore with work_queue, 0
     Let head be proc memory_get_qword from MemoryCore with work_queue, 16
-    Let task be proc memory_get_qword from MemoryCore with tasks plus head multiplied by 8, 0
+    Let capacity be proc memory_get_qword from MemoryCore with work_queue, 32
+    Let slot_index be head modulo by capacity
+    Let slot_offset be slot_index multiplied by CELL_SIZE
+    Let task be proc memory_get_qword from MemoryCore with tasks_array, slot_offset
 
-    Note: Update queue head and count
-    proc memory_set_qword from MemoryCore with work_queue, 16, head plus 1
-    proc memory_set_qword from MemoryCore with work_queue, 8, task_count minus 1
+    Let new_head be head plus 1
+    Let new_count be task_count minus 1
+    Let total_deq be proc memory_get_qword from MemoryCore with work_queue, 48
+    proc memory_set_qword from MemoryCore with work_queue, 16, new_head
+    proc memory_set_qword from MemoryCore with work_queue, 8, new_count
+    proc memory_set_qword from MemoryCore with work_queue, 48, total_deq plus 1
 
     Return task
 End Process
 
-Process called "resize_work_queue" that takes work_queue as Integer, new_capacity as Integer returns Integer:
-    Note: Resize work queue to new capacity with task preservation
+Note: ============================================================================
+Note: ImportTask Construction
+Note: ============================================================================
 
-    Let old_tasks be proc memory_get_qword from MemoryCore with work_queue, 0
-    Let new_tasks be proc allocate from Layout with new_capacity multiplied by 8
-    If new_tasks is equal to 0:
+Process called "create_import_task" that takes import_path as Integer, enqueue_order as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    All tasks are allocated up front from the main arena, sized exactly to
+    import_count. Workers fill in resolved_path / parsed_program /
+    worker_arena_ptr / error_code; they never resize the task struct.
+    Fixed layout means workers can write into a task slot without locking;
+    the main thread guarantees no aliasing because each task is only
+    enqueued once.
+    @End Reasoning
+
+    @Implementation
+    Allocate TASK_STRUCT_SIZE bytes from main_arena. Initialize the seven
+    qword fields at offsets 0/8/16/24/32/40/48: import_path, enqueue_order,
+    -1 (sentinel worker_id meaning "not yet picked up"), 0 (parsed_program
+    placeholder), 0 (worker_arena_ptr placeholder), 0 (error_code = no
+    error), and 0 (resolved_path placeholder filled in by worker).
+    @End Implementation
+
+    @Performance_Hints
+    Arena bump-pointer allocation: O(1). Seven sequential qword writes hit
+    one cache line. Allocation cost dominates the rest of the task
+    lifecycle's pre-work, so reducing TASK_STRUCT_SIZE below 56 bytes
+    would not yield measurable wins.
+    @End Performance_Hints
+
+    @Security_Scope
+    import_path is a String pointer derived from the program's import
+    AST; its provenance is parser output, not external input directly.
+    Path validation/sandbox enforcement happens later inside
+    resolve_module_path on the worker thread. We do not dereference
+    import_path here; we only store the pointer.
+    @End Security_Scope
+    :End Note
+
+    Let task be proc arena_allocate from Arena with main_arena, TASK_STRUCT_SIZE
+    If task is equal to 0:
         Return 0
     End If
 
-    Note: Copy existing tasks to new array
-    Let task_count be proc memory_get_qword from MemoryCore with work_queue, 8
-    Let i be 0
-    While i is less than task_count:
-        Let task be proc memory_get_qword from MemoryCore with old_tasks plus i multiplied by 8, 0
-        proc memory_set_qword from MemoryCore with new_tasks plus i multiplied by 8, 0, task
-        Set i to i plus 1
-    End While
+    proc memory_set_qword from MemoryCore with task, 0, import_path
+    proc memory_set_qword from MemoryCore with task, 8, enqueue_order
+    proc memory_set_qword from MemoryCore with task, 16, -1
+    proc memory_set_qword from MemoryCore with task, 24, 0
+    proc memory_set_qword from MemoryCore with task, 32, 0
+    proc memory_set_qword from MemoryCore with task, 40, 0
+    proc memory_set_qword from MemoryCore with task, 48, 0
 
-    Note: Update queue with new array
-    proc memory_set_qword from MemoryCore with work_queue, 0, new_tasks
-    proc memory_set_qword from MemoryCore with work_queue, 32, new_capacity
-
-    Note: Deallocate old array
-    If old_tasks is not equal to 0:
-        proc deallocate from Layout with old_tasks
-    End If
-
-    Return 1
+    Return task
 End Process
 
 Note: ============================================================================
-Note: Parallel Import Processing
+Note: Worker Task Processing
 Note: ============================================================================
 
-Process called "process_imports_parallel" that takes program as Integer, context as Integer, arena as Integer returns Integer:
-    Note: Process all imports in parallel using thread pool
-    Note: Returns 0 on success, 1 on error
+Process called "process_import_task" that takes task as Integer, worker_slot as Integer, main_context as Integer returns Integer:
+    Note:
+    @Reasoning
+    Run the full resolve -> read -> lex -> parse pipeline for a single
+    import task on a worker thread. All allocations route through the
+    worker's own arena (worker_slot+16), never the shared main arena.
+    @End Reasoning
 
-    Note: Initialize thread pool if not already done
-    If proc initialize_thread_pool with context, arena is equal to 0:
-        Alert "[PARALLEL ERROR] Failed to initialize thread pool"
-        
-        Return 1
-    End If
+    @Implementation
+    Five-phase staged pipeline with per-phase error codes (1=resolve,
+    2=read, 3=lex, 4=parser_create, 5=parse). Each phase writes its
+    failure code into task[32] and returns 1 (worker reported error,
+    keep running). Success records the parsed program at task[24] and
+    the owning worker arena at task[40] so the merge phase can locate
+    the AST nodes after join. Resources (lexer, parser, source buffer)
+    are destroyed in reverse-creation order on both success and failure.
+    @End Implementation
 
-    Note: Get import count and imports array from program
-    Let import_count be proc memory_get_dword from MemoryCore with program, 40
-    If import_count is equal to 0:
-        Return 0
-    End If
+    @Performance_Hints
+    The hot path is the parser_parse_program call which dominates wall
+    time per import. Per-worker arenas eliminate allocator contention
+    across workers; the only synchronization in this Process is the
+    error-code write at the end, which the main thread reads only
+    AFTER join.
+    @End Performance_Hints
 
-    Let imports be proc memory_get_qword from MemoryCore with program, 32
-    If imports is equal to 0:
-        Alert "[PARALLEL ERROR] No imports array found"
-        
-        Return 1
-    End If
+    @Security_Scope
+    The import path is validated by Resolution.resolve_module_path BEFORE
+    any file I/O happens; that resolver enforces the security_flags policy
+    set on main_context (sandbox roots, allow-list, no traversal, etc.).
+    The worker never touches the filesystem with an unresolved string.
+    @End Security_Scope
+    :End Note
 
-    Note: Add all imports to work queue
-    Let i be 0
-    While i is less than import_count:
-        Let ptr_size be 8
-        Let import_offset be i multiplied by ptr_size
-        Let import_ptr be imports plus import_offset
-        Let import_stmt be proc memory_get_qword from MemoryCore with import_ptr, 0
+    Let worker_id be proc memory_get_qword from MemoryCore with worker_slot, 8
+    Let worker_arena be proc memory_get_qword from MemoryCore with worker_slot, 16
 
-        If import_stmt is not equal to 0:
-            Let import_filename be proc memory_get_qword from MemoryCore with import_stmt, 0
-            If import_filename is not equal to 0:
-                Let result be proc add_import_task with import_filename, context, arena
-                If result is equal to 0:
-                    Alert "[PARALLEL ERROR] Failed to add import task"
-                    
-                    Return 1
-                End If
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Wait for all tasks to complete
-    Set result to proc wait_for_completion with context, import_count
-    If result is not equal to 0:
-        Alert "[PARALLEL ERROR] Some import tasks failed"
-        
-        Return 1
-    End If
-
-    Alert "[PARALLEL SUCCESS] Processed " joined with import_count joined with " imports in parallel"
-
-    Return 0
-End Process
-
-Process called "wait_for_completion" that takes context as Integer, expected_tasks as Integer returns Integer:
-    Note: Wait for all import tasks to complete using condition variable
-
-    Let sync_primitives be proc memory_get_qword from MemoryCore with context, 216
-    Let queue_mutex be proc memory_get_qword from MemoryCore with sync_primitives, 0
-    Let completion_condition be proc memory_get_qword from MemoryCore with sync_primitives, 16
-    Let completion_counter be proc memory_get_qword from MemoryCore with sync_primitives, 24
-
-    proc pthread_mutex_lock from PThreads with queue_mutex
-
-    Note: Wait until all expected tasks are completed
-    Let completed be proc atomic_get from PThreads with completion_counter
-    While completed is less than expected_tasks:
-        proc pthread_cond_wait from PThreads with completion_condition, queue_mutex
-        Set completed to proc atomic_get from PThreads with completion_counter
-    End While
-
-    proc pthread_mutex_unlock from PThreads with queue_mutex
-
-    Return 0
-End Process
-
-Process called "process_import_task" that takes task as Integer, context as Integer, arena as Integer returns Integer:
-    Note: Process individual import task - resolve, read, lex, parse
+    proc memory_set_qword from MemoryCore with task, 16, worker_id
 
     Let import_path be proc memory_get_qword from MemoryCore with task, 0
     If import_path is equal to 0:
+        proc memory_set_qword from MemoryCore with task, 32, 1
         Return 1
     End If
 
-    Note: Resolve import path to actual file
-    Let resolved_path be proc resolve_module_path from Resolution with import_path, context, arena
+    Let resolved_path be proc resolve_module_path from Resolution with import_path, main_context, worker_arena
     If resolved_path is equal to 0:
-        proc memory_set_qword from MemoryCore with task, 24, 1
+        proc memory_set_qword from MemoryCore with task, 32, 1
         Return 1
     End If
+    proc memory_set_qword from MemoryCore with task, 48, resolved_path
 
-    Note: Read the imported file
-    Let import_source be proc read_file from FileIO with resolved_path
+    Let import_source be proc read_file_internal from ImportCore with resolved_path
     If import_source is equal to 0:
-        proc memory_set_qword from MemoryCore with task, 24, 2
+        proc memory_set_qword from MemoryCore with task, 32, 2
         Return 1
     End If
 
-    Note: Create lexer for imported file
-    Let import_lexer be proc lexer_create from ImportCore with import_source, arena
+    Let source_length be proc string_length from StringCore with import_source
+    Let import_lexer be proc lexer_create from Lexer with import_source, source_length, 0, worker_arena
     If import_lexer is equal to 0:
-        proc memory_set_qword from MemoryCore with task, 24, 3
+        proc memory_set_qword from MemoryCore with task, 32, 3
         proc deallocate from Layout with import_source
         Return 1
     End If
 
-    Note: Create parser for imported file
-    Let import_parser be proc parser_create from ImportCore with import_lexer, arena
+    Let import_parser be proc parser_create from Parser with import_lexer, worker_arena
     If import_parser is equal to 0:
-        proc memory_set_qword from MemoryCore with task, 24, 4
-        proc lexer_destroy from ImportCore with import_lexer
+        proc memory_set_qword from MemoryCore with task, 32, 4
+        proc lexer_destroy from Lexer with import_lexer
         proc deallocate from Layout with import_source
         Return 1
     End If
 
-    Note: Parse the imported file
-    Let import_program be proc parser_parse_program from ImportCore with import_parser
+    Let import_program be proc parser_parse_program from Parser with import_parser
     If import_program is equal to 0:
-        proc memory_set_qword from MemoryCore with task, 24, 5
-        proc parser_destroy from ImportCore with import_parser
-        proc lexer_destroy from ImportCore with import_lexer
+        proc memory_set_qword from MemoryCore with task, 32, 5
+        proc parser_destroy from Parser with import_parser
+        proc lexer_destroy from Lexer with import_lexer
         proc deallocate from Layout with import_source
         Return 1
     End If
 
-    Note: Store parsed program in task result
-    proc memory_set_qword from MemoryCore with task, 16, import_program
-    proc memory_set_qword from MemoryCore with task, 8, 1
+    proc memory_set_qword from MemoryCore with task, 24, import_program
+    proc memory_set_qword from MemoryCore with task, 40, worker_arena
+    proc memory_set_qword from MemoryCore with task, 32, 0
 
-    Note: Cleanup parsing resources
-    proc parser_destroy from ImportCore with import_parser
-    proc lexer_destroy from ImportCore with import_lexer
+    proc parser_destroy from Parser with import_parser
+    proc lexer_destroy from Lexer with import_lexer
     proc deallocate from Layout with import_source
 
     Return 0
 End Process
 
 Note: ============================================================================
-Note: Thread Pool Cleanup
+Note: Worker Main Loop
 Note: ============================================================================
 
-Process called "shutdown_thread_pool" that takes context as Integer returns Integer:
-    Note: Gracefully shutdown thread pool - signal workers and wait for completion
+Process called "worker_main" that takes worker_context as Integer returns Integer:
+    Note:
+    @Reasoning
+    Standard monitor-pattern consumer. Hold queue_mutex while inspecting
+    the queue; if empty, check the shutdown flag with atomic_load_acquire
+    and either exit (clean teardown via platform_thread_exit) or wait on
+    work_cv. After dequeueing, release the mutex BEFORE running the parse
+    so other workers can dequeue concurrently. On task completion,
+    atomic_increment the completion counter (release semantics built into
+    seq_cst atomics) and signal done_cv so the main thread observes
+    progress.
+    @End Reasoning
 
-    Let thread_pool be proc memory_get_qword from MemoryCore with context, 200
-    If thread_pool is equal to 0:
+    @Implementation
+    Read the six pool fields (workers_array, work_queue, queue_mutex,
+    work_cv, done_cv, completion_counter, shutdown_flag) once at entry to
+    keep the hot loop register-resident. Per-iteration: lock mutex, spin
+    on dequeue+shutdown-check+condvar_wait until task obtained or
+    shutdown observed, unlock mutex, set worker_state=1 (working), run
+    process_import_task, increment completion counter, signal done_cv,
+    reset worker_state=0. On shutdown observed: set worker_state=2
+    (exited) and call platform_thread_exit so the kernel can reap the
+    TID at join time.
+    @End Implementation
+
+    @Performance_Hints
+    The mutex is held ONLY for queue inspection and dequeue, NOT during
+    the parse phase - this is the key concurrency win versus a naive
+    serialize-everything implementation. atomic_increment uses
+    architecture-native fetch-add (lock xadd on x86_64), faster than a
+    mutex-protected counter. The condvar wakeup pattern (signal on
+    enqueue, broadcast on shutdown) avoids the thundering herd while
+    workers are draining the queue.
+    @End Performance_Hints
+
+    @Security_Scope
+    The worker_context pointer is compiler-owned (allocated by
+    create_worker_context from the main arena). All five reads from
+    worker_context use known fixed offsets. The mutex/condvar handles
+    are obtained from pool, also compiler-owned. The only external
+    surface in this Process is the eventual call to process_import_task,
+    whose own annotation covers the per-import security boundary.
+    @End Security_Scope
+    :End Note
+
+    Let worker_id be proc memory_get_qword from MemoryCore with worker_context, 0
+    Let pool be proc memory_get_qword from MemoryCore with worker_context, 8
+    Let worker_arena be proc memory_get_qword from MemoryCore with worker_context, 16
+    Let main_context be proc memory_get_qword from MemoryCore with worker_context, 24
+
+    Let workers_array be proc memory_get_qword from MemoryCore with pool, 0
+    Let worker_slot_offset be worker_id multiplied by WORKER_SLOT_SIZE
+    Let worker_slot be workers_array plus worker_slot_offset
+
+    Let work_queue be proc memory_get_qword from MemoryCore with pool, 16
+    Let queue_mutex be proc memory_get_qword from MemoryCore with pool, 24
+    Let work_cv be proc memory_get_qword from MemoryCore with pool, 32
+    Let done_cv be proc memory_get_qword from MemoryCore with pool, 40
+    Let completion_counter be proc memory_get_qword from MemoryCore with pool, 48
+    Let shutdown_flag be proc memory_get_qword from MemoryCore with pool, 56
+
+    Let keep_running be 1
+    While keep_running is equal to 1:
+        proc platform_mutex_lock from Threading with queue_mutex
+
+        Let task be proc dequeue_task with work_queue
+        While task is equal to 0:
+            Let shutdown_state be proc atomic_load_acquire from Atomic with shutdown_flag
+            If shutdown_state is equal to 1:
+                proc platform_mutex_unlock from Threading with queue_mutex
+                proc memory_set_qword from MemoryCore with worker_slot, 32, 2
+                proc platform_thread_exit from Threading with 0
+                Return 0
+            End If
+            proc platform_condvar_wait from Threading with work_cv, queue_mutex
+            Set task to proc dequeue_task with work_queue
+        End While
+
+        proc platform_mutex_unlock from Threading with queue_mutex
+
+        proc memory_set_qword from MemoryCore with worker_slot, 32, 1
+
+        proc process_import_task with task, worker_slot, main_context
+
+        proc atomic_increment from Atomic with completion_counter
+        proc platform_condvar_signal from Threading with done_cv
+
+        proc memory_set_qword from MemoryCore with worker_slot, 32, 0
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Worker Spawn / Cleanup
+Note: ============================================================================
+
+Process called "create_worker_context" that takes worker_id as Integer, pool as Integer, worker_arena as Integer, main_context as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Build the four-field context struct passed by-pointer to worker_main
+    as its sole argument. The struct contents are immutable for the
+    worker's lifetime, so they can be read without synchronization. Living
+    in the main arena means the context survives until end-of-compilation,
+    matching the worker thread's join-then-arena-destroy lifecycle.
+    @End Reasoning
+
+    @Implementation
+    Allocate WORKER_CONTEXT_SIZE bytes from main_arena, then write the
+    four qword fields at offsets 0/8/16/24: worker_id, pool pointer,
+    worker_arena pointer (the per-worker arena used for parse output),
+    and main_context (used for resolve_module_path policy lookups).
+    Return the struct pointer.
+    @End Implementation
+
+    @Performance_Hints
+    Arena bump-pointer allocation: O(1). Four sequential qword writes hit
+    one cache line. The context is read once per worker boot then is
+    cold for the rest of the worker's life.
+    @End Performance_Hints
+
+    @Security_Scope
+    All five arguments are compiler-owned pointers/integers. No untrusted
+    input. The worker_arena passed in here becomes the allocation root
+    for all per-task work; if it were swapped to point at the shared
+    main_arena, all per-worker isolation would collapse. The caller
+    (create_worker_thread) is the sole site that constructs this arena
+    via arena_create.
+    @End Security_Scope
+    :End Note
+
+    Let worker_ctx be proc arena_allocate from Arena with main_arena, WORKER_CONTEXT_SIZE
+    If worker_ctx is equal to 0:
         Return 0
     End If
 
-    Note: Set shutdown flag in work queue
-    Let work_queue be proc memory_get_qword from MemoryCore with context, 208
-    If work_queue is not equal to 0:
-        proc memory_set_qword from MemoryCore with work_queue, 40, 1
+    proc memory_set_qword from MemoryCore with worker_ctx, 0, worker_id
+    proc memory_set_qword from MemoryCore with worker_ctx, 8, pool
+    proc memory_set_qword from MemoryCore with worker_ctx, 16, worker_arena
+    proc memory_set_qword from MemoryCore with worker_ctx, 24, main_context
+
+    Return worker_ctx
+End Process
+
+Process called "create_worker_thread" that takes worker_id as Integer, pool as Integer, workers_array as Integer, main_context as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Spawn one worker: allocate its arena, initialize its slot in the
+    pool's workers_array, build its context, then call
+    platform_thread_create to start the OS thread. Doing all four steps
+    atomically per worker (rather than batching) means a partial-failure
+    cleanup path is simple: if any step fails the caller
+    (create_worker_threads) has a coherent state to roll back from.
+    @End Reasoning
+
+    @Implementation
+    Compute the slot pointer (workers_array + worker_id * WORKER_SLOT_SIZE).
+    Create the per-worker arena via arena_create with WORKER_ARENA_CAPACITY
+    (mmap-backed, independent of the main arena). Initialize the five
+    qword slot fields at offsets 0/8/16/24/32: handle=0 (filled after
+    thread_create), worker_id, worker_arena, pool, worker_state=0 (idle).
+    Build the worker context via create_worker_context. If either context
+    or thread creation fails, destroy the arena and clear the slot
+    fields before returning 0.
+    @End Implementation
+
+    @Performance_Hints
+    Worker spawn is amortized once per parallel session; not on the hot
+    path. arena_create is the dominant cost (one mmap syscall plus a
+    small header init); platform_thread_create costs one clone() syscall.
+    The slot field writes use known compile-time offsets so the codegen
+    folds them to direct memory stores with no indirection.
+    @End Performance_Hints
+
+    @Security_Scope
+    All five arguments are compiler-owned. The platform_thread_create
+    call passes worker_main (a code pointer) and worker_ctx (a data
+    pointer) - both compiler-controlled, no possibility of confused
+    deputy. If platform_thread_create returns <= 0 we treat it as failure
+    and roll back; we never store a negative handle into the slot.
+    @End Security_Scope
+    :End Note
+
+    Let slot_offset be worker_id multiplied by WORKER_SLOT_SIZE
+    Let worker_slot be workers_array plus slot_offset
+
+    Let worker_arena be proc arena_create from Arena with WORKER_ARENA_CAPACITY
+    If worker_arena is equal to 0:
+        Return 0
     End If
 
-    Note: Broadcast to all waiting workers
-    Let sync_primitives be proc memory_get_qword from MemoryCore with context, 216
-    If sync_primitives is not equal to 0:
-        Let work_condition be proc memory_get_qword from MemoryCore with sync_primitives, 8
-        If work_condition is not equal to 0:
-            proc pthread_cond_broadcast from PThreads with work_condition
-        End If
+    proc memory_set_qword from MemoryCore with worker_slot, 0, 0
+    proc memory_set_qword from MemoryCore with worker_slot, 8, worker_id
+    proc memory_set_qword from MemoryCore with worker_slot, 16, worker_arena
+    proc memory_set_qword from MemoryCore with worker_slot, 24, pool
+    proc memory_set_qword from MemoryCore with worker_slot, 32, 0
+
+    Let worker_ctx be proc create_worker_context with worker_id, pool, worker_arena, main_context, main_arena
+    If worker_ctx is equal to 0:
+        proc arena_destroy from Arena with worker_arena
+        proc memory_set_qword from MemoryCore with worker_slot, 16, 0
+        Return 0
     End If
 
-    Note: Wait for all worker threads to finish
-    Let worker_count be proc memory_get_qword from MemoryCore with thread_pool, 8
-    Let workers be proc memory_get_qword from MemoryCore with thread_pool, 0
-    If workers is not equal to 0:
-        Let i be 0
-        While i is less than worker_count:
-            Let worker_thread be proc memory_get_qword from MemoryCore with workers plus i multiplied by 8, 0
-            If worker_thread is not equal to 0:
-                proc pthread_join from PThreads with worker_thread
-            End If
-            Set i to i plus 1
-        End While
+    Let handle be proc platform_thread_create from Threading with worker_main, worker_ctx
+    If handle is less than or equal to 0:
+        proc arena_destroy from Arena with worker_arena
+        proc memory_set_qword from MemoryCore with worker_slot, 16, 0
+        Return 0
     End If
 
+    proc memory_set_qword from MemoryCore with worker_slot, 0, handle
     Return 1
 End Process
 
-Process called "cleanup_worker_threads" that takes workers as Integer, count as Integer returns Integer:
-    Note: Cleanup worker threads on initialization error
+Process called "create_worker_threads" that takes worker_count as Integer, pool as Integer, main_context as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Allocate the workers_array (worker_count contiguous slots, each
+    WORKER_SLOT_SIZE bytes) then spawn worker_count threads in sequence.
+    On any spawn failure, signal already-spawned workers to exit, join
+    them, and destroy their arenas via cleanup_worker_threads; this
+    leaves the system in a clean state where the caller can fall back to
+    serial without leaking threads or arenas.
+    @End Reasoning
+
+    @Implementation
+    arena_allocate workers_array (worker_count * WORKER_SLOT_SIZE bytes).
+    Zero-init the array byte-by-byte so every slot field starts at 0
+    (handle, worker_id, worker_arena, pool, worker_state). Loop spawn_idx
+    from 0 to worker_count-1 calling create_worker_thread for each. If
+    any spawn returns 0, call cleanup_worker_threads with the already-
+    spawned subset (spawn_idx) and return 0. On success, return the
+    workers_array pointer for the caller to store in the pool struct.
+    @End Implementation
+
+    @Performance_Hints
+    Sequential spawn rather than barrier-style fan-out: simpler, and the
+    spawn cost is dominated by the kernel clone() syscall which is
+    inherently serial in glibc. For worker_count <= 16 the total spawn
+    time is sub-millisecond. The byte-level zero-init loop could be
+    coalesced to qword writes but the savings are negligible for
+    typical worker_counts (4-8).
+    @End Performance_Hints
+
+    @Security_Scope
+    All four arguments are compiler-owned. worker_count is sized from
+    platform_hardware_concurrency and clamped to a sane range upstream
+    in initialize_thread_pool. If allocation of workers_array fails we
+    return 0 immediately without spawning anything; partial-failure
+    cleanup is handled by cleanup_worker_threads which validates each
+    slot field before acting on it.
+    @End Security_Scope
+    :End Note
+
+    Let array_bytes be worker_count multiplied by WORKER_SLOT_SIZE
+    Let workers_array be proc arena_allocate from Arena with main_arena, array_bytes
+    If workers_array is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+    While i is less than array_bytes:
+        proc memory_set_byte from MemoryCore with workers_array, i, 0
+        Set i to i plus 1
+    End While
+
+    Let spawn_idx be 0
+    While spawn_idx is less than worker_count:
+        Let ok be proc create_worker_thread with spawn_idx, pool, workers_array, main_context, main_arena
+        If ok is equal to 0:
+            proc cleanup_worker_threads with workers_array, spawn_idx, pool
+            Return 0
+        End If
+        Set spawn_idx to spawn_idx plus 1
+    End While
+
+    Return workers_array
+End Process
+
+Process called "cleanup_worker_threads" that takes workers_array as Integer, count as Integer, pool as Integer returns Integer:
+    Note:
+    @Reasoning
+    Used only on initialization failure (and from shutdown_thread_pool). Signal
+    every already-spawned worker to exit, join their handles, then destroy
+    their per-worker arenas. We NEVER abandon a thread handle; joining is
+    mandatory to avoid leaking the kernel TID.
+    @End Reasoning
+
+    @Implementation
+    If pool is non-null, set the shutdown_flag via atomic_store_release
+    and broadcast on work_cv to wake any worker blocked in
+    platform_condvar_wait. Then loop i from 0 to count-1: read the slot
+    handle, if non-zero platform_thread_join it and clear the slot, read
+    the worker_arena, if non-zero arena_destroy it and clear the slot.
+    Order matters: signal first (so workers exit their blocking wait),
+    join second (so we know the worker has stopped touching its arena),
+    arena_destroy third (so we don't unmap memory the worker is still
+    using).
+    @End Implementation
+
+    @Performance_Hints
+    Cleanup is off the hot path - called only at init-failure or end of
+    parallel session. The broadcast wakes all waiting workers in one
+    syscall (futex_wake with INT_MAX). Each join is one wait4-style
+    kernel call; arena_destroy is one munmap. Total cost scales linearly
+    with the number of spawned workers but is sub-millisecond for
+    typical worker_counts.
+    @End Performance_Hints
+
+    @Security_Scope
+    workers_array, count, and pool are compiler-owned. We defensively
+    check the pool pointer for 0 before dereferencing because this
+    Process is also called from create_worker_threads's roll-back path,
+    where a partial pool could be passed. Each slot field is checked
+    for non-zero before acting on it (handle != 0 before join,
+    worker_arena != 0 before destroy), so re-entering cleanup with an
+    already-cleaned slot is safe.
+    @End Security_Scope
+    :End Note
+
+    If pool is not equal to 0:
+        Let shutdown_flag be proc memory_get_qword from MemoryCore with pool, 56
+        If shutdown_flag is not equal to 0:
+            proc atomic_store_release from Atomic with shutdown_flag, 1
+        End If
+        Let work_cv be proc memory_get_qword from MemoryCore with pool, 32
+        If work_cv is not equal to 0:
+            proc platform_condvar_broadcast from Threading with work_cv
+        End If
+    End If
 
     Let i be 0
     While i is less than count:
-        Let worker_thread be proc memory_get_qword from MemoryCore with workers plus i multiplied by 8, 0
-        If worker_thread is not equal to 0:
-            proc pthread_destroy from PThreads with worker_thread
+        Let slot_offset be i multiplied by WORKER_SLOT_SIZE
+        Let slot be workers_array plus slot_offset
+        Let handle be proc memory_get_qword from MemoryCore with slot, 0
+        If handle is not equal to 0:
+            proc platform_thread_join from Threading with handle
+            proc memory_set_qword from MemoryCore with slot, 0, 0
+        End If
+        Let worker_arena be proc memory_get_qword from MemoryCore with slot, 16
+        If worker_arena is not equal to 0:
+            proc arena_destroy from Arena with worker_arena
+            proc memory_set_qword from MemoryCore with slot, 16, 0
         End If
         Set i to i plus 1
     End While
 
     Return 1
+End Process
+
+Note: ============================================================================
+Note: Thread Pool Initialization
+Note: ============================================================================
+
+Process called "initialize_thread_pool" that takes main_context as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Build the ThreadPool struct, queue, mutex, two condvars, the completion
+    counter, the shutdown flag, then spawn N workers. If
+    platform_threading_available() returns 0 we set threading_available=0
+    in the pool and return -1 (sentinel: caller falls back to serial).
+    @End Reasoning
+
+    @Implementation
+    All control structures (pool, queue, counter/flag cells, worker slot
+    array, worker contexts) live in the main arena. Per-worker arenas are
+    created via arena_create (mmap-backed) and destroyed at shutdown. The
+    mutex/condvar handles are platform-allocated (futex words on Linux) and
+    must be destroyed via platform_mutex_destroy / platform_condvar_destroy.
+    @End Implementation
+
+    @Performance_Hints
+    Worker count is sized from platform_hardware_concurrency at init time,
+    capped to a sane upper bound to avoid oversubscription on large hosts.
+    The mutex/condvar/counter/flag allocations are one-time, off the hot
+    path; the dominant cost is N x arena_create + N x platform_thread_create.
+    The pool struct is laid out so the hot fields (work_queue, queue_mutex,
+    work_cv, done_cv, completion_counter) sit in a single cache line for
+    worker_main's per-iteration reads.
+    @End Performance_Hints
+
+    @Security_Scope
+    main_context is the import-system context with its security_flags
+    intact; we do not modify those flags. main_arena is the per-compilation
+    arena. The platform_threading_available probe gates the entire path: if
+    the current backend has not been verified to a known-working state, we
+    refuse to spawn workers and return sentinel -1 so the caller falls back
+    to serial. This prevents spawning threads on unverified platforms where
+    a wrong-platform syscall could corrupt the process.
+    @End Security_Scope
+    :End Note
+
+    Let existing be proc memory_get_qword from MemoryCore with main_context, 200
+    If existing is not equal to 0:
+        Return 1
+    End If
+
+    Let available be proc platform_threading_available from Threading
+    If available is equal to 0:
+        Return -1
+    End If
+
+    Let worker_count be proc memory_get_qword from MemoryCore with main_context, 64
+    If worker_count is less than or equal to 0:
+        Set worker_count to proc platform_hardware_concurrency from Threading
+        If worker_count is less than 1:
+            Set worker_count to 1
+        End If
+        proc memory_set_qword from MemoryCore with main_context, 64, worker_count
+    End If
+
+    Let pool be proc arena_allocate from Arena with main_arena, POOL_STRUCT_SIZE
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_qword from MemoryCore with pool, 0, 0
+    proc memory_set_qword from MemoryCore with pool, 8, worker_count
+    proc memory_set_qword from MemoryCore with pool, 16, 0
+    proc memory_set_qword from MemoryCore with pool, 24, 0
+    proc memory_set_qword from MemoryCore with pool, 32, 0
+    proc memory_set_qword from MemoryCore with pool, 40, 0
+    proc memory_set_qword from MemoryCore with pool, 48, 0
+    proc memory_set_qword from MemoryCore with pool, 56, 0
+    proc memory_set_qword from MemoryCore with pool, 64, 1
+
+    Let work_queue be proc initialize_work_queue with main_arena
+    If work_queue is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with pool, 16, work_queue
+
+    Let queue_mutex be proc platform_mutex_create from Threading
+    If queue_mutex is equal to 0:
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with pool, 24, queue_mutex
+
+    Let work_cv be proc platform_condvar_create from Threading
+    If work_cv is equal to 0:
+        proc platform_mutex_destroy from Threading with queue_mutex
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with pool, 32, work_cv
+
+    Let done_cv be proc platform_condvar_create from Threading
+    If done_cv is equal to 0:
+        proc platform_condvar_destroy from Threading with work_cv
+        proc platform_mutex_destroy from Threading with queue_mutex
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with pool, 40, done_cv
+
+    Let completion_counter be proc arena_allocate from Arena with main_arena, CELL_SIZE
+    If completion_counter is equal to 0:
+        proc platform_condvar_destroy from Threading with done_cv
+        proc platform_condvar_destroy from Threading with work_cv
+        proc platform_mutex_destroy from Threading with queue_mutex
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with completion_counter, 0, 0
+    proc memory_set_qword from MemoryCore with pool, 48, completion_counter
+
+    Let shutdown_flag be proc arena_allocate from Arena with main_arena, CELL_SIZE
+    If shutdown_flag is equal to 0:
+        proc platform_condvar_destroy from Threading with done_cv
+        proc platform_condvar_destroy from Threading with work_cv
+        proc platform_mutex_destroy from Threading with queue_mutex
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with shutdown_flag, 0, 0
+    proc memory_set_qword from MemoryCore with pool, 56, shutdown_flag
+
+    proc memory_set_qword from MemoryCore with main_context, 200, pool
+    proc memory_set_qword from MemoryCore with main_context, 208, work_queue
+    proc memory_set_qword from MemoryCore with main_context, 216, 0
+
+    Let workers_array be proc create_worker_threads with worker_count, pool, main_context, main_arena
+    If workers_array is equal to 0:
+        proc platform_condvar_destroy from Threading with done_cv
+        proc platform_condvar_destroy from Threading with work_cv
+        proc platform_mutex_destroy from Threading with queue_mutex
+        proc memory_set_qword from MemoryCore with main_context, 200, 0
+        proc memory_set_qword from MemoryCore with main_context, 208, 0
+        Return 0
+    End If
+    proc memory_set_qword from MemoryCore with pool, 0, workers_array
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Enqueue / Wait / Shutdown
+Note: ============================================================================
+
+Process called "add_import_task" that takes import_path as Integer, enqueue_order as Integer, main_context as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Public producer entry point: build a task, push it onto the queue
+    under the mutex, signal one waiting worker. Returns the task pointer
+    on success (so process_imports_parallel can index it into the
+    tasks_index array for deterministic merge), or 0 on failure.
+    @End Reasoning
+
+    @Implementation
+    Look up the pool via main_context offset 200. Read the queue, mutex,
+    and work_cv from the pool. Construct the task via create_import_task,
+    return 0 if allocation failed. Acquire queue_mutex, enqueue the task,
+    release. If enqueue failed (defensive - it cannot under current code
+    paths because enqueue resizes on overflow), return 0. Signal work_cv
+    so an idle worker wakes up to consume the task.
+    @End Implementation
+
+    @Performance_Hints
+    Mutex hold time is bounded: just one enqueue_task call plus optional
+    resize. Signal-after-unlock semantics (we call condvar_signal AFTER
+    unlock) avoids the spurious-mutex-reacquire path some monitor
+    implementations suffer from. Producers are not on the worker hot
+    path; this Process is called once per import on the main thread.
+    @End Performance_Hints
+
+    @Security_Scope
+    import_path is a String pointer from the parser's import AST. We do
+    not dereference or validate it here - resolve_module_path on the
+    worker thread is the security boundary for path validation. The pool
+    pointer is read from main_context's known offset 200; if it is 0 we
+    return 0 (no enqueue) rather than crashing.
+    @End Security_Scope
+    :End Note
+
+    Let pool be proc memory_get_qword from MemoryCore with main_context, 200
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Let work_queue be proc memory_get_qword from MemoryCore with pool, 16
+    Let queue_mutex be proc memory_get_qword from MemoryCore with pool, 24
+    Let work_cv be proc memory_get_qword from MemoryCore with pool, 32
+
+    Let task be proc create_import_task with import_path, enqueue_order, main_arena
+    If task is equal to 0:
+        Return 0
+    End If
+
+    proc platform_mutex_lock from Threading with queue_mutex
+    Let ok be proc enqueue_task with work_queue, task
+    proc platform_mutex_unlock from Threading with queue_mutex
+    If ok is equal to 0:
+        Return 0
+    End If
+
+    proc platform_condvar_signal from Threading with work_cv
+    Return task
+End Process
+
+Process called "wait_for_completion" that takes main_context as Integer, expected_tasks as Integer returns Integer:
+    Note:
+    @Reasoning
+    Standard monitor wait. We hold queue_mutex (the same mutex workers use
+    to publish completion via done_cv) and check the atomic counter under
+    that lock. If the counter is short, wait on done_cv; the wait atomically
+    releases the mutex and re-acquires it on wakeup, so we cannot miss a
+    signal between read and wait.
+    @End Reasoning
+
+    @Implementation
+    Look up the pool from main_context offset 200; if 0, treat as
+    success (no work to wait for) and return 1. Acquire queue_mutex,
+    read the completion counter via atomic_load_acquire, loop while
+    it is less than expected_tasks calling platform_condvar_wait then
+    re-reading. Release the mutex and return 0 on success.
+    @End Implementation
+
+    @Performance_Hints
+    Spurious wakeups are tolerated by the while-loop predicate
+    (completed < expected_tasks), so platform_condvar_wait does not need
+    to be perfect. The mutex is held during the wait but condvar_wait
+    atomically releases it during the kernel sleep, so workers can
+    continue to dequeue and signal done_cv. Wakeup overhead is one futex
+    wake per completion, amortized cheap.
+    @End Performance_Hints
+
+    @Security_Scope
+    main_context and expected_tasks are compiler-owned. expected_tasks
+    is the count of successfully-enqueued imports (returned by
+    process_imports_parallel's enqueue loop), so the wait predicate
+    cannot overshoot the actual amount of work. If the pool was never
+    initialized (offset 200 == 0) we return success without waiting,
+    matching the no-work-to-do case.
+    @End Security_Scope
+    :End Note
+
+    Let pool be proc memory_get_qword from MemoryCore with main_context, 200
+    If pool is equal to 0:
+        Return 1
+    End If
+
+    Let queue_mutex be proc memory_get_qword from MemoryCore with pool, 24
+    Let done_cv be proc memory_get_qword from MemoryCore with pool, 40
+    Let completion_counter be proc memory_get_qword from MemoryCore with pool, 48
+
+    proc platform_mutex_lock from Threading with queue_mutex
+    Let completed be proc atomic_load_acquire from Atomic with completion_counter
+    While completed is less than expected_tasks:
+        proc platform_condvar_wait from Threading with done_cv, queue_mutex
+        Set completed to proc atomic_load_acquire from Atomic with completion_counter
+    End While
+    proc platform_mutex_unlock from Threading with queue_mutex
+
+    Return 0
+End Process
+
+Process called "shutdown_thread_pool" that takes main_context as Integer returns Integer:
+    Note:
+    @Reasoning
+    Signal shutdown to every worker (atomic store + broadcast on work_cv so
+    workers blocked in platform_condvar_wait observe the new shutdown_flag),
+    then join every thread handle. Worker arenas are destroyed AFTER the
+    merge phase has consumed their AST nodes; we destroy them here, plus
+    the platform mutex/condvar handles. Counter/flag cells are arena-owned,
+    so they get reclaimed automatically when the import context's arena is
+    destroyed at end-of-compilation.
+    @End Reasoning
+
+    @Implementation
+    Look up the pool from main_context offset 200; return 0 if not
+    initialized. Read workers_array, worker_count, queue_mutex, work_cv,
+    done_cv, shutdown_flag. Atomic-release-store 1 into shutdown_flag,
+    broadcast work_cv to wake any blocked worker. Two-pass slot loop:
+    pass 1 joins every non-zero handle (so we know no worker is still
+    touching its arena), pass 2 destroys every non-zero worker_arena.
+    Then destroy done_cv, work_cv, queue_mutex (each guarded by non-zero
+    check) and clear the pool pointer at context+200 plus the worker
+    count at context+208.
+    @End Implementation
+
+    @Performance_Hints
+    Shutdown is one-time per parallel session. The two-pass loop is
+    required for correctness (join before arena_destroy); for typical
+    worker_counts (4-8) it adds negligible overhead vs a single pass.
+    Each thread_join is one wait4-style syscall; each arena_destroy is
+    one munmap; each condvar_destroy/mutex_destroy is essentially free
+    in the futex implementation.
+    @End Performance_Hints
+
+    @Security_Scope
+    main_context is compiler-owned. Every dereferenced field is checked
+    for non-zero before use, so partial-init or double-shutdown is safe.
+    We clear the pool slot in main_context (offset 200) so subsequent
+    calls observe the pool as un-initialized and treat the situation as
+    no-op rather than re-running destructors on freed handles.
+    @End Security_Scope
+    :End Note
+
+    Let pool be proc memory_get_qword from MemoryCore with main_context, 200
+    If pool is equal to 0:
+        Return 0
+    End If
+
+    Let workers_array be proc memory_get_qword from MemoryCore with pool, 0
+    Let worker_count be proc memory_get_qword from MemoryCore with pool, 8
+    Let queue_mutex be proc memory_get_qword from MemoryCore with pool, 24
+    Let work_cv be proc memory_get_qword from MemoryCore with pool, 32
+    Let done_cv be proc memory_get_qword from MemoryCore with pool, 40
+    Let shutdown_flag be proc memory_get_qword from MemoryCore with pool, 56
+
+    If shutdown_flag is not equal to 0:
+        proc atomic_store_release from Atomic with shutdown_flag, 1
+    End If
+    If work_cv is not equal to 0:
+        proc platform_condvar_broadcast from Threading with work_cv
+    End If
+
+    If workers_array is not equal to 0:
+        Let i be 0
+        While i is less than worker_count:
+            Let slot_offset be i multiplied by WORKER_SLOT_SIZE
+            Let slot be workers_array plus slot_offset
+            Let handle be proc memory_get_qword from MemoryCore with slot, 0
+            If handle is not equal to 0:
+                proc platform_thread_join from Threading with handle
+                proc memory_set_qword from MemoryCore with slot, 0, 0
+            End If
+            Set i to i plus 1
+        End While
+
+        Let j be 0
+        While j is less than worker_count:
+            Let slot2_offset be j multiplied by WORKER_SLOT_SIZE
+            Let slot2 be workers_array plus slot2_offset
+            Let warena be proc memory_get_qword from MemoryCore with slot2, 16
+            If warena is not equal to 0:
+                proc arena_destroy from Arena with warena
+                proc memory_set_qword from MemoryCore with slot2, 16, 0
+            End If
+            Set j to j plus 1
+        End While
+    End If
+
+    If done_cv is not equal to 0:
+        proc platform_condvar_destroy from Threading with done_cv
+        proc memory_set_qword from MemoryCore with pool, 40, 0
+    End If
+    If work_cv is not equal to 0:
+        proc platform_condvar_destroy from Threading with work_cv
+        proc memory_set_qword from MemoryCore with pool, 32, 0
+    End If
+    If queue_mutex is not equal to 0:
+        proc platform_mutex_destroy from Threading with queue_mutex
+        proc memory_set_qword from MemoryCore with pool, 24, 0
+    End If
+
+    proc memory_set_qword from MemoryCore with main_context, 200, 0
+    proc memory_set_qword from MemoryCore with main_context, 208, 0
+
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: Result Merge (deterministic, main thread, post-join)
+Note: ============================================================================
+
+Process called "merge_worker_results" that takes program as Integer, tasks_array as Integer, import_count as Integer, main_arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Run the merge phase on the main thread AFTER every worker has joined.
+    Iterate tasks in enqueue_order (= source order) so the merged
+    program.functions / program.types arrays are byte-identical to the
+    serial path's output. Worker arenas STILL OWN the AST nodes; we copy
+    only pointers into main_program. Per design risk in #117 sec5, worker
+    arenas must outlive the merge - they do, because shutdown_thread_pool
+    destroys them only after this Process returns.
+    @End Reasoning
+
+    @Implementation
+    Loop i from 0 to import_count - 1. Read tasks_array[i*8] - if 0 the
+    slot has no enqueued task (import statement was empty), skip. Read
+    task[32] (error_code); on non-zero, Alert and return 1 (hard fail).
+    Read task[24] (parsed_program); if non-zero call
+    merge_imported_functions then merge_imported_types from ImportCore
+    with (program, parsed_program, main_arena). Each merge returns 0 on
+    success; non-zero is a hard fail. Return 0 on full success.
+    @End Implementation
+
+    @Performance_Hints
+    Merge is serial by design (deterministic ordering matters more than
+    speed at this step, and per-import merge_imported_functions/types
+    each do a fast pointer copy not a deep traversal). Wall time is
+    O(total_functions + total_types) across all imports. The pointers
+    being copied reference worker-arena memory which remains valid for
+    the rest of the compilation pipeline.
+    @End Performance_Hints
+
+    @Security_Scope
+    program, tasks_array, and main_arena are compiler-owned. import_count
+    is the count from the original program's import statement array. The
+    error_code field at task[32] gates the merge: any worker-reported
+    failure aborts the merge with diagnostic Alert output rather than
+    silently dropping the failed import's data.
+    @End Security_Scope
+    :End Note
+
+    Let i be 0
+    While i is less than import_count:
+        Let task_slot_offset be i multiplied by CELL_SIZE
+        Let task be proc memory_get_qword from MemoryCore with tasks_array, task_slot_offset
+        If task is equal to 0:
+            Set i to i plus 1
+        Otherwise:
+            Let error_code be proc memory_get_qword from MemoryCore with task, 32
+            If error_code is not equal to 0:
+                Alert "[PARALLEL ERROR] import task failed at index"
+                Alert i
+                Alert "phase"
+                Alert error_code
+                Return 1
+            End If
+
+            Let parsed_program be proc memory_get_qword from MemoryCore with task, 24
+            If parsed_program is not equal to 0:
+                Let merge_fn_result be proc merge_imported_functions from ImportCore with program, parsed_program, main_arena
+                If merge_fn_result is not equal to 0:
+                    Alert "[PARALLEL ERROR] failed to merge functions for task"
+                    Alert i
+                    Return 1
+                End If
+
+                Let merge_ty_result be proc merge_imported_types from ImportCore with program, parsed_program, main_arena
+                If merge_ty_result is not equal to 0:
+                    Alert "[PARALLEL ERROR] failed to merge types for task"
+                    Alert i
+                    Return 1
+                End If
+            End If
+
+            Set i to i plus 1
+        End If
+    End While
+
+    Return 0
+End Process
+
+Note: ============================================================================
+Note: Top-Level Entry Point
+Note: ============================================================================
+
+Process called "process_imports_parallel" that takes program as Integer, context as Integer, arena as Integer returns Integer:
+    Note:
+    @Reasoning
+    Orchestrate the full parallel pipeline:
+      1. Initialize the pool. If platform_threading_available returns 0,
+         immediately return sentinel 2 so the driver falls back to serial.
+      2. Allocate a tasks_index array sized to import_count so we can merge
+         in deterministic enqueue order after join.
+      3. Enqueue every import statement. Workers begin draining as soon as
+         the first signal lands.
+      4. Wait until completion_counter equals import_count.
+      5. Shut down the pool (signal + join + destroy CVs/mutex/per-worker
+         arenas).
+      6. Merge results into main program on the main thread.
+    @End Reasoning
+
+    @Implementation
+    Three-valued return contract: 0 = success, 1 = hard failure, 2 =
+    graceful degradation (threading unavailable, caller should fall
+    back to serial). Pipeline order: initialize_thread_pool, allocate
+    tasks_index (one cell per import for deterministic merge ordering),
+    zero-fill the index, walk program.imports (offset 32, count at
+    offset 40) calling add_import_task per non-null import and
+    recording the resulting task pointer into the index, call
+    wait_for_completion with the count of successfully enqueued tasks,
+    call merge_worker_results, call shutdown_thread_pool. Diagnostic
+    Alert + Return 1 on any allocation, enqueue, wait, or merge failure
+    (shutdown is still run in the cleanup-on-failure path to release
+    workers).
+    @End Implementation
+
+    @Performance_Hints
+    Speedup is roughly min(N, B) where N = worker_count and B is the
+    file-I/O bandwidth divided by mean parse time. For the bootstrap stage1
+    self-host we expect 4-8 workers to saturate before B becomes the
+    bottleneck. Per-worker arenas eliminate allocator contention; the only
+    shared hot path is the queue_mutex which is touched O(import_count)
+    times, not O(allocation_count).
+    @End Performance_Hints
+
+    @Security_Scope
+    program, context, and arena are compiler-owned. The import statements
+    walked from program.imports carry the same security_flags context
+    that the serial path uses; per-import path validation happens inside
+    process_import_task on the worker via resolve_module_path. The
+    sentinel-2 graceful-degradation path is the safety mechanism for
+    unverified platforms - it ensures we never spawn threads on a
+    platform whose threading primitives have not been verified.
+    @End Security_Scope
+    :End Note
+
+    Let init_result be proc initialize_thread_pool with context, arena
+    If init_result is equal to -1:
+        Alert "[PARALLEL UNAVAILABLE] platform threading backend not verified, falling back to serial"
+        Return 2
+    End If
+    If init_result is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to initialize thread pool"
+        Return 1
+    End If
+
+    Let import_count be proc memory_get_dword from MemoryCore with program, 40
+    If import_count is equal to 0:
+        proc shutdown_thread_pool with context
+        Return 0
+    End If
+
+    Let imports be proc memory_get_qword from MemoryCore with program, 32
+    If imports is equal to 0:
+        Alert "[PARALLEL ERROR] No imports array found"
+        proc shutdown_thread_pool with context
+        Return 1
+    End If
+
+    Let tasks_index_bytes be import_count multiplied by CELL_SIZE
+    Let tasks_index be proc arena_allocate from Arena with arena, tasks_index_bytes
+    If tasks_index is equal to 0:
+        Alert "[PARALLEL ERROR] Failed to allocate tasks_index"
+        proc shutdown_thread_pool with context
+        Return 1
+    End If
+
+    Let zero_idx be 0
+    While zero_idx is less than tasks_index_bytes:
+        proc memory_set_byte from MemoryCore with tasks_index, zero_idx, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+
+    Let enqueued be 0
+    Let i be 0
+    While i is less than import_count:
+        Let import_offset be i multiplied by CELL_SIZE
+        Let import_ptr be imports plus import_offset
+        Let import_stmt be proc memory_get_qword from MemoryCore with import_ptr, 0
+
+        If import_stmt is not equal to 0:
+            Let import_filename be proc memory_get_qword from MemoryCore with import_stmt, 0
+            If import_filename is not equal to 0:
+                Let task be proc add_import_task with import_filename, i, context, arena
+                If task is equal to 0:
+                    Alert "[PARALLEL ERROR] Failed to enqueue task"
+                    proc shutdown_thread_pool with context
+                    Return 1
+                End If
+                proc memory_set_qword from MemoryCore with tasks_index, import_offset, task
+                Set enqueued to enqueued plus 1
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Let wait_result be proc wait_for_completion with context, enqueued
+    If wait_result is not equal to 0:
+        Alert "[PARALLEL ERROR] wait_for_completion failed"
+        proc shutdown_thread_pool with context
+        Return 1
+    End If
+
+    Let merge_result be proc merge_worker_results with program, tasks_index, import_count, arena
+    If merge_result is not equal to 0:
+        proc shutdown_thread_pool with context
+        Return 1
+    End If
+
+    proc shutdown_thread_pool with context
+
+    Display "[PARALLEL SUCCESS] Processed "
+    Display enqueued
+    Display " imports in parallel"
+
+    Return 0
 End Process
