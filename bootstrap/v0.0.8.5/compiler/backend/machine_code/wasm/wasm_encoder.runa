@@ -69,6 +69,8 @@ Dependencies:
 Import "compiler/backend/machine_code/wasm/instruction_encoder.runa" as WasmInstr
 Import "compiler/backend/machine_code/common/machine_code_interface.runa" as MachineCode
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 
 Note: ============================================================================
@@ -129,9 +131,11 @@ Type called "WasmModuleState":
     start_func_idx as Integer        Note: Start function index (-1 = none)
     temp_buffer as Integer           Note: Temporary buffer for section content
     temp_buffer_size as Integer      Note: Size of temp buffer
+    import_entries as Integer        Note: Pointer to list of import entries
+    import_count as Integer          Note: Number of imports
 End Type
 
-Note: Size: 15 fields * 8 bytes = 120 bytes
+Note: Size: 17 fields * 8 bytes = 136 bytes
 
 Note: ============================================================================
 Note: MODULE CREATION
@@ -144,7 +148,7 @@ Process called "create_wasm_module" that takes output as Integer returns Integer
     The output buffer must already be initialized by the caller.
     @End Reasoning
 
-    Let state be Layout.allocate(120)
+    Let state be Layout.allocate(136)
     If state is equal to 0:
         Display "create_wasm_module: allocation failed"
         Return 0
@@ -162,6 +166,8 @@ Process called "create_wasm_module" that takes output as Integer returns Integer
     Let data_segments be Layout.allocate(2048)
     Note: Allocate temporary buffer for section content (64 KB)
     Let temp_buf be Layout.allocate(65536)
+    Note: Allocate import entry storage (max 256 imports, each 40 bytes)
+    Let import_entries be Layout.allocate(10240)
 
     If type_entries is equal to 0:
         Display "create_wasm_module: type entries allocation failed"
@@ -187,6 +193,10 @@ Process called "create_wasm_module" that takes output as Integer returns Integer
         Display "create_wasm_module: temp buffer allocation failed"
         Return 0
     End If
+    If import_entries is equal to 0:
+        Display "create_wasm_module: import entries allocation failed"
+        Return 0
+    End If
 
     __store(state, 0, output)
     __store(state, 8, type_entries)
@@ -203,6 +213,8 @@ Process called "create_wasm_module" that takes output as Integer returns Integer
     __store(state, 96, -1)           Note: start_func_idx = none
     __store(state, 104, temp_buf)
     __store(state, 112, 65536)
+    __store(state, 120, import_entries)
+    __store(state, 128, 0)           Note: import_count = 0
 
     Return state
 End Process
@@ -648,6 +660,296 @@ Process called "add_data_segment" that takes state as Integer, memory_idx as Int
 End Process
 
 Note: ============================================================================
+Note: STRING LITERAL DESCRIPTORS
+Note: ============================================================================
+
+@Reasoning
+A WASM import or export entry needs both the name bytes (UTF-8) and a byte
+length, because the WASM binary format encodes names as vec(byte) — i.e. a
+LEB128-prefixed length followed by the raw bytes. Runa strings are
+null-terminated, so the length is recoverable, but the WASI registration
+path needs to store the (ptr, length) pair compactly across multiple calls.
+
+string_literal packs a Runa null-terminated string pointer into a small
+16-byte descriptor:
+  Offset 0: pointer to the UTF-8 bytes (typically a string literal in the
+            program's read-only data segment)
+  Offset 8: byte length (computed once via string_length)
+
+Callers pass the returned descriptor handle to add_function_import and
+add_export. The encoder reads ptr+length back out at emit time.
+
+This avoids re-walking the string on every section emit and avoids
+allocating a heap copy of the bytes — we hold a reference to the original
+literal storage, which has program lifetime.
+@End Reasoning
+
+@Implementation
+1. NULL guard on str — return 0.
+2. Allocate a 16-byte descriptor block.
+3. Compute byte length via StringCore.string_length once at registration.
+4. Store ptr at offset 0, length at offset 8.
+5. Return descriptor pointer.
+
+The descriptor lifetime equals module-state lifetime; descriptors are
+referenced by import_entries and live until Layout.deallocate of the state.
+@End Implementation
+
+@Performance_Hints
+One Layout.allocate (16 bytes, owned-heap tier) plus one O(n) string_length
+walk. Both happen at WASI-import-registration time (cold path, once per
+unique WASI function name per module). Subsequent emit passes are pointer
+loads only. Total cost negligible relative to module-level encoding.
+@End Performance_Hints
+
+@Security_Scope
+Caller-controlled string pointer is treated as opaque bytes. string_length
+guards against non-terminated strings by virtue of its own NULL-pointer
+check and byte-by-byte scan. The descriptor stores a *reference* to the
+caller's storage, not a copy — callers must keep the underlying string
+alive for the module-state lifetime. WASI function names are always
+program literals, which satisfies this lifetime constraint statically.
+@End Security_Scope
+
+Process called "string_literal" that takes str as Integer returns Integer:
+    If str is equal to 0:
+        Return 0
+    End If
+
+    Let descriptor be Layout.allocate(16)
+    If descriptor is equal to 0:
+        Return 0
+    End If
+
+    Let length be proc string_length from StringCore with str
+    proc memory_set_int64 from Memory with descriptor, 0, str
+    proc memory_set_int64 from Memory with descriptor, 8, length
+
+    Return descriptor
+End Process
+
+Process called "string_descriptor_get_ptr" that takes descriptor as Integer returns Integer:
+    @Reasoning
+    Accessor for the bytes pointer field of a string_literal descriptor.
+    Centralizes the offset constant (0) so the import-section emitter does
+    not bake a magic number into its source.
+    @End Reasoning
+
+    @Implementation
+    Single load at offset 0. NULL descriptor returns 0 to keep callers
+    defensive on partial-construction paths.
+    @End Implementation
+
+    @Performance_Hints
+    Single 8-byte load. Inlined as the underlying memory_get_int64.
+    @End Performance_Hints
+
+    @Security_Scope
+    No bounds check on descriptor pointer beyond the NULL guard. Callers
+    pass descriptors returned only by string_literal, which guarantees
+    16-byte allocation and the (ptr, length) layout.
+    @End Security_Scope
+
+    If descriptor is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with descriptor, 0
+End Process
+
+Process called "string_descriptor_get_length" that takes descriptor as Integer returns Integer:
+    @Reasoning
+    Accessor for the byte-length field of a string_literal descriptor.
+    Returns 0 for a NULL descriptor; matches WASM vec(byte) semantics
+    where an empty name is encoded as a single LEB128 0 byte.
+    @End Reasoning
+
+    @Implementation
+    Single load at offset 8.
+    @End Implementation
+
+    @Performance_Hints
+    Single 8-byte load. No additional work.
+    @End Performance_Hints
+
+    @Security_Scope
+    NULL-safe. Matches string_descriptor_get_ptr defensive-load idiom.
+    @End Security_Scope
+
+    If descriptor is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Memory with descriptor, 8
+End Process
+
+Note: ============================================================================
+Note: IMPORT SECTION
+Note: ============================================================================
+
+@Reasoning
+The WASM import section (section ID 2) declares external entities the module
+imports from the host (or from other modules in a module-linking setup). For
+WASI integration, every WASI function used by user code must be declared
+here with module name "wasi_snapshot_preview1" and the WASI-spec field name
+("fd_write", "proc_exit", etc.).
+
+Import entries occupy function indices BEFORE locally-defined functions.
+The function-index space ordering is: imports first (in registration order),
+then locals (in registration order). add_function_import must therefore be
+called before add_function for any function that calls imports through a
+hard-coded index — but since wasi_get_import_index registers on demand, this
+ordering is enforced naturally for WASI calls.
+
+Import entry layout (40 bytes):
+  Offset 0:  module_descriptor pointer  (string_literal handle)
+  Offset 8:  field_descriptor pointer   (string_literal handle)
+  Offset 16: import_kind                (0=func, 1=table, 2=memory, 3=global)
+  Offset 24: type_idx                   (function type index from add_function_type)
+  Offset 32: assigned import index      (returned to caller for use in encode_call)
+@End Reasoning
+
+@Implementation
+add_function_import:
+1. Validate state, descriptors, type_idx.
+2. Compute the next import index = current import_count.
+3. Append a 40-byte entry to import_entries with (module, field, kind=0,
+   type_idx, index).
+4. Bump import_count.
+5. Return the assigned index.
+
+add_import_section:
+1. Skip if import_count == 0 (omit empty section per WASM spec).
+2. Build content into temp_output: vec(import) where each import is
+   name1 (vec byte) + name2 (vec byte) + kind + type_idx.
+3. Names are encoded as LEB128-prefixed UTF-8 byte vectors.
+4. Function imports use kind byte 0x00 followed by LEB128 type index.
+5. Write section header + content into the module's final output buffer.
+@End Implementation
+
+@Performance_Hints
+add_function_import: 5 memory stores plus state field bumps. O(1).
+add_import_section: O(I * (M + F)) where I = import count, M/F = byte
+lengths of module/field names. Each byte is one MachineCode.emit_byte call.
+For a typical WASM/WASI module with ~15 imports averaging 30 bytes of
+combined name, total cost is ~450 byte-emits + LEB128 overhead. Cold path
+(once per module encode).
+@End Performance_Hints
+
+@Security_Scope
+add_function_import accepts caller-allocated descriptors verbatim. NULL
+descriptors are stored but rendered as empty-name imports at emit time;
+WASI runtimes reject empty-name imports, so the failure surfaces at module
+load. The 256-import cap is enforced by the fixed import_entries allocation
+(10240 bytes / 40 bytes per entry) — overflow corrupts the next state
+field. Callers must not exceed this cap. WASI preview1 has 30 functions
+total, so the cap is comfortably above the realistic ceiling.
+@End Security_Scope
+
+Process called "add_function_import" that takes state as Integer, module_descriptor as Integer, field_descriptor as Integer, type_idx as Integer returns Integer:
+    If state is equal to 0:
+        Return -1
+    End If
+
+    Let import_entries be __load(state, 120)
+    Let import_count be __load(state, 128)
+    Let entry_offset be import_count multiplied by 40
+
+    __store(import_entries, entry_offset, module_descriptor)
+    __store(import_entries, entry_offset plus 8, field_descriptor)
+    __store(import_entries, entry_offset plus 16, 0)               Note: kind=function
+    __store(import_entries, entry_offset plus 24, type_idx)
+    __store(import_entries, entry_offset plus 32, import_count)    Note: assigned index
+
+    __store(state, 128, import_count plus 1)
+    Return import_count
+End Process
+
+Process called "add_import_section" that takes state as Integer returns Integer:
+    @Reasoning
+    Emits the import section (section ID 2). Section ordering: type (1)
+    must come before import (2), and import (2) must come before function
+    (3) — encode_module is responsible for that ordering.
+    @End Reasoning
+
+    @Implementation
+    Mirrors add_export_section: build content into a temp buffer first
+    (since section size must precede content as LEB128), then write
+    section header + content to the final output.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path. One temp-buffer allocation per encode_module call.
+    @End Performance_Hints
+
+    @Security_Scope
+    Defensive against NULL descriptors (renders empty names). The temp
+    buffer is sized at 16384 bytes — sufficient for >150 imports of
+    100-byte combined name on average.
+    @End Security_Scope
+
+    Let import_count be __load(state, 128)
+    If import_count is equal to 0:
+        Return 1
+    End If
+
+    Let output be __load(state, 0)
+    Let import_entries be __load(state, 120)
+
+    Let temp_output be MachineCode.create_output_buffer(16384)
+    If temp_output is equal to 0:
+        Return 0
+    End If
+
+    WasmInstr.encode_leb128_unsigned(temp_output, import_count)
+
+    Let ii be 0
+    While ii is less than import_count:
+        Let entry_offset be ii multiplied by 40
+        Let module_desc be __load(import_entries, entry_offset)
+        Let field_desc be __load(import_entries, entry_offset plus 8)
+        Let kind be __load(import_entries, entry_offset plus 16)
+        Let type_idx be __load(import_entries, entry_offset plus 24)
+
+        Note: Module name as vec(byte)
+        Let module_ptr be string_descriptor_get_ptr(module_desc)
+        Let module_len be string_descriptor_get_length(module_desc)
+        WasmInstr.encode_leb128_unsigned(temp_output, module_len)
+        Let mi be 0
+        While mi is less than module_len:
+            Let mch be __load8(module_ptr, mi)
+            MachineCode.emit_byte(temp_output, mch)
+            Set mi to mi plus 1
+        End While
+
+        Note: Field name as vec(byte)
+        Let field_ptr be string_descriptor_get_ptr(field_desc)
+        Let field_len be string_descriptor_get_length(field_desc)
+        WasmInstr.encode_leb128_unsigned(temp_output, field_len)
+        Let fi be 0
+        While fi is less than field_len:
+            Let fch be __load8(field_ptr, fi)
+            MachineCode.emit_byte(temp_output, fch)
+            Set fi to fi plus 1
+        End While
+
+        Note: Import kind byte (0 = function)
+        MachineCode.emit_byte(temp_output, kind)
+
+        Note: For function imports, the type index follows as LEB128
+        If kind is equal to 0:
+            WasmInstr.encode_leb128_unsigned(temp_output, type_idx)
+        End If
+
+        Set ii to ii plus 1
+    End While
+
+    Let content_size be MachineCode.get_output_size(temp_output)
+    write_section_header(output, WASM_SECTION_IMPORT, content_size)
+    MachineCode.copy_output(temp_output, output)
+
+    Return 1
+End Process
+
+Note: ============================================================================
 Note: COMPLETE MODULE ENCODING
 Note: ============================================================================
 
@@ -671,6 +973,7 @@ Process called "encode_module" that takes state as Integer returns Integer:
 
     Note: Sections in order
     add_type_section(state)
+    add_import_section(state)
     add_function_section(state)
     add_memory_section(state)
     add_export_section(state)

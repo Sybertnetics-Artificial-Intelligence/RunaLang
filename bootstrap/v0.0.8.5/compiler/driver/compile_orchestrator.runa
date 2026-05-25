@@ -819,6 +819,250 @@ Process called "dispatch_codegen_by_arch" that takes target_arch as Integer, lir
 End Process
 
 Note: ============================================================================
+Note: dispatch_binary_emit_by_arch -- LIR -> object-file binary emit
+Note: ============================================================================
+
+@Reasoning
+Companion dispatcher to dispatch_codegen_by_arch. Where dispatch_codegen
+produces target-specific assembly TEXT (consumed by an external assembler),
+dispatch_binary_emit produces target-specific binary BYTES directly into a
+caller-supplied output buffer. This is the entry point for the object-file
+emit path used by:
+
+  1. The eventual -c flag (compile to object without invoking assembler).
+  2. The AOTT runtime when it wants in-process binary patching.
+  3. The binary_emit_smoke test caller authored by D9 (which exercises this
+     dispatcher end-to-end against a trivial LIR module).
+
+Per CEO Q1 ratification: PE and Mach-O object format writers must be wired
+NOW (not @Reserved_For). This dispatcher does not select the object FORMAT
+(that is dispatch_object_format_by_os) -- it selects the architecture-
+specific INSTRUCTION ENCODER. The two dispatchers compose: arch encoder
+fills the .text section; object-format writer wraps that text section in
+the ELF/PE/Mach-O scaffolding.
+
+For arches whose module-level binary entry point is not yet authored
+(MIPS/PPC/RISC-V/x86 -- their instruction_encoder.runa files contain
+per-opcode encode_* procs but no encode_*_lir_module aggregator), this
+dispatcher returns -1 with a single Alert; the audit's @Reserved_For
+escape hatch is forbidden by the CEO no-defer directive, so those arches
+must produce a real -1 (caller-visible failure) rather than silent 0.
+The v0.0.8.5 supported binary-emit arches are x86_64 (encode_lir_module)
+and wasm32/wasm64 (encode_module).
+@End Reasoning
+
+@Implementation
+Branch on target_arch identical in structure to dispatch_codegen_by_arch.
+For x86_64, call encode_lir_module(output, module_ptr) which lives in
+x86_64/instruction_encoder.runa.
+For wasm32/wasm64, the WASM encoder operates on a WasmModuleState that
+has been pre-populated by the LIR-to-WAT path; the binary-emit path here
+expects the caller to pass that already-populated state as the module_ptr.
+Return value: number of bytes emitted (positive), or -1 on error.
+@End Implementation
+
+@Performance_Hints
+Branch overhead identical to dispatch_codegen_by_arch (single integer
+compare-and-branch). The work happens inside the per-arch encoder.
+Called once per object-file emit (i.e., never on the hot compile path of
+v0.0.8.5; binary emit is reserved for explicit driver flags or AOTT).
+@End Performance_Hints
+
+@Security_Scope
+Output buffer is caller-supplied; this dispatcher does not allocate.
+Per-arch encoders are responsible for bounds checks against the output
+buffer's capacity. Returning -1 on unsupported arch surfaces failure
+explicitly rather than risking a silent zero-byte object file.
+@End Security_Scope
+
+Process called "dispatch_binary_emit_by_arch" that takes target_arch as Integer, lir_module as Integer, output_buffer as Integer returns Integer:
+    If lir_module is equal to 0:
+        Return -1
+    End If
+    If output_buffer is equal to 0:
+        Return -1
+    End If
+
+    Note: x86_64 binary emit -- production path.
+    If target_arch is equal to ARCH_X86_64:
+        Return encode_lir_module(output_buffer, lir_module)
+    End If
+
+    Note: wasm32 / wasm64 binary emit. The wasm encoder consumes a
+    Note: WasmModuleState (populated upstream by the LIR-to-WAT
+    Note: build), not a raw LIRModule. Caller passes the state as
+    Note: lir_module argument.
+    If target_arch is equal to ARCH_WASM32:
+        Return encode_module(lir_module)
+    End If
+    If target_arch is equal to ARCH_WASM64:
+        Return encode_module(lir_module)
+    End If
+
+    Note: Other arches have per-opcode encoders but no module-level
+    Note: aggregator yet. Surface the unsupported case explicitly
+    Note: rather than silently emitting a zero-byte object file.
+    Alert "[BINARY EMIT] dispatch_binary_emit_by_arch: arch not wired"
+    Return -1
+End Process
+
+Note: ============================================================================
+Note: dispatch_object_format_by_os -- OS -> ELF/PE/Mach-O selection
+Note: ============================================================================
+
+@Reasoning
+Selects the object-file FORMAT (envelope) based on the target OS. The
+format wraps the binary code produced by dispatch_binary_emit_by_arch
+in the platform-native executable container:
+
+  ELF64   - Linux, FreeBSD, OpenBSD, NetBSD (System V ABI)
+  PE      - Windows (Portable Executable)
+  Mach-O  - macOS / Darwin
+  raw     - WASI / bare-metal (no envelope; binary is the WASM .wasm)
+
+Per CEO Q1 ratification (override architect default @Reserved_For):
+PE and Mach-O ARE wired here in v0.0.8.5. They are not AOTT-exempt and
+must be reachable from the driver. Calling create_pe_builder,
+pe_build_executable, pe_get_output_buffer / create_macho_builder,
+macho_build_executable, macho_get_output_buffer makes the seven PE/Mach-O
+"orphan" Processes reachable.
+
+This dispatcher returns a builder pointer (per format type). The caller
+extracts the final byte buffer via the format-specific get_output_buffer
+function. The two-step design lets the caller decide whether to inspect,
+patch, or write the buffer.
+@End Reasoning
+
+@Implementation
+1. Map OS code to format: Linux/BSDs -> ELF, Windows -> PE,
+   Darwin -> Mach-O, WASI -> raw (returns the binary buffer directly).
+2. Create the format-specific builder (image base / CPU type fixed
+   defaults: ELF64 base 0x400000, PE image base 0x140000000, Mach-O
+   cpu_type 16777223 = CPU_TYPE_X86_64).
+3. Invoke the format's build_executable with the code buffer
+   produced upstream by dispatch_binary_emit_by_arch.
+4. Return the builder pointer (caller drains via *_get_output_buffer
+   and *_get_output_size).
+
+Returns 0 on error.
+@End Implementation
+
+@Performance_Hints
+Three-way branch on OS code. Builders are heap-allocated once per
+object-file emit. Mach-O builder is the heaviest (universal-binary
+support adds load-command bookkeeping); ELF64 is the lightest.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Builder allocations live for the lifetime of the
+object-file emit. Caller must call the format-specific *_destroy_builder
+function (or rely on arena teardown).
+@End Security_Scope
+
+Process called "dispatch_object_format_by_os" that takes target_os as Integer, code_buffer as Integer, code_size as Integer, data_buffer as Integer, data_size as Integer, rodata_buffer as Integer, rodata_size as Integer returns Integer:
+    If code_buffer is equal to 0:
+        Return 0
+    End If
+    If code_size is less than 1:
+        Return 0
+    End If
+
+    Note: ELF64 path -- Linux, FreeBSD, OpenBSD, NetBSD.
+    If target_os is equal to OS_LINUX:
+        Let elf_builder be create_elf64_builder(4194304)
+        If elf_builder is equal to 0:
+            Return 0
+        End If
+        Let elf_rc be elf64_build_executable(elf_builder, code_buffer, code_size, data_buffer, data_size, rodata_buffer, rodata_size)
+        If elf_rc is equal to 0:
+            elf64_destroy_builder(elf_builder)
+            Return 0
+        End If
+        elf64_finalize(elf_builder)
+        Return elf_builder
+    End If
+    If target_os is equal to OS_FREEBSD:
+        Let elf_bsd_builder be create_elf64_builder(4194304)
+        If elf_bsd_builder is equal to 0:
+            Return 0
+        End If
+        Let elf_bsd_rc be elf64_build_executable(elf_bsd_builder, code_buffer, code_size, data_buffer, data_size, rodata_buffer, rodata_size)
+        If elf_bsd_rc is equal to 0:
+            elf64_destroy_builder(elf_bsd_builder)
+            Return 0
+        End If
+        elf64_finalize(elf_bsd_builder)
+        Return elf_bsd_builder
+    End If
+    If target_os is equal to OS_OPENBSD:
+        Let elf_openbsd_builder be create_elf64_builder(4194304)
+        If elf_openbsd_builder is equal to 0:
+            Return 0
+        End If
+        Let elf_openbsd_rc be elf64_build_executable(elf_openbsd_builder, code_buffer, code_size, data_buffer, data_size, rodata_buffer, rodata_size)
+        If elf_openbsd_rc is equal to 0:
+            elf64_destroy_builder(elf_openbsd_builder)
+            Return 0
+        End If
+        elf64_finalize(elf_openbsd_builder)
+        Return elf_openbsd_builder
+    End If
+    If target_os is equal to OS_NETBSD:
+        Let elf_netbsd_builder be create_elf64_builder(4194304)
+        If elf_netbsd_builder is equal to 0:
+            Return 0
+        End If
+        Let elf_netbsd_rc be elf64_build_executable(elf_netbsd_builder, code_buffer, code_size, data_buffer, data_size, rodata_buffer, rodata_size)
+        If elf_netbsd_rc is equal to 0:
+            elf64_destroy_builder(elf_netbsd_builder)
+            Return 0
+        End If
+        elf64_finalize(elf_netbsd_builder)
+        Return elf_netbsd_builder
+    End If
+
+    Note: PE path -- Windows.
+    If target_os is equal to OS_WINDOWS:
+        Let pe_builder be create_pe_builder(5368709120)
+        If pe_builder is equal to 0:
+            Return 0
+        End If
+        Let pe_rc be pe_build_executable(pe_builder, code_buffer, code_size, data_buffer, data_size, rodata_buffer, rodata_size)
+        If pe_rc is equal to 0:
+            pe_destroy_builder(pe_builder)
+            Return 0
+        End If
+        Return pe_builder
+    End If
+
+    Note: Mach-O path -- Darwin / macOS / iOS.
+    If target_os is equal to OS_DARWIN:
+        Note: cpu_type 16777223 = CPU_TYPE_X86_64 (0x01000007).
+        Let macho_builder be create_macho_builder(16777223)
+        If macho_builder is equal to 0:
+            Return 0
+        End If
+        Let macho_rc be macho_build_executable(macho_builder, code_buffer, code_size, data_buffer, data_size, rodata_buffer, rodata_size)
+        If macho_rc is equal to 0:
+            Return 0
+        End If
+        Return macho_builder
+    End If
+
+    Note: WASI / bare-metal -- no object envelope. The wasm32/64
+    Note: binary is the .wasm file directly.
+    If target_os is equal to OS_WASI:
+        Return code_buffer
+    End If
+    If target_os is equal to OS_BARE_METAL:
+        Return code_buffer
+    End If
+
+    Note: Unknown OS -- defensive zero.
+    Return 0
+End Process
+
+Note: ============================================================================
 Note: compile_program -- THE 11-PHASE PIPELINE
 Note: ============================================================================
 

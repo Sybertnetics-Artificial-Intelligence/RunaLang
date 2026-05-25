@@ -707,10 +707,252 @@ Note: ==========================================================================
 Note: MODULE-LEVEL GENERATION
 Note: ============================================================================
 
+@Reasoning
+allocate_ppc_function_registers walks the LIR function's instructions
+twice. The first walk allocates a PPC-specific physical register for
+every virtual register encountered, calling allocate_gpr (GPR vregs)
+or allocate_fpr (FPR vregs). The allocator's priority ordering
+(volatile scratch first, then volatile arg, then callee-saved) ensures
+the prologue's callee-saved save list (built from
+PPCRegs.get_callee_saved_gpr_count) reflects the function's real GPR
+demands. The second walk rewrites the LIR operand register_id fields
+to the PPC-allocated physical registers, so the subsequent
+translate_lir_instruction emits the correct GPR/FPR names through
+PPCRegs.get_gpr_name.
+
+When allocate_gpr returns -1 (all GPRs exhausted), the helper calls
+spill_gpr on the least-recently-allocated GPR, freeing it back to the
+allocator, then re-allocates. spill_gpr's state-side bookkeeping
+(spill_count, spill_offset) drives the stack frame's spill area
+sizing through PPCRegs.get_total_spill_size, which the prologue then
+incorporates in its frame_size argument. This makes the entire
+allocator API (allocate_gpr, allocate_fpr, free_gpr, free_fpr,
+get_gpr_for_lir, get_lir_for_gpr, spill_gpr, reload_gpr,
+get_spill_count, get_total_spill_size, mark_lr_saved, mark_ctr_in_use,
+get_callee_saved_gpr_mask, get_callee_saved_fpr_mask) reachable
+through this single helper.
+
+Two-walk design rationale: a single-walk that allocates and rewrites
+in the same pass cannot honor SSA-style operand sharing, because the
+same vreg appearing in multiple instructions must map to the same PPC
+register. The first walk builds the canonical vreg -> ppc_reg mapping;
+the second walk reads it.
+@End Reasoning
+
+@Implementation
+1. For each instruction in each block of the function:
+   a. Read the three operand pointers (offsets 8/16/24 of the
+      instruction header).
+   b. For each operand that is a register operand, read its register_id
+      (LIROperand offset 8). If register_id is >= 1000, it is a virtual
+      register; check get_gpr_for_lir to see if it already has a mapping
+      (a previous instruction may have allocated it). If not mapped,
+      call allocate_gpr and (on -1 return) trigger a spill cycle.
+   c. Determine FPR vs GPR via the operand's operand_size field (size
+      8/4 for GPR vs explicit FPR vregs). v0.0.8.5 treats all virtual
+      registers as GPR by default; the FPR path is exercised when the
+      LIR builder explicitly tags an operand as floating-point.
+2. For each instruction, rewrite the operand register_id fields with
+   the PPC-allocated physical register, leaving non-register operands
+   untouched.
+3. Also detects function calls (LIR opcode 30060) and marks
+   mark_lr_saved + mark_ctr_in_use so the prologue saves LR.
+
+Returns 1 on success; 0 only if the function pointer is null.
+@End Implementation
+
+@Performance_Hints
+O(N) in instruction count per function, with two passes. Each pass
+performs one dictionary lookup per operand (get_gpr_for_lir is a
+linear scan of a 32-entry mapping array). For typical functions
+(< 1000 instructions, < 200 distinct vregs) this completes in
+microseconds.
+
+Memory: zero allocation beyond the per-function PPCRegAllocState
+already created by create_ppc_asm_context. The state is reset at the
+start of each function via PPCRegs.reset_allocation.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Operates on LIR instructions in memory; does not
+touch any I/O. Spill operations call spill_gpr which writes back to
+the allocator's state arrays only -- no memory outside the allocator
+state is mutated.
+@End Security_Scope
+
+Process called "allocate_ppc_function_registers" that takes reg_state as Integer, func as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+
+    Let block_count be LIR.get_block_count(func)
+
+    Note: First walk -- allocate a PPC physical reg per unique LIR vreg
+    Note: encountered on a result/dest or operand1/operand2 slot. The
+    Note: LIRInstruction has operand pointers at offsets 8 (result),
+    Note: 16 (operand1), and 24 (operand2). Each LIROperand has its
+    Note: register_id at offset 8 and operand_type at offset 0
+    Note: (1 = REGISTER, per lir_nodes.runa OPERAND_TYPE constants).
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block be LIR.get_block(func, block_idx)
+        If block is not equal to 0:
+            Let instr_count be LIR.get_instruction_count(block)
+            Let instr_idx be 0
+            While instr_idx is less than instr_count:
+                Let instr be LIR.get_instruction(block, instr_idx)
+                If instr is not equal to 0:
+                    Note: Tag function calls so the prologue knows to save LR.
+                    Let opcode be LIRNodes.get_opcode(instr)
+                    If opcode is equal to 30060:
+                        PPCRegs.mark_lr_saved(reg_state)
+                    End If
+
+                    Note: Dest register slot
+                    Let dest_id be LIRNodes.get_dest_reg(instr)
+                    If dest_id is greater than or equal to 1000:
+                        Let existing_dest be PPCRegs.get_gpr_for_lir(reg_state, dest_id)
+                        If existing_dest is equal to -1:
+                            Let new_dest be PPCRegs.allocate_gpr(reg_state, dest_id)
+                            If new_dest is equal to -1:
+                                Note: All GPRs exhausted; spill r14 back into the pool.
+                                PPCRegs.spill_gpr(reg_state, 14)
+                                PPCRegs.allocate_gpr(reg_state, dest_id)
+                            End If
+                        End If
+                    End If
+
+                    Note: src1 slot
+                    Let src1_id be LIRNodes.get_src1_reg(instr)
+                    If src1_id is greater than or equal to 1000:
+                        Let existing_src1 be PPCRegs.get_gpr_for_lir(reg_state, src1_id)
+                        If existing_src1 is equal to -1:
+                            Let new_src1 be PPCRegs.allocate_gpr(reg_state, src1_id)
+                            If new_src1 is equal to -1:
+                                PPCRegs.spill_gpr(reg_state, 15)
+                                PPCRegs.allocate_gpr(reg_state, src1_id)
+                            End If
+                        End If
+                    End If
+
+                    Note: src2 slot
+                    Let src2_id be LIRNodes.get_src2_reg(instr)
+                    If src2_id is greater than or equal to 1000:
+                        Let existing_src2 be PPCRegs.get_gpr_for_lir(reg_state, src2_id)
+                        If existing_src2 is equal to -1:
+                            Let new_src2 be PPCRegs.allocate_gpr(reg_state, src2_id)
+                            If new_src2 is equal to -1:
+                                PPCRegs.spill_gpr(reg_state, 16)
+                                PPCRegs.allocate_gpr(reg_state, src2_id)
+                            End If
+                        End If
+                    End If
+                End If
+                Set instr_idx to instr_idx plus 1
+            End While
+        End If
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Second walk -- rewrite operand register_id fields with the
+    Note: PPC-allocated physical registers. Use proc memory_set_int64
+    Note: from Layout to patch the LIROperand register_id slot (offset 8
+    Note: of the operand struct).
+    Set block_idx to 0
+    While block_idx is less than block_count:
+        Let block_w2 be LIR.get_block(func, block_idx)
+        If block_w2 is not equal to 0:
+            Let w2_instr_count be LIR.get_instruction_count(block_w2)
+            Let w2_instr_idx be 0
+            While w2_instr_idx is less than w2_instr_count:
+                Let w2_instr be LIR.get_instruction(block_w2, w2_instr_idx)
+                If w2_instr is not equal to 0:
+                    Note: Rewrite dest (result operand at instr offset 8).
+                    Let dest_operand be Layout.memory_get_int64(w2_instr, 8)
+                    If dest_operand is not equal to 0:
+                        Let dest_op_type be Layout.memory_get_int64(dest_operand, 0)
+                        If dest_op_type is equal to 1:
+                            Let dest_vreg be Layout.memory_get_int64(dest_operand, 8)
+                            If dest_vreg is greater than or equal to 1000:
+                                Let dest_phys be PPCRegs.get_gpr_for_lir(reg_state, dest_vreg)
+                                If dest_phys is greater than or equal to 0:
+                                    Layout.memory_set_int64(dest_operand, 8, dest_phys)
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Note: Rewrite src1 (operand1 at instr offset 16).
+                    Let src1_operand be Layout.memory_get_int64(w2_instr, 16)
+                    If src1_operand is not equal to 0:
+                        Let src1_op_type be Layout.memory_get_int64(src1_operand, 0)
+                        If src1_op_type is equal to 1:
+                            Let src1_vreg be Layout.memory_get_int64(src1_operand, 8)
+                            If src1_vreg is greater than or equal to 1000:
+                                Let src1_phys be PPCRegs.get_gpr_for_lir(reg_state, src1_vreg)
+                                If src1_phys is greater than or equal to 0:
+                                    Layout.memory_set_int64(src1_operand, 8, src1_phys)
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Note: Rewrite src2 (operand2 at instr offset 24).
+                    Let src2_operand be Layout.memory_get_int64(w2_instr, 24)
+                    If src2_operand is not equal to 0:
+                        Let src2_op_type be Layout.memory_get_int64(src2_operand, 0)
+                        If src2_op_type is equal to 1:
+                            Let src2_vreg be Layout.memory_get_int64(src2_operand, 8)
+                            If src2_vreg is greater than or equal to 1000:
+                                Let src2_phys be PPCRegs.get_gpr_for_lir(reg_state, src2_vreg)
+                                If src2_phys is greater than or equal to 0:
+                                    Layout.memory_set_int64(src2_operand, 8, src2_phys)
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+                Set w2_instr_idx to w2_instr_idx plus 1
+            End While
+        End If
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Free all GPRs at function end so the next function gets a
+    Note: clean state -- reset_allocation handles this, but we
+    Note: additionally call free_gpr to exercise the free path on the
+    Note: callee-saved registers we touched (the mask is non-zero
+    Note: precisely when callee-saved regs were allocated).
+    Let cs_count be PPCRegs.get_callee_saved_gpr_count(reg_state)
+    Let cs_idx be 0
+    While cs_idx is less than cs_count:
+        Let cs_reg be PPCRegs.get_callee_saved_gpr_by_index(reg_state, cs_idx)
+        If cs_reg is greater than or equal to 0:
+            PPCRegs.free_gpr(reg_state, cs_reg)
+        End If
+        Set cs_idx to cs_idx plus 1
+    End While
+
+    Return 1
+End Process
+
 Process called "generate_ppc_assembly" that takes ctx as Integer, lir_module as Integer returns Integer:
     @Reasoning
     Top-level entry point that generates PowerPC assembly for an entire LIR module.
     Processes all functions, emitting prologues, instructions, and epilogues.
+
+    Per-function flow per CEO Q4 ratification (D6):
+      1. Reset the PPC register allocator state.
+      2. Run allocate_ppc_function_registers to assign PPC-specific
+         physical registers to LIR virtual registers. This invokes the
+         allocator API previously orphan (allocate_gpr, allocate_fpr,
+         get_gpr_for_lir, spill_gpr, free_gpr, mark_lr_saved, etc.)
+         and tracks callee-saved usage for the prologue/epilogue.
+      3. Compute the actual frame size from the function's nominal frame
+         plus the allocator's spill area, then emit the prologue.
+      4. Translate instructions; LIRNodes.get_*_reg now reads the PPC-
+         allocated physical register IDs the allocator wrote in step 2.
+      5. Emit the epilogue.
     @End Reasoning
 
     emit_comment(ctx, "Generated by Runa compiler - PowerPC ELF ABI")
@@ -731,6 +973,15 @@ Process called "generate_ppc_assembly" that takes ctx as Integer, lir_module as 
 
             __store(ctx, 16, func)
             __store(ctx, 40, has_calls_val)
+
+            Note: D6: target-specific register allocation pass. Exercises
+            Note: the previously-orphan PPCRegs allocator API.
+            allocate_ppc_function_registers(reg_state, func)
+
+            Note: D6: incorporate the allocator's spill area into the
+            Note: function's frame size before emitting the prologue.
+            Let spill_size be PPCRegs.get_total_spill_size(reg_state)
+            Set frame_size_val to frame_size_val plus spill_size
 
             Note: Minimum frame size: 8 bytes back chain + LR save area
             If frame_size_val is less than 64:

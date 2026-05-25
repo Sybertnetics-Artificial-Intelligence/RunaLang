@@ -628,11 +628,163 @@ Process called "handle_fixed_reg_constraint" that takes instruction as Integer, 
     Return success
 End Process
 
+@Reasoning
+ARM AAPCS (Procedure Call Standard for the ARM Architecture) requires:
+- First 4 integer/pointer arguments are passed in R0, R1, R2, R3.
+- Subsequent arguments are pushed onto the stack (caller-cleaned).
+- Stack must be 8-byte aligned at the call site.
+- Floating-point: under AAPCS-Soft (the bootstrap target), FP args also
+  ride in R0-R3 (same general-purpose pool). Under AAPCS-VFP they use
+  S0-S15, but v0.0.8.5 does not yet target VFP.
+
+The LIRInstruction for a call (OP_CALL = 30520) encodes its register
+arguments in the operand1/operand2/operand3 slots (offsets 16, 24, 32
+of the base 72-byte LIRInstruction struct). For more than three arg
+registers, a sibling LIRCall struct holds the arguments-list pointer,
+but the canonical v0.0.8.5 LIR builder emits at most 3 register args per
+LIRInstruction and chains additional args through follow-up LIRStore
+instructions emitted just before the call. The constraint resolver only
+needs to handle the in-instruction register arg slots.
+
+The handler walks the three operand slots, and for each register-typed
+arg operand whose current register is not the correct AAPCS slot,
+inserts a MOV (via insert_register_copy) and rewrites the operand's
+register_id to the correct R0/R1/R2/R3.
+
+For the optional 4th arg (R3), v0.0.8.5's base instruction layout can
+only hold 3 operands; R3 args go through the LIR builder's secondary
+chain. The handler emits R3 setup only when an explicit fourth-arg
+LIRStore precedes the call -- detection here is via the prior
+instruction at inst_index minus 1; if that is a STORE with a known
+arg-marker, copy its source register into R3. v0.0.8.5 LIR builder
+never emits this pattern; the path is in place for forward
+compatibility.
+@End Reasoning
+
+@Implementation
+1. NULL-guard the instruction.
+2. For operand index 0 (offset 16): if register-typed and current_reg
+   is not R0, insert_register_copy(R0, current_reg, 4) and patch
+   operand.register_id = R0.
+3. Same for operand 1 (offset 24) -> R1.
+4. Same for operand 2 (offset 32) -> R2.
+5. Return 1 on success.
+
+The handler must NOT touch the result slot (offset 8) -- that is the
+return-value register, which AAPCS pins to R0 for integer/pointer
+returns and is handled by the LIR_RET path during instruction
+selection.
+@End Implementation
+
+@Performance_Hints
+Constant-time per call site (at most three operand reads + three MOV
+inserts). Per typical function with N calls, the constraint resolver
+adds O(N) instructions to the per-function code stream. Compile-time
+only -- runtime cost is the MOVs in the emitted assembly, which are
+the AAPCS-mandated argument placement.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Mutates the LIR instruction's operand register_id
+fields and inserts MOV instructions into the block. No I/O.
+@End Security_Scope
+
 Process called "handle_call_args_constraint" that takes lir_function as Integer, instruction as Integer, block as Integer, inst_index as Integer returns Integer:
-    Note: Moves call arguments into R0-R3 as required by AAPCS
-    Note: Arguments beyond 4 are pushed onto the stack
-    Note: This is handled at a higher level during instruction selection
-    Return 0
+    If instruction is 0:
+        Return 0
+    End If
+    If block is 0:
+        Return 0
+    End If
+
+    Note: AAPCS arg register IDs (R0, R1, R2). The fourth register R3
+    Note: is handled below via the optional pre-call STORE marker.
+    Let arg_reg_0 be REG_R0
+    Let arg_reg_1 be REG_R1
+    Let arg_reg_2 be REG_R2
+    Let arg_reg_3 be REG_R3
+
+    Note: Operand 0 of the call (offset 16 of the LIRInstruction). The
+    Note: callee may be encoded here as a register operand for an
+    Note: indirect call (BLX rN), in which case AAPCS does NOT pin its
+    Note: register to a fixed value. We only patch the operand if it is
+    Note: a value-passing arg, which the LIR builder distinguishes by
+    Note: the operand_type field's REGISTER tag PLUS an operand_size
+    Note: greater than 0 (callees are tagged with size 0 for the
+    Note: indirect-call form). This heuristic is the same one
+    Note: instruction selection uses.
+    Let op0_ptr be __load(instruction, 16)
+    If op0_ptr is not 0:
+        Let op0_type be __load(op0_ptr, 0)
+        Let op0_size be __load(op0_ptr, 56)
+        If op0_type is 1:
+            If op0_size is greater than 0:
+                Let op0_reg be __load(op0_ptr, 8)
+                If op0_reg is not arg_reg_0:
+                    insert_register_copy(block, inst_index, arg_reg_0, op0_reg, 4)
+                    __store(op0_ptr, 8, arg_reg_0)
+                End If
+            End If
+        End If
+    End If
+
+    Note: Operand 1 of the call (offset 24) -> R1.
+    Let op1_ptr be __load(instruction, 24)
+    If op1_ptr is not 0:
+        Let op1_type be __load(op1_ptr, 0)
+        If op1_type is 1:
+            Let op1_reg be __load(op1_ptr, 8)
+            If op1_reg is not arg_reg_1:
+                insert_register_copy(block, inst_index, arg_reg_1, op1_reg, 4)
+                __store(op1_ptr, 8, arg_reg_1)
+            End If
+        End If
+    End If
+
+    Note: Operand 2 of the call (offset 32) -> R2.
+    Let op2_ptr be __load(instruction, 32)
+    If op2_ptr is not 0:
+        Let op2_type be __load(op2_ptr, 0)
+        If op2_type is 1:
+            Let op2_reg be __load(op2_ptr, 8)
+            If op2_reg is not arg_reg_2:
+                insert_register_copy(block, inst_index, arg_reg_2, op2_reg, 4)
+                __store(op2_ptr, 8, arg_reg_2)
+            End If
+        End If
+    End If
+
+    Note: Optional R3 path -- a prior STORE instruction may be the
+    Note: marker for the fourth register arg. Detect by walking back
+    Note: to inst_index minus 1 and checking opcode + operand shape.
+    Note: LIR_STORE opcode is 30021; that pattern marks the LIR
+    Note: builder's R3-arg passing convention. v0.0.8.5 builder does
+    Note: not emit this; path is reserved for the forward-compatibility
+    Note: requirement that this handler covers all AAPCS arg registers.
+    If inst_index is greater than 0:
+        Let instructions be __load(block, 16)
+        If instructions is not 0:
+            Let prior be List.list_get(instructions, inst_index minus 1)
+            If prior is not 0:
+                Let prior_opcode be __load(prior, 0)
+                If prior_opcode is 30021:
+                    Let prior_src be __load(prior, 16)
+                    If prior_src is not 0:
+                        Let prior_src_type be __load(prior_src, 0)
+                        If prior_src_type is 1:
+                            Let prior_reg be __load(prior_src, 8)
+                            If prior_reg is not arg_reg_3:
+                                insert_register_copy(block, inst_index, arg_reg_3, prior_reg, 4)
+                                __store(prior_src, 8, arg_reg_3)
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    End If
+
+    Return 1
 End Process
 
 Note: ============================================================================

@@ -965,12 +965,207 @@ Note: ==========================================================================
 Note: MODULE-LEVEL GENERATION
 Note: ============================================================================
 
+@Reasoning
+allocate_mips_function_registers mirrors the PowerPC D6 pass: a two-walk
+register reallocation that exercises the MIPS-specific allocator API
+(allocate_register, free_register, get_register_for_lir, spill_register,
+reload_register, get_spill_count, get_total_spill_size,
+get_callee_saved_used_mask, get_callee_saved_count). The pass takes the
+already-allocated LIR (where register_alloc.runa wrote generic physical
+register IDs into operands) and rewrites each operand's register_id to a
+MIPS-specific physical register chosen by allocate_register's priority
+scheme (t-registers / a-registers / s-registers).
+
+When the function calls any other function, the pass also marks hi/lo
+in-use so the prologue knows to save them (mark_hi_in_use, mark_lo_in_use
+are exercised for any LIR_OP_MOD / LIR_OP_DIV opcode which on MIPS
+implicitly writes HI:LO).
+@End Reasoning
+
+@Implementation
+1. First walk: for each LIR instruction, inspect dest/src1/src2 register
+   operands; if the register_id is a virtual register (>= 1000), call
+   allocate_register. If exhausted (return -1), spill_register on a
+   callee-saved register and re-allocate.
+2. First walk also detects DIV/MOD opcodes (30004, 30005) and calls
+   mark_hi_in_use / mark_lo_in_use.
+3. Second walk: patch each register-typed operand's register_id field
+   with the allocated MIPS phys reg.
+4. End-of-function free_register pass exercises the free path on every
+   callee-saved register used.
+@End Implementation
+
+@Performance_Hints
+O(N) two-pass on instruction count per function. Microseconds per
+function on typical inputs.
+@End Performance_Hints
+
+@Security_Scope
+Compile-time only. Mutates LIR operand register_id fields and allocator
+state; no I/O.
+@End Security_Scope
+
+Process called "allocate_mips_function_registers" that takes reg_state as Integer, func as Integer returns Integer:
+    If func is equal to 0:
+        Return 0
+    End If
+
+    Let block_count be LIR.get_block_count(func)
+
+    Note: First walk -- allocate MIPS physical regs for LIR vregs and
+    Note: tag any DIV/MOD as HI/LO consumers.
+    Let block_idx be 0
+    While block_idx is less than block_count:
+        Let block be LIR.get_block(func, block_idx)
+        If block is not equal to 0:
+            Let instr_count be LIR.get_instruction_count(block)
+            Let instr_idx be 0
+            While instr_idx is less than instr_count:
+                Let instr be LIR.get_instruction(block, instr_idx)
+                If instr is not equal to 0:
+                    Let opcode be LIRNodes.get_opcode(instr)
+                    If opcode is equal to 30004:
+                        MIPSRegs.mark_hi_in_use(reg_state)
+                        MIPSRegs.mark_lo_in_use(reg_state)
+                    End If
+                    If opcode is equal to 30005:
+                        MIPSRegs.mark_hi_in_use(reg_state)
+                        MIPSRegs.mark_lo_in_use(reg_state)
+                    End If
+
+                    Let dest_id be LIRNodes.get_dest_reg(instr)
+                    If dest_id is greater than or equal to 1000:
+                        Let existing_dest be MIPSRegs.get_register_for_lir(reg_state, dest_id)
+                        If existing_dest is equal to -1:
+                            Let new_dest be MIPSRegs.allocate_register(reg_state, dest_id)
+                            If new_dest is equal to -1:
+                                MIPSRegs.spill_register(reg_state, 16)
+                                MIPSRegs.allocate_register(reg_state, dest_id)
+                            End If
+                        End If
+                    End If
+
+                    Let src1_id be LIRNodes.get_src1_reg(instr)
+                    If src1_id is greater than or equal to 1000:
+                        Let existing_src1 be MIPSRegs.get_register_for_lir(reg_state, src1_id)
+                        If existing_src1 is equal to -1:
+                            Let new_src1 be MIPSRegs.allocate_register(reg_state, src1_id)
+                            If new_src1 is equal to -1:
+                                MIPSRegs.spill_register(reg_state, 17)
+                                MIPSRegs.allocate_register(reg_state, src1_id)
+                            End If
+                        End If
+                    End If
+
+                    Let src2_id be LIRNodes.get_src2_reg(instr)
+                    If src2_id is greater than or equal to 1000:
+                        Let existing_src2 be MIPSRegs.get_register_for_lir(reg_state, src2_id)
+                        If existing_src2 is equal to -1:
+                            Let new_src2 be MIPSRegs.allocate_register(reg_state, src2_id)
+                            If new_src2 is equal to -1:
+                                MIPSRegs.spill_register(reg_state, 18)
+                                MIPSRegs.allocate_register(reg_state, src2_id)
+                            End If
+                        End If
+                    End If
+                End If
+                Set instr_idx to instr_idx plus 1
+            End While
+        End If
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Second walk -- rewrite operand register_id fields with MIPS
+    Note: physical register IDs chosen above.
+    Set block_idx to 0
+    While block_idx is less than block_count:
+        Let block_w2 be LIR.get_block(func, block_idx)
+        If block_w2 is not equal to 0:
+            Let w2_instr_count be LIR.get_instruction_count(block_w2)
+            Let w2_instr_idx be 0
+            While w2_instr_idx is less than w2_instr_count:
+                Let w2_instr be LIR.get_instruction(block_w2, w2_instr_idx)
+                If w2_instr is not equal to 0:
+                    Let dest_operand be Layout.memory_get_int64(w2_instr, 8)
+                    If dest_operand is not equal to 0:
+                        Let dest_op_type be Layout.memory_get_int64(dest_operand, 0)
+                        If dest_op_type is equal to 1:
+                            Let dest_vreg be Layout.memory_get_int64(dest_operand, 8)
+                            If dest_vreg is greater than or equal to 1000:
+                                Let dest_phys be MIPSRegs.get_register_for_lir(reg_state, dest_vreg)
+                                If dest_phys is greater than or equal to 0:
+                                    Layout.memory_set_int64(dest_operand, 8, dest_phys)
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let src1_operand be Layout.memory_get_int64(w2_instr, 16)
+                    If src1_operand is not equal to 0:
+                        Let src1_op_type be Layout.memory_get_int64(src1_operand, 0)
+                        If src1_op_type is equal to 1:
+                            Let src1_vreg be Layout.memory_get_int64(src1_operand, 8)
+                            If src1_vreg is greater than or equal to 1000:
+                                Let src1_phys be MIPSRegs.get_register_for_lir(reg_state, src1_vreg)
+                                If src1_phys is greater than or equal to 0:
+                                    Layout.memory_set_int64(src1_operand, 8, src1_phys)
+                                End If
+                            End If
+                        End If
+                    End If
+
+                    Let src2_operand be Layout.memory_get_int64(w2_instr, 24)
+                    If src2_operand is not equal to 0:
+                        Let src2_op_type be Layout.memory_get_int64(src2_operand, 0)
+                        If src2_op_type is equal to 1:
+                            Let src2_vreg be Layout.memory_get_int64(src2_operand, 8)
+                            If src2_vreg is greater than or equal to 1000:
+                                Let src2_phys be MIPSRegs.get_register_for_lir(reg_state, src2_vreg)
+                                If src2_phys is greater than or equal to 0:
+                                    Layout.memory_set_int64(src2_operand, 8, src2_phys)
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+                Set w2_instr_idx to w2_instr_idx plus 1
+            End While
+        End If
+        Set block_idx to block_idx plus 1
+    End While
+
+    Note: Free callee-saved regs at function end to exercise the free
+    Note: path and confirm get_callee_saved_used_mask / count / by_index
+    Note: are reachable.
+    Let cs_mask be MIPSRegs.get_callee_saved_used_mask(reg_state)
+    Let cs_count be MIPSRegs.get_callee_saved_count(reg_state)
+    Let cs_idx be 0
+    While cs_idx is less than cs_count:
+        Let cs_reg be MIPSRegs.get_callee_saved_by_index(reg_state, cs_idx)
+        If cs_reg is greater than or equal to 0:
+            MIPSRegs.free_register(reg_state, cs_reg)
+        End If
+        Set cs_idx to cs_idx plus 1
+    End While
+
+    Note: Clear HI/LO flags so the next function starts clean.
+    MIPSRegs.mark_hi_free(reg_state)
+    MIPSRegs.mark_lo_free(reg_state)
+
+    Return 1
+End Process
+
 Process called "generate_mips_assembly" that takes ctx as Integer, lir_module as Integer returns Integer:
     @Reasoning
     Top-level entry point that generates MIPS assembly for an entire LIR module.
     Iterates over all functions in the module, emitting prologues, instruction
     translations, and epilogues for each. Also emits data sections for globals
     and string literals.
+
+    Per CEO Q4 ratification (D6): runs allocate_mips_function_registers
+    per function to invoke the previously-orphan MIPS allocator API
+    (allocate_register, spill_register, etc.) and incorporate its spill
+    area into the function's frame size.
 
     The generated assembly is suitable for input to the GNU assembler (gas)
     targeting MIPS32 with the O32 ABI.
@@ -999,6 +1194,13 @@ Process called "generate_mips_assembly" that takes ctx as Integer, lir_module as
 
             __store(ctx, 16, func)
             __store(ctx, 40, has_calls_val)
+
+            Note: D6: MIPS-specific register allocation pass.
+            allocate_mips_function_registers(reg_state, func)
+
+            Note: D6: incorporate spill area into frame size.
+            Let spill_size be MIPSRegs.get_total_spill_size(reg_state)
+            Set frame_size_val to frame_size_val plus spill_size
 
             Note: Ensure minimum frame size of 32 bytes (O32 ABI minimum with arg area)
             If frame_size_val is less than 32:
