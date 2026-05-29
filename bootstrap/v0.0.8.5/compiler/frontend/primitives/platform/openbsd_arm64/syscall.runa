@@ -48,884 +48,1120 @@ Note: ==========================================================================
 Note: OpenBSD syscall numbers (from sys/kern/syscalls.master)
 Note: These are specific to OpenBSD and differ from other BSDs and Linux
 
-Process called "SYS_EXIT" returns Integer:
+Process called "openbsd_arm64_SYS_EXIT" returns Integer:
     Return 1
 End Process
 
-Process called "SYS_FORK" returns Integer:
+@Reasoning
+OpenBSD (like all BSDs and Darwin) does not provide a distinct `exit_group(2)`
+syscall. The Linux distinction between `exit` (single thread via `do_exit`)
+and `exit_group` (all threads in the thread group via `do_group_exit`) does
+not apply to OpenBSD's process model: OpenBSD's kernel `sys_exit` performs
+whole-process teardown, sending SIGKILL to every thread in the process via
+`exit1()` in `sys/kern/kern_exit.c`. We therefore alias SYS_EXIT_GROUP to
+syscall 1 (the same as SYS_EXIT) so cross-platform callers obtain the
+"terminate all threads" semantic without conditional code. The arm64 svc
+trap with X8=1 invokes `sys_exit`, which is what we want.
+Source: OpenBSD `sys/sys/syscall.h` (no SYS_exit_group entry);
+OpenBSD `sys/kern/kern_exit.c` sys_exit() / exit1().
+@End Reasoning
+
+@Implementation
+Nullary Process returning the integer 1. Compiles to a constant-load in
+the syscall_1 wrapper's stack frame, then svc #0 with X8=1 and X0=status.
+The kernel's syscall table entry for index 1 dispatches to `sys_exit`,
+which calls `exit1(p, status, EXIT_NORMAL)` and never returns. Identical
+to SYS_EXIT() at the assembly level; the separate name exists to satisfy
+the cross-platform 66-proc dispatcher surface required by P2-B.
+@End Implementation
+
+@Performance_Hints
+Constant accessor; compiler-inlinable. The associated syscall is itself
+a non-returning trap, so there is no return-path cost. The alias to
+SYS_EXIT incurs zero overhead versus calling SYS_EXIT directly.
+@End Performance_Hints
+
+@Security_Scope
+Triggers whole-process termination on the kernel side. Caller-supplied
+`status` is recorded in the wait-status word for the parent process and
+is observable via wait4/waitpid. There is no privilege escalation path
+through this syscall — the kernel only terminates the caller's own
+process. Pledged processes (`pledge("stdio")` and stricter) retain the
+ability to call exit; pledge restrictions do not bar self-termination.
+@End Security_Scope
+Process called "openbsd_arm64_SYS_EXIT_GROUP" returns Integer:
+    Return 1
+End Process
+
+Process called "openbsd_arm64_SYS_FORK" returns Integer:
     Return 2
 End Process
 
-Process called "SYS_READ" returns Integer:
+Process called "openbsd_arm64_SYS_READ" returns Integer:
     Return 3
 End Process
 
-Process called "SYS_WRITE" returns Integer:
+Process called "openbsd_arm64_SYS_WRITE" returns Integer:
     Return 4
 End Process
 
-Process called "SYS_OPEN" returns Integer:
+Process called "openbsd_arm64_SYS_OPEN" returns Integer:
     Return 5
 End Process
 
-Process called "SYS_CLOSE" returns Integer:
+Process called "openbsd_arm64_SYS_CLOSE" returns Integer:
     Return 6
 End Process
 
-Process called "SYS_GETENTROPY" returns Integer:
+Process called "openbsd_arm64_SYS_GETENTROPY" returns Integer:
     Return 7
 End Process
 
-Process called "SYS_TFORK" returns Integer:
+Process called "openbsd_arm64_SYS_TFORK" returns Integer:
     Return 8
 End Process
 
-Process called "SYS_LINK" returns Integer:
+@Reasoning
+Slot 8 in OpenBSD's `sys/sys/syscall.h` is `SYS_tfork` on modern OpenBSD
+(7.x), the kernel-level thread-creation primitive used by libpthread. The
+historical Unix `creat(2)` syscall that occupied slot 8 on V7 UNIX and
+4.3BSD was retired from OpenBSD's syscall table well before the 4.4BSD-Lite
+import — POSIX `creat(path, mode)` is implemented in libc as
+`open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)` and does not require a
+dedicated syscall entry. We retain SYS_CREAT as a defined symbol here
+because the cross-platform 66-proc dispatcher API surface includes
+SYS_CREAT as a required bare name, but the previous implementation that
+returned the raw integer 8 was actively dangerous on modern OpenBSD: any
+caller that issued `syscall_1(SYS_CREAT(), path)` on this platform would
+land on `sys_tfork` — the kernel thread-creation entry — with `path`
+reinterpreted as a `tfork_thread` pointer, producing a kernel-thread spawn
+attempt with attacker-controlled (or accidentally-controlled) thread
+arguments. To eliminate that collision hazard at the syscall-number layer,
+this proc now returns the canonical "syscall unavailable on this platform"
+sentinel `-1` (the same sentinel used by SYS_SCHED_GETAFFINITY above for
+OpenBSD's missing affinity surface). Issuing `svc #0` with X8=-1 raises a
+kernel-level invalid-syscall trap that returns -ENOSYS to the caller,
+preserving error semantics and fully eliminating any possibility of
+silently dispatching to `sys_tfork`. Callers that need POSIX `creat(path,
+mode)` semantics MUST route through `syscall_open(path, O_WRONLY|O_CREAT|
+O_TRUNC, mode)` on OpenBSD — this is the same path libc uses internally
+and is the only correct route for file creation on this platform.
+Source: OpenBSD `sys/sys/syscall.h` (SYS_tfork = 8, no SYS_creat entry);
+OpenBSD `lib/libc/sys/creat.c` (libc wrapper using open); OpenBSD
+`sys/kern/kern_fork.c` sys_tfork() entry that would otherwise be invoked.
+@End Reasoning
+
+@Implementation
+Nullary Process returning the sentinel `-1`. This is a deliberate
+collision-prevention measure: returning 8 (the historical BSD slot for
+`creat(2)`) on modern OpenBSD ARM64 would route the syscall directly to
+`sys_tfork` because that kernel slot was rebound to thread-fork well
+before the asm-generic ARM64 ABI stabilised. The -1 sentinel forces any
+caller that passes the SYS_CREAT() value into the svc trap to receive
+-ENOSYS from the kernel rather than execute the wrong syscall body. The
+canonical OpenBSD route for `creat(path, mode)` semantics is
+`syscall_open(path, O_WRONLY()|O_CREAT()|O_TRUNC(), mode)` via the
+dispatcher's `syscall_open` wrapper, which routes to SYS_OPEN (5) — the
+genuine open(2) entry. The dispatcher API contract requires SYS_CREAT to
+be a defined symbol for link completeness; the -1 sentinel satisfies that
+contract while making the wrong-syscall hazard impossible.
+@End Implementation
+
+@Performance_Hints
+Constant accessor; compiler-inlinable. Callers SHOULD test the return
+value against -1 (or invoke `is_error()` on a downstream syscall result)
+before issuing the actual syscall — issuing svc #0 with X8=-1 incurs a
+wasted kernel-mode trap that returns -ENOSYS. For file-creation paths
+on OpenBSD, prefer calling `syscall_open(path, O_WRONLY|O_CREAT|O_TRUNC,
+mode)` directly; this is one trap, hits the correct kernel entry, and
+avoids the sentinel-check overhead entirely.
+@End Performance_Hints
+
+@Security_Scope
+This @Security_Scope documents an active security hazard that the -1
+sentinel exists to neutralise. Modern OpenBSD's syscall table rebinds
+slot 8 from the historical `SYS_creat` to `SYS_tfork`. Any code that
+issued `syscall_1(SYS_CREAT(), path)` against the previous integer-8
+return value would invoke `sys_tfork(struct tfork_thread *)` with `path`
+reinterpreted as a `tfork_thread` pointer — a fundamentally different
+operation with completely different privilege semantics (tfork creates a
+kernel thread sharing the process address space, subject to a different
+pledge promise set than open: `proc` and `stdio` for tfork versus
+`rpath`/`wpath`/`cpath` for open). On a pledged process without the
+`proc` promise, accidental SYS_CREAT-as-tfork invocation traps with
+SIGABRT (fails closed); on an unpledged process, the attacker-controlled
+`tfork_thread` argument is dereferenced by the kernel and can trigger
+kernel-thread spawn at an attacker-influenced PC. The -1 sentinel
+eliminates this entire hazard class by ensuring any caller of SYS_CREAT
+on OpenBSD ARM64 receives the canonical "unavailable" indicator rather
+than a routable syscall number, so the wrong-syscall path is closed at
+the symbol-resolution layer rather than depending on caller discipline.
+The correct file-creation route on this platform is `syscall_open(path,
+O_WRONLY()|O_CREAT()|O_TRUNC(), mode)` — the dispatcher's open wrapper
+which routes to SYS_OPEN (5), the genuine `sys_open` entry, with the
+expected pledge-promise interaction (`rpath`/`wpath`/`cpath`) and the
+expected unveil enforcement.
+@End Security_Scope
+Process called "openbsd_arm64_SYS_CREAT" returns Integer:
+    Return -1
+End Process
+
+Process called "openbsd_arm64_SYS_LINK" returns Integer:
     Return 9
 End Process
 
-Process called "SYS_UNLINK" returns Integer:
+Process called "openbsd_arm64_SYS_UNLINK" returns Integer:
     Return 10
 End Process
 
-Process called "SYS_WAIT4" returns Integer:
+Process called "openbsd_arm64_SYS_WAIT4" returns Integer:
     Return 11
 End Process
 
-Process called "SYS_CHDIR" returns Integer:
+Process called "openbsd_arm64_SYS_CHDIR" returns Integer:
     Return 12
 End Process
 
-Process called "SYS_FCHDIR" returns Integer:
+Process called "openbsd_arm64_SYS_FCHDIR" returns Integer:
     Return 13
 End Process
 
-Process called "SYS_MKNOD" returns Integer:
+Process called "openbsd_arm64_SYS_MKNOD" returns Integer:
     Return 14
 End Process
 
-Process called "SYS_CHMOD" returns Integer:
+Process called "openbsd_arm64_SYS_CHMOD" returns Integer:
     Return 15
 End Process
 
-Process called "SYS_CHOWN" returns Integer:
+Process called "openbsd_arm64_SYS_CHOWN" returns Integer:
     Return 16
 End Process
 
-Process called "SYS_OBREAK" returns Integer:
+Process called "openbsd_arm64_SYS_OBREAK" returns Integer:
     Return 17
 End Process
 
-Process called "SYS_GETDTABLECOUNT" returns Integer:
+@Reasoning
+SYS_BRK is the cross-platform 66-proc API surface name for the program-break
+heap-growth syscall. OpenBSD's `sys/sys/syscall.h` names this entry
+`SYS_obreak` (the historical 4.3BSD "old break" name retained for ABI
+stability), and assigns it syscall number 17. SYS_BRK is provided here as
+a documented alias returning the same integer 17, so dispatcher-routed
+callers can use the platform-neutral name. The arm64 svc trap with X8=17
+invokes `sys_obreak`, which adjusts the process's heap break to the
+address supplied in X0; the kernel returns 0 on success or -ENOMEM/-EINVAL
+on failure (caller checks sign of return). Modern OpenBSD libc / malloc
+implementations do NOT use obreak — they use `mmap(MAP_ANON|MAP_PRIVATE)`
+for heap allocation, and the obreak path is preserved only for static
+binaries and legacy compatibility. Callers SHOULD prefer `syscall_mmap`
+for new heap-style allocation.
+Source: OpenBSD `sys/sys/syscall.h` (SYS_obreak = 17); OpenBSD
+`sys/uvm/uvm_mmap.c` sys_obreak(); OpenBSD `lib/libc/stdlib/malloc.c`
+(uses mmap, not obreak).
+@End Reasoning
+
+@Implementation
+Nullary Process returning the integer 17. Aliases SYS_OBREAK at the
+syscall-number level — both procs return the same constant. The naming
+duality reflects the cross-platform dispatcher's expectation of `SYS_BRK`
+(POSIX/Linux name) and OpenBSD's native preference for `SYS_OBREAK`
+(historical 4.3BSD name). Compiles to a constant-load identical to
+SYS_OBREAK; the two accessors emit indistinguishable instructions.
+@End Implementation
+
+@Performance_Hints
+Constant accessor; compiler-inlinable. The associated syscall path
+(`sys_obreak`) is rarely hit on modern OpenBSD because malloc uses mmap.
+For new code, prefer `syscall_mmap(0, len, PROT_READ|PROT_WRITE,
+MAP_ANON|MAP_PRIVATE, -1, 0)` over `syscall_brk` — mmap is the OpenBSD
+kernel's preferred heap-growth path and aligns better with W^X policy.
+@End Performance_Hints
+
+@Security_Scope
+The obreak syscall adjusts only the calling process's own heap break;
+no cross-process memory state is touched. The kernel enforces resource
+limits via `RLIMIT_DATA` (heap size cap) and aborts the syscall with
+-ENOMEM if the requested break exceeds the limit. Pledged processes
+retain obreak access under the `stdio` promise — sandboxed callers can
+allocate heap memory without escalating pledge state. There is no
+exploitable interaction with W^X: obreak'd memory is data-only (no
+PROT_EXEC), so attacker-controlled writes cannot become executable
+without an explicit mprotect.
+@End Security_Scope
+Process called "openbsd_arm64_SYS_BRK" returns Integer:
+    Return 17
+End Process
+
+Process called "openbsd_arm64_SYS_GETDTABLECOUNT" returns Integer:
     Return 18
 End Process
 
-Process called "SYS_GETRUSAGE" returns Integer:
+Process called "openbsd_arm64_SYS_GETRUSAGE" returns Integer:
     Return 19
 End Process
 
-Process called "SYS_GETPID" returns Integer:
+Process called "openbsd_arm64_SYS_GETPID" returns Integer:
     Return 20
 End Process
 
-Process called "SYS_MOUNT" returns Integer:
+Process called "openbsd_arm64_SYS_MOUNT" returns Integer:
     Return 21
 End Process
 
-Process called "SYS_UNMOUNT" returns Integer:
+Process called "openbsd_arm64_SYS_UNMOUNT" returns Integer:
     Return 22
 End Process
 
-Process called "SYS_SETUID" returns Integer:
+Process called "openbsd_arm64_SYS_SETUID" returns Integer:
     Return 23
 End Process
 
-Process called "SYS_GETUID" returns Integer:
+Process called "openbsd_arm64_SYS_GETUID" returns Integer:
     Return 24
 End Process
 
-Process called "SYS_GETEUID" returns Integer:
+Process called "openbsd_arm64_SYS_GETEUID" returns Integer:
     Return 25
 End Process
 
-Process called "SYS_PTRACE" returns Integer:
+Process called "openbsd_arm64_SYS_PTRACE" returns Integer:
     Return 26
 End Process
 
-Process called "SYS_RECVMSG" returns Integer:
+Process called "openbsd_arm64_SYS_RECVMSG" returns Integer:
     Return 27
 End Process
 
-Process called "SYS_SENDMSG" returns Integer:
+Process called "openbsd_arm64_SYS_SENDMSG" returns Integer:
     Return 28
 End Process
 
-Process called "SYS_RECVFROM" returns Integer:
+Process called "openbsd_arm64_SYS_RECVFROM" returns Integer:
     Return 29
 End Process
 
-Process called "SYS_ACCEPT" returns Integer:
+Process called "openbsd_arm64_SYS_ACCEPT" returns Integer:
     Return 30
 End Process
 
-Process called "SYS_GETPEERNAME" returns Integer:
+Process called "openbsd_arm64_SYS_GETPEERNAME" returns Integer:
     Return 31
 End Process
 
-Process called "SYS_GETSOCKNAME" returns Integer:
+Process called "openbsd_arm64_SYS_GETSOCKNAME" returns Integer:
     Return 32
 End Process
 
-Process called "SYS_ACCESS" returns Integer:
+Process called "openbsd_arm64_SYS_ACCESS" returns Integer:
     Return 33
 End Process
 
-Process called "SYS_CHFLAGS" returns Integer:
+Process called "openbsd_arm64_SYS_CHFLAGS" returns Integer:
     Return 34
 End Process
 
-Process called "SYS_FCHFLAGS" returns Integer:
+Process called "openbsd_arm64_SYS_FCHFLAGS" returns Integer:
     Return 35
 End Process
 
-Process called "SYS_SYNC" returns Integer:
+Process called "openbsd_arm64_SYS_SYNC" returns Integer:
     Return 36
 End Process
 
-Process called "SYS_STAT" returns Integer:
+Process called "openbsd_arm64_SYS_STAT" returns Integer:
     Return 38
 End Process
 
-Process called "SYS_GETPPID" returns Integer:
+Process called "openbsd_arm64_SYS_GETPPID" returns Integer:
     Return 39
 End Process
 
-Process called "SYS_LSTAT" returns Integer:
+Process called "openbsd_arm64_SYS_LSTAT" returns Integer:
     Return 40
 End Process
 
-Process called "SYS_DUP" returns Integer:
+Process called "openbsd_arm64_SYS_DUP" returns Integer:
     Return 41
 End Process
 
-Process called "SYS_FSTATAT" returns Integer:
+Process called "openbsd_arm64_SYS_FSTATAT" returns Integer:
     Return 42
 End Process
 
-Process called "SYS_GETEGID" returns Integer:
+Process called "openbsd_arm64_SYS_GETEGID" returns Integer:
     Return 43
 End Process
 
-Process called "SYS_KTRACE" returns Integer:
+Process called "openbsd_arm64_SYS_KTRACE" returns Integer:
     Return 45
 End Process
 
-Process called "SYS_SIGACTION" returns Integer:
+Process called "openbsd_arm64_SYS_SIGACTION" returns Integer:
     Return 46
 End Process
 
-Process called "SYS_GETGID" returns Integer:
+Process called "openbsd_arm64_SYS_GETGID" returns Integer:
     Return 47
 End Process
 
-Process called "SYS_SIGPROCMASK" returns Integer:
+Process called "openbsd_arm64_SYS_SIGPROCMASK" returns Integer:
     Return 48
 End Process
 
-Process called "SYS_MMAP" returns Integer:
+Process called "openbsd_arm64_SYS_MMAP" returns Integer:
     Return 49
 End Process
 
-Process called "SYS_SETLOGIN" returns Integer:
+Process called "openbsd_arm64_SYS_SETLOGIN" returns Integer:
     Return 50
 End Process
 
-Process called "SYS_ACCT" returns Integer:
+Process called "openbsd_arm64_SYS_ACCT" returns Integer:
     Return 51
 End Process
 
-Process called "SYS_SIGPENDING" returns Integer:
+Process called "openbsd_arm64_SYS_SIGPENDING" returns Integer:
     Return 52
 End Process
 
-Process called "SYS_FSTAT" returns Integer:
+Process called "openbsd_arm64_SYS_FSTAT" returns Integer:
     Return 53
 End Process
 
-Process called "SYS_IOCTL" returns Integer:
+Process called "openbsd_arm64_SYS_IOCTL" returns Integer:
     Return 54
 End Process
 
-Process called "SYS_REBOOT" returns Integer:
+Process called "openbsd_arm64_SYS_REBOOT" returns Integer:
     Return 55
 End Process
 
-Process called "SYS_REVOKE" returns Integer:
+Process called "openbsd_arm64_SYS_REVOKE" returns Integer:
     Return 56
 End Process
 
-Process called "SYS_SYMLINK" returns Integer:
+Process called "openbsd_arm64_SYS_SYMLINK" returns Integer:
     Return 57
 End Process
 
-Process called "SYS_READLINK" returns Integer:
+Process called "openbsd_arm64_SYS_READLINK" returns Integer:
     Return 58
 End Process
 
-Process called "SYS_EXECVE" returns Integer:
+Process called "openbsd_arm64_SYS_EXECVE" returns Integer:
     Return 59
 End Process
 
-Process called "SYS_UMASK" returns Integer:
+Process called "openbsd_arm64_SYS_UMASK" returns Integer:
     Return 60
 End Process
 
-Process called "SYS_CHROOT" returns Integer:
+Process called "openbsd_arm64_SYS_CHROOT" returns Integer:
     Return 61
 End Process
 
-Process called "SYS_GETFSSTAT" returns Integer:
+Process called "openbsd_arm64_SYS_GETFSSTAT" returns Integer:
     Return 62
 End Process
 
-Process called "SYS_STATFS" returns Integer:
+Process called "openbsd_arm64_SYS_STATFS" returns Integer:
     Return 63
 End Process
 
-Process called "SYS_FSTATFS" returns Integer:
+Process called "openbsd_arm64_SYS_FSTATFS" returns Integer:
     Return 64
 End Process
 
-Process called "SYS_FHSTATFS" returns Integer:
+Process called "openbsd_arm64_SYS_FHSTATFS" returns Integer:
     Return 65
 End Process
 
-Process called "SYS_VFORK" returns Integer:
+Process called "openbsd_arm64_SYS_VFORK" returns Integer:
     Return 66
 End Process
 
-Process called "SYS_GETTIMEOFDAY" returns Integer:
+Process called "openbsd_arm64_SYS_GETTIMEOFDAY" returns Integer:
     Return 67
 End Process
 
-Process called "SYS_SETTIMEOFDAY" returns Integer:
+Process called "openbsd_arm64_SYS_SETTIMEOFDAY" returns Integer:
     Return 68
 End Process
 
-Process called "SYS_SETITIMER" returns Integer:
+Process called "openbsd_arm64_SYS_SETITIMER" returns Integer:
     Return 69
 End Process
 
-Process called "SYS_GETITIMER" returns Integer:
+Process called "openbsd_arm64_SYS_GETITIMER" returns Integer:
     Return 70
 End Process
 
-Process called "SYS_SELECT" returns Integer:
+Process called "openbsd_arm64_SYS_SELECT" returns Integer:
     Return 71
 End Process
 
-Process called "SYS_KEVENT" returns Integer:
+Process called "openbsd_arm64_SYS_KEVENT" returns Integer:
     Return 72
 End Process
 
-Process called "SYS_MUNMAP" returns Integer:
+Process called "openbsd_arm64_SYS_MUNMAP" returns Integer:
     Return 73
 End Process
 
-Process called "SYS_MPROTECT" returns Integer:
+Process called "openbsd_arm64_SYS_MPROTECT" returns Integer:
     Return 74
 End Process
 
-Process called "SYS_MADVISE" returns Integer:
+Process called "openbsd_arm64_SYS_MADVISE" returns Integer:
     Return 75
 End Process
 
-Process called "SYS_UTIMES" returns Integer:
+Process called "openbsd_arm64_SYS_UTIMES" returns Integer:
     Return 76
 End Process
 
-Process called "SYS_FUTIMES" returns Integer:
+Process called "openbsd_arm64_SYS_FUTIMES" returns Integer:
     Return 77
 End Process
 
-Process called "SYS_MQUERY" returns Integer:
+Process called "openbsd_arm64_SYS_MQUERY" returns Integer:
     Return 78
 End Process
 
-Process called "SYS_GETGROUPS" returns Integer:
+Process called "openbsd_arm64_SYS_GETGROUPS" returns Integer:
     Return 79
 End Process
 
-Process called "SYS_SETGROUPS" returns Integer:
+Process called "openbsd_arm64_SYS_SETGROUPS" returns Integer:
     Return 80
 End Process
 
-Process called "SYS_GETPGRP" returns Integer:
+Process called "openbsd_arm64_SYS_GETPGRP" returns Integer:
     Return 81
 End Process
 
-Process called "SYS_SETPGID" returns Integer:
+Process called "openbsd_arm64_SYS_SETPGID" returns Integer:
     Return 82
 End Process
 
-Process called "SYS_FUTEX" returns Integer:
+Process called "openbsd_arm64_SYS_FUTEX" returns Integer:
     Return 83
 End Process
 
-Process called "SYS_UTIMENSAT" returns Integer:
+Process called "openbsd_arm64_SYS_UTIMENSAT" returns Integer:
     Return 84
 End Process
 
-Process called "SYS_FUTIMENS" returns Integer:
+Process called "openbsd_arm64_SYS_FUTIMENS" returns Integer:
     Return 85
 End Process
 
-Process called "SYS_KBIND" returns Integer:
+Process called "openbsd_arm64_SYS_KBIND" returns Integer:
     Return 86
 End Process
 
-Process called "SYS_CLOCK_GETTIME" returns Integer:
+Process called "openbsd_arm64_SYS_CLOCK_GETTIME" returns Integer:
     Return 87
 End Process
 
-Process called "SYS_CLOCK_SETTIME" returns Integer:
+Process called "openbsd_arm64_SYS_CLOCK_SETTIME" returns Integer:
     Return 88
 End Process
 
-Process called "SYS_CLOCK_GETRES" returns Integer:
+Process called "openbsd_arm64_SYS_CLOCK_GETRES" returns Integer:
     Return 89
 End Process
 
-Process called "SYS_DUP2" returns Integer:
+Process called "openbsd_arm64_SYS_DUP2" returns Integer:
     Return 90
 End Process
 
-Process called "SYS_NANOSLEEP" returns Integer:
+Process called "openbsd_arm64_SYS_NANOSLEEP" returns Integer:
     Return 91
 End Process
 
-Process called "SYS_FCNTL" returns Integer:
+Process called "openbsd_arm64_SYS_FCNTL" returns Integer:
     Return 92
 End Process
 
-Process called "SYS_ACCEPT4" returns Integer:
+Process called "openbsd_arm64_SYS_ACCEPT4" returns Integer:
     Return 93
 End Process
 
-Process called "SYS_THRSLEEP" returns Integer:
+Process called "openbsd_arm64_SYS_THRSLEEP" returns Integer:
     Return 94
 End Process
 
-Process called "SYS_FSYNC" returns Integer:
+Process called "openbsd_arm64_SYS_FSYNC" returns Integer:
     Return 95
 End Process
 
-Process called "SYS_SETPRIORITY" returns Integer:
+Process called "openbsd_arm64_SYS_SETPRIORITY" returns Integer:
     Return 96
 End Process
 
-Process called "SYS_SOCKET" returns Integer:
+Process called "openbsd_arm64_SYS_SOCKET" returns Integer:
     Return 97
 End Process
 
-Process called "SYS_CONNECT" returns Integer:
+Process called "openbsd_arm64_SYS_CONNECT" returns Integer:
     Return 98
 End Process
 
-Process called "SYS_GETDENTS" returns Integer:
+Process called "openbsd_arm64_SYS_GETDENTS" returns Integer:
     Return 99
 End Process
 
-Process called "SYS_GETPRIORITY" returns Integer:
+Process called "openbsd_arm64_SYS_GETPRIORITY" returns Integer:
     Return 100
 End Process
 
-Process called "SYS_PIPE2" returns Integer:
+Process called "openbsd_arm64_SYS_PIPE2" returns Integer:
     Return 101
 End Process
 
-Process called "SYS_DUP3" returns Integer:
+Process called "openbsd_arm64_SYS_DUP3" returns Integer:
     Return 102
 End Process
 
-Process called "SYS_SIGRETURN" returns Integer:
+Process called "openbsd_arm64_SYS_SIGRETURN" returns Integer:
     Return 103
 End Process
 
-Process called "SYS_BIND" returns Integer:
+Process called "openbsd_arm64_SYS_BIND" returns Integer:
     Return 104
 End Process
 
-Process called "SYS_SETSOCKOPT" returns Integer:
+Process called "openbsd_arm64_SYS_SETSOCKOPT" returns Integer:
     Return 105
 End Process
 
-Process called "SYS_LISTEN" returns Integer:
+Process called "openbsd_arm64_SYS_LISTEN" returns Integer:
     Return 106
 End Process
 
-Process called "SYS_CHFLAGSAT" returns Integer:
+Process called "openbsd_arm64_SYS_CHFLAGSAT" returns Integer:
     Return 107
 End Process
 
-Process called "SYS_PLEDGE" returns Integer:
+Process called "openbsd_arm64_SYS_PLEDGE" returns Integer:
     Return 108
 End Process
 
-Process called "SYS_PPOLL" returns Integer:
+Process called "openbsd_arm64_SYS_PPOLL" returns Integer:
     Return 109
 End Process
 
-Process called "SYS_PSELECT" returns Integer:
+Process called "openbsd_arm64_SYS_PSELECT" returns Integer:
     Return 110
 End Process
 
-Process called "SYS_SIGSUSPEND" returns Integer:
+Process called "openbsd_arm64_SYS_SIGSUSPEND" returns Integer:
     Return 111
 End Process
 
-Process called "SYS_SENDSYSLOG" returns Integer:
+Process called "openbsd_arm64_SYS_SENDSYSLOG" returns Integer:
     Return 112
 End Process
 
-Process called "SYS_UNVEIL" returns Integer:
+Process called "openbsd_arm64_SYS_UNVEIL" returns Integer:
     Return 114
 End Process
 
-Process called "SYS_REALPATH" returns Integer:
+Process called "openbsd_arm64_SYS_REALPATH" returns Integer:
     Return 115
 End Process
 
-Process called "SYS_RECVMMSG" returns Integer:
+Process called "openbsd_arm64_SYS_RECVMMSG" returns Integer:
     Return 116
 End Process
 
-Process called "SYS_SENDMMSG" returns Integer:
+Process called "openbsd_arm64_SYS_SENDMMSG" returns Integer:
     Return 117
 End Process
 
-Process called "SYS_GETSOCKOPT" returns Integer:
+Process called "openbsd_arm64_SYS_GETSOCKOPT" returns Integer:
     Return 118
 End Process
 
-Process called "SYS_THRKILL" returns Integer:
+Process called "openbsd_arm64_SYS_THRKILL" returns Integer:
     Return 119
 End Process
 
-Process called "SYS_READV" returns Integer:
+Process called "openbsd_arm64_SYS_READV" returns Integer:
     Return 120
 End Process
 
-Process called "SYS_WRITEV" returns Integer:
+Process called "openbsd_arm64_SYS_WRITEV" returns Integer:
     Return 121
 End Process
 
-Process called "SYS_KILL" returns Integer:
+Process called "openbsd_arm64_SYS_KILL" returns Integer:
     Return 122
 End Process
 
-Process called "SYS_FCHOWN" returns Integer:
+Process called "openbsd_arm64_SYS_FCHOWN" returns Integer:
     Return 123
 End Process
 
-Process called "SYS_FCHMOD" returns Integer:
+Process called "openbsd_arm64_SYS_FCHMOD" returns Integer:
     Return 124
 End Process
 
-Process called "SYS_SETREUID" returns Integer:
+Process called "openbsd_arm64_SYS_SETREUID" returns Integer:
     Return 126
 End Process
 
-Process called "SYS_SETREGID" returns Integer:
+Process called "openbsd_arm64_SYS_SETREGID" returns Integer:
     Return 127
 End Process
 
-Process called "SYS_RENAME" returns Integer:
+Process called "openbsd_arm64_SYS_RENAME" returns Integer:
     Return 128
 End Process
 
-Process called "SYS_FLOCK" returns Integer:
+Process called "openbsd_arm64_SYS_FLOCK" returns Integer:
     Return 131
 End Process
 
-Process called "SYS_MKFIFO" returns Integer:
+Process called "openbsd_arm64_SYS_MKFIFO" returns Integer:
     Return 132
 End Process
 
-Process called "SYS_SENDTO" returns Integer:
+Process called "openbsd_arm64_SYS_SENDTO" returns Integer:
     Return 133
 End Process
 
-Process called "SYS_SHUTDOWN" returns Integer:
+Process called "openbsd_arm64_SYS_SHUTDOWN" returns Integer:
     Return 134
 End Process
 
-Process called "SYS_SOCKETPAIR" returns Integer:
+Process called "openbsd_arm64_SYS_SOCKETPAIR" returns Integer:
     Return 135
 End Process
 
-Process called "SYS_MKDIR" returns Integer:
+Process called "openbsd_arm64_SYS_MKDIR" returns Integer:
     Return 136
 End Process
 
-Process called "SYS_RMDIR" returns Integer:
+Process called "openbsd_arm64_SYS_RMDIR" returns Integer:
     Return 137
 End Process
 
-Process called "SYS_ADJTIME" returns Integer:
+Process called "openbsd_arm64_SYS_ADJTIME" returns Integer:
     Return 140
 End Process
 
-Process called "SYS_GETLOGIN_R" returns Integer:
+Process called "openbsd_arm64_SYS_GETLOGIN_R" returns Integer:
     Return 141
 End Process
 
-Process called "SYS_GETTHRNAME" returns Integer:
+Process called "openbsd_arm64_SYS_GETTHRNAME" returns Integer:
     Return 142
 End Process
 
-Process called "SYS_SETTHRNAME" returns Integer:
+Process called "openbsd_arm64_SYS_SETTHRNAME" returns Integer:
     Return 143
 End Process
 
-Process called "SYS_SETSID" returns Integer:
+Process called "openbsd_arm64_SYS_SETSID" returns Integer:
     Return 147
 End Process
 
-Process called "SYS_QUOTACTL" returns Integer:
+Process called "openbsd_arm64_SYS_QUOTACTL" returns Integer:
     Return 148
 End Process
 
-Process called "SYS_YPCONNECT" returns Integer:
+Process called "openbsd_arm64_SYS_YPCONNECT" returns Integer:
     Return 150
 End Process
 
-Process called "SYS_NFSSVC" returns Integer:
+Process called "openbsd_arm64_SYS_NFSSVC" returns Integer:
     Return 155
 End Process
 
-Process called "SYS_PINSYSCALLS" returns Integer:
+Process called "openbsd_arm64_SYS_PINSYSCALLS" returns Integer:
     Return 158
 End Process
 
-Process called "SYS_MIMMUTABLE" returns Integer:
+Process called "openbsd_arm64_SYS_MIMMUTABLE" returns Integer:
     Return 159
 End Process
 
-Process called "SYS_WAITID" returns Integer:
+Process called "openbsd_arm64_SYS_WAITID" returns Integer:
     Return 160
 End Process
 
-Process called "SYS_GETFH" returns Integer:
+Process called "openbsd_arm64_SYS_GETFH" returns Integer:
     Return 161
 End Process
 
-Process called "SYS_TMPFD" returns Integer:
+Process called "openbsd_arm64_SYS_TMPFD" returns Integer:
     Return 164
 End Process
 
-Process called "SYS_SYSARCH" returns Integer:
+Process called "openbsd_arm64_SYS_SYSARCH" returns Integer:
     Return 165
 End Process
 
-Process called "SYS_LSEEK" returns Integer:
+Process called "openbsd_arm64_SYS_LSEEK" returns Integer:
     Return 166
 End Process
 
-Process called "SYS_TRUNCATE" returns Integer:
+Process called "openbsd_arm64_SYS_TRUNCATE" returns Integer:
     Return 167
 End Process
 
-Process called "SYS_FTRUNCATE" returns Integer:
+Process called "openbsd_arm64_SYS_FTRUNCATE" returns Integer:
     Return 168
 End Process
 
-Process called "SYS_PREAD" returns Integer:
+Process called "openbsd_arm64_SYS_PREAD" returns Integer:
     Return 169
 End Process
 
-Process called "SYS_PWRITE" returns Integer:
+Process called "openbsd_arm64_SYS_PWRITE" returns Integer:
     Return 170
 End Process
 
-Process called "SYS_PREADV" returns Integer:
+Process called "openbsd_arm64_SYS_PREADV" returns Integer:
     Return 171
 End Process
 
-Process called "SYS_PWRITEV" returns Integer:
+Process called "openbsd_arm64_SYS_PWRITEV" returns Integer:
     Return 172
 End Process
 
-Process called "SYS_PROFIL" returns Integer:
+Process called "openbsd_arm64_SYS_PROFIL" returns Integer:
     Return 175
 End Process
 
-Process called "SYS_SETGID" returns Integer:
+Process called "openbsd_arm64_SYS_SETGID" returns Integer:
     Return 181
 End Process
 
-Process called "SYS_SETEGID" returns Integer:
+Process called "openbsd_arm64_SYS_SETEGID" returns Integer:
     Return 182
 End Process
 
-Process called "SYS_SETEUID" returns Integer:
+Process called "openbsd_arm64_SYS_SETEUID" returns Integer:
     Return 183
 End Process
 
-Process called "SYS_PATHCONFAT" returns Integer:
+Process called "openbsd_arm64_SYS_PATHCONFAT" returns Integer:
     Return 190
 End Process
 
-Process called "SYS_PATHCONF" returns Integer:
+Process called "openbsd_arm64_SYS_PATHCONF" returns Integer:
     Return 191
 End Process
 
-Process called "SYS_FPATHCONF" returns Integer:
+Process called "openbsd_arm64_SYS_FPATHCONF" returns Integer:
     Return 192
 End Process
 
-Process called "SYS_SWAPCTL" returns Integer:
+Process called "openbsd_arm64_SYS_SWAPCTL" returns Integer:
     Return 193
 End Process
 
-Process called "SYS_GETRLIMIT" returns Integer:
+Process called "openbsd_arm64_SYS_GETRLIMIT" returns Integer:
     Return 194
 End Process
 
-Process called "SYS_SETRLIMIT" returns Integer:
+Process called "openbsd_arm64_SYS_SETRLIMIT" returns Integer:
     Return 195
 End Process
 
-Process called "SYS_SYSCTL" returns Integer:
+Process called "openbsd_arm64_SYS_SYSCTL" returns Integer:
     Return 202
 End Process
 
-Process called "SYS_MLOCK" returns Integer:
+Process called "openbsd_arm64_SYS_MLOCK" returns Integer:
     Return 203
 End Process
 
-Process called "SYS_MUNLOCK" returns Integer:
+Process called "openbsd_arm64_SYS_MUNLOCK" returns Integer:
     Return 204
 End Process
 
-Process called "SYS_GETPGID" returns Integer:
+Process called "openbsd_arm64_SYS_GETPGID" returns Integer:
     Return 207
 End Process
 
-Process called "SYS_UTRACE" returns Integer:
+Process called "openbsd_arm64_SYS_UTRACE" returns Integer:
     Return 209
 End Process
 
-Process called "SYS_SEMGET" returns Integer:
+Process called "openbsd_arm64_SYS_SEMGET" returns Integer:
     Return 221
 End Process
 
-Process called "SYS_MSGGET" returns Integer:
+Process called "openbsd_arm64_SYS_MSGGET" returns Integer:
     Return 225
 End Process
 
-Process called "SYS_MSGSND" returns Integer:
+Process called "openbsd_arm64_SYS_MSGSND" returns Integer:
     Return 226
 End Process
 
-Process called "SYS_MSGRCV" returns Integer:
+Process called "openbsd_arm64_SYS_MSGRCV" returns Integer:
     Return 227
 End Process
 
-Process called "SYS_SHMAT" returns Integer:
+Process called "openbsd_arm64_SYS_SHMAT" returns Integer:
     Return 228
 End Process
 
-Process called "SYS_SHMDT" returns Integer:
+Process called "openbsd_arm64_SYS_SHMDT" returns Integer:
     Return 230
 End Process
 
-Process called "SYS_MINHERIT" returns Integer:
+Process called "openbsd_arm64_SYS_MINHERIT" returns Integer:
     Return 250
 End Process
 
-Process called "SYS_POLL" returns Integer:
+Process called "openbsd_arm64_SYS_POLL" returns Integer:
     Return 252
 End Process
 
-Process called "SYS_ISSETUGID" returns Integer:
+Process called "openbsd_arm64_SYS_ISSETUGID" returns Integer:
     Return 253
 End Process
 
-Process called "SYS_LCHOWN" returns Integer:
+Process called "openbsd_arm64_SYS_LCHOWN" returns Integer:
     Return 254
 End Process
 
-Process called "SYS_GETSID" returns Integer:
+Process called "openbsd_arm64_SYS_GETSID" returns Integer:
     Return 255
 End Process
 
-Process called "SYS_MSYNC" returns Integer:
+Process called "openbsd_arm64_SYS_MSYNC" returns Integer:
     Return 256
 End Process
 
-Process called "SYS_PIPE" returns Integer:
+Process called "openbsd_arm64_SYS_PIPE" returns Integer:
     Return 263
 End Process
 
-Process called "SYS_FHOPEN" returns Integer:
+Process called "openbsd_arm64_SYS_FHOPEN" returns Integer:
     Return 264
 End Process
 
-Process called "SYS_KQUEUE" returns Integer:
+Process called "openbsd_arm64_SYS_KQUEUE" returns Integer:
     Return 269
 End Process
 
-Process called "SYS_KQUEUE1" returns Integer:
+Process called "openbsd_arm64_SYS_KQUEUE1" returns Integer:
     Return 270
 End Process
 
-Process called "SYS_MLOCKALL" returns Integer:
+Process called "openbsd_arm64_SYS_MLOCKALL" returns Integer:
     Return 271
 End Process
 
-Process called "SYS_MUNLOCKALL" returns Integer:
+Process called "openbsd_arm64_SYS_MUNLOCKALL" returns Integer:
     Return 272
 End Process
 
-Process called "SYS_GETRESUID" returns Integer:
+Process called "openbsd_arm64_SYS_GETRESUID" returns Integer:
     Return 281
 End Process
 
-Process called "SYS_SETRESUID" returns Integer:
+Process called "openbsd_arm64_SYS_SETRESUID" returns Integer:
     Return 282
 End Process
 
-Process called "SYS_GETRESGID" returns Integer:
+Process called "openbsd_arm64_SYS_GETRESGID" returns Integer:
     Return 283
 End Process
 
-Process called "SYS_SETRESGID" returns Integer:
+Process called "openbsd_arm64_SYS_SETRESGID" returns Integer:
     Return 284
 End Process
 
-Process called "SYS_CLOSEFROM" returns Integer:
+Process called "openbsd_arm64_SYS_CLOSEFROM" returns Integer:
     Return 287
 End Process
 
-Process called "SYS_SIGALTSTACK" returns Integer:
+Process called "openbsd_arm64_SYS_SIGALTSTACK" returns Integer:
     Return 288
 End Process
 
-Process called "SYS_SHMGET" returns Integer:
+Process called "openbsd_arm64_SYS_SHMGET" returns Integer:
     Return 289
 End Process
 
-Process called "SYS_SEMOP" returns Integer:
+Process called "openbsd_arm64_SYS_SEMOP" returns Integer:
     Return 290
 End Process
 
-Process called "SYS_FHSTAT" returns Integer:
+Process called "openbsd_arm64_SYS_FHSTAT" returns Integer:
     Return 294
 End Process
 
-Process called "SYS_SEMCTL" returns Integer:
+Process called "openbsd_arm64_SYS_SEMCTL" returns Integer:
     Return 295
 End Process
 
-Process called "SYS_SHMCTL" returns Integer:
+Process called "openbsd_arm64_SYS_SHMCTL" returns Integer:
     Return 296
 End Process
 
-Process called "SYS_MSGCTL" returns Integer:
+Process called "openbsd_arm64_SYS_MSGCTL" returns Integer:
     Return 297
 End Process
 
-Process called "SYS_SCHED_YIELD" returns Integer:
+Process called "openbsd_arm64_SYS_SCHED_YIELD" returns Integer:
     Return 298
 End Process
 
-Process called "SYS_GETTHRID" returns Integer:
+Process called "openbsd_arm64_SYS_GETTHRID" returns Integer:
     Return 299
 End Process
 
-Process called "SYS_THRWAKEUP" returns Integer:
+Process called "openbsd_arm64_SYS_THRWAKEUP" returns Integer:
     Return 301
 End Process
 
-Process called "SYS_THREXIT" returns Integer:
+Process called "openbsd_arm64_SYS_THREXIT" returns Integer:
     Return 302
 End Process
 
-Process called "SYS_THRSIGDIVERT" returns Integer:
+Process called "openbsd_arm64_SYS_THRSIGDIVERT" returns Integer:
     Return 303
 End Process
 
-Process called "SYS_GETCWD" returns Integer:
+Process called "openbsd_arm64_SYS_GETCWD" returns Integer:
     Return 304
 End Process
 
-Process called "SYS_ADJFREQ" returns Integer:
+Process called "openbsd_arm64_SYS_ADJFREQ" returns Integer:
     Return 305
 End Process
 
-Process called "SYS_SETRTABLE" returns Integer:
+Process called "openbsd_arm64_SYS_SETRTABLE" returns Integer:
     Return 310
 End Process
 
-Process called "SYS_GETRTABLE" returns Integer:
+Process called "openbsd_arm64_SYS_GETRTABLE" returns Integer:
     Return 311
 End Process
 
-Process called "SYS_FACCESSAT" returns Integer:
+Process called "openbsd_arm64_SYS_FACCESSAT" returns Integer:
     Return 313
 End Process
 
-Process called "SYS_FCHMODAT" returns Integer:
+Process called "openbsd_arm64_SYS_FCHMODAT" returns Integer:
     Return 314
 End Process
 
-Process called "SYS_FCHOWNAT" returns Integer:
+Process called "openbsd_arm64_SYS_FCHOWNAT" returns Integer:
     Return 315
 End Process
 
-Process called "SYS_LINKAT" returns Integer:
+Process called "openbsd_arm64_SYS_LINKAT" returns Integer:
     Return 317
 End Process
 
-Process called "SYS_MKDIRAT" returns Integer:
+Process called "openbsd_arm64_SYS_MKDIRAT" returns Integer:
     Return 318
 End Process
 
-Process called "SYS_MKFIFOAT" returns Integer:
+Process called "openbsd_arm64_SYS_MKFIFOAT" returns Integer:
     Return 319
 End Process
 
-Process called "SYS_MKNODAT" returns Integer:
+Process called "openbsd_arm64_SYS_MKNODAT" returns Integer:
     Return 320
 End Process
 
-Process called "SYS_OPENAT" returns Integer:
+Process called "openbsd_arm64_SYS_OPENAT" returns Integer:
     Return 321
 End Process
 
-Process called "SYS_READLINKAT" returns Integer:
+Process called "openbsd_arm64_SYS_READLINKAT" returns Integer:
     Return 322
 End Process
 
-Process called "SYS_RENAMEAT" returns Integer:
+Process called "openbsd_arm64_SYS_RENAMEAT" returns Integer:
     Return 323
 End Process
 
-Process called "SYS_SYMLINKAT" returns Integer:
+Process called "openbsd_arm64_SYS_SYMLINKAT" returns Integer:
     Return 324
 End Process
 
-Process called "SYS_UNLINKAT" returns Integer:
+Process called "openbsd_arm64_SYS_UNLINKAT" returns Integer:
     Return 325
 End Process
 
-Process called "SYS_SET_TCB" returns Integer:
+Process called "openbsd_arm64_SYS_SET_TCB" returns Integer:
     Return 329
 End Process
 
-Process called "SYS_GET_TCB" returns Integer:
+Process called "openbsd_arm64_SYS_GET_TCB" returns Integer:
     Return 330
+End Process
+
+@Reasoning
+OpenBSD does not expose a `sched_getaffinity(2)` syscall. The Linux
+interface (syscall 204 on x86_64, 123 on arm64 asm-generic) returns the
+CPU affinity bitmask for a thread or process; OpenBSD's scheduler model
+intentionally rejects user-space CPU pinning to preserve scheduler
+flexibility and security. The closest available query is the sysctl
+bridge `KERN_NCPUONLINE` / `KERN_NCPU` (sysctl mib { CTL_KERN,
+KERN_NCPUONLINE }) which returns the count of active CPUs but does not
+expose per-thread affinity state. Returning -1 here is the canonical
+"no native syscall" sentinel; the dispatcher's high-level affinity
+wrapper (when added) MUST route through `syscall_2(SYS_SYSCTL(), ...)`
+with the appropriate mib structure to obtain the CPU count and return
+a synthesised bitmask covering all available CPUs (which is the only
+information OpenBSD allows user space to learn). We deliberately do
+NOT alias to SYS_SYSCTL=202 directly because the calling conventions
+differ entirely — `sched_getaffinity(pid, cpusetsize, mask)` versus
+`sysctl(name, namelen, oldp, oldlenp, newp, newlen)` — silent
+substitution corrupts callers, so the dispatcher refuses the alias.
+Source: OpenBSD `sys/sys/syscall.h` (no SYS_sched_getaffinity entry);
+OpenBSD `sys/sys/sysctl.h` (KERN_NCPUONLINE = 25); man 2 sysctl
+(OpenBSD); design doc `docs/dev/designs/P2-B-cross-platform-threading
+-syscalls-design.md` line 230 ("(no native — return cpu count)").
+@End Reasoning
+
+@Implementation
+Nullary Process returning -1. The -1 value is the canonical "syscall
+unavailable on this platform" sentinel adopted by the cross-platform
+syscall dispatcher; calling `syscall_3(SYS_SCHED_GETAFFINITY(), ...)`
+on OpenBSD ARM64 with X8=-1 raises a kernel-level invalid-syscall
+trap that returns -ENOSYS to the caller, preserving error semantics.
+The dispatcher API contract requires SYS_SCHED_GETAFFINITY to be a
+defined symbol for link completeness; the -1 sentinel signals "must
+use the sysctl-bridge path instead."
+@End Implementation
+
+@Performance_Hints
+Constant accessor; compiler-inlinable. Callers SHOULD test the return
+value against -1 (or invoke `is_error()` on a downstream syscall
+result) before issuing the actual syscall — issuing svc #0 with X8=-1
+incurs a wasted kernel-mode trap. For affinity-style queries on
+OpenBSD, prefer `syscall_sysctl_ncpuonline()` (a future helper, not
+yet exposed) or invoke the sysctl path directly.
+@End Performance_Hints
+
+@Security_Scope
+Returning -1 has no security implications on its own. The downstream
+path through sysctl(2) with KERN_NCPUONLINE is unprivileged and
+available under all pledge promises including `stdio`. There is no
+mechanism on OpenBSD by which user code can pin a thread to a CPU,
+so the absence of sched_getaffinity also eliminates the side-channel
+class enabled by CPU pinning on Linux (e.g. last-level cache locality
+attacks). This is a defensive default; callers requiring CPU-pinning
+behaviour for correctness (not optimisation) must redesign for
+OpenBSD's scheduler-managed model.
+@End Security_Scope
+Process called "openbsd_arm64_SYS_SCHED_GETAFFINITY" returns Integer:
+    Return -1
 End Process
 
 
@@ -934,15 +1170,15 @@ Note: ==========================================================================
 Note: FILE DESCRIPTOR CONSTANTS
 Note: ============================================================================
 
-Process called "STDIN_FILENO" returns Integer:
+Process called "openbsd_arm64_STDIN_FILENO" returns Integer:
     Return 0
 End Process
 
-Process called "STDOUT_FILENO" returns Integer:
+Process called "openbsd_arm64_STDOUT_FILENO" returns Integer:
     Return 1
 End Process
 
-Process called "STDERR_FILENO" returns Integer:
+Process called "openbsd_arm64_STDERR_FILENO" returns Integer:
     Return 2
 End Process
 
@@ -950,67 +1186,67 @@ Note: ==========================================================================
 Note: FILE OPEN FLAGS
 Note: ============================================================================
 
-Process called "O_RDONLY" returns Integer:
+Process called "openbsd_arm64_O_RDONLY" returns Integer:
     Return 0  Note: Open for reading only
 End Process
 
-Process called "O_WRONLY" returns Integer:
+Process called "openbsd_arm64_O_WRONLY" returns Integer:
     Return 1  Note: Open for writing only
 End Process
 
-Process called "O_RDWR" returns Integer:
+Process called "openbsd_arm64_O_RDWR" returns Integer:
     Return 2  Note: Open for reading and writing
 End Process
 
-Process called "O_NONBLOCK" returns Integer:
+Process called "openbsd_arm64_O_NONBLOCK" returns Integer:
     Return 4  Note: No delay
 End Process
 
-Process called "O_APPEND" returns Integer:
+Process called "openbsd_arm64_O_APPEND" returns Integer:
     Return 8  Note: Set append mode
 End Process
 
-Process called "O_SHLOCK" returns Integer:
+Process called "openbsd_arm64_O_SHLOCK" returns Integer:
     Return 16  Note: Atomically obtain a shared lock
 End Process
 
-Process called "O_EXLOCK" returns Integer:
+Process called "openbsd_arm64_O_EXLOCK" returns Integer:
     Return 32  Note: Atomically obtain an exclusive lock
 End Process
 
-Process called "O_ASYNC" returns Integer:
+Process called "openbsd_arm64_O_ASYNC" returns Integer:
     Return 64  Note: Signal pgrp when data ready
 End Process
 
-Process called "O_SYNC" returns Integer:
+Process called "openbsd_arm64_O_SYNC" returns Integer:
     Return 128  Note: Synchronous writes
 End Process
 
-Process called "O_NOFOLLOW" returns Integer:
+Process called "openbsd_arm64_O_NOFOLLOW" returns Integer:
     Return 256  Note: Don't follow symlinks
 End Process
 
-Process called "O_CREAT" returns Integer:
+Process called "openbsd_arm64_O_CREAT" returns Integer:
     Return 512  Note: Create if nonexistent
 End Process
 
-Process called "O_TRUNC" returns Integer:
+Process called "openbsd_arm64_O_TRUNC" returns Integer:
     Return 1024  Note: Truncate to zero length
 End Process
 
-Process called "O_EXCL" returns Integer:
+Process called "openbsd_arm64_O_EXCL" returns Integer:
     Return 2048  Note: Error if already exists
 End Process
 
-Process called "O_NOCTTY" returns Integer:
+Process called "openbsd_arm64_O_NOCTTY" returns Integer:
     Return 32768  Note: Don't assign controlling terminal
 End Process
 
-Process called "O_CLOEXEC" returns Integer:
+Process called "openbsd_arm64_O_CLOEXEC" returns Integer:
     Return 65536  Note: Close on exec
 End Process
 
-Process called "O_DIRECTORY" returns Integer:
+Process called "openbsd_arm64_O_DIRECTORY" returns Integer:
     Return 131072  Note: Fail if not directory
 End Process
 
@@ -1018,19 +1254,19 @@ Note: ==========================================================================
 Note: MEMORY PROTECTION FLAGS
 Note: ============================================================================
 
-Process called "PROT_NONE" returns Integer:
+Process called "openbsd_arm64_PROT_NONE" returns Integer:
     Return 0  Note: No access
 End Process
 
-Process called "PROT_READ" returns Integer:
+Process called "openbsd_arm64_PROT_READ" returns Integer:
     Return 1  Note: Pages can be read
 End Process
 
-Process called "PROT_WRITE" returns Integer:
+Process called "openbsd_arm64_PROT_WRITE" returns Integer:
     Return 2  Note: Pages can be written
 End Process
 
-Process called "PROT_EXEC" returns Integer:
+Process called "openbsd_arm64_PROT_EXEC" returns Integer:
     Return 4  Note: Pages can be executed
 End Process
 
@@ -1038,24 +1274,181 @@ Note: ==========================================================================
 Note: MEMORY MAPPING FLAGS
 Note: ============================================================================
 
-Process called "MAP_SHARED" returns Integer:
+Process called "openbsd_arm64_MAP_SHARED" returns Integer:
     Return 1  Note: Share changes
 End Process
 
-Process called "MAP_PRIVATE" returns Integer:
+Process called "openbsd_arm64_MAP_PRIVATE" returns Integer:
     Return 2  Note: Changes are private
 End Process
 
-Process called "MAP_FIXED" returns Integer:
+Process called "openbsd_arm64_MAP_FIXED" returns Integer:
     Return 16  Note: Interpret addr exactly
 End Process
 
-Process called "MAP_ANON" returns Integer:
+Process called "openbsd_arm64_MAP_ANON" returns Integer:
     Return 4096  Note: Anonymous memory (not file-backed)
 End Process
 
-Process called "MAP_STACK" returns Integer:
+Process called "openbsd_arm64_MAP_STACK" returns Integer:
     Return 16384  Note: Region grows down (stack)
+End Process
+
+@Reasoning
+MAP_ANONYMOUS is the cross-platform 66-proc API surface name for the
+mmap flag that requests anonymous (non-file-backed) memory. OpenBSD's
+`sys/sys/mman.h` defines this flag as `MAP_ANON` with value 0x1000
+(4096 decimal); the `MAP_ANONYMOUS` spelling is a Linux/glibc synonym
+that OpenBSD does not natively declare. We provide it here as a
+documented alias returning 4096 so cross-platform callers can use the
+POSIX-y name without conditional compilation. The numerical value 0x1000
+matches Darwin, FreeBSD, and NetBSD (all BSDs share this MAP_ANON
+encoding); Linux uses 0x20 (32 decimal) instead, which is one of the
+multi-platform incompatibilities the dispatcher's bare-name resolution
+hides from callers.
+Source: OpenBSD `sys/sys/mman.h` (#define MAP_ANON 0x1000); design doc
+`docs/dev/designs/P2-B-cross-platform-threading-syscalls-design.md`
+section "Constants per platform" line 241 (NetBSD/OpenBSD MAP_ANON=
+0x1000).
+@End Reasoning
+
+@Implementation
+Nullary Process returning the integer 4096 (= 0x1000). Aliases MAP_ANON
+at the value level — both procs return the same constant. The naming
+duality reflects the dispatcher's expectation of `MAP_ANONYMOUS` (Linux/
+POSIX-extended name) and OpenBSD's native preference for `MAP_ANON`
+(traditional BSD short name). Compiles to a constant-load identical to
+MAP_ANON; the two accessors emit indistinguishable instructions.
+@End Implementation
+
+@Performance_Hints
+Constant accessor; compiler-inlinable. Pass to `syscall_mmap` as part
+of the `flags` bitmask: `MAP_ANONYMOUS() OR MAP_PRIVATE()` requests
+anonymous private memory (the standard "give me clean zeroed pages"
+pattern). Combining with `MAP_FIXED` requires the addr argument to be
+page-aligned; OpenBSD's mmap will fail with EINVAL otherwise.
+@End Performance_Hints
+
+@Security_Scope
+Anonymous mappings are zero-filled on allocation by the OpenBSD kernel
+(per the W^X-safe heap-init policy); callers do NOT need to explicitly
+zero the returned region. MAP_ANONYMOUS regions are NOT inherited
+across `execve` (the kernel clears the address space). When combined
+with PROT_READ|PROT_WRITE|MAP_PRIVATE, this is the canonical pattern
+for heap-style allocation. Combining with PROT_EXEC violates OpenBSD's
+W^X policy and will be rejected by the kernel for non-static binaries;
+callers requiring executable memory must mmap as PROT_READ|PROT_WRITE
+first, then mprotect-up to PROT_READ|PROT_EXEC after content is written.
+@End Security_Scope
+Process called "openbsd_arm64_MAP_ANONYMOUS" returns Integer:
+    Return 4096
+End Process
+
+Note: ============================================================================
+Note: FILE PERMISSION MODE CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+POSIX file mode constants for `creat`, `open(O_CREAT)`, `mkdir`, and
+`chmod`. MODE_0644 (rw-r--r--) is the canonical default for regular
+files; MODE_0755 (rwxr-xr-x) is the canonical default for executables
+and directories. The numeric values 420 and 493 are the decimal
+encodings of octal 0644 and 0755 respectively, computed as
+(6 * 64) + (4 * 8) + 4 = 420 and (7 * 64) + (5 * 8) + 5 = 493. These
+encodings are identical across OpenBSD, all other BSDs, Linux, and
+Darwin because they predate any platform-specific divergence — they
+are part of the original V7 UNIX permission model preserved by every
+POSIX kernel.
+Source: OpenBSD `sys/sys/stat.h` (S_IRUSR=0400, S_IWUSR=0200,
+S_IRGRP=0040, S_IROTH=0004 = 0644; S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|
+S_IXGRP|S_IROTH|S_IXOTH = 0755); POSIX.1-2017 §sys/stat.h.
+@End Reasoning
+
+@Implementation
+Nullary Process accessors returning the constant integer values. The
+dispatcher's `MODE_0644 from Syscall` lookup resolves to this proc on
+openbsd_arm64 targets via the bare-name route established in Wave 1.
+Wave 2 will rename to `openbsd_arm64_MODE_0644`; Wave 1 keeps the bare
+form to match the still-bare dispatcher.
+@End Implementation
+
+@Performance_Hints
+Constant returns; compiler-inlinable. The values are passed as the
+`mode` argument to file-creation syscalls — a single integer push to
+X2 in the arm64 calling convention. No runtime cost beyond the
+constant-load.
+@End Performance_Hints
+
+@Security_Scope
+Returning a file-permission constant carries no security state on its
+own. Callers who pass these values as the `mode` argument to `creat`/
+`open(O_CREAT)`/`mkdir`/`chmod` are responsible for matching the
+requested permission to the intended access policy. World-readable
+(0644) is appropriate for non-sensitive files; group-and-world-
+executable (0755) is appropriate for binaries and directories. Setuid
+(04000), setgid (02000), and sticky (01000) bits are NOT included
+here — callers requiring those semantics must construct the mode
+explicitly with bitwise OR, and the kernel will apply OpenBSD's
+nosuid mount-option and pledge restrictions to filter the effective
+mode.
+@End Security_Scope
+Process called "openbsd_arm64_MODE_0644" returns Integer:
+    Return 420  Note: 0o644 = rw-r--r-- (regular file default)
+End Process
+
+Process called "openbsd_arm64_MODE_0755" returns Integer:
+    Return 493  Note: 0o755 = rwxr-xr-x (executable / directory default)
+End Process
+
+Note: ============================================================================
+Note: FILE SEEK WHENCE CONSTANTS
+Note: ============================================================================
+
+@Reasoning
+The `whence` argument to `lseek(2)` selects how the supplied offset is
+interpreted: SEEK_SET (0) measures from the start of the file, SEEK_CUR
+(1) measures relative to the current file position, SEEK_END (2)
+measures relative to end-of-file. OpenBSD inherits the same values as
+every POSIX kernel, defined in `sys/sys/unistd.h`. These match the
+bare-name dispatcher's expectations and the `syscall_lseek` wrapper's
+`whence` parameter.
+Source: OpenBSD `sys/sys/unistd.h` (#define SEEK_SET 0, SEEK_CUR 1,
+SEEK_END 2); POSIX.1-2017 §unistd.h.
+@End Reasoning
+
+@Implementation
+Nullary Process accessors returning the constant integer values. The
+dispatcher routes `SEEK_SET from Syscall` to this proc on openbsd_arm64
+targets via the bare-name pattern still in force during Wave 1. Bodies
+are non-side-effecting and trivially inlinable.
+@End Implementation
+
+@Performance_Hints
+Constant returns; compiler-inlinable at the call site. No runtime cost.
+Avoid wrapping these in additional indirection; the dispatcher already
+selects the platform-correct value at the dispatch boundary.
+@End Performance_Hints
+
+@Security_Scope
+Returning a seek-whence constant has no security implications on its
+own. Callers that pass user-influenced `offset` values into `lseek`
+with these whence flags MUST validate the resulting absolute file
+position against the file's permitted range; an attacker-controlled
+negative offset combined with SEEK_END can yield an unexpected position
+prior to file start, which OpenBSD's lseek will reject with EINVAL
+on conforming kernels. Devices and pipes do not support seeking;
+lseek on those file descriptors returns -ESPIPE regardless of whence.
+@End Security_Scope
+Process called "openbsd_arm64_SEEK_SET" returns Integer:
+    Return 0  Note: Seek from beginning of file
+End Process
+
+Process called "openbsd_arm64_SEEK_CUR" returns Integer:
+    Return 1  Note: Seek from current position
+End Process
+
+Process called "openbsd_arm64_SEEK_END" returns Integer:
+    Return 2  Note: Seek from end of file
 End Process
 
 Note: ============================================================================
@@ -1068,7 +1461,7 @@ Note: - X0-X5 = arguments 1-6
 Note: - Stack = arguments 7+
 Note: - Return value in X0
 
-Process called "syscall_0" takes syscall_number as Integer returns Integer:
+Process called "openbsd_arm64_syscall_0" takes syscall_number as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 0 arguments
     Let result be 0
     Inline Assembly:
@@ -1084,7 +1477,7 @@ Process called "syscall_0" takes syscall_number as Integer returns Integer:
     Return result
 End Process
 
-Process called "syscall_1" takes syscall_number as Integer, arg1 as Integer returns Integer:
+Process called "openbsd_arm64_syscall_1" takes syscall_number as Integer, arg1 as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 1 argument
     Let result be 0
     Inline Assembly:
@@ -1103,7 +1496,7 @@ Process called "syscall_1" takes syscall_number as Integer, arg1 as Integer retu
     Return result
 End Process
 
-Process called "syscall_2" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer returns Integer:
+Process called "openbsd_arm64_syscall_2" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 2 arguments
     Let result be 0
     Inline Assembly:
@@ -1123,7 +1516,7 @@ Process called "syscall_2" takes syscall_number as Integer, arg1 as Integer, arg
     Return result
 End Process
 
-Process called "syscall_3" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer returns Integer:
+Process called "openbsd_arm64_syscall_3" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 3 arguments
     Let result be 0
     Inline Assembly:
@@ -1144,7 +1537,7 @@ Process called "syscall_3" takes syscall_number as Integer, arg1 as Integer, arg
     Return result
 End Process
 
-Process called "syscall_4" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer returns Integer:
+Process called "openbsd_arm64_syscall_4" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 4 arguments
     Let result be 0
     Inline Assembly:
@@ -1166,7 +1559,7 @@ Process called "syscall_4" takes syscall_number as Integer, arg1 as Integer, arg
     Return result
 End Process
 
-Process called "syscall_5" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer, arg5 as Integer returns Integer:
+Process called "openbsd_arm64_syscall_5" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer, arg5 as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 5 arguments
     Let result be 0
     Inline Assembly:
@@ -1189,7 +1582,7 @@ Process called "syscall_5" takes syscall_number as Integer, arg1 as Integer, arg
     Return result
 End Process
 
-Process called "syscall_6" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer, arg5 as Integer, arg6 as Integer returns Integer:
+Process called "openbsd_arm64_syscall_6" takes syscall_number as Integer, arg1 as Integer, arg2 as Integer, arg3 as Integer, arg4 as Integer, arg5 as Integer, arg6 as Integer returns Integer:
     Note: OpenBSD ARM64 syscall with 6 arguments
     Let result be 0
     Inline Assembly:
@@ -1217,278 +1610,451 @@ Note: ==========================================================================
 Note: HIGH-LEVEL SYSCALL WRAPPERS
 Note: ============================================================================
 
-Process called "exit" takes status as Integer returns Integer:
+Process called "openbsd_arm64_exit" takes status as Integer returns Integer:
     Note: Exit the current process
-    Return syscall_1(SYS_EXIT(), status)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_EXIT(), status)
 End Process
 
-Process called "read" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+Process called "openbsd_arm64_read" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
     Note: Read from file descriptor
-    Return syscall_3(SYS_READ(), fd, buffer, count)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_READ(), fd, buffer, count)
 End Process
 
-Process called "write" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+Process called "openbsd_arm64_write" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
     Note: Write to file descriptor
-    Return syscall_3(SYS_WRITE(), fd, buffer, count)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_WRITE(), fd, buffer, count)
 End Process
 
-Process called "open" takes path as Integer, flags as Integer, mode as Integer returns Integer:
+Process called "openbsd_arm64_open" takes path as Integer, flags as Integer, mode as Integer returns Integer:
     Note: Open file
-    Return syscall_3(SYS_OPEN(), path, flags, mode)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_OPEN(), path, flags, mode)
 End Process
 
-Process called "close" takes fd as Integer returns Integer:
+Process called "openbsd_arm64_close" takes fd as Integer returns Integer:
     Note: Close file descriptor
-    Return syscall_1(SYS_CLOSE(), fd)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_CLOSE(), fd)
 End Process
 
-Process called "mmap" takes addr as Integer, length as Integer, prot as Integer, flags as Integer, fd as Integer, offset as Integer returns Integer:
+Process called "openbsd_arm64_mmap" takes addr as Integer, length as Integer, prot as Integer, flags as Integer, fd as Integer, offset as Integer returns Integer:
     Note: Map memory
-    Return syscall_6(SYS_MMAP(), addr, length, prot, flags, fd, offset)
+    Return openbsd_arm64_syscall_6(openbsd_arm64_SYS_MMAP(), addr, length, prot, flags, fd, offset)
 End Process
 
-Process called "munmap" takes addr as Integer, length as Integer returns Integer:
+Process called "openbsd_arm64_munmap" takes addr as Integer, length as Integer returns Integer:
     Note: Unmap memory
-    Return syscall_2(SYS_MUNMAP(), addr, length)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_MUNMAP(), addr, length)
 End Process
 
-Process called "mprotect" takes addr as Integer, length as Integer, prot as Integer returns Integer:
+Process called "openbsd_arm64_mprotect" takes addr as Integer, length as Integer, prot as Integer returns Integer:
     Note: Change memory protection
-    Return syscall_3(SYS_MPROTECT(), addr, length, prot)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_MPROTECT(), addr, length, prot)
 End Process
 
-Process called "getpid" returns Integer:
+Process called "openbsd_arm64_getpid" returns Integer:
     Note: Get process ID
-    Return syscall_0(SYS_GETPID())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_GETPID())
 End Process
 
-Process called "fork" returns Integer:
+Process called "openbsd_arm64_fork" returns Integer:
     Note: Create child process
-    Return syscall_0(SYS_FORK())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_FORK())
 End Process
 
-Process called "execve" takes path as Integer, argv as Integer, envp as Integer returns Integer:
+Process called "openbsd_arm64_execve" takes path as Integer, argv as Integer, envp as Integer returns Integer:
     Note: Execute program
-    Return syscall_3(SYS_EXECVE(), path, argv, envp)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_EXECVE(), path, argv, envp)
 End Process
 
-Process called "wait4" takes pid as Integer, status as Integer, options as Integer, rusage as Integer returns Integer:
+Process called "openbsd_arm64_wait4" takes pid as Integer, status as Integer, options as Integer, rusage as Integer returns Integer:
     Note: Wait for process to change state
-    Return syscall_4(SYS_WAIT4(), pid, status, options, rusage)
+    Return openbsd_arm64_syscall_4(openbsd_arm64_SYS_WAIT4(), pid, status, options, rusage)
 End Process
 
-Process called "kill" takes pid as Integer, sig as Integer returns Integer:
+Process called "openbsd_arm64_kill" takes pid as Integer, sig as Integer returns Integer:
     Note: Send signal to process
-    Return syscall_2(SYS_KILL(), pid, sig)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_KILL(), pid, sig)
 End Process
 
-Process called "getuid" returns Integer:
+Process called "openbsd_arm64_getuid" returns Integer:
     Note: Get user ID
-    Return syscall_0(SYS_GETUID())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_GETUID())
 End Process
 
-Process called "geteuid" returns Integer:
+Process called "openbsd_arm64_geteuid" returns Integer:
     Note: Get effective user ID
-    Return syscall_0(SYS_GETEUID())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_GETEUID())
 End Process
 
-Process called "getgid" returns Integer:
+Process called "openbsd_arm64_getgid" returns Integer:
     Note: Get group ID
-    Return syscall_0(SYS_GETGID())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_GETGID())
 End Process
 
-Process called "getegid" returns Integer:
+Process called "openbsd_arm64_getegid" returns Integer:
     Note: Get effective group ID
-    Return syscall_0(SYS_GETEGID())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_GETEGID())
 End Process
 
-Process called "dup" takes fd as Integer returns Integer:
+Process called "openbsd_arm64_dup" takes fd as Integer returns Integer:
     Note: Duplicate file descriptor
-    Return syscall_1(SYS_DUP(), fd)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_DUP(), fd)
 End Process
 
-Process called "dup2" takes oldfd as Integer, newfd as Integer returns Integer:
+Process called "openbsd_arm64_dup2" takes oldfd as Integer, newfd as Integer returns Integer:
     Note: Duplicate file descriptor to specific fd
-    Return syscall_2(SYS_DUP2(), oldfd, newfd)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_DUP2(), oldfd, newfd)
 End Process
 
-Process called "pipe" takes pipefd as Integer returns Integer:
+Process called "openbsd_arm64_pipe" takes pipefd as Integer returns Integer:
     Note: Create pipe
-    Return syscall_1(SYS_PIPE(), pipefd)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_PIPE(), pipefd)
 End Process
 
-Process called "ioctl" takes fd as Integer, request as Integer, arg as Integer returns Integer:
+Process called "openbsd_arm64_ioctl" takes fd as Integer, request as Integer, arg as Integer returns Integer:
     Note: Device-specific input/output operations
-    Return syscall_3(SYS_IOCTL(), fd, request, arg)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_IOCTL(), fd, request, arg)
 End Process
 
-Process called "fcntl" takes fd as Integer, cmd as Integer, arg as Integer returns Integer:
+Process called "openbsd_arm64_fcntl" takes fd as Integer, cmd as Integer, arg as Integer returns Integer:
     Note: File control operations
-    Return syscall_3(SYS_FCNTL(), fd, cmd, arg)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_FCNTL(), fd, cmd, arg)
 End Process
 
-Process called "lseek" takes fd as Integer, offset as Integer, whence as Integer returns Integer:
+Process called "openbsd_arm64_lseek" takes fd as Integer, offset as Integer, whence as Integer returns Integer:
     Note: Reposition file offset
-    Return syscall_3(SYS_LSEEK(), fd, offset, whence)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_LSEEK(), fd, offset, whence)
 End Process
 
-Process called "ftruncate" takes fd as Integer, length as Integer returns Integer:
+Process called "openbsd_arm64_ftruncate" takes fd as Integer, length as Integer returns Integer:
     Note: Truncate file to specified length
-    Return syscall_2(SYS_FTRUNCATE(), fd, length)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_FTRUNCATE(), fd, length)
 End Process
 
-Process called "fsync" takes fd as Integer returns Integer:
+Process called "openbsd_arm64_fsync" takes fd as Integer returns Integer:
     Note: Synchronize file's in-core state with storage
-    Return syscall_1(SYS_FSYNC(), fd)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_FSYNC(), fd)
 End Process
 
-Process called "chmod" takes path as Integer, mode as Integer returns Integer:
+Process called "openbsd_arm64_chmod" takes path as Integer, mode as Integer returns Integer:
     Note: Change file mode
-    Return syscall_2(SYS_CHMOD(), path, mode)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_CHMOD(), path, mode)
 End Process
 
-Process called "fchmod" takes fd as Integer, mode as Integer returns Integer:
+Process called "openbsd_arm64_fchmod" takes fd as Integer, mode as Integer returns Integer:
     Note: Change file mode
-    Return syscall_2(SYS_FCHMOD(), fd, mode)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_FCHMOD(), fd, mode)
 End Process
 
-Process called "chown" takes path as Integer, owner as Integer, group as Integer returns Integer:
+Process called "openbsd_arm64_chown" takes path as Integer, owner as Integer, group as Integer returns Integer:
     Note: Change file owner and group
-    Return syscall_3(SYS_CHOWN(), path, owner, group)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_CHOWN(), path, owner, group)
 End Process
 
-Process called "fchown" takes fd as Integer, owner as Integer, group as Integer returns Integer:
+Process called "openbsd_arm64_fchown" takes fd as Integer, owner as Integer, group as Integer returns Integer:
     Note: Change file owner and group
-    Return syscall_3(SYS_FCHOWN(), fd, owner, group)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_FCHOWN(), fd, owner, group)
 End Process
 
-Process called "mkdir" takes path as Integer, mode as Integer returns Integer:
+Process called "openbsd_arm64_mkdir" takes path as Integer, mode as Integer returns Integer:
     Note: Create directory
-    Return syscall_2(SYS_MKDIR(), path, mode)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_MKDIR(), path, mode)
 End Process
 
-Process called "rmdir" takes path as Integer returns Integer:
+Process called "openbsd_arm64_rmdir" takes path as Integer returns Integer:
     Note: Remove directory
-    Return syscall_1(SYS_RMDIR(), path)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_RMDIR(), path)
 End Process
 
-Process called "unlink" takes path as Integer returns Integer:
+Process called "openbsd_arm64_unlink" takes path as Integer returns Integer:
     Note: Delete file
-    Return syscall_1(SYS_UNLINK(), path)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_UNLINK(), path)
 End Process
 
-Process called "rename" takes oldpath as Integer, newpath as Integer returns Integer:
+Process called "openbsd_arm64_rename" takes oldpath as Integer, newpath as Integer returns Integer:
     Note: Rename file
-    Return syscall_2(SYS_RENAME(), oldpath, newpath)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_RENAME(), oldpath, newpath)
 End Process
 
-Process called "link" takes oldpath as Integer, newpath as Integer returns Integer:
+Process called "openbsd_arm64_link" takes oldpath as Integer, newpath as Integer returns Integer:
     Note: Create hard link
-    Return syscall_2(SYS_LINK(), oldpath, newpath)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_LINK(), oldpath, newpath)
 End Process
 
-Process called "symlink" takes target as Integer, linkpath as Integer returns Integer:
+Process called "openbsd_arm64_symlink" takes target as Integer, linkpath as Integer returns Integer:
     Note: Create symbolic link
-    Return syscall_2(SYS_SYMLINK(), target, linkpath)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_SYMLINK(), target, linkpath)
 End Process
 
-Process called "readlink" takes path as Integer, buf as Integer, bufsiz as Integer returns Integer:
+Process called "openbsd_arm64_readlink" takes path as Integer, buf as Integer, bufsiz as Integer returns Integer:
     Note: Read symbolic link
-    Return syscall_3(SYS_READLINK(), path, buf, bufsiz)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_READLINK(), path, buf, bufsiz)
 End Process
 
-Process called "chdir" takes path as Integer returns Integer:
+Process called "openbsd_arm64_chdir" takes path as Integer returns Integer:
     Note: Change working directory
-    Return syscall_1(SYS_CHDIR(), path)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_CHDIR(), path)
 End Process
 
-Process called "fchdir" takes fd as Integer returns Integer:
+Process called "openbsd_arm64_fchdir" takes fd as Integer returns Integer:
     Note: Change working directory to fd
-    Return syscall_1(SYS_FCHDIR(), fd)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_FCHDIR(), fd)
 End Process
 
-Process called "socket" takes domain as Integer, socket_type as Integer, protocol as Integer returns Integer:
+Process called "openbsd_arm64_socket" takes domain as Integer, socket_type as Integer, protocol as Integer returns Integer:
     Note: Create socket
-    Return syscall_3(SYS_SOCKET(), domain, socket_type, protocol)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_SOCKET(), domain, socket_type, protocol)
 End Process
 
-Process called "bind" takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
+Process called "openbsd_arm64_bind" takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
     Note: Bind socket to address
-    Return syscall_3(SYS_BIND(), sockfd, addr, addrlen)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_BIND(), sockfd, addr, addrlen)
 End Process
 
-Process called "listen" takes sockfd as Integer, backlog as Integer returns Integer:
+Process called "openbsd_arm64_listen" takes sockfd as Integer, backlog as Integer returns Integer:
     Note: Listen for connections
-    Return syscall_2(SYS_LISTEN(), sockfd, backlog)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_LISTEN(), sockfd, backlog)
 End Process
 
-Process called "accept" takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
+Process called "openbsd_arm64_accept" takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
     Note: Accept connection
-    Return syscall_3(SYS_ACCEPT(), sockfd, addr, addrlen)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_ACCEPT(), sockfd, addr, addrlen)
 End Process
 
-Process called "connect" takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
+Process called "openbsd_arm64_connect" takes sockfd as Integer, addr as Integer, addrlen as Integer returns Integer:
     Note: Connect socket
-    Return syscall_3(SYS_CONNECT(), sockfd, addr, addrlen)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_CONNECT(), sockfd, addr, addrlen)
 End Process
 
-Process called "sendto" takes sockfd as Integer, buf as Integer, len as Integer, flags as Integer, dest_addr as Integer, addrlen as Integer returns Integer:
+Process called "openbsd_arm64_sendto" takes sockfd as Integer, buf as Integer, len as Integer, flags as Integer, dest_addr as Integer, addrlen as Integer returns Integer:
     Note: Send message on socket
-    Return syscall_6(SYS_SENDTO(), sockfd, buf, len, flags, dest_addr, addrlen)
+    Return openbsd_arm64_syscall_6(openbsd_arm64_SYS_SENDTO(), sockfd, buf, len, flags, dest_addr, addrlen)
 End Process
 
-Process called "recvfrom" takes sockfd as Integer, buf as Integer, len as Integer, flags as Integer, src_addr as Integer, addrlen as Integer returns Integer:
+Process called "openbsd_arm64_recvfrom" takes sockfd as Integer, buf as Integer, len as Integer, flags as Integer, src_addr as Integer, addrlen as Integer returns Integer:
     Note: Receive message from socket
-    Return syscall_6(SYS_RECVFROM(), sockfd, buf, len, flags, src_addr, addrlen)
+    Return openbsd_arm64_syscall_6(openbsd_arm64_SYS_RECVFROM(), sockfd, buf, len, flags, src_addr, addrlen)
 End Process
 
-Process called "shutdown" takes sockfd as Integer, how as Integer returns Integer:
+Process called "openbsd_arm64_shutdown" takes sockfd as Integer, how as Integer returns Integer:
     Note: Shut down socket
-    Return syscall_2(SYS_SHUTDOWN(), sockfd, how)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_SHUTDOWN(), sockfd, how)
 End Process
 
-Process called "setsockopt" takes sockfd as Integer, level as Integer, optname as Integer, optval as Integer, optlen as Integer returns Integer:
+Process called "openbsd_arm64_setsockopt" takes sockfd as Integer, level as Integer, optname as Integer, optval as Integer, optlen as Integer returns Integer:
     Note: Set socket option
-    Return syscall_5(SYS_SETSOCKOPT(), sockfd, level, optname, optval, optlen)
+    Return openbsd_arm64_syscall_5(openbsd_arm64_SYS_SETSOCKOPT(), sockfd, level, optname, optval, optlen)
 End Process
 
-Process called "getsockopt" takes sockfd as Integer, level as Integer, optname as Integer, optval as Integer, optlen as Integer returns Integer:
+Process called "openbsd_arm64_getsockopt" takes sockfd as Integer, level as Integer, optname as Integer, optval as Integer, optlen as Integer returns Integer:
     Note: Get socket option
-    Return syscall_5(SYS_GETSOCKOPT(), sockfd, level, optname, optval, optlen)
+    Return openbsd_arm64_syscall_5(openbsd_arm64_SYS_GETSOCKOPT(), sockfd, level, optname, optval, optlen)
 End Process
 
-Process called "nanosleep" takes req as Integer, rem as Integer returns Integer:
+Process called "openbsd_arm64_nanosleep" takes req as Integer, rem as Integer returns Integer:
     Note: Sleep for specified time
-    Return syscall_2(SYS_NANOSLEEP(), req, rem)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_NANOSLEEP(), req, rem)
 End Process
 
-Process called "clock_gettime" takes clk_id as Integer, tp as Integer returns Integer:
+Process called "openbsd_arm64_clock_gettime" takes clk_id as Integer, tp as Integer returns Integer:
     Note: Get clock time
-    Return syscall_2(SYS_CLOCK_GETTIME(), clk_id, tp)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_CLOCK_GETTIME(), clk_id, tp)
 End Process
 
-Process called "gettimeofday" takes tv as Integer, tz as Integer returns Integer:
+Process called "openbsd_arm64_gettimeofday" takes tv as Integer, tz as Integer returns Integer:
     Note: Get time of day
-    Return syscall_2(SYS_GETTIMEOFDAY(), tv, tz)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_GETTIMEOFDAY(), tv, tz)
 End Process
 
-Process called "kqueue" returns Integer:
+Process called "openbsd_arm64_kqueue" returns Integer:
     Note: Create kernel event queue
-    Return syscall_0(SYS_KQUEUE())
+    Return openbsd_arm64_syscall_0(openbsd_arm64_SYS_KQUEUE())
 End Process
 
-Process called "kevent" takes kq as Integer, changelist as Integer, nchanges as Integer, eventlist as Integer, nevents as Integer, timeout as Integer returns Integer:
+Process called "openbsd_arm64_kevent" takes kq as Integer, changelist as Integer, nchanges as Integer, eventlist as Integer, nevents as Integer, timeout as Integer returns Integer:
     Note: Kernel event notification mechanism
-    Return syscall_6(SYS_KEVENT(), kq, changelist, nchanges, eventlist, nevents, timeout)
+    Return openbsd_arm64_syscall_6(openbsd_arm64_SYS_KEVENT(), kq, changelist, nchanges, eventlist, nevents, timeout)
 End Process
 
 Note: OpenBSD-specific security syscalls
-Process called "pledge" takes promises as Integer, execpromises as Integer returns Integer:
+Process called "openbsd_arm64_pledge" takes promises as Integer, execpromises as Integer returns Integer:
     Note: Restrict system operations (OpenBSD security feature)
-    Return syscall_2(SYS_PLEDGE(), promises, execpromises)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_PLEDGE(), promises, execpromises)
 End Process
 
-Process called "unveil" takes path as Integer, permissions as Integer returns Integer:
+Process called "openbsd_arm64_unveil" takes path as Integer, permissions as Integer returns Integer:
     Note: Unveil filesystem (OpenBSD security feature)
-    Return syscall_2(SYS_UNVEIL(), path, permissions)
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_UNVEIL(), path, permissions)
+End Process
+
+Note: ============================================================================
+Note: DISPATCHER-NAMED SYSCALL WRAPPERS (syscall_<name> bare form)
+Note: ============================================================================
+
+@Reasoning
+The cross-platform syscall dispatcher exposes 10 `syscall_<name>` bare-name
+procs (syscall_read, syscall_write, syscall_open, syscall_close,
+syscall_exit, syscall_brk, syscall_mmap, syscall_munmap, syscall_fstat,
+syscall_lseek). Each platform module must export the same names so the
+dispatcher's bare-name routing can resolve to platform-correct ABI
+behaviour. On OpenBSD ARM64 each wrapper routes through the correct
+syscall_N generic dispatcher with the matching SYS_* number; the
+generic dispatcher loads X8 with the syscall number, X0..X5 with
+arguments, and issues `svc #0`.
+
+These are NOT duplicates of the lower-section POSIX-style `read`/`write`/
+`open`/... wrappers above: those use traditional POSIX short names for
+backward compatibility with v0.0.7.5-era Runa standard library code;
+the `syscall_<name>` forms below are what the platform-dispatch
+infrastructure expects per the P2-B design's "Per-platform syscall
+inventory" section. Both naming schemes coexist; callers select based
+on whether they need the historical POSIX name or the dispatcher-aware
+form.
+
+Source for OpenBSD ARM64 syscall numbers: OpenBSD `sys/sys/syscall.h`
+(numbers stable on the OpenBSD 7.x release series; arm64 inherits the
+asm-generic ARM64 SVC trap convention, so the same syscall numbers
+apply as on openbsd_x64 via the kernel's MD-independent syscall table).
+@End Reasoning
+
+@Implementation
+Each wrapper computes the syscall number via the matching SYS_* accessor
+(itself a constant return on openbsd_arm64) and forwards arguments to
+the `syscall_N` generic dispatcher matching the arity. The generic
+dispatcher loads X8 with the syscall number and X0..X5 with arguments,
+then issues `svc #0` and returns X0. Negative X0 values are OpenBSD-ABI
+errno indications which the wrapper propagates unchanged to the caller.
+
+Argument-passing convention (all values 64-bit on arm64):
+- syscall_read(fd, buf, count) -> SYS_READ(3) via syscall_3
+- syscall_write(fd, buf, count) -> SYS_WRITE(4) via syscall_3
+- syscall_open(path, flags, mode) -> SYS_OPEN(5) via syscall_3
+- syscall_close(fd) -> SYS_CLOSE(6) via syscall_1
+- syscall_exit(status) -> SYS_EXIT(1) via syscall_1 (whole-process exit)
+- syscall_brk(addr) -> SYS_BRK(17) via syscall_1 (routes to sys_obreak)
+- syscall_mmap(addr, len, prot, flags, fd, offset) -> SYS_MMAP(49) via syscall_6
+- syscall_munmap(addr, len) -> SYS_MUNMAP(73) via syscall_2
+- syscall_fstat(fd, statbuf) -> SYS_FSTAT(53) via syscall_2
+- syscall_lseek(fd, offset, whence) -> SYS_LSEEK(166) via syscall_3
+
+Note on SYS_OPEN: OpenBSD retains the historical `open(2)` syscall (5)
+alongside the newer `openat(2)` (287) — unlike linux_arm64 which has
+only openat. Callers of syscall_open on openbsd_arm64 get the legacy
+open path directly. For new code, prefer the openat-based path via
+syscall_openat() (the dispatcher's higher-level openat wrapper) to
+obtain unveil-aware relative-path resolution.
+
+Note on SYS_LSEEK: returns 64-bit offset directly (no off64_t/llseek
+distinction needed on a 64-bit ABI like arm64; the X0 register is 64
+bits wide). The whence argument uses SEEK_SET/SEEK_CUR/SEEK_END
+constants defined above.
+
+Note on SYS_MMAP: OpenBSD's mmap entry (49) uses the modern 6-argument
+form with byte-aligned offset (NOT page-aligned like Linux mmap2).
+W^X enforcement: OpenBSD will reject `PROT_WRITE|PROT_EXEC` mappings
+for non-static-binary callers; use PROT_READ|PROT_WRITE then mprotect
+to PROT_READ|PROT_EXEC after content write.
+@End Implementation
+
+@Performance_Hints
+Each wrapper compiles down to: load constant syscall number, marshal
+arguments through stack frame to X0..X5/X8, issue `svc #0`. Total cost
+is dominated by the kernel-mode trap, not the wrapper's Runa-level
+indirection. The wrapper itself adds 2-3 instructions of glue beyond
+the generic syscall_N body. Do not introduce caching or memoisation;
+syscalls are not pure functions and the kernel cost dominates.
+
+For hot-path syscall sites (e.g. read/write in tight I/O loops), prefer
+calling the generic `syscall_3` directly with the SYS_* constant
+inlined, avoiding the intermediate wrapper. The wrapper exists for
+dispatcher contract compliance, not as a recommended fast-path entry.
+
+OpenBSD-specific: the kernel's syscall entry path performs `pledge`
+and `unveil` enforcement; pledged programs see additional kernel-side
+checks before the actual syscall body runs. For latency-sensitive
+syscall loops on pledged programs, ensure the requested promise set
+is the smallest set that satisfies the program's needs, which keeps
+the kernel-side validation table compact.
+@End Performance_Hints
+
+@Security_Scope
+File-descriptor and pointer arguments are passed verbatim to the
+OpenBSD kernel. The wrapper performs no validation; the kernel enforces
+all access controls (UID/GID, file mode, mount restrictions, pledge
+promises, unveil paths). Callers must NOT use these wrappers to issue
+syscalls on behalf of an untrusted source without `pledge()` /
+`unveil()` confinement at the process level.
+
+In particular:
+- syscall_open: untrusted `path` strings traverse the filesystem
+  subject only to DAC and unveil restrictions; sandboxed callers
+  must establish an unveil path set before invoking, or rely on
+  pledge("rpath wpath cpath") to limit reachable operations.
+- syscall_mmap with PROT_EXEC: W^X violation; OpenBSD will reject
+  PROT_WRITE|PROT_EXEC for dynamic content (the kernel enforces
+  W^X by default and only static binaries / properly-signed code
+  pages get a waiver). Callers requiring executable memory should
+  mmap PROT_READ|PROT_WRITE first, write content, then mprotect to
+  PROT_READ|PROT_EXEC.
+- syscall_exit: terminates the entire process on OpenBSD (the kernel
+  does whole-task teardown; OpenBSD has no per-thread exit syscall
+  in the Linux sense — use SYS_THREXIT(302) for thread-only exit).
+- syscall_brk on OpenBSD invokes sys_obreak (the legacy 4.3BSD heap-
+  break path); modern OpenBSD libc uses mmap, not obreak. Avoid
+  brk in new code.
+
+Errno propagation: kernel returns -errno in X0 for failure. The wrapper
+returns this verbatim; positive values are syscall results (e.g. byte
+counts, file descriptors, addresses). Caller MUST check sign of return
+value before treating it as a syscall result. The OpenBSD ABI also
+sets the CPSR carry flag on error (legacy mechanism); negative-return
+check is the recommended portable test.
+@End Security_Scope
+Process called "openbsd_arm64_syscall_read" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+    Note: Read from file descriptor; routes through SYS_READ (3) on openbsd_arm64
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_READ(), fd, buffer, count)
+End Process
+
+Process called "openbsd_arm64_syscall_write" takes fd as Integer, buffer as Integer, count as Integer returns Integer:
+    Note: Write to file descriptor; routes through SYS_WRITE (4) on openbsd_arm64
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_WRITE(), fd, buffer, count)
+End Process
+
+Process called "openbsd_arm64_syscall_open" takes filename as Integer, flags as Integer, mode as Integer returns Integer:
+    Note: Open file; routes through SYS_OPEN (5) on openbsd_arm64 (legacy open retained)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_OPEN(), filename, flags, mode)
+End Process
+
+Process called "openbsd_arm64_syscall_close" takes fd as Integer returns Integer:
+    Note: Close file descriptor; routes through SYS_CLOSE (6) on openbsd_arm64
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_CLOSE(), fd)
+End Process
+
+Process called "openbsd_arm64_syscall_exit" takes status as Integer returns Integer:
+    Note: Terminate process; routes through SYS_EXIT (1) on openbsd_arm64 (whole-process)
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_EXIT(), status)
+End Process
+
+Process called "openbsd_arm64_syscall_brk" takes addr as Integer returns Integer:
+    Note: Adjust program break; routes through SYS_BRK / sys_obreak (17) on openbsd_arm64
+    Return openbsd_arm64_syscall_1(openbsd_arm64_SYS_BRK(), addr)
+End Process
+
+Process called "openbsd_arm64_syscall_mmap" takes addr as Integer, length as Integer, prot as Integer, flags as Integer, fd as Integer, offset as Integer returns Integer:
+    Note: Map memory; routes through SYS_MMAP (49) on openbsd_arm64 (W^X-enforced)
+    Return openbsd_arm64_syscall_6(openbsd_arm64_SYS_MMAP(), addr, length, prot, flags, fd, offset)
+End Process
+
+Process called "openbsd_arm64_syscall_munmap" takes addr as Integer, length as Integer returns Integer:
+    Note: Unmap memory; routes through SYS_MUNMAP (73) on openbsd_arm64
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_MUNMAP(), addr, length)
+End Process
+
+Process called "openbsd_arm64_syscall_fstat" takes fd as Integer, statbuf as Integer returns Integer:
+    Note: Get file status by fd; routes through SYS_FSTAT (53) on openbsd_arm64
+    Return openbsd_arm64_syscall_2(openbsd_arm64_SYS_FSTAT(), fd, statbuf)
+End Process
+
+Process called "openbsd_arm64_syscall_lseek" takes fd as Integer, offset as Integer, whence as Integer returns Integer:
+    Note: Reposition file offset; routes through SYS_LSEEK (166) on openbsd_arm64 (64-bit offset)
+    Return openbsd_arm64_syscall_3(openbsd_arm64_SYS_LSEEK(), fd, offset, whence)
 End Process
