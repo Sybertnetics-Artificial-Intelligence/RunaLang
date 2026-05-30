@@ -4,611 +4,1174 @@ Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-WINDOWS_ARM64 THREADING - Win32 API implementation
-Uses NT syscalls from ntdll.dll for all threading operations
+WINDOWS ARM64 THREADING - Win32 API implementation
+
+Implements the 33-proc threading API for Windows running on ARM64 (AArch64)
+using the Win32 API surface exposed by kernel32.dll. Per the P2-B Decision 4
+design ratification, no raw NT syscalls are issued from this file; all kernel
+work is routed through Microsoft-documented kernel32 entry points via the
+api_* wrappers in compiler/frontend/primitives/platform/windows_arm64/syscall.runa.
+
+Win32 API surface used:
+  CreateThread                 -> thread_create
+  WaitForSingleObject + CloseHandle -> thread_join
+  CloseHandle                  -> thread_detach
+  ExitThread                   -> thread_exit
+  GetCurrentThreadId           -> thread_current_id
+  SwitchToThread               -> thread_yield
+  Sleep                        -> thread_sleep
+  SetThreadDescription         -> thread_set_name
+  (none / sentinel)            -> thread_get_name (matches Linux pilot semantics)
+  InitializeSRWLock /          -> mutex_create
+    AcquireSRWLockExclusive /  -> mutex_lock
+    ReleaseSRWLockExclusive /  -> mutex_unlock
+    TryAcquireSRWLockExclusive -> mutex_try_lock
+  CreateSemaphoreA /           -> semaphore_create
+    WaitForSingleObject /      -> semaphore_wait, semaphore_try_wait
+    ReleaseSemaphore /         -> semaphore_signal
+    CloseHandle                -> semaphore_destroy
+  InitializeConditionVariable /                -> condvar_create
+    SleepConditionVariableSRW /                -> condvar_wait, condvar_timed_wait
+    WakeConditionVariable / WakeAllConditionVariable -> condvar_signal, condvar_broadcast
+  SRWLOCK shared/exclusive     -> rwlock_*
+  GetSystemInfo                -> hardware_concurrency
+
+Reference documentation:
+  Win32 Threading: https://learn.microsoft.com/windows/win32/api/processthreadsapi/
+  Synchronization: https://learn.microsoft.com/windows/win32/api/synchapi/
+  System Info:     https://learn.microsoft.com/windows/win32/api/sysinfoapi/
+  Microsoft ARM64 ABI:       https://learn.microsoft.com/cpp/build/arm64-windows-abi-conventions
 :End Note
 
 Import "compiler/frontend/primitives/assembly/syscall.runa" as Syscall
+Import "compiler/frontend/primitives/platform/windows_arm64/syscall.runa" as WinAPI
 Import "compiler/frontend/primitives/memory/layout.runa" as Memory
-Import "compiler/frontend/primitives/core/atomic_core.runa" as Atomic
 
-Note: Windows NT syscalls (syscall numbers vary by Windows version, using Windows 10 x64)
-Note: NtCreateThreadEx = 0xC5, NtWaitForSingleObject = 0x04, NtClose = 0x0F
-Note: NtDelayExecution = 0x34
+Note:
+============================================================================
+THREAD CREATION
+============================================================================
+:End Note
 
 Process called "thread_create" takes function_ptr as Integer, arg_ptr as Integer returns Integer:
-    Note: NtCreateThreadEx - create new thread
-    Note: Syscall 0xC5 (Windows 10 ARM64): NtCreateThreadEx
-    Note: .
-    Note: Signature:
-    Note: NTSTATUS NtCreateThreadEx(
-    Note:   OUT PHANDLE ThreadHandle,
-    Note:   IN ACCESS_MASK DesiredAccess,
-    Note:   IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
-    Note:   IN HANDLE ProcessHandle,
-    Note:   IN PVOID StartRoutine,
-    Note:   IN PVOID Argument OPTIONAL,
-    Note:   IN ULONG CreateFlags,
-    Note:   IN SIZE_T ZeroBits,
-    Note:   IN SIZE_T StackSize,
-    Note:   IN SIZE_T MaximumStackSize,
-    Note:   IN PPS_ATTRIBUTE_LIST AttributeList OPTIONAL
-    Note: )
+    @Reasoning
+    Create a new thread on Windows ARM64 using kernel32!CreateThread.
+    Per the Microsoft Win32 documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createthread)
+    CreateThread receives the start routine and a single LPVOID parameter
+    and returns a HANDLE the parent uses to join, terminate, or duplicate
+    the new thread.
 
-    Note: Allocate handle storage (8 bytes for HANDLE)
-    Let handle_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
-    If handle_ptr is less than 0:
-        Return 0
-    End If
+    Per the P2-B Decision 4 design, we do NOT build a manual clone
+    trampoline as the Linux pilot does - Windows already handles the
+    arg-marshalling, stack setup, TEB initialization, and DllMain
+    DLL_THREAD_ATTACH notifications inside CreateThread. The user function
+    receives arg_ptr as its single argument (X0 under Microsoft ARM64 ABI), and
+    when it returns Windows invokes ExitThread on its behalf to release
+    the stack and signal the handle.
 
-    Note: Initialize handle to 0
-    proc memory_set_int64 from Memory with handle_ptr, 0, 0
+    Contract: returns the HANDLE (a positive integer) on success or 0 on
+    failure. Caller passes the HANDLE to thread_join / thread_detach.
+    @End Reasoning
 
-    Note: NtCreateThreadEx parameters
-    Let desired_access be 2097151  Note: THREAD_ALL_ACCESS (0x1FFFFF)
-    Let object_attributes be 0  Note: NULL minus no special attributes
-    Let process_handle be -1  Note: -1 = NtCurrentProcess()
-    Let create_flags be 0  Note: 0 = run immediately (not CREATE_SUSPENDED)
-    Let zero_bits be 0  Note: No specific address requirements
-    Let stack_size be 0  Note: 0 = default stack size (1MB typically)
-    Let max_stack_size be 0  Note: 0 = default maximum stack size
-    Let attribute_list be 0  Note: NULL minus no additional attributes
+    @Implementation
+    Single api_create_thread call with all six CreateThread parameters:
+      thread_attributes = 0       (NULL = default security descriptor)
+      stack_size        = 0       (use PE-header default, typically 1 MiB
+                                   reserved, 64 KiB committed)
+      start_address     = function_ptr (LPTHREAD_START_ROUTINE)
+      parameter         = arg_ptr      (LPVOID delivered to start_address)
+      creation_flags    = 0       (run immediately - no CREATE_SUSPENDED)
+      thread_id_ptr     = 0       (we do not need the DWORD tid out-param;
+                                   the HANDLE is sufficient for all Runa
+                                   threading ops)
+    Returns the HANDLE produced by CreateThread directly.
+    @End Implementation
 
-    Note: Call NtCreateThreadEx (syscall 0xC5 = 197 decimal)
-    Note: Windows ARM64 uses ARM64 calling convention
-    Note: Parameters: x0-x7 for first 8 args, stack for remaining
-    Note: We use syscall_11 for 11 parameters
-    Let result be proc syscall_11 from Syscall with 197, handle_ptr, desired_access, object_attributes, process_handle, function_ptr, arg_ptr, create_flags, zero_bits, stack_size, max_stack_size, attribute_list
+    @Performance_Hints
+    CreateThread end-to-end cost is dominated by the kernel object
+    allocation + initial thread-stack reservation, typically 10-50
+    microseconds on modern hardware. The PE-default stack reservation
+    (1 MiB) does NOT commit physical memory until the thread touches it,
+    so the cost is constant regardless of the eventual stack usage.
+    @End Performance_Hints
 
-    Note: Check if syscall succeeded (STATUS_SUCCESS = 0)
-    If result is not equal to 0:
-        Note: Thread creation failed, free handle storage
-        proc syscall_munmap from Syscall with handle_ptr, 8
-        Return 0
-    End If
+    @Security_Scope
+    The new thread inherits the parent process's primary token, handle
+    table, and address space - same isolation semantics as a clone() with
+    CLONE_VM | CLONE_FILES on POSIX. Sandboxed callers must apply any
+    AppContainer / Job Object restrictions in the parent BEFORE invoking
+    thread_create; the child inherits the parent's restriction set.
 
-    Note: Read the created thread handle
-    Let thread_handle be proc memory_get_int64 from Memory with handle_ptr, 0
+    Default security descriptor (thread_attributes = 0) grants
+    THREAD_ALL_ACCESS to the parent only. Other processes can open the
+    thread handle only with the rights granted by the descriptor.
+    @End Security_Scope
 
-    Note: Free temporary handle storage and return the handle value
-    proc syscall_munmap from Syscall with handle_ptr, 8
-    Return thread_handle
+    Return proc windows_arm64_api_create_thread from WinAPI with 0, 0, function_ptr, arg_ptr, 0, 0
 End Process
 
+Note:
+============================================================================
+THREAD LIFECYCLE
+============================================================================
+:End Note
+
 Process called "thread_join" takes handle as Integer returns Integer:
-    Note: NtWaitForSingleObject(handle, FALSE, NULL) - INFINITE wait
-    Note: Syscall 0x04: NtWaitForSingleObject
-    Let alertable be 0
-    Let timeout_ptr be 0
-    proc syscall_3 from Syscall with 4, handle, alertable, timeout_ptr
+    @Reasoning
+    Block the calling thread until the target thread (identified by its
+    HANDLE) terminates, then release the kernel-object reference. Per
+    Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+    a thread HANDLE becomes signalled when the thread exits via return,
+    ExitThread, or TerminateThread. WaitForSingleObject with INFINITE
+    timeout blocks until that signal fires; CloseHandle then decrements
+    the refcount so the kernel object can be reclaimed.
+    @End Reasoning
+
+    @Implementation
+    Two-step sequence:
+      1. WaitForSingleObject(handle, INFINITE = 0xFFFFFFFF = -1 as
+         signed int64). Returns WAIT_OBJECT_0 (0) on signal,
+         WAIT_FAILED (-1 as DWORD) on error.
+      2. CloseHandle(handle) to release the parent's reference.
+    Both steps go through api_* wrappers; no direct syscalls.
+    @End Implementation
+
+    @Performance_Hints
+    Pure kernel-blocking call; the joining thread is descheduled until
+    the target exits. No spin, no userspace polling. CloseHandle is
+    constant-time once the wait completes.
+    @End Performance_Hints
+
+    @Security_Scope
+    The HANDLE must carry SYNCHRONIZE (0x00100000) access for the wait
+    to succeed; CreateThread returns a handle with THREAD_ALL_ACCESS
+    which always includes SYNCHRONIZE.
+    @End Security_Scope
+
+    Let infinite_ms be -1
+    proc windows_arm64_api_wait_for_single_object from WinAPI with handle, infinite_ms
+    proc windows_arm64_api_close_handle from WinAPI with handle
     Return 1
 End Process
 
 Process called "thread_detach" takes handle as Integer returns Integer:
-    Note: NtClose(handle)
-    proc syscall_1 from Syscall with 15, handle
+    @Reasoning
+    Release the parent's reference to the thread HANDLE without waiting
+    for the thread to exit. On Windows this maps directly to CloseHandle
+    - the kernel keeps the thread object alive as long as the thread is
+    running, but the parent loses its handle and forfeits the ability to
+    join, terminate, or query the thread later.
+
+    Differs from the Linux pilot, where detach is a no-op because the
+    POSIX kernel auto-reaps threads with no joiner. On Windows the
+    parent's HANDLE counts as a refcount and must be released explicitly.
+    @End Reasoning
+
+    @Implementation
+    Single api_close_handle call. Returns 1 on success path. CloseHandle
+    failures (invalid handle) are not propagated - the Linux pilot has
+    no error path either, and the Runa thread_detach contract returns
+    only a boolean success indicator.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-microsecond; one library call into kernel32 that decrements the
+    refcount.
+    @End Performance_Hints
+
+    @Security_Scope
+    No additional privileges; the handle was already owned by the caller.
+    @End Security_Scope
+
+    proc windows_arm64_api_close_handle from WinAPI with handle
     Return 1
 End Process
 
 Process called "thread_exit" takes exit_code as Integer returns Integer:
-    Note: NtTerminateThread(NULL, exit_code) - NULL = current thread
-    proc syscall_2 from Syscall with 83, 0, exit_code
-    Return 0
+    @Reasoning
+    Terminate the calling thread immediately with the supplied exit_code,
+    invoking the full Win32 thread-teardown sequence: DLL_THREAD_DETACH
+    DllMain notifications, FLS destructors, stack release, and HANDLE
+    signal. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitthread)
+    this is the SAFE way to end a thread - TerminateThread is the
+    dangerous variant that skips cleanup.
+    @End Reasoning
+
+    @Implementation
+    Single api_exit_thread call. ExitThread does not return; the post-
+    call Return statement exists only for Runa Process-signature
+    conformance.
+    @End Implementation
+
+    @Performance_Hints
+    One library call that runs DllMain DLL_THREAD_DETACH for every loaded
+    DLL. The cost scales with the number of loaded DLLs - typically a
+    few microseconds on a stock process, more under heavy DLL use.
+    @End Performance_Hints
+
+    @Security_Scope
+    Affects only the calling thread; siblings continue running.
+    @End Security_Scope
+
+    Return proc windows_arm64_api_exit_thread from WinAPI with exit_code
 End Process
 
 Process called "thread_current_id" returns Integer:
-    Note: Get current thread ID from TEB (Thread Environment Block)
-    Note: TEB is accessed via x18 register on ARM64 Windows
-    Note: ClientId.UniqueThread is at offset 0x48 in TEB
-    Note: .
-    Note: In ARM64 assembly: ldr x0, [x18, #0x48]
-    Note: We use compiler intrinsic to read TEB
+    @Reasoning
+    Return the kernel thread ID (TID) of the calling thread. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthreadid)
+    GetCurrentThreadId reads the ClientId.UniqueThread field of the
+    current thread's TEB and returns it as a DWORD. Distinct from the
+    process ID and from the thread HANDLE - the TID is a stable, kernel-
+    assigned integer that survives handle close and is the value
+    debuggers, ETW, and performance counters use to identify threads.
+    @End Reasoning
 
-    Note: Read TEB ClientId.UniqueThread (offset 0x48)
-    Let tid be proc __builtin_read_teb_qword with 72  Note: 0x48 = 72 decimal
-    Return tid
+    @Implementation
+    Single api_get_current_thread_id call. No arguments; result returned
+    directly.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-100ns; kernel32 inlines the TEB read on Windows 10+. No syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    No permissions required; the TID is always observable by the thread
+    itself.
+    @End Security_Scope
+
+    Return proc windows_arm64_api_get_current_thread_id from WinAPI
 End Process
 
 Process called "thread_yield" returns Integer:
-    Note: NtYieldExecution (syscall 0x46)
-    proc syscall_0 from Syscall with 70
-    Return 1
+    @Reasoning
+    Voluntarily yield the remainder of the calling thread's scheduling
+    quantum. Used by cooperative spin-loops and busy-wait fallback paths.
+    Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-switchtothread)
+    SwitchToThread is preferred over Sleep(0) because it restricts the
+    candidate set to threads on the SAME processor, avoiding cross-core
+    migration costs that Sleep(0) can incur.
+    @End Reasoning
+
+    @Implementation
+    Single api_switch_to_thread call. Returns nonzero if a context switch
+    occurred, zero if no other ready thread was available.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-microsecond when another runnable thread exists; near-zero when
+    the run queue is empty.
+    @End Performance_Hints
+
+    @Security_Scope
+    Affects only the caller's scheduling state.
+    @End Security_Scope
+
+    Return proc windows_arm64_api_switch_to_thread from WinAPI
 End Process
 
 Process called "thread_sleep" takes microseconds as Integer returns Integer:
-    Note: NtDelayExecution - sleep for specified time
-    Note: Syscall 0x34: NtDelayExecution(Alertable, DelayInterval)
+    @Reasoning
+    Sleep the calling thread for the requested duration. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-sleep)
+    kernel32!Sleep takes a millisecond count; we round the supplied
+    microsecond count to the nearest millisecond (with a floor of 1 ms
+    for any nonzero microsecond input to avoid the Sleep(0) yield-only
+    semantics when the caller actually wanted a sleep).
+
+    Differs from the Linux pilot which uses nanosleep with a timespec
+    pointer; Windows's API takes the timeout inline as a DWORD so no
+    auxiliary allocation is needed.
+    @End Reasoning
+
+    @Implementation
+    1. Convert microseconds to milliseconds (integer divide).
+    2. If the caller asked for any nonzero microseconds but the integer
+       divide rounded to 0, force 1 ms so the call genuinely sleeps
+       instead of degenerating to Sleep(0) (which only yields).
+    3. Invoke api_sleep with the resolved millisecond count.
+    @End Implementation
+
+    @Performance_Hints
+    Sleep precision depends on the system timer resolution (typically
+    15.625 ms on a default Windows desktop, down to 1 ms under
+    timeBeginPeriod). For tight sub-millisecond pacing prefer spinning
+    on QueryPerformanceCounter.
+    @End Performance_Hints
+
+    @Security_Scope
+    No special privileges; Sleep is unrestricted.
+    @End Security_Scope
 
     Let milliseconds be microseconds divided by 1000
-    Let nanoseconds_100 be milliseconds multiplied by 10000  Note: Windows uses 100-nanosecond intervals
-    Let negative_delay be -nanoseconds_100  Note: Negative = relative time
-
-    Note: Allocate LARGE_INTEGER (8 bytes)
-    Let delay_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
-    If delay_ptr is less than 0:
-        Return -1
+    If microseconds is greater than 0:
+        If milliseconds is equal to 0:
+            Set milliseconds to 1
+        End If
     End If
-
-    proc memory_set_int64 from Memory with delay_ptr, 0, negative_delay
-
-    Note: NtDelayExecution(Alertable=FALSE, DelayInterval)
-    Let alertable be 0
-    proc syscall_2 from Syscall with 52, alertable, delay_ptr
-
-    proc syscall_munmap from Syscall with delay_ptr, 8
+    proc windows_arm64_api_sleep from WinAPI with milliseconds
     Return 1
 End Process
 
 Process called "thread_set_name" takes name as Integer returns Integer:
-    Note: SetThreadDescription() - not critical, return success
-    Return 1
+    @Reasoning
+    Set a human-readable name for the calling thread, observable in
+    debuggers, performance tools, and ETW traces. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreaddescription)
+    SetThreadDescription accepts a wide-character (UTF-16) string; we
+    accept an opaque pointer Integer because Runa's String layout above
+    this primitive is responsible for encoding.
+
+    Uses the current thread pseudo-handle (-2 as signed int64 =
+    0xFFFFFFFFFFFFFFFE in DWORD-style truncation), which kernel32
+    interprets as the calling thread.
+    @End Reasoning
+
+    @Implementation
+    Two-argument api_set_thread_description call:
+      thread_handle = -2 (GetCurrentThread() pseudo-handle)
+      description   = name (caller-supplied LPCWSTR)
+    Returns HRESULT; we forward as-is. S_OK (0) means success.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-microsecond; the descriptor is stored in the thread's kernel
+    object. Called rarely (typically once per thread creation).
+    @End Performance_Hints
+
+    @Security_Scope
+    The pseudo-handle grants full access to the calling thread, so the
+    THREAD_SET_LIMITED_INFORMATION requirement is automatically satisfied.
+    @End Security_Scope
+
+    Let current_thread_pseudo be -2
+    Return proc windows_arm64_api_set_thread_description from WinAPI with current_thread_pseudo, name
 End Process
 
 Process called "thread_get_name" returns Integer:
+    @Reasoning
+    Windows exposes thread names via GetThreadDescription, but the API
+    requires a caller-supplied PWSTR* output parameter that LocalFree's
+    a heap-allocated buffer. To preserve the 33-proc dispatcher
+    signature (returns Integer, no out-parameter), this implementation
+    returns 0 as the same sentinel the Linux pilot uses. Callers who
+    need the name should invoke api_get_thread_description directly
+    (a future API addition if needed).
+    @End Reasoning
+
+    @Implementation
+    Return 0 unconditionally. Matches the Linux pilot contract.
+    @End Implementation
+
+    @Performance_Hints
+    Zero cost; no syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    No kernel transition.
+    @End Security_Scope
+
     Return 0
 End Process
 
-Note: Mutex operations (using CRITICAL_SECTION structure)
+Note:
+============================================================================
+MUTEX (Slim Reader/Writer Lock in exclusive mode)
+============================================================================
+:End Note
 
 Process called "mutex_create" returns Integer:
-    Note: CRITICAL_SECTION is 40 bytes on x64
-    Let cs_ptr be proc syscall_mmap from Syscall with 0, 40, 3, 34, -1, 0
-    If cs_ptr is less than 0:
+    @Reasoning
+    Allocate an 8-byte SRWLOCK (single pointer-sized opaque value) and
+    initialize it to the released, no-waiters state. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/sync/slim-reader-writer--srw--locks)
+    SRWLOCK is the modern Win32 lock primitive: pointer-sized footprint
+    (vs CRITICAL_SECTION's 40 bytes), no kernel-object allocation, and a
+    faster uncontended fast path. Used in exclusive mode for the
+    mutex API.
+
+    Returns the lock pointer (handle); 0 on mmap failure.
+    @End Reasoning
+
+    @Implementation
+    1. mmap 8 bytes (PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS)
+       via the generic syscall_mmap dispatcher.
+    2. Call api_initialize_srwlock to set the lock to RTL_SRWLOCK_INIT
+       (a zero pointer).
+    3. Return the lock pointer.
+    @End Implementation
+
+    @Performance_Hints
+    One mmap call (~5 us) per mutex creation. The InitializeSRWLock call
+    is sub-100ns. Callers creating many mutexes should batch into an
+    arena.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mapping is process-private (MAP_PRIVATE | MAP_ANONYMOUS); no cross-
+    process leakage of the lock word.
+    @End Security_Scope
+
+    Let lock_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
+    If lock_ptr is less than 0:
         Return 0
     End If
-
-    Note: Initialize CRITICAL_SECTION fields
-    Note: DebugInfo = NULL, LockCount = -1, RecursionCount = 0, OwningThread = 0
-    proc memory_set_int64 from Memory with cs_ptr, 0, 0   Note: DebugInfo
-    proc memory_set_int32 from Memory with cs_ptr, 8, -1  Note: LockCount
-    proc memory_set_int32 from Memory with cs_ptr, 12, 0  Note: RecursionCount
-    proc memory_set_int64 from Memory with cs_ptr, 16, 0  Note: OwningThread
-    proc memory_set_int64 from Memory with cs_ptr, 24, 0  Note: LockSemaphore
-    proc memory_set_int64 from Memory with cs_ptr, 32, 0  Note: SpinCount
-
-    Return cs_ptr
+    proc windows_arm64_api_initialize_srwlock from WinAPI with lock_ptr
+    Return lock_ptr
 End Process
 
 Process called "mutex_destroy" takes handle as Integer returns Integer:
-    proc syscall_munmap from Syscall with handle, 40
-    Return 1
+    @Reasoning
+    Release the 8-byte SRWLOCK mapping. SRWLOCK requires no explicit
+    teardown call - per Microsoft documentation it is "self-destroying"
+    once no thread holds or waits on it. Caller MUST ensure no other
+    thread is contending; destroying a held SRWLOCK is undefined
+    behaviour.
+    @End Reasoning
+
+    @Implementation
+    Single syscall_munmap(handle, 8) call.
+    @End Implementation
+
+    @Performance_Hints
+    One munmap syscall (~5 us).
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller owns the mapping.
+    @End Security_Scope
+
+    Return proc syscall_munmap from Syscall with handle, 8
 End Process
 
 Process called "mutex_lock" takes handle as Integer returns Integer:
-    Note: EnterCriticalSection - acquire lock
-    Note: Use atomic operations on LockCount field (offset 8)
-    Let lock_count_ptr be handle plus 8
+    @Reasoning
+    Acquire the mutex (SRWLOCK in exclusive mode), blocking if a
+    contender holds it. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-acquiresrwlockexclusive)
+    AcquireSRWLockExclusive is non-recursive: re-entry from the holder
+    thread is undefined behaviour. Callers needing recursion should use
+    a higher-level reentrant lock layered on top.
+    @End Reasoning
 
-    While 1 is equal to 1:
-        Let old_count be proc atomic_fetch_add from Atomic with lock_count_ptr, 1
-        If old_count is equal to -1:
-            Note: Lock acquired
-            Let tid be thread_current_id()
-            proc memory_set_int64 from Memory with handle, 16, tid  Note: Set OwningThread
-            Return 1
-        End If
+    @Implementation
+    Single api_acquire_srwlock_exclusive call. Returns 1 once the lock
+    is held.
+    @End Implementation
 
-        Note: Lock is held, wait briefly
-        thread_yield()
-    End While
+    @Performance_Hints
+    Uncontended acquire is ~10 ns. Contended path descends into the
+    kernel via keyed-event wait (~1 microsecond).
+    @End Performance_Hints
 
+    @Security_Scope
+    Process-private lock; no cross-process contention.
+    @End Security_Scope
+
+    proc windows_arm64_api_acquire_srwlock_exclusive from WinAPI with handle
     Return 1
 End Process
 
 Process called "mutex_unlock" takes handle as Integer returns Integer:
-    Note: LeaveCriticalSection - release lock
-    proc memory_set_int64 from Memory with handle, 16, 0  Note: Clear OwningThread
+    @Reasoning
+    Release the exclusive hold on the SRWLOCK and wake the next queued
+    waiter (writer or reader cohort depending on queue order). Per
+    Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-releasesrwlockexclusive)
+    pairs 1:1 with AcquireSRWLockExclusive - releasing a lock not held
+    exclusively is undefined behaviour.
+    @End Reasoning
 
-    Let lock_count_ptr be handle plus 8
-    proc atomic_fetch_add from Atomic with lock_count_ptr, -1
-    proc memory_barrier_release from Atomic
+    @Implementation
+    Single api_release_srwlock_exclusive call.
+    @End Implementation
 
+    @Performance_Hints
+    Uncontended release is ~5 ns. Contended path wakes the next waiter
+    via NtReleaseKeyedEvent.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must hold the lock exclusively.
+    @End Security_Scope
+
+    proc windows_arm64_api_release_srwlock_exclusive from WinAPI with handle
     Return 1
 End Process
 
 Process called "mutex_try_lock" takes handle as Integer returns Integer:
-    Note: TryEnterCriticalSection - try to acquire without blocking
-    Let lock_count_ptr be handle plus 8
-    Let expected be -1
-    Let success be proc atomic_compare_and_swap from Atomic with lock_count_ptr, expected, 0
+    @Reasoning
+    Non-blocking exclusive acquire. Returns 1 on success, 0 if a
+    contender holds the lock. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-tryacquiresrwlockexclusive)
+    succeeds atomically without descending into the kernel.
+    @End Reasoning
 
-    If success is equal to 1:
-        Let tid be thread_current_id()
-        proc memory_set_int64 from Memory with handle, 16, tid
-    End If
+    @Implementation
+    Single api_try_acquire_srwlock_exclusive call; return its BOOLEAN
+    result.
+    @End Implementation
 
-    Return success
+    @Performance_Hints
+    Constant-time, no syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    No kernel transition.
+    @End Security_Scope
+
+    Return proc windows_arm64_api_try_acquire_srwlock_exclusive from WinAPI with handle
 End Process
 
-Note: Semaphore operations
+Note:
+============================================================================
+SEMAPHORE (kernel-object counting semaphore)
+============================================================================
+:End Note
 
 Process called "semaphore_create" takes initial_count as Integer returns Integer:
-    Note: Allocate 8 bytes: 4 for count, 4 for max_count
-    Let sem_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
-    If sem_ptr is less than 0:
-        Return 0
-    End If
+    @Reasoning
+    Create a kernel-object counting semaphore. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-createsemaphorea)
+    the semaphore is signalled while its internal count is greater than
+    zero. WaitForSingleObject decrements the count by one when it
+    succeeds; ReleaseSemaphore increments by a caller-supplied amount.
+    The maximum count is set to LONG_MAX (2147483647) to permit
+    unbounded signals.
 
-    proc memory_set_int32 from Memory with sem_ptr, 0, initial_count
-    proc memory_set_int32 from Memory with sem_ptr, 4, 2147483647  Note: MAX_LONG
+    Returns the semaphore HANDLE; 0 on failure.
+    @End Reasoning
 
-    Return sem_ptr
+    @Implementation
+    Single api_create_semaphore call:
+      security_attributes = 0       (NULL - default descriptor)
+      initial_count       = caller-supplied
+      maximum_count       = 2147483647 (LONG_MAX)
+      name_ptr            = 0       (anonymous - process-private)
+    @End Implementation
+
+    @Performance_Hints
+    Single kernel-object creation; ~10 microseconds typical. Anonymous
+    semaphores avoid the named-object namespace lookup.
+    @End Performance_Hints
+
+    @Security_Scope
+    Anonymous semaphore is process-private. Default security descriptor
+    grants SEMAPHORE_ALL_ACCESS to the creator only.
+    @End Security_Scope
+
+    Let long_max be 2147483647
+    Return proc windows_arm64_api_create_semaphore from WinAPI with 0, initial_count, long_max, 0
 End Process
 
 Process called "semaphore_destroy" takes handle as Integer returns Integer:
-    proc syscall_munmap from Syscall with handle, 8
+    @Reasoning
+    Release the semaphore kernel object via CloseHandle. Caller must
+    ensure no thread is blocked on the semaphore via WaitForSingleObject;
+    Microsoft documents the behaviour as undefined if waiters remain.
+    @End Reasoning
+
+    @Implementation
+    Single api_close_handle call.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-microsecond.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller owns the handle.
+    @End Security_Scope
+
+    proc windows_arm64_api_close_handle from WinAPI with handle
     Return 1
 End Process
 
 Process called "semaphore_wait" takes handle as Integer returns Integer:
-    Note: Decrement semaphore, wait if zero
-    While 1 is equal to 1:
-        Let current be proc memory_get_int32 from Memory with handle, 0
-        If current is greater than 0:
-            Let old_val be proc atomic_fetch_add from Atomic with handle, -1
-            If old_val is greater than 0:
-                Return 1
-            End If
-            proc atomic_fetch_add from Atomic with handle, 1  Note: Restore on race
-        End If
-        thread_yield()
-    End While
+    @Reasoning
+    Decrement the semaphore's internal count by one, blocking if the
+    count is zero. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+    WaitForSingleObject with INFINITE timeout performs the decrement
+    atomically when the semaphore becomes signalled.
+    @End Reasoning
 
+    @Implementation
+    Single api_wait_for_single_object call with INFINITE timeout
+    (0xFFFFFFFF = -1 as signed int64).
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended: ~100 ns (kernel32 fast path). Blocked: kernel descheduling.
+    @End Performance_Hints
+
+    @Security_Scope
+    Handle must carry SYNCHRONIZE access (granted by default to
+    semaphores created via api_create_semaphore).
+    @End Security_Scope
+
+    Let infinite_ms be -1
+    proc windows_arm64_api_wait_for_single_object from WinAPI with handle, infinite_ms
     Return 1
 End Process
 
 Process called "semaphore_signal" takes handle as Integer returns Integer:
-    Note: Increment semaphore
-    proc atomic_fetch_add from Atomic with handle, 1
+    @Reasoning
+    Increment the semaphore's internal count by one, waking at most one
+    waiter if the prior count was zero. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-releasesemaphore)
+    the call fails (returns 0) if incrementing would exceed the
+    semaphore's maximum_count - with our LONG_MAX ceiling that effectively
+    never happens.
+    @End Reasoning
+
+    @Implementation
+    Single api_release_semaphore call with release_count = 1 and
+    previous_count_ptr = 0 (we do not need the prior value).
+    @End Implementation
+
+    @Performance_Hints
+    Single kernel transition; wakes at most one waiter.
+    @End Performance_Hints
+
+    @Security_Scope
+    Handle must carry SEMAPHORE_MODIFY_STATE access (granted by default).
+    @End Security_Scope
+
+    proc windows_arm64_api_release_semaphore from WinAPI with handle, 1, 0
     Return 1
 End Process
 
 Process called "semaphore_try_wait" takes handle as Integer returns Integer:
-    Let current be proc memory_get_int32 from Memory with handle, 0
-    If current is greater than 0:
-        Let old_val be proc atomic_fetch_add from Atomic with handle, -1
-        If old_val is greater than 0:
-            Return 1
-        End If
-        proc atomic_fetch_add from Atomic with handle, 1
+    @Reasoning
+    Non-blocking variant of semaphore_wait. Per Microsoft documentation
+    WaitForSingleObject with timeout = 0 polls the object: returns
+    WAIT_OBJECT_0 (0) if the semaphore was signalled (and decrements),
+    WAIT_TIMEOUT (0x102 = 258) if it would block. We map those to 1 /
+    0 for the Runa contract.
+    @End Reasoning
+
+    @Implementation
+    1. api_wait_for_single_object(handle, 0) - poll only.
+    2. If result == 0 (WAIT_OBJECT_0): return 1 (acquired).
+    3. Otherwise: return 0 (would block / error).
+    @End Implementation
+
+    @Performance_Hints
+    Constant-time; the kernel32 fast path completes without yielding.
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as semaphore_wait.
+    @End Security_Scope
+
+    Let wait_result be proc windows_arm64_api_wait_for_single_object from WinAPI with handle, 0
+    If wait_result is equal to 0:
+        Return 1
     End If
     Return 0
 End Process
 
-Note: Event operations (for condition variable implementation)
-
-Process called "event_create" takes manual_reset as Integer, initial_state as Integer returns Integer:
-    Note: Create Windows event object using NtCreateEvent
-    Note: Syscall 0x48: NtCreateEvent
-    Note: NTSTATUS NtCreateEvent(OUT PHANDLE EventHandle, IN ACCESS_MASK DesiredAccess,
-    Note:                         IN POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL,
-    Note:                         IN EVENT_TYPE EventType, IN BOOLEAN InitialState)
-
-    Note: Allocate handle storage
-    Let handle_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
-    If handle_ptr is less than 0:
-        Return 0
-    End If
-
-    Let desired_access be 2031619  Note: EVENT_ALL_ACCESS (0x1F0003)
-    Let object_attributes be 0  Note: NULL
-    Let event_type be manual_reset  Note: 0=NotificationEvent (manual), 1=SynchronizationEvent (auto)
-
-    Note: Call NtCreateEvent
-    Let result be proc syscall with 72, handle_ptr, desired_access, object_attributes, event_type, initial_state
-
-    If result is not equal to 0:
-        proc syscall_munmap from Syscall with handle_ptr, 8
-        Return 0
-    End If
-
-    Let event_handle be proc memory_get_int64 from Memory with handle_ptr, 0
-    proc syscall_munmap from Syscall with handle_ptr, 8
-
-    Return event_handle
-End Process
-
-Process called "event_wait_multiple" takes event1 as Integer, event2 as Integer, timeout_ns as Integer returns Integer:
-    Note: Wait for multiple events using NtWaitForMultipleObjects
-    Note: Syscall 0x5A: NtWaitForMultipleObjects
-    Note: Returns 0 if event1 signaled, 1 if event2 signaled, 258 if timeout
-
-    Note: Create handle array
-    Let handles_ptr be proc syscall_mmap from Syscall with 0, 16, 3, 34, -1, 0
-    If handles_ptr is less than 0:
-        Return 258  Note: Timeout
-    End If
-
-    proc memory_set_int64 from Memory with handles_ptr, 0, event1
-    proc memory_set_int64 from Memory with handles_ptr, 8, event2
-
-    Note: Create timeout structure (LARGE_INTEGER, 8 bytes)
-    Let timeout_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
-    If timeout_ptr is less than 0:
-        proc syscall_munmap from Syscall with handles_ptr, 16
-        Return 258
-    End If
-    proc memory_set_int64 from Memory with timeout_ptr, 0, timeout_ns
-
-    Note: Call NtWaitForMultipleObjects(Count=2, Handles, WaitType=WaitAny, Alertable=FALSE, Timeout)
-    Let wait_type be 1  Note: WaitAny
-    Let alertable be 0
-    Let result be proc syscall with 90, 2, handles_ptr, wait_type, alertable, timeout_ptr
-
-    proc syscall_munmap from Syscall with handles_ptr, 16
-    proc syscall_munmap from Syscall with timeout_ptr, 8
-
-    Return result
-End Process
-
-Process called "event_set" takes event_handle as Integer returns Integer:
-    Note: Set event to signaled state using NtSetEvent
-    Note: Syscall 0x0E: NtSetEvent
-    Let previous_state_ptr be 0  Note: NULL minus don't need previous state
-    Let result be proc syscall with 14, event_handle, previous_state_ptr
-    Return result
-End Process
-
-Process called "event_reset" takes event_handle as Integer returns Integer:
-    Note: Reset event to non-signaled state using NtResetEvent
-    Note: Syscall 0x0D: NtResetEvent
-    Let previous_state_ptr be 0  Note: NULL
-    Let result be proc syscall with 13, event_handle, previous_state_ptr
-    Return result
-End Process
-
-Process called "event_close" takes event_handle as Integer returns Integer:
-    Note: Close event handle using NtClose
-    Note: Syscall 0x0F: NtClose
-    Let result be proc syscall with 15, event_handle
-    Return result
-End Process
-
-Note: Condition variable operations
+Note:
+============================================================================
+CONDITION VARIABLE (Win32 CONDITION_VARIABLE backed by SRWLOCK)
+============================================================================
+:End Note
 
 Process called "condvar_create" returns Integer:
-    Note: Condition variable structure (24 bytes):
-    Note:   offset 0:  waiters_count (number of waiting threads, 8 bytes)
-    Note:   offset 8:  signal_event (event handle for signaling, 8 bytes)
-    Note:   offset 16: broadcast_event (event handle for broadcast, 8 bytes)
+    @Reasoning
+    Allocate an 8-byte CONDITION_VARIABLE (single pointer-sized opaque
+    value) and initialize it. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-initializeconditionvariable)
+    the cv pairs with an SRWLOCK or CRITICAL_SECTION; SleepConditionVariable*
+    atomically releases the lock and blocks until woken or timed out,
+    then reacquires the lock before returning.
 
-    Let cv_ptr be proc syscall_mmap from Syscall with 0, 24, 3, 34, -1, 0
+    Returns the cv pointer; 0 on mmap failure.
+    @End Reasoning
+
+    @Implementation
+    1. mmap 8 bytes (PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS).
+    2. api_initialize_condition_variable to set the cv to the empty-
+       queue state.
+    3. Return the cv pointer.
+    @End Implementation
+
+    @Performance_Hints
+    One mmap (~5 us) + one near-zero init call.
+    @End Performance_Hints
+
+    @Security_Scope
+    Process-private mapping; no cross-process visibility.
+    @End Security_Scope
+
+    Let cv_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
     If cv_ptr is less than 0:
         Return 0
     End If
-
-    Note: Initialize waiters count to 0
-    proc memory_set_int64 from Memory with cv_ptr, 0, 0
-
-    Note: Create manual-reset event for broadcast (initially non-signaled)
-    Let broadcast_event be proc event_create with 1, 0
-    If broadcast_event is equal to 0:
-        proc syscall_munmap from Syscall with cv_ptr, 24
-        Return 0
-    End If
-
-    Note: Create auto-reset event for signal (initially non-signaled)
-    Let signal_event be proc event_create with 0, 0
-    If signal_event is equal to 0:
-        proc event_close with broadcast_event
-        proc syscall_munmap from Syscall with cv_ptr, 24
-        Return 0
-    End If
-
-    proc memory_set_int64 from Memory with cv_ptr, 8, signal_event
-    proc memory_set_int64 from Memory with cv_ptr, 16, broadcast_event
-
+    proc windows_arm64_api_initialize_condition_variable from WinAPI with cv_ptr
     Return cv_ptr
 End Process
 
 Process called "condvar_destroy" takes handle as Integer returns Integer:
-    If handle is equal to 0:
-        Return 0
-    End If
+    @Reasoning
+    Release the cv mapping. CONDITION_VARIABLE requires no explicit
+    teardown call - it is self-destroying once no thread is waiting on
+    it. Caller MUST ensure no waiters remain; destroying a cv with
+    parked threads is undefined behaviour.
+    @End Reasoning
 
-    Note: Close event handles
-    Let signal_event be proc memory_get_int64 from Memory with handle, 8
-    Let broadcast_event be proc memory_get_int64 from Memory with handle, 16
+    @Implementation
+    Single syscall_munmap(handle, 8).
+    @End Implementation
 
-    If signal_event is not equal to 0:
-        proc event_close with signal_event
-    End If
+    @Performance_Hints
+    One munmap syscall.
+    @End Performance_Hints
 
-    If broadcast_event is not equal to 0:
-        proc event_close with broadcast_event
-    End If
+    @Security_Scope
+    Caller owns the mapping.
+    @End Security_Scope
 
-    Note: Free condition variable structure
-    proc syscall_munmap from Syscall with handle, 24
-    Return 1
+    Return proc syscall_munmap from Syscall with handle, 8
 End Process
 
 Process called "condvar_wait" takes cv_handle as Integer, mutex_handle as Integer returns Integer:
-    If cv_handle is equal to 0:
-        Return 0
-    End If
+    @Reasoning
+    Atomically release the associated mutex (SRWLOCK in exclusive mode)
+    and block on the cv until woken via condvar_signal / condvar_broadcast.
+    Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-sleepconditionvariablesrw)
+    SleepConditionVariableSRW reacquires the lock before returning, so
+    the caller sees the same invariant on entry and exit.
 
-    Note: Increment waiters count atomically
-    Let waiters_ptr be cv_handle
-    proc atomic_fetch_add from Atomic with waiters_ptr, 1
+    INFINITE timeout (0xFFFFFFFF = -1 as DWORD); flags = 0 (exclusive
+    mode reacquisition).
+    @End Reasoning
 
-    Note: Get event handles
-    Let signal_event be proc memory_get_int64 from Memory with cv_handle, 8
-    Let broadcast_event be proc memory_get_int64 from Memory with cv_handle, 16
+    @Implementation
+    Single api_sleep_condition_variable_srw call with:
+      cv_ptr     = cv_handle
+      lock_ptr   = mutex_handle
+      ms_timeout = -1 (INFINITE)
+      flags      = 0  (exclusive mode)
+    @End Implementation
 
-    Note: Release mutex before waiting
-    mutex_unlock(mutex_handle)
+    @Performance_Hints
+    Uncontended signal path: 2 syscalls (release + wait, then reacquire).
+    @End Performance_Hints
 
-    Note: Wait for either signal or broadcast event (infinite timeout)
-    Let timeout_ns be -10000000000  Note: Negative = infinite wait in NT API (100ns units)
-    Let wait_result be proc event_wait_multiple with signal_event, broadcast_event, timeout_ns
+    @Security_Scope
+    Caller must hold the mutex exclusively on entry; the cv enforces
+    that pairing internally.
+    @End Security_Scope
 
-    Note: Decrement waiters count atomically
-    proc atomic_fetch_sub from Atomic with waiters_ptr, 1
-
-    Note: Reacquire mutex
-    mutex_lock(mutex_handle)
-
+    Let infinite_ms be -1
+    proc windows_arm64_api_sleep_condition_variable_srw from WinAPI with cv_handle, mutex_handle, infinite_ms, 0
     Return 1
 End Process
 
 Process called "condvar_timed_wait" takes cv_handle as Integer, mutex_handle as Integer, timeout_us as Integer returns Integer:
-    If cv_handle is equal to 0:
-        Return 0
+    @Reasoning
+    Bounded variant of condvar_wait. Per Microsoft documentation
+    SleepConditionVariableSRW returns FALSE (0) on timeout and the
+    Win32 last-error is set to ERROR_TIMEOUT (0x5B4); nonzero on
+    successful wake.
+
+    Microsecond input is rounded to the nearest millisecond with a floor
+    of 1 ms for any nonzero microsecond input, matching the thread_sleep
+    rounding strategy.
+    @End Reasoning
+
+    @Implementation
+    1. Convert microseconds to milliseconds; floor at 1 ms for any
+       nonzero input.
+    2. Invoke api_sleep_condition_variable_srw with the resolved ms,
+       flags = 0 (exclusive mode), and the supplied cv / lock.
+    3. Return the BOOL result directly so the caller can distinguish
+       wake (nonzero) from timeout (zero).
+    @End Implementation
+
+    @Performance_Hints
+    Adds timer setup to condvar_wait's cost (~100 ns extra).
+    @End Performance_Hints
+
+    @Security_Scope
+    Same as condvar_wait.
+    @End Security_Scope
+
+    Let milliseconds be timeout_us divided by 1000
+    If timeout_us is greater than 0:
+        If milliseconds is equal to 0:
+            Set milliseconds to 1
+        End If
     End If
-
-    Note: Increment waiters count atomically
-    Let waiters_ptr be cv_handle
-    proc atomic_fetch_add from Atomic with waiters_ptr, 1
-
-    Note: Get event handles
-    Let signal_event be proc memory_get_int64 from Memory with cv_handle, 8
-    Let broadcast_event be proc memory_get_int64 from Memory with cv_handle, 16
-
-    Note: Release mutex before waiting
-    mutex_unlock(mutex_handle)
-
-    Note: Convert microseconds to NT time units (100-nanosecond intervals)
-    Note: Negative value indicates relative time
-    Let timeout_100ns be timeout_us multiplied by 10
-    Let timeout_ns be -timeout_100ns
-
-    Note: Wait for either signal or broadcast event with timeout
-    Let wait_result be proc event_wait_multiple with signal_event, broadcast_event, timeout_ns
-
-    Note: Decrement waiters count atomically
-    proc atomic_fetch_sub from Atomic with waiters_ptr, 1
-
-    Note: Reacquire mutex
-    mutex_lock(mutex_handle)
-
-    Note: Return 1 if signaled, 0 if timeout
-    If wait_result is equal to 0:
-        Return 1  Note: Event was signaled
-    Otherwise:
-        Return 0  Note: Timeout occurred
-    End If
+    Return proc windows_arm64_api_sleep_condition_variable_srw from WinAPI with cv_handle, mutex_handle, milliseconds, 0
 End Process
 
 Process called "condvar_signal" takes handle as Integer returns Integer:
-    If handle is equal to 0:
-        Return 0
-    End If
+    @Reasoning
+    Wake exactly one thread sleeping on the cv. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakeconditionvariable)
+    a missed wake (no waiter) is silently dropped - condvar predicate
+    invariants must be checked by the waiter after wake, as is standard
+    cv discipline.
+    @End Reasoning
 
-    Note: Check if there are any waiters
-    Let waiters_count be proc memory_get_int64 from Memory with handle, 0
-    If waiters_count is equal to 0:
-        Return 1  Note: No waiters, nothing to signal
-    End If
+    @Implementation
+    Single api_wake_condition_variable call.
+    @End Implementation
 
-    Note: Signal the auto-reset event to wake ONE waiter
-    Let signal_event be proc memory_get_int64 from Memory with handle, 8
-    proc event_set with signal_event
+    @Performance_Hints
+    Uncontended (no waiters): ~10 ns. Contended: one kernel transition.
+    @End Performance_Hints
 
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    proc windows_arm64_api_wake_condition_variable from WinAPI with handle
     Return 1
 End Process
 
 Process called "condvar_broadcast" takes handle as Integer returns Integer:
-    If handle is equal to 0:
-        Return 0
-    End If
+    @Reasoning
+    Wake every thread currently sleeping on the cv. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakeallconditionvariable)
+    no fairness guarantee on the order in which woken threads reacquire
+    the associated SRWLOCK.
+    @End Reasoning
 
-    Note: Check if there are any waiters
-    Let waiters_count be proc memory_get_int64 from Memory with handle, 0
-    If waiters_count is equal to 0:
-        Return 1  Note: No waiters, nothing to broadcast
-    End If
+    @Implementation
+    Single api_wake_all_condition_variable call.
+    @End Implementation
 
-    Note: Set the manual-reset broadcast event to wake ALL waiters
-    Let broadcast_event be proc memory_get_int64 from Memory with handle, 16
-    proc event_set with broadcast_event
+    @Performance_Hints
+    Single syscall regardless of waiter count.
+    @End Performance_Hints
 
-    Note: Reset the broadcast event after a brief moment (let waiters wake up)
-    proc event_reset with broadcast_event
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
 
+    proc windows_arm64_api_wake_all_condition_variable from WinAPI with handle
     Return 1
 End Process
 
-Note: Read-write lock operations
+Note:
+============================================================================
+READ-WRITE LOCK (Slim Reader/Writer Lock in shared + exclusive modes)
+============================================================================
+:End Note
 
 Process called "rwlock_create" returns Integer:
-    Note: SRW_LOCK is pointer-sized (8 bytes on x64)
-    Let srw_ptr be proc syscall_mmap from Syscall with 0, 8, 3, 34, -1, 0
-    If srw_ptr is less than 0:
+    @Reasoning
+    Allocate a 16-byte rwlock record:
+      offset 0:  SRWLOCK (kernel32-managed pointer-sized opaque value)
+      offset 8:  last-acquire mode flag (int64: 0 = shared, 1 = exclusive)
+    The mode flag exists because Windows SRWLOCK has separate Release
+    entry points for shared vs exclusive holders and no introspection -
+    rwlock_unlock cannot otherwise dispatch correctly. The flag is
+    written by every acquire path (read_lock, write_lock, try_read_lock,
+    try_write_lock); read by rwlock_unlock. SRWLOCK's exclusive-mode
+    serialization guarantees the flag's correctness across overlapping
+    readers and exclusive ownership transitions.
+
+    Returns the rwlock pointer; 0 on mmap failure.
+    @End Reasoning
+
+    @Implementation
+    1. mmap 16 bytes (PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS).
+    2. api_initialize_srwlock at offset 0 (the SRWLOCK slot).
+    3. memory_set_int64 at offset 8 (the mode flag) to 0 (shared default
+       - rwlock_destroy is safe to call on an unused rwlock with
+       shared-mode flag).
+    4. Return the rwlock pointer.
+    @End Implementation
+
+    @Performance_Hints
+    One mmap (~5 us) + two near-zero memory writes. Per-lock memory
+    footprint is 16 bytes vs the pilot's 4-byte futex word - the cost
+    of platform parity.
+    @End Performance_Hints
+
+    @Security_Scope
+    Process-private mapping.
+    @End Security_Scope
+
+    Let rwlock_ptr be proc syscall_mmap from Syscall with 0, 16, 3, 34, -1, 0
+    If rwlock_ptr is less than 0:
         Return 0
     End If
-
-    proc memory_set_int64 from Memory with srw_ptr, 0, 0
-    Return srw_ptr
+    proc windows_arm64_api_initialize_srwlock from WinAPI with rwlock_ptr
+    proc memory_set_int64 from Memory with rwlock_ptr, 8, 0
+    Return rwlock_ptr
 End Process
 
 Process called "rwlock_destroy" takes handle as Integer returns Integer:
-    proc syscall_munmap from Syscall with handle, 8
-    Return 1
+    @Reasoning
+    Release the 16-byte rwlock mapping. SRWLOCK is self-destroying once
+    quiescent; caller MUST ensure no readers or writers remain.
+    @End Reasoning
+
+    @Implementation
+    Single syscall_munmap(handle, 16) - matches the rwlock_create
+    allocation size.
+    @End Implementation
+
+    @Performance_Hints
+    One munmap syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller owns the mapping.
+    @End Security_Scope
+
+    Return proc syscall_munmap from Syscall with handle, 16
 End Process
 
 Process called "rwlock_read_lock" takes handle as Integer returns Integer:
-    Note: Acquire shared lock (increment reader count if no exclusive owner)
-    While 1 is equal to 1:
-        Let current be proc memory_get_int64 from Memory with handle, 0
-        If current is less than 0:
-            thread_yield()  Note: Exclusive lock held
-        Otherwise:
-            Let new_val be current plus 1
-            Let old_val be proc atomic_compare_and_swap from Atomic with handle, current, new_val
-            If old_val is equal to 1:
-                Return 1
-            End If
-        End If
-    End While
+    @Reasoning
+    Acquire the SRWLOCK in shared (reader) mode and record the mode
+    in the flag at offset 8. Multiple readers may hold simultaneously;
+    each writes 0 to the flag (idempotent across overlapping readers).
+    Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-acquiresrwlockshared)
+    SRWLOCK favors writer fairness - new readers queue behind a waiting
+    writer, preventing reader-starvation of writers (the inverse of the
+    Linux pilot's reader-favored CAS approach, by design).
+    @End Reasoning
 
+    @Implementation
+    1. api_acquire_srwlock_shared on the SRWLOCK at offset 0.
+    2. memory_set_int64 at offset 8 to 0 (shared mode marker).
+    The flag write happens AFTER the lock is held, so the write is
+    serialized against other writers but races with concurrent readers -
+    that race is safe because every reader writes the same value 0.
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended: ~10 ns lock + 1 store = ~11 ns. Writer-blocked: kernel
+    keyed-event wait.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    proc windows_arm64_api_acquire_srwlock_shared from WinAPI with handle
+    proc memory_set_int64 from Memory with handle, 8, 0
     Return 1
 End Process
 
 Process called "rwlock_write_lock" takes handle as Integer returns Integer:
-    Note: Acquire exclusive lock
-    Let exclusive_bit be -9223372036854775808  Note: 0x8000000000000000
+    @Reasoning
+    Acquire the SRWLOCK in exclusive (writer) mode and record the mode
+    flag as 1. Writers wait for all active readers to release. Per
+    Microsoft documentation AcquireSRWLockExclusive blocks until
+    exclusive ownership is granted; the lock is non-recursive.
+    @End Reasoning
 
-    While 1 is equal to 1:
-        Let current be proc memory_get_int64 from Memory with handle, 0
-        If current is equal to 0:
-            Let success be proc atomic_compare_and_swap from Atomic with handle, 0, exclusive_bit
-            If success is equal to 1:
-                Return 1
-            End If
-        End If
-        thread_yield()
-    End While
+    @Implementation
+    1. api_acquire_srwlock_exclusive on the SRWLOCK at offset 0.
+    2. memory_set_int64 at offset 8 to 1 (exclusive mode marker).
+    The flag write is safe because exclusive ownership guarantees no
+    concurrent observer.
+    @End Implementation
 
+    @Performance_Hints
+    Uncontended: ~10 ns lock + 1 store. Contended: O(active_reader_count)
+    wait time until the last reader releases.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    proc windows_arm64_api_acquire_srwlock_exclusive from WinAPI with handle
+    proc memory_set_int64 from Memory with handle, 8, 1
     Return 1
 End Process
 
 Process called "rwlock_unlock" takes handle as Integer returns Integer:
-    Note: Release read or write lock
-    Let current be proc memory_get_int64 from Memory with handle, 0
-    If current is less than 0:
-        proc memory_set_int64 from Memory with handle, 0, 0  Note: Release exclusive
-    Otherwise:
-        proc atomic_fetch_add from Atomic with handle, -1  Note: Decrement reader count
-    End If
+    @Reasoning
+    Release the SRWLOCK in whichever mode it was last acquired. The
+    mode flag at offset 8 (written by read_lock / write_lock /
+    try_read_lock / try_write_lock) selects the appropriate Release
+    entry point. Per Microsoft documentation Windows has separate
+    Release entry points for shared vs exclusive holders, and no
+    introspection on the lock itself - the flag bridges the gap so
+    rwlock_unlock preserves the Linux pilot's mode-agnostic API
+    contract.
+    @End Reasoning
 
-    proc memory_barrier_release from Atomic
+    @Implementation
+    1. memory_get_int64 from offset 8 - read the mode flag.
+    2. If flag == 1: api_release_srwlock_exclusive.
+    3. Otherwise:    api_release_srwlock_shared.
+    The flag is reset implicitly by the next acquire - it carries the
+    state of the most recent acquire only, which is exactly what
+    rwlock_unlock needs.
+    @End Implementation
+
+    @Performance_Hints
+    One load + one branch + one library call: ~12 ns uncontended.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must hold the lock in the same mode as the most recent
+    acquire (which is invariant under the documented locking contract).
+    @End Security_Scope
+
+    Let mode_flag be proc memory_get_int64 from Memory with handle, 8
+    If mode_flag is equal to 1:
+        proc windows_arm64_api_release_srwlock_exclusive from WinAPI with handle
+    Otherwise:
+        proc windows_arm64_api_release_srwlock_shared from WinAPI with handle
+    End If
     Return 1
 End Process
 
 Process called "rwlock_try_read_lock" takes handle as Integer returns Integer:
-    Let current be proc memory_get_int64 from Memory with handle, 0
-    If current is less than 0:
-        Return 0
-    End If
+    @Reasoning
+    Non-blocking shared-mode acquire. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-tryacquiresrwlockshared)
+    returns nonzero on success, zero if a writer holds or is queued.
+    On success we record the mode flag as 0 (shared); on failure the
+    flag remains untouched.
+    @End Reasoning
 
-    Let new_val be current plus 1
-    Let success be proc atomic_compare_and_swap from Atomic with handle, current, new_val
+    @Implementation
+    1. api_try_acquire_srwlock_shared.
+    2. If success (nonzero), memory_set_int64 at offset 8 to 0.
+    3. Return the BOOLEAN.
+    @End Implementation
+
+    @Performance_Hints
+    Constant-time, no syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    No kernel transition.
+    @End Security_Scope
+
+    Let success be proc windows_arm64_api_try_acquire_srwlock_shared from WinAPI with handle
+    If success is not equal to 0:
+        proc memory_set_int64 from Memory with handle, 8, 0
+    End If
     Return success
 End Process
 
 Process called "rwlock_try_write_lock" takes handle as Integer returns Integer:
-    Let exclusive_bit be -9223372036854775808
-    Let success be proc atomic_compare_and_swap from Atomic with handle, 0, exclusive_bit
+    @Reasoning
+    Non-blocking exclusive-mode acquire. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-tryacquiresrwlockexclusive)
+    returns nonzero on success, zero if any contender holds or is queued
+    (reader or writer). On success we record the mode flag as 1
+    (exclusive); on failure the flag remains untouched.
+    @End Reasoning
+
+    @Implementation
+    1. api_try_acquire_srwlock_exclusive.
+    2. If success (nonzero), memory_set_int64 at offset 8 to 1.
+    3. Return the BOOLEAN.
+    @End Implementation
+
+    @Performance_Hints
+    Constant-time, no syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    No kernel transition.
+    @End Security_Scope
+
+    Let success be proc windows_arm64_api_try_acquire_srwlock_exclusive from WinAPI with handle
+    If success is not equal to 0:
+        proc memory_set_int64 from Memory with handle, 8, 1
+    End If
     Return success
+End Process
+
+Note:
+============================================================================
+Hardware Query - GetSystemInfo-based logical-processor count
+============================================================================
+:End Note
+
+Process called "hardware_concurrency" returns Integer:
+    @Reasoning
+    Return the number of logical processors visible to the calling
+    process. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsysteminfo)
+    GetSystemInfo fills a SYSTEM_INFO structure whose dwNumberOfProcessors
+    field (offset 32 = 0x20 on 64-bit Windows) reports the logical
+    processor count.
+
+    On any failure (mmap or unexpected zero count) we return 1 - the
+    Linux pilot makes the same defensive choice, and callers downstream
+    of hardware_concurrency typically use the result as a worker-pool
+    size and would deadlock if given 0.
+    @End Reasoning
+
+    @Implementation
+    1. mmap a 64-byte buffer for the SYSTEM_INFO struct (the canonical
+       layout is 48 bytes plus padding; 64 is the smallest aligned
+       allocation that comfortably holds the struct).
+    2. Zero the buffer (defensive - GetSystemInfo writes every field
+       but we cannot rely on mmap's initial-zero guarantee across all
+       backends).
+    3. Invoke api_get_system_info on the buffer.
+    4. Read dwNumberOfProcessors at offset 32 (DWORD = int32, but
+       memory_get_int32 returns it as an Integer with the upper bits
+       zero - exactly what we want).
+    5. munmap the buffer.
+    6. If the count is 0 or negative, return 1; otherwise return the
+       count.
+    @End Implementation
+
+    @Performance_Hints
+    One mmap + one near-zero GetSystemInfo (internally cached by
+    kernel32) + one munmap. The result should be cached by callers
+    above the primitive layer.
+    @End Performance_Hints
+
+    @Security_Scope
+    GetSystemInfo is unrestricted; the SYSTEM_INFO buffer is process-
+    private (MAP_PRIVATE | MAP_ANONYMOUS).
+    @End Security_Scope
+
+    Let info_buf be proc syscall_mmap from Syscall with 0, 64, 3, 34, -1, 0
+    If info_buf is less than 0:
+        Return 1
+    End If
+
+    Note: Defensively zero the 64-byte buffer before the API populates it.
+    Let zero_idx be 0
+    While zero_idx is less than 64:
+        proc memory_set_byte from Memory with info_buf, zero_idx, 0
+        Set zero_idx to zero_idx plus 1
+    End While
+
+    proc windows_arm64_api_get_system_info from WinAPI with info_buf
+
+    Note: dwNumberOfProcessors at SYSTEM_INFO offset 32 (0x20) on 64-bit Windows.
+    Let processor_count be proc memory_get_int32 from Memory with info_buf, 32
+
+    proc syscall_munmap from Syscall with info_buf, 64
+
+    If processor_count is less than 1:
+        Return 1
+    End If
+
+    Return processor_count
 End Process

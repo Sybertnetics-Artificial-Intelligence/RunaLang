@@ -375,7 +375,6 @@ Process called "windows_x86_64_SYS_LSEEK" returns Integer:
 End Process
 
 Process called "windows_x86_64_SYS_FSYNC" returns Integer:
-    Note:
     @Reasoning
     Windows has no direct fsync(2)-equivalent syscall in the NT
     syscall surface. The semantic equivalent — forcing a file's
@@ -411,12 +410,10 @@ Process called "windows_x86_64_SYS_FSYNC" returns Integer:
     wrapper for actual flush semantics, and those wrappers enforce
     the Windows ACL / HANDLE security model.
     @End Security_Scope
-    :End Note
     Return -1
 End Process
 
 Process called "windows_x86_64_SYS_IOCTL" returns Integer:
-    Note:
     @Reasoning
     Windows has no direct ioctl(2)-equivalent syscall in the NT
     syscall surface. The semantic equivalent — device-specific I/O
@@ -453,7 +450,6 @@ Process called "windows_x86_64_SYS_IOCTL" returns Integer:
     enforces the Windows ACL / HANDLE security model along with
     any driver-specific access checks.
     @End Security_Scope
-    :End Note
     Return -1
 End Process
 
@@ -1728,6 +1724,714 @@ End Process
 
 Note:
 ============================================================================
+THREADING SUPPORT WRAPPERS (P2-B.2)
+SRWLOCK, CONDITION_VARIABLE, ExitThread, SwitchToThread, SetThreadDescription,
+CreateSemaphore, ReleaseSemaphore, GetSystemInfo. All target kernel32.dll
+(SRWLOCK / CONDITION_VARIABLE entry points are present in kernel32 on
+Windows Vista and later; GetSystemInfo is present on all NT versions).
+Microsoft Win32 API documentation:
+  https://learn.microsoft.com/windows/win32/api/processthreadsapi/
+  https://learn.microsoft.com/windows/win32/api/synchapi/
+  https://learn.microsoft.com/windows/win32/api/sysinfoapi/
+============================================================================
+:End Note
+
+Process called "windows_x86_64_api_exit_thread" takes exit_code as Integer returns Integer:
+    @Reasoning
+    ExitThread - terminate the calling thread with the supplied DWORD
+    exit code. Used by Runa's thread_exit primitive to cleanly tear down
+    a worker thread without unwinding the stack frame that launched it.
+    Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitthread)
+    ExitThread runs all thread-attached DLL detach routines, flushes
+    Fiber-Local Storage destructors, releases the thread's stack, and
+    signals the thread handle - precisely the cleanup Runa wants on the
+    "user function returned normally" path. Unlike TerminateThread it
+    does NOT leak thread-local destructors.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call. Win64 ABI requires the 32-byte shadow space to
+    be reserved before the call; the function does not return, so the
+    post-call epilogue exists only for code-shape symmetry - control
+    transfers to the Windows scheduler when ExitThread tears the thread
+    down. result is initialized to 0 because the Runa Process signature
+    requires an Integer return value; in practice no caller observes it.
+    @End Implementation
+
+    @Performance_Hints
+    One library call; the thread leaves the run queue after kernel32
+    teardown. No syscall fast path - ExitThread always runs DllMain
+    DLL_THREAD_DETACH notifications.
+    @End Performance_Hints
+
+    @Security_Scope
+    Affects only the calling thread; the process and sibling threads
+    are unaffected. No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # Load DWORD exit_code into RCX (Win64 ABI 1st arg)
+        mov rcx, [rsp+8]
+
+        # Reserve 32-byte shadow space
+        sub rsp, 32
+
+        # Call ExitThread from kernel32.dll via PE import thunk
+        call ExitThread
+
+        # ExitThread is __declspec(noreturn); the lines below exist
+        # only for code-shape symmetry with other api_* wrappers.
+        add rsp, 32
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_switch_to_thread" returns Integer:
+    @Reasoning
+    SwitchToThread - yield the remainder of the calling thread's
+    scheduling quantum to another ready thread on the same processor.
+    Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-switchtothread)
+    distinguishes this from Sleep(0): SwitchToThread restricts the
+    candidate set to threads on the SAME processor, which avoids the
+    cross-core migration that Sleep(0) can incur. For thread_yield in
+    Runa's cooperative spin-wait paths this is the cheaper option.
+    Returns nonzero if a context switch occurred, zero if no other ready
+    thread was available.
+    @End Reasoning
+
+    @Implementation
+    Zero-argument Win32 call. Reserves the mandatory 32-byte shadow
+    space before the call per Win64 ABI; restores after. RAX carries
+    the BOOL result back to the caller.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-microsecond when another runnable thread exists; near-zero when
+    the run queue is empty. Cheaper than NtYieldExecution because no
+    syscall transition occurs - kernel32 inlines the dispatcher hop.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privilege change; affects only the calling thread's scheduling
+    state.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # Reserve 32-byte shadow space (no args to marshal)
+        sub rsp, 32
+
+        # Call SwitchToThread from kernel32.dll
+        call SwitchToThread
+
+        # Restore stack
+        add rsp, 32
+
+        # Store BOOL result from RAX
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_set_thread_description" takes thread_handle as Integer, description_ptr as Integer returns Integer:
+    @Reasoning
+    SetThreadDescription - attach a human-readable wide-character name
+    to a thread, observable in debuggers, performance tools, and ETW
+    traces. Available on Windows 10 1607+ via kernel32.dll
+    (https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreaddescription).
+    Replaces the legacy SEH exception-tag hack used pre-Windows 10.
+    Used by Runa's thread_set_name primitive.
+    @End Reasoning
+
+    @Implementation
+    Two-argument Win32 call. Win64 ABI passes thread_handle in RCX and
+    the LPCWSTR description in RDX. Reserves 32-byte shadow space
+    before call. Returns HRESULT (S_OK = 0 on success, negative on
+    failure - caller must test with FAILED() / SUCCEEDED() semantics).
+    @End Implementation
+
+    @Performance_Hints
+    One library call; kernel32 stores the description in the thread's
+    TEB / kernel thread object. Sub-microsecond cost; called rarely
+    (typically once per thread creation).
+    @End Performance_Hints
+
+    @Security_Scope
+    Requires THREAD_SET_LIMITED_INFORMATION (0x0400) access on the
+    target thread handle. Thread descriptions are visible to debuggers
+    attached to the process - do not encode secrets in the name.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # Load parameters into Win64 ABI registers
+        mov rcx, [rsp+8]       # thread_handle (1st arg)
+        mov rdx, [rsp+16]      # description_ptr (2nd arg)
+
+        # Reserve 32-byte shadow space
+        sub rsp, 32
+
+        # Call SetThreadDescription from kernel32.dll
+        call SetThreadDescription
+
+        # Restore stack
+        add rsp, 32
+
+        # Store HRESULT result from RAX
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_initialize_srwlock" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    InitializeSRWLock - initialize a Slim Reader/Writer lock to its
+    released, no-waiters state. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-initializesrwlock)
+    the lock is a single pointer-sized opaque value; the function
+    simply zeroes that pointer (RTL_SRWLOCK_INIT). Used by Runa's
+    mutex_create and rwlock_create to prepare a freshly mmap'd 8-byte
+    region for use with the SRWLOCK API family.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call. Win64 ABI passes the PSRWLOCK in RCX. Function
+    returns void; result is forced to 0 for Runa Process-signature
+    conformance.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-100ns call; effectively a memory write of zero to the lock
+    word. Called once per lock lifetime.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required. The lock memory must be process-owned and
+    writable.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # Load PSRWLOCK into RCX (Win64 ABI 1st arg)
+        mov rcx, [rsp+8]
+
+        # Reserve 32-byte shadow space
+        sub rsp, 32
+
+        # Call InitializeSRWLock from kernel32.dll
+        call InitializeSRWLock
+
+        # Restore stack
+        add rsp, 32
+
+        # InitializeSRWLock returns void; force result = 0
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_acquire_srwlock_exclusive" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    AcquireSRWLockExclusive - block the calling thread until the SRWLOCK
+    can be acquired in exclusive (writer) mode. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-acquiresrwlockexclusive)
+    the SRWLOCK provides a far smaller footprint than a CRITICAL_SECTION
+    (single pointer vs 40 bytes) and a faster uncontended path. Used as
+    the underlying primitive for Runa's mutex_lock.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call. The lock pointer is passed in RCX per Win64 ABI;
+    32-byte shadow space is reserved before the call. Function returns
+    void; result is forced to 0.
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended acquire is ~10 ns (lock-cmpxchg fast path inside
+    kernel32). Contended path descends into the kernel via NtWaitForKeyedEvent.
+    SRWLOCK is non-recursive; re-entering from the holder thread is
+    undefined behaviour.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required. The lock memory must be process-owned.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        # Load PSRWLOCK into RCX
+        mov rcx, [rsp+8]
+
+        # Reserve 32-byte shadow space
+        sub rsp, 32
+
+        # Call AcquireSRWLockExclusive from kernel32.dll
+        call AcquireSRWLockExclusive
+
+        # Restore stack
+        add rsp, 32
+
+        # Returns void
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_release_srwlock_exclusive" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    ReleaseSRWLockExclusive - release an SRWLOCK held in exclusive
+    (writer) mode. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-releasesrwlockexclusive)
+    pairs 1:1 with AcquireSRWLockExclusive; releasing a lock not held
+    exclusively is undefined behaviour.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PSRWLOCK in RCX; 32-byte shadow space; void return.
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended release is ~5 ns; if waiters are queued the call wakes
+    exactly one writer or the entire reader cohort depending on the
+    queue head.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must hold the lock exclusively. No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call ReleaseSRWLockExclusive
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_try_acquire_srwlock_exclusive" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    TryAcquireSRWLockExclusive - non-blocking variant of AcquireSRWLockExclusive.
+    Returns BOOLEAN TRUE if the lock was acquired, FALSE if a contender
+    holds it. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-tryacquiresrwlockexclusive)
+    succeeds atomically without descending into the kernel. Used by
+    Runa's mutex_try_lock.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PSRWLOCK in RCX; 32-byte shadow space; BOOLEAN
+    return in AL extended to RAX. Caller treats nonzero as success.
+    @End Implementation
+
+    @Performance_Hints
+    Single cmpxchg on the lock word; constant time, no syscall.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call TryAcquireSRWLockExclusive
+        add rsp, 32
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_acquire_srwlock_shared" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    AcquireSRWLockShared - acquire an SRWLOCK in shared (reader) mode.
+    Multiple readers may hold the lock concurrently; writers wait for
+    the reader count to drain. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-acquiresrwlockshared)
+    pairs with ReleaseSRWLockShared. Used by Runa's rwlock_read_lock.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PSRWLOCK in RCX; 32-byte shadow space; void return.
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended path is ~10 ns; reader count incremented atomically.
+    Contended path (writer queued) blocks the new reader until the
+    writer completes - readers do not starve writers under SRWLOCK.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call AcquireSRWLockShared
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_release_srwlock_shared" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    ReleaseSRWLockShared - release a reader hold on an SRWLOCK. Per
+    Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-releasesrwlockshared)
+    decrements the reader count; if the count reaches zero with a writer
+    queued, the writer is woken. Used by Runa's rwlock_unlock on the
+    reader path.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PSRWLOCK in RCX; 32-byte shadow space; void return.
+    @End Implementation
+
+    @Performance_Hints
+    Atomic decrement plus an optional wake; ~10 ns uncontended.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must hold the lock in shared mode.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call ReleaseSRWLockShared
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_try_acquire_srwlock_shared" takes lock_ptr as Integer returns Integer:
+    @Reasoning
+    TryAcquireSRWLockShared - non-blocking shared-mode acquire. Per
+    Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-tryacquiresrwlockshared)
+    returns nonzero on success, zero if a writer holds or is queued.
+    Used by Runa's rwlock_try_read_lock.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PSRWLOCK in RCX; 32-byte shadow space; BOOLEAN
+    return in AL.
+    @End Implementation
+
+    @Performance_Hints
+    Single cmpxchg, constant time.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call TryAcquireSRWLockShared
+        add rsp, 32
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_create_semaphore" takes security_attributes as Integer, initial_count as Integer, maximum_count as Integer, name_ptr as Integer returns Integer:
+    @Reasoning
+    CreateSemaphoreA - create a kernel-object counting semaphore. Per
+    Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-createsemaphorea)
+    the returned HANDLE is signalled while the internal count is greater
+    than zero. WaitForSingleObject decrements the count by one when it
+    succeeds; ReleaseSemaphore increments by a caller-supplied amount.
+    Used by Runa's semaphore_create.
+    @End Reasoning
+
+    @Implementation
+    Four-argument Win32 call. Win64 ABI: RCX = security_attributes,
+    RDX = initial_count, R8 = maximum_count, R9 = name_ptr (LPCSTR or
+    NULL for anonymous). 32-byte shadow space reserved before call.
+    Returns HANDLE (0 on failure).
+    @End Implementation
+
+    @Performance_Hints
+    Single kernel-object creation; ~10 microseconds typical. Anonymous
+    semaphores (name_ptr = 0) avoid namespace lookup.
+    @End Performance_Hints
+
+    @Security_Scope
+    Anonymous semaphores are process-private. Named semaphores live in
+    the kernel object namespace and may be inherited or duplicated
+    across processes - use only with explicit cross-process design.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]       # security_attributes
+        mov rdx, [rsp+16]      # initial_count
+        mov r8,  [rsp+24]      # maximum_count
+        mov r9,  [rsp+32]      # name_ptr
+
+        sub rsp, 32
+
+        call CreateSemaphoreA
+
+        add rsp, 32
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_release_semaphore" takes semaphore_handle as Integer, release_count as Integer, previous_count_ptr as Integer returns Integer:
+    @Reasoning
+    ReleaseSemaphore - increment the semaphore's internal count by the
+    supplied amount, optionally returning the prior value through
+    previous_count_ptr. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-releasesemaphore)
+    fails (returns 0) if the new total would exceed maximum_count.
+    Used by Runa's semaphore_signal.
+    @End Reasoning
+
+    @Implementation
+    Three-argument Win32 call. Win64 ABI: RCX = handle, RDX = release_count,
+    R8 = previous_count_ptr (LPLONG or NULL). 32-byte shadow space.
+    Returns BOOL.
+    @End Implementation
+
+    @Performance_Hints
+    Single kernel transition; wakes at most release_count waiters.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must hold a valid handle with SEMAPHORE_MODIFY_STATE (0x0002)
+    access.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        mov rdx, [rsp+16]
+        mov r8,  [rsp+24]
+
+        sub rsp, 32
+
+        call ReleaseSemaphore
+
+        add rsp, 32
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_initialize_condition_variable" takes cv_ptr as Integer returns Integer:
+    @Reasoning
+    InitializeConditionVariable - initialize a CONDITION_VARIABLE
+    (pointer-sized opaque value) to its empty-queue state. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-initializeconditionvariable)
+    pairs with SleepConditionVariableSRW / WakeConditionVariable /
+    WakeAllConditionVariable. Used by Runa's condvar_create.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PCONDITION_VARIABLE in RCX; 32-byte shadow space;
+    void return.
+    @End Implementation
+
+    @Performance_Hints
+    Sub-100ns; effectively a single store of zero to the cv word.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required. The cv memory must be process-owned.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call InitializeConditionVariable
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_sleep_condition_variable_srw" takes cv_ptr as Integer, lock_ptr as Integer, ms_timeout as Integer, flags as Integer returns Integer:
+    @Reasoning
+    SleepConditionVariableSRW - atomically release the supplied SRWLOCK
+    and block on the CONDITION_VARIABLE until woken or the timeout
+    elapses, then reacquire the SRWLOCK before returning. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-sleepconditionvariablesrw)
+    flags = 0 for exclusive-mode reacquisition or CONDITION_VARIABLE_LOCKMODE_SHARED
+    (0x1) for shared-mode reacquisition. Used by Runa's condvar_wait /
+    condvar_timed_wait.
+    @End Reasoning
+
+    @Implementation
+    Four-argument Win32 call. Win64 ABI: RCX = cv, RDX = lock, R8 = ms,
+    R9 = flags. 32-byte shadow space. Returns BOOL (0 = timeout, nonzero
+    = signal).
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended signal path: 2 syscalls (release + wait, then reacquire).
+    Contended timeout: 1 syscall with timer setup.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller must hold the supplied SRWLOCK in the mode that matches flags.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        mov rdx, [rsp+16]
+        mov r8,  [rsp+24]
+        mov r9,  [rsp+32]
+
+        sub rsp, 32
+
+        call SleepConditionVariableSRW
+
+        add rsp, 32
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_wake_condition_variable" takes cv_ptr as Integer returns Integer:
+    @Reasoning
+    WakeConditionVariable - wake exactly one thread sleeping on the
+    supplied CONDITION_VARIABLE. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakeconditionvariable)
+    a missed wake (no thread sleeping) is silently dropped. Used by
+    Runa's condvar_signal.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PCONDITION_VARIABLE in RCX; 32-byte shadow space;
+    void return.
+    @End Implementation
+
+    @Performance_Hints
+    Uncontended (no waiters): ~10 ns. Contended: one kernel transition
+    to wake the queued waiter.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call WakeConditionVariable
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_wake_all_condition_variable" takes cv_ptr as Integer returns Integer:
+    @Reasoning
+    WakeAllConditionVariable - wake every thread currently sleeping on
+    the supplied CONDITION_VARIABLE. Per Microsoft documentation
+    (https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-wakeallconditionvariable)
+    threads must contend for the associated SRWLOCK in the order the
+    scheduler picks them up - there is no fairness guarantee. Used by
+    Runa's condvar_broadcast.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call; PCONDITION_VARIABLE in RCX; 32-byte shadow space;
+    void return.
+    @End Implementation
+
+    @Performance_Hints
+    Single syscall regardless of waiter count.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call WakeAllConditionVariable
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Process called "windows_x86_64_api_get_system_info" takes system_info_ptr as Integer returns Integer:
+    @Reasoning
+    GetSystemInfo - fill a SYSTEM_INFO structure with hardware and OS
+    parameters: processor architecture, page size, processor count,
+    allocation granularity, address-space bounds. Per Microsoft
+    documentation
+    (https://learn.microsoft.com/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsysteminfo)
+    the SYSTEM_INFO layout places dwNumberOfProcessors at offset 32
+    (0x20) on 64-bit Windows - the count of logical processors visible
+    to the calling process's affinity mask. Used by Runa's
+    hardware_concurrency primitive.
+    @End Reasoning
+
+    @Implementation
+    Single Win32 call. Win64 ABI: RCX = LPSYSTEM_INFO. 32-byte shadow
+    space. Returns void; caller reads fields from the supplied buffer.
+    @End Implementation
+
+    @Performance_Hints
+    Single library call; the result is internally cached by kernel32,
+    so repeated calls are near-zero cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    No privileges required. The buffer must be process-owned and at
+    least 64 bytes for the canonical SYSTEM_INFO layout.
+    @End Security_Scope
+
+    Let result be 0
+    Inline Assembly:
+        mov rcx, [rsp+8]
+        sub rsp, 32
+        call GetSystemInfo
+        add rsp, 32
+        mov rax, 0
+        mov [rsp-8], rax
+    End Assembly
+    Return result
+End Process
+
+Note:
+============================================================================
 HIGH-LEVEL WRAPPER FUNCTIONS
 ============================================================================
 :End Note
@@ -2232,7 +2936,6 @@ Process called "windows_x86_64_syscall_lseek" takes fd as Integer, offset as Int
 End Process
 
 Process called "windows_x86_64_syscall_ioctl" takes fd as Integer, cmd as Integer, arg as Integer returns Integer:
-    Note:
     @Reasoning
     Dispatcher-API entry-point for ioctl-equivalent device control on
     Windows amd64. There is no NT syscall for ioctl(2); the semantic
@@ -2272,7 +2975,6 @@ Process called "windows_x86_64_syscall_ioctl" takes fd as Integer, cmd as Intege
     DeviceIoControl enforces the Windows ACL / driver-IOCTL access
     model.
     @End Security_Scope
-    :End Note
     Return -1
 End Process
 
