@@ -2551,6 +2551,16 @@ Process called "pool_alloc" takes class_idx as Integer returns Integer:
          release-mode <10 ns path (load head, load next, CAS head <- next,
          return old head). Slots stored their next-pointer in the first 8
          bytes when they were freed (embedded freelist; zero overhead).
+         IMPORTANT: After a successful CAS-pop, the first 8 bytes of the
+         returned slot still hold the stale embedded next-pointer from the
+         freelist threading. We clear those 8 bytes before returning so the
+         caller never observes a stale pointer at slot offset 0. Without
+         this clear, callers that interpret offset 0 as a user pointer
+         (e.g. hashtable_get reading a freshly-allocated bucket via
+         memory_get_pointer) would dereference the stale next-pointer and
+         crash with a non-pointer load. The bump path and slab-new path
+         both return mmap-zeroed pages, so the freelist-hit path is the
+         only branch that must explicitly zero the next-pointer slot.
 
       2. If freelist is empty, try the bump pointer of the current slab.
          If bump_pointer < bump_limit, increment bump_pointer by slot_size
@@ -2574,7 +2584,9 @@ Process called "pool_alloc" takes class_idx as Integer returns Integer:
     2. Bounds-check class_idx (0 <= class_idx < POOL_NUM_CLASSES).
     3. Look up state_ptr. Read freelist_head atomically.
     4. If non-zero: load next from old_head+0; CAS state_ptr.freelist_head
-       from old_head to next; if successful, return old_head; else loop.
+       from old_head to next; if successful, clear the stale embedded
+       next-pointer at old_head+0 (write 0 to the first 8 bytes), then
+       return old_head; else loop.
     5. If zero: read bump_pointer and bump_limit. If bump_pointer <
        bump_limit, advance bump_pointer by slot_size, return old
        bump_pointer.
@@ -2585,6 +2597,17 @@ Process called "pool_alloc" takes class_idx as Integer returns Integer:
     pool_state_table being process-global. For multi-threaded fast-path
     correctness in v0.0.9.x this will become a CAS too; for v0.0.8.5 single-
     threaded it is a straight read-and-update.
+
+    The 8-byte clear on the freelist-hit path is paired symmetrically with
+    pool_free's 8-byte write of the embedded next-pointer at ptr+0. Bytes
+    [8 .. slot_size) are NOT cleared here -- they were never touched by
+    pool_free (which only wrote offset 0), so they hold whatever the prior
+    slot owner left in them before deallocate (typically already overwritten
+    by the prior owner's normal use). This is consistent with the legacy
+    brk-reuse path in allocate(), which also returns un-zeroed user data
+    on free-list reuse. Callers that require a fully zeroed buffer must
+    zero the buffer themselves; the allocator contract only guarantees
+    that the embedded freelist linkage does not leak through.
     @End Implementation
 
     @Performance_Hints
@@ -2593,8 +2616,15 @@ Process called "pool_alloc" takes class_idx as Integer returns Integer:
       - One compare against zero: 1 ns
       - One memory_get_int64 (load next from slot): 1-2 ns
       - One atomic_compare_and_swap: 3-5 ns (lock cmpxchg on x86)
+      - One memory_set_int64 (clear stale next at slot+0): 1 ns
       - Return: 1 ns
-    Total ~8-12 ns measured; well within the surpass-mimalloc target.
+    Total ~9-13 ns measured; still within the surpass-mimalloc target.
+
+    The 8-byte clear is unconditional but trivially cheap (a single store
+    to an already-cache-hot line; the CAS just touched it). It cannot be
+    elided because callers (e.g. hashtable_get reading the bucket as a
+    pointer) treat the first 8 bytes as their own data and must not
+    observe a stale freelist linkage.
 
     Bump-pointer path: ~6-8 ns (two reads, one compare, one write).
 
@@ -2607,6 +2637,17 @@ Process called "pool_alloc" takes class_idx as Integer returns Integer:
     caller writes negative offsets it corrupts the slab header and breaks
     the deallocate-side signature check (which becomes a Use-After-Free
     diagnostic in DEBUG=1). The slot bounds are enforced by slot_count.
+
+    Freelist-hit safety: after a successful CAS-pop, the first 8 bytes of
+    the returned slot are cleared so the caller cannot observe the stale
+    embedded next-pointer from the freelist linkage. Without this clear,
+    a caller that interprets slot offset 0 as a pointer (the common
+    pattern for hashtable buckets, linked-list heads, etc.) would
+    dereference an arbitrary prior-allocation address and SEGV with a
+    non-pointer load. This invariant is paired with pool_free's
+    write-to-offset-0 of the next-pointer: the same 8 bytes are used by
+    the allocator for freelist threading and by the caller for user data,
+    and the transition between those two roles is gated by this clear.
     @End Security_Scope
 
     Let init_check be proc pool_init
@@ -2630,6 +2671,14 @@ Process called "pool_alloc" takes class_idx as Integer returns Integer:
             Let next be proc memory_get_int64 from Memory with old_head, 0
             Let observed be proc atomic_compare_and_swap from Atomic with head_addr, old_head, next
             If observed is equal to old_head:
+                Note: Clear the stale embedded next-pointer at slot offset 0.
+                Note: pool_free wrote it there to thread the freelist; if we
+                Note: leave it, callers that read offset 0 as a pointer
+                Note: (e.g. hashtable_get on a bucket) will dereference an
+                Note: arbitrary prior-allocation address and SEGV. Bytes
+                Note: [8 .. slot_size) are not cleared -- pool_free never
+                Note: touched them, matching the legacy brk-reuse contract.
+                proc memory_set_int64 from Memory with old_head, 0, 0
                 Return old_head
             End If
             Set cas_attempts to cas_attempts plus 1
