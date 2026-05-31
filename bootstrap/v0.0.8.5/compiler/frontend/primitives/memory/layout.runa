@@ -209,6 +209,70 @@ Let pool_state_table be 0           Note: mmap'd 640-byte pool state array
 Let pool_initialized be 0           Note: 1 once pool_state_table mmap'd
 
 Note: ============================================================================
+Note: POOL SLAB REGISTRY - Authoritative membership test for deallocate fast path
+Note: ============================================================================
+
+Note:
+The slab registry replaces the pre-existing bitmask-only check
+("pool_slab_base_of(ptr) followed by a signature read") with a
+sorted-array membership test that decisively distinguishes "ptr is
+from a pool slab" from "ptr is from brk/mmap/argv/libc/foreign
+memory".
+
+Why the bitmask alone is unsafe:
+* pool_slab_base_of(ptr) computes ptr & POOL_SLAB_BASE_MASK -- the
+  64-KB-rounded address. For pointers that lie BETWEEN registered
+  slabs (e.g. the lexer's mmap'd source buffer, an argv string, a
+  libc-owned allocation), this rounded address can land in an
+  UNMAPPED page. Reading 8 bytes at that address segfaults the
+  process even though the original pointer is perfectly valid.
+
+The registry is a single contiguous 32 KB array of 8-byte slab-base
+addresses kept sorted ascending. pool_slab_new inserts the slab base
+on creation. deallocate's fast path calls slab_registry_contains
+BEFORE any read at slab_base+0; non-pool pointers are rejected in
+~15 ns via binary search and never touch the (potentially unmapped)
+rounded address.
+
+Initial capacity: 4096 entries covers 4096 * 64 KiB = 256 MiB of pool
+memory. Self-host compilation of the largest v0.0.8.5 sources peaks
+near 100 live slabs; 4096 provides ~40x headroom for typical
+workloads. When live slabs would exceed the current capacity,
+slab_registry_grow doubles the backing array via a fresh mmap +
+memory_copy + munmap (classic geometric resize). No hard upper
+bound; the only ceiling is the kernel mmap budget. On OOM grow
+returns 0, slab_registry_insert returns 0, pool_slab_new munmaps
+the slab it just installed, and allocate falls back to brk. The
+allocator degrades gracefully under OOM -- it never crashes.
+
+Single-thread safety: slab_registry_insert (the only writer) and
+slab_registry_contains (the only reader) never run concurrently in
+v0.0.8.5 because the compiler is single-threaded. The
+pointer-then-capacity swap order inside slab_registry_grow is the
+safe-default sequence for the v0.0.9.x multi-thread RCU upgrade.
+
+A cheap two-compare pre-filter (pool_slab_addr_min,
+pool_slab_addr_max) elides the binary search for the common case of
+pointers numerically far from the mmap'd pool region. The pre-filter
+is updated on every successful slab insert and is correct-but-
+loose: it may admit non-pool pointers that happen to fall in the
+numeric range, which is why the registry binary search is
+authoritative.
+:End Note
+
+Constant SLAB_REGISTRY_CAPACITY as Integer is 4096
+Constant SLAB_REGISTRY_ENTRY_SIZE as Integer is 8
+Constant SLAB_REGISTRY_TOTAL_SIZE as Integer is 32768
+
+Let slab_registry be 0              Note: mmap'd array of sorted slab bases, or 0 before init
+Let slab_registry_count be 0        Note: Number of live entries in [0, slab_registry_capacity)
+Let slab_registry_capacity be 0     Note: Current capacity in entries; 0 before init, SLAB_REGISTRY_CAPACITY at first init, doubles on grow
+Let slab_registry_initialized be 0  Note: 1 once slab_registry mmap completes
+
+Let pool_slab_addr_min be 0         Note: Lowest registered slab base; 0 before first insert
+Let pool_slab_addr_max be 0         Note: Highest registered slab base + POOL_SLAB_SIZE; 0 before first insert
+
+Note: ============================================================================
 Note: REGISTRY TRACKING GATE (E3 release-mode optimization)
 Note: ============================================================================
 
@@ -1824,6 +1888,375 @@ Process called "pool_slab_base_of" takes ptr as Integer returns Integer:
     Return ptr bitwise and POOL_SLAB_BASE_MASK
 End Process
 
+Process called "slab_registry_init" returns Integer:
+    @Reasoning
+    Lazy first-touch initialization of the slab-base registry. Allocates
+    SLAB_REGISTRY_TOTAL_SIZE bytes (32 KiB, exactly 8 pages on a 4 KiB
+    page) via syscall_mmap with PROT_READ | PROT_WRITE, MAP_PRIVATE |
+    MAP_ANONYMOUS, fd=-1, offset=0. The mapped region is zero-filled by
+    the kernel which gives slab_registry_count an implicit starting value
+    of zero entries.
+
+    Idempotent: returns immediately if slab_registry_initialized is
+    already 1. This allows slab_registry_insert to call init on every
+    invocation without measurable overhead after first-touch.
+
+    The registry is mmap'd directly via syscall, NOT through allocate.
+    It must not depend on the very allocator whose deallocate fast path
+    it gates -- a self-reference would deadlock or recurse infinitely.
+    @End Reasoning
+
+    @Implementation
+    1. If slab_registry_initialized is 1, return 1.
+    2. syscall_mmap(0, 32768, PROT=3, MAP_PRIVATE|ANONYMOUS=34, -1, 0).
+    3. If the syscall returned a negative value, mmap failed; return 0.
+    4. Store the address in slab_registry, set slab_registry_initialized
+       to 1, and return 1.
+    @End Implementation
+
+    @Performance_Hints
+    Called once per process lifetime in the successful case. After the
+    first invocation the early-exit branch is ~1 ns. mmap itself is
+    ~5 us, amortized to negligible across thousands of allocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocates 32 KiB of anonymous private memory readable and writable
+    by the current process. No attacker-controlled byte enters the
+    mmap arguments. Returning 0 on mmap failure is the only failure
+    mode; the caller (slab_registry_insert) treats this as a hard
+    allocator failure.
+    @End Security_Scope
+
+    If slab_registry_initialized is equal to 1:
+        Return 1
+    End If
+    Let prot be 3
+    Let flags be 34
+    Let region be proc syscall_mmap from Syscall with 0, SLAB_REGISTRY_TOTAL_SIZE, prot, flags, -1, 0
+    If region is less than 0:
+        Return 0
+    End If
+    Set slab_registry to region
+    Set slab_registry_capacity to SLAB_REGISTRY_CAPACITY
+    Set slab_registry_initialized to 1
+    Return 1
+End Process
+
+Process called "slab_registry_grow" returns Integer:
+    @Reasoning
+    Doubles the slab registry backing array via mmap+memory_copy+munmap.
+    Invoked by slab_registry_insert when slab_registry_count has reached
+    slab_registry_capacity, BEFORE the binary search and shift logic so
+    that from the caller's perspective the insert is atomic: either the
+    array has room and the insert proceeds, or grow failed (OOM) and
+    insert returns 0 without mutating registry state.
+
+    Geometric doubling (4096 -> 8192 -> 16384 -> ...) is the classic
+    pattern used by every production allocator (mimalloc, jemalloc,
+    tcmalloc, glibc malloc) when its internal bookkeeping fills up. It
+    gives amortized O(1) per insert and an exponentially shrinking grow
+    frequency. There is no hard upper bound on capacity; the only
+    ceiling is the kernel mmap budget. On OOM grow returns 0, insert
+    returns 0, pool_slab_new munmaps the just-installed slab, allocate
+    falls back to brk -- the allocator degrades gracefully under
+    exhaustion. It never crashes.
+
+    Pointer-then-capacity swap order: the new pointer is published
+    before the new capacity is published, and the old array is
+    munmapped AFTER both publishes. For single-threaded v0.0.8.5 the
+    ordering is irrelevant (insert and contains never overlap on a
+    single thread), but it is the correct safe-default sequence for
+    the v0.0.9.x RCU upgrade path. A reader that loaded the old
+    pointer would see "old pointer with old capacity"; one that loaded
+    the new pointer would see "new pointer with capacity at least old
+    capacity"; neither combination can index past the end of its
+    observed buffer.
+    @End Reasoning
+
+    @Implementation
+    1. Compute new_capacity = slab_registry_capacity * 2.
+    2. Compute new_size_bytes = new_capacity * SLAB_REGISTRY_ENTRY_SIZE.
+    3. syscall_mmap(0, new_size_bytes, PROT_READ|WRITE=3,
+       MAP_PRIVATE|ANONYMOUS=34, -1, 0). On a negative return value,
+       mmap failed: return 0 and leave the registry untouched.
+    4. memory_copy(new_table, old_table, slab_registry_count *
+       SLAB_REGISTRY_ENTRY_SIZE). Only the live prefix is copied; the
+       remaining new entries are kernel-zeroed.
+    5. Capture saved_old_table and saved_old_size, then publish:
+       slab_registry := new_table; slab_registry_capacity := new_capacity.
+    6. syscall_munmap(saved_old_table, saved_old_size). On modern Linux
+       munmap of an mmap'd region cannot fail for an aligned process-
+       owned region; the return value is not checked.
+    7. Return 1.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path. Frequency falls exponentially: 0 grows on workloads
+    below 4096 live slabs, 1 grow at 4097, 2 at 8193, etc. Cost per
+    grow is one syscall_mmap + one memory_copy (32 KiB doubling to 64
+    KiB at the first grow) + one syscall_munmap, on the order of
+    10-20 us total. Amortized cost per insert is O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocates anonymous private memory readable and writable by the
+    current process and copies the existing sorted entries into it.
+    The destination is freshly mapped (kernel-zeroed beyond the copied
+    prefix). No attacker-controlled byte enters the mmap arguments or
+    the copy length. The old mapping is unmapped immediately, returning
+    its pages to the kernel.
+
+    MULTI-THREAD FUTURE WORK: When v0.0.9.x introduces per-thread pools
+    this grow path will require either (a) an exclusive writer / shared
+    reader lock around init/insert/grow/contains, or (b) RCU / seqlock
+    with epoch-based old-array reclamation, or (c) per-thread registries
+    with merge-on-collection. The current pointer-then-capacity swap
+    order is the safe-default for option (b).
+    @End Security_Scope
+
+    Let old_capacity be slab_registry_capacity
+    Let new_capacity be old_capacity multiplied by 2
+    Let new_size_bytes be new_capacity multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    Let prot be 3
+    Let flags be 34
+    Let new_table be proc syscall_mmap from Syscall with 0, new_size_bytes, prot, flags, -1, 0
+    If new_table is less than 0:
+        Return 0
+    End If
+    Let old_table be slab_registry
+    Let live_bytes be slab_registry_count multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    If live_bytes is greater than 0:
+        proc memory_copy with new_table, old_table, live_bytes
+    End If
+    Let saved_old_table be old_table
+    Let saved_old_size be old_capacity multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    Set slab_registry to new_table
+    Set slab_registry_capacity to new_capacity
+    proc syscall_munmap from Syscall with saved_old_table, saved_old_size
+    Return 1
+End Process
+
+Process called "slab_registry_insert" takes slab_base as Integer returns Integer:
+    @Reasoning
+    Registers a freshly-allocated slab in the sorted slab-base registry.
+    Called exactly once per slab by pool_slab_new, before any user
+    pointer derived from the slab can reach deallocate. Maintains the
+    registry's sorted-ascending invariant via upper-bound binary search
+    + top-down shift-right.
+
+    Also updates the pool_slab_addr_min / pool_slab_addr_max bounding-
+    box pair. min is the lowest registered slab base, max is the
+    highest registered slab base plus POOL_SLAB_SIZE (one past the last
+    payload byte). The pair is a cheap pre-filter ahead of the binary
+    search in slab_registry_contains; it admits some false positives
+    (pointers numerically in the range but in gaps between slabs), but
+    those are caught by the binary search.
+
+    Overflow (count == slab_registry_capacity) triggers a dynamic
+    resize: slab_registry_grow doubles the backing array via fresh
+    mmap + memory_copy + munmap before the binary search proceeds. On
+    grow failure (OOM) insert returns 0 without mutating registry
+    state, and the caller (pool_slab_new) treats a non-1 return as
+    "registry unavailable, undo the slab mmap and propagate failure".
+    From the caller's perspective the insert is atomic: either count
+    is incremented and the entry is in place, or 0 is returned and
+    nothing changed.
+    @End Reasoning
+
+    @Implementation
+    1. Lazy init via slab_registry_init. If init fails, return 0.
+    2. Reject NULL or negative slab_base defensively.
+    3. If count is at or above slab_registry_capacity, call
+       slab_registry_grow. On grow failure (OOM), return 0.
+    4. Upper-bound binary search: find lowest index i in [0, count]
+       such that registry[i] > slab_base. Invariant: every entry at
+       index < lo is <= slab_base; every entry at index >= hi is >
+       slab_base. On loop exit lo == hi == i, the insertion point.
+    5. Top-down shift: for j from count down to i+1, copy
+       registry[j-1] into registry[j]. Reading j-1 before writing
+       j-1 preserves correctness because each iteration writes a
+       slot whose previous value has already been read.
+    6. Write slab_base at registry[i].
+    7. Increment count.
+    8. Update pool_slab_addr_min and pool_slab_addr_max from the
+       new sorted endpoints.
+    9. Return 1.
+    @End Implementation
+
+    @Performance_Hints
+    Cold path -- called once per slab creation, amortized across
+    thousands of pool allocations per slab. Binary search is O(log
+    count); shift cost is O(count - i). The grow check is a single
+    compare in the common case; the grow body itself fires at
+    exponentially shrinking frequency (zero grows under 4096 live
+    slabs, then once each doubling).
+    @End Performance_Hints
+
+    @Security_Scope
+    Reads and writes the slab_registry region (mmap'd private memory
+    owned by this process). slab_base is supplied by pool_slab_new
+    immediately after syscall_mmap; only this allocator writes to the
+    registry. No attacker-controlled byte determines a registry
+    index or stored value. slab_registry_capacity is the only state
+    that the grow path mutates outside of the registry buffer itself.
+    @End Security_Scope
+
+    Let init_ok be proc slab_registry_init
+    If init_ok is equal to 0:
+        Return 0
+    End If
+    If slab_base is less than or equal to 0:
+        Return 0
+    End If
+    If slab_registry_count is greater than or equal to slab_registry_capacity:
+        Let grow_ok be proc slab_registry_grow
+        If grow_ok is equal to 0:
+            Return 0
+        End If
+    End If
+
+    Let lo be 0
+    Let hi be slab_registry_count
+    While lo is less than hi:
+        Let mid be lo plus hi
+        Set mid to mid divided by 2
+        Let mid_offset be mid multiplied by SLAB_REGISTRY_ENTRY_SIZE
+        Let mid_base be proc memory_get_int64 from Memory with slab_registry, mid_offset
+        If mid_base is greater than slab_base:
+            Set hi to mid
+        Otherwise:
+            Set lo to mid plus 1
+        End If
+    End While
+    Let insert_index be lo
+
+    Let j be slab_registry_count
+    While j is greater than insert_index:
+        Let src_index be j minus 1
+        Let src_offset be src_index multiplied by SLAB_REGISTRY_ENTRY_SIZE
+        Let dst_offset be j multiplied by SLAB_REGISTRY_ENTRY_SIZE
+        Let moved_base be proc memory_get_int64 from Memory with slab_registry, src_offset
+        proc memory_set_int64 from Memory with slab_registry, dst_offset, moved_base
+        Set j to j minus 1
+    End While
+
+    Let insert_offset be insert_index multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    proc memory_set_int64 from Memory with slab_registry, insert_offset, slab_base
+    Set slab_registry_count to slab_registry_count plus 1
+
+    Let first_base be proc memory_get_int64 from Memory with slab_registry, 0
+    Set pool_slab_addr_min to first_base
+    Let last_index be slab_registry_count minus 1
+    Let last_offset be last_index multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    Let last_base be proc memory_get_int64 from Memory with slab_registry, last_offset
+    Set pool_slab_addr_max to last_base plus POOL_SLAB_SIZE
+
+    Return 1
+End Process
+
+Process called "slab_registry_contains" takes ptr as Integer returns Integer:
+    @Reasoning
+    Authoritative membership test invoked at the head of deallocate's
+    pool fast path and at any other site that would otherwise read
+    slab_base+0 on an arbitrary pointer. Returns 1 iff ptr lies inside
+    a registered pool slab -- i.e., there exists a registered slab base
+    B such that B <= ptr < B + POOL_SLAB_SIZE. Returns 0 for all other
+    pointers: brk-region allocations, mmap-region allocations not
+    backed by the pool, argv strings, environment strings, libc-owned
+    memory, foreign-library pointers, fabricated addresses.
+
+    Critical: this function MUST be called BEFORE the bitmask-based
+    pool_slab_base_of(ptr) is dereferenced via memory_get_int64. The
+    bitmask rounds to a 64-KB boundary which, for non-pool pointers,
+    can land in an unmapped page; reading 8 bytes from such an address
+    SEGVs the process even though the original pointer is valid.
+
+    The pre-filter (pool_slab_addr_min / pool_slab_addr_max) handles
+    the common case: brk pointers numerically far below the mmap'd
+    pool region are rejected in ~1 ns without touching the registry.
+    Pointers that survive the pre-filter are subjected to the binary
+    search.
+
+    Binary search uses the classic upper-bound shape: find lowest
+    index i such that registry[i] > ptr. The candidate slab is
+    registry[i - 1]; ptr belongs to that slab iff ptr < candidate +
+    POOL_SLAB_SIZE. Edge cases (empty registry, ptr below first base,
+    ptr above last base + size, ptr in a gap between slabs) all return
+    0 correctly.
+    @End Reasoning
+
+    @Implementation
+    1. NULL guard.
+    2. Pre-filter: reject if ptr < pool_slab_addr_min or
+       ptr >= pool_slab_addr_max. These bounds are 0 before the first
+       slab insert; either compare rejects immediately in that case
+       (ptr >= 0 > 0 fails, or ptr < 0 fails for any positive ptr).
+    3. Early-out if slab_registry is 0 (not yet initialized).
+    4. Empty-registry short-circuit: count == 0 returns 0.
+    5. Upper-bound binary search yielding i in [0, count].
+    6. If i == 0, no entry is <= ptr; return 0.
+    7. Read candidate base at registry[i - 1]; return 1 iff
+       ptr < candidate + POOL_SLAB_SIZE, otherwise 0.
+    @End Implementation
+
+    @Performance_Hints
+    Pre-filter rejects: 2 compares + 2 branches, ~1 ns. Registry
+    survivors: ~12 iterations of (load + compare + branch) for a full
+    4096-entry registry, ~10-15 ns total. Inserted directly into the
+    deallocate hot path; the added latency on the brk fast path is
+    bounded by the pre-filter, which almost always rejects.
+    @End Performance_Hints
+
+    @Security_Scope
+    Reads only the slab_registry region (process-private mmap memory).
+    Never dereferences ptr; ptr is treated purely as a numeric key.
+    No attacker-controlled byte propagates into memory accesses.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+    If ptr is less than pool_slab_addr_min:
+        Return 0
+    End If
+    If ptr is greater than or equal to pool_slab_addr_max:
+        Return 0
+    End If
+    If slab_registry is equal to 0:
+        Return 0
+    End If
+    If slab_registry_count is equal to 0:
+        Return 0
+    End If
+
+    Let lo be 0
+    Let hi be slab_registry_count
+    While lo is less than hi:
+        Let mid be lo plus hi
+        Set mid to mid divided by 2
+        Let mid_offset be mid multiplied by SLAB_REGISTRY_ENTRY_SIZE
+        Let mid_base be proc memory_get_int64 from Memory with slab_registry, mid_offset
+        If mid_base is greater than ptr:
+            Set hi to mid
+        Otherwise:
+            Set lo to mid plus 1
+        End If
+    End While
+
+    If lo is equal to 0:
+        Return 0
+    End If
+    Let candidate_index be lo minus 1
+    Let candidate_offset be candidate_index multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    Let candidate_base be proc memory_get_int64 from Memory with slab_registry, candidate_offset
+    Let candidate_end be candidate_base plus POOL_SLAB_SIZE
+    If ptr is less than candidate_end:
+        Return 1
+    End If
+    Return 0
+End Process
+
 Process called "pool_slab_new" takes class_idx as Integer returns Integer:
     @Reasoning
     Slow path: allocates a fresh 64 KB slab for the given size class via
@@ -1871,6 +2304,19 @@ Process called "pool_slab_new" takes class_idx as Integer returns Integer:
     End If
     Let slot_size be proc pool_size_for_class with class_idx
     If slot_size is equal to 0:
+        proc syscall_munmap from Syscall with slab_base, POOL_SLAB_SIZE
+        Return 0
+    End If
+    Note: Register the slab base in the authoritative membership registry
+    Note: BEFORE writing the slab header. This guarantees that any pointer
+    Note: derived from this slab, if it reaches deallocate concurrently or
+    Note: via an unexpected code path, will be classified correctly. When
+    Note: the registry reaches its capacity it doubles via slab_registry_grow;
+    Note: the only path that returns 0 here is the grow's mmap failing
+    Note: (genuine OOM), in which case we undo the slab mmap and propagate
+    Note: allocation failure -- allocate then falls back to the brk path.
+    Let registry_ok be proc slab_registry_insert with slab_base
+    If registry_ok is equal to 0:
         proc syscall_munmap from Syscall with slab_base, POOL_SLAB_SIZE
         Return 0
     End If
@@ -2435,16 +2881,24 @@ Process called "allocator_user_size" takes ptr as Integer returns Integer:
         Return 0
     End If
 
-    Note: E3 size-class pool fast path. If ptr is inside a pool slab the
-    Note: slot_size at slab_base+16 is the user-buffer size. Pool slots
-    Note: have no per-allocation header overhead so this IS the full
-    Note: writable range.
-    Let pool_slab_base be proc pool_slab_base_of with ptr
-    If pool_slab_base is not equal to 0:
-        Let pool_sig be proc memory_get_int64 from Memory with pool_slab_base, 0
-        If pool_sig is equal to POOL_SLAB_SIGNATURE:
-            Let slot_size be proc memory_get_int64 from Memory with pool_slab_base, 16
-            Return slot_size
+    Note: E3 size-class pool fast path. Gate the slab_base + signature read
+    Note: behind slab_registry_contains so non-pool pointers (argv strings,
+    Note: libc-owned memory, brk allocations, foreign-library pointers) are
+    Note: rejected before any 64-KB-rounded address is dereferenced. The
+    Note: rounded address can land in an unmapped page for non-pool inputs;
+    Note: an ungated memory_get_int64 there would SEGV. For confirmed pool
+    Note: slots the slot_size at slab_base+16 is the user-buffer size; pool
+    Note: slots carry no per-allocation header so that IS the full writable
+    Note: range.
+    Let in_pool_slab be proc slab_registry_contains with ptr
+    If in_pool_slab is not equal to 0:
+        Let pool_slab_base be proc pool_slab_base_of with ptr
+        If pool_slab_base is not equal to 0:
+            Let pool_sig be proc memory_get_int64 from Memory with pool_slab_base, 0
+            If pool_sig is equal to POOL_SLAB_SIGNATURE:
+                Let slot_size be proc memory_get_int64 from Memory with pool_slab_base, 16
+                Return slot_size
+            End If
         End If
     End If
 
@@ -2539,22 +2993,31 @@ Process called "deallocate" takes ptr as Integer returns Integer:
 
     Note:
     ====== E3 SIZE-CLASS FAST PATH ======
-    Recover the slab base via bitmask. If the byte at slab_base+0 is the
-    POOL_SLAB_SIGNATURE magic, the pointer is a pool slot and we return it
-    to the per-class freelist via pool_free in ~8-12 ns. Otherwise the
-    pointer is from the brk/mmap path and we fall through to the legacy
-    canary/registry/quarantine handling below.
+    Gate the slab-base + signature read behind slab_registry_contains.
+    The registry is authoritative: it returns 1 iff ptr lies inside a
+    pool slab actually mmap'd by pool_slab_new. Non-pool pointers
+    (brk allocations, argv/env strings, libc memory, foreign-library
+    pointers) are rejected here in ~1-15 ns and never reach the bitmask
+    + memory_get_int64 below.
 
-    The signature check is a single load + compare; false positives are
-    bounded by the 64-bit signature so the worst-case observable behavior
-    is correct on real workloads.
+    Why this gate is mandatory: pool_slab_base_of(ptr) rounds to a
+    64-KB boundary. For a non-pool pointer that boundary can land in an
+    UNMAPPED page (e.g. the page-aligned gap between two registered
+    slabs, or a page that no one mapped at all). Reading 8 bytes at
+    that address SEGVs the process even though ptr itself is valid.
+    The signature check that follows is still kept as a final
+    correctness gate against any future code path that mis-registers
+    or stale-registers a slab.
     :End Note
-    Let pool_slab_base be proc pool_slab_base_of with ptr
-    If pool_slab_base is not equal to 0:
-        Let pool_sig be proc memory_get_int64 from Memory with pool_slab_base, 0
-        If pool_sig is equal to POOL_SLAB_SIGNATURE:
-            Let pool_free_result be proc pool_free with ptr, pool_slab_base
-            Return pool_free_result
+    Let in_pool_slab be proc slab_registry_contains with ptr
+    If in_pool_slab is not equal to 0:
+        Let pool_slab_base be proc pool_slab_base_of with ptr
+        If pool_slab_base is not equal to 0:
+            Let pool_sig be proc memory_get_int64 from Memory with pool_slab_base, 0
+            If pool_sig is equal to POOL_SLAB_SIGNATURE:
+                Let pool_free_result be proc pool_free with ptr, pool_slab_base
+                Return pool_free_result
+            End If
         End If
     End If
 
