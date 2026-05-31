@@ -549,6 +549,30 @@ Process called "memory_allocate" takes size as Integer returns Integer:
 End Process
 
 Process called "memory_realloc" takes ptr as Integer, new_size as Integer returns Integer:
+    Note:
+    libc-realloc-compatible reallocate. Grows or shrinks the allocation
+    at ptr to new_size bytes, preserving the prefix bytes that fit in
+    both old and new buffers. Returns a new pointer (which may equal
+    ptr in a future in-place-grow optimization; current implementation
+    always allocates fresh and copies).
+
+    THE OLD SOURCE COPY SIZE IS BOUNDED BY THE OLD USER-BUFFER SIZE.
+    The naive implementation that copies new_size source bytes is
+    INCORRECT when growing: the old buffer is by definition smaller
+    than new_size, so the source-side read walks past the end of the
+    old allocation. On heap layouts where the old block ends at a
+    page boundary the read faults with SIGSEGV; on the ASan-class
+    canary layout the read triggers QUARANTINE_EVICT (loc=5) on the
+    next eviction because the OOB read disturbs an adjacent
+    quarantined block's canary.
+
+    Correct behavior: query the actual user-buffer size via
+    Heap.allocator_user_size and clamp the copy to min(old, new).
+    For grow operations the trailing (new_size - old_size) bytes of
+    the new buffer are NOT zero-initialized by this function; if
+    callers require zeroing they must use reallocate(ptr, old_size,
+    new_size) which has that contract.
+    :End Note
     If ptr is equal to 0:
         Return Heap.allocate(new_size)
     End If
@@ -560,12 +584,21 @@ Process called "memory_realloc" takes ptr as Integer, new_size as Integer return
     If new_ptr is equal to 0:
         Return 0
     End If
-    Note: We do not know the old size at this entry point, so we copy
-    Note: new_size bytes; the caller is responsible for ensuring the
-    Note: old allocation was at least new_size bytes if shrinking or
-    Note: the source range is valid if growing. For the growing-with-
-    Note: zero-fill variant, use reallocate(ptr, old_size, new_size).
-    Let _copy be Memory.memory_copy(new_ptr, ptr, new_size)
+
+    Note: Query the actual size of the user buffer at ptr. allocator_user_size
+    Note: dispatches identically to deallocate's E3 fast path: pool slots
+    Note: return their slab's slot_size, brk/mmap allocations return
+    Note: total_size minus header_size minus optional post-canary.
+    Let old_size be Heap.allocator_user_size(ptr)
+
+    Note: Clamp the copy length to min(old_size, new_size) so we never
+    Note: read past the end of the old user buffer. This is the fix for
+    Note: the OOB-read SIGSEGV/canary cluster observed in P2-F Wave 1.
+    Let copy_len be new_size
+    If old_size is less than copy_len:
+        Set copy_len to old_size
+    End If
+    Let _copy be Memory.memory_copy(new_ptr, ptr, copy_len)
     Let _free be Heap.deallocate(ptr)
     Return new_ptr
 End Process

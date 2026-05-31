@@ -2375,6 +2375,99 @@ Process called "allocate" takes size as Integer returns Integer:
     Return user_ptr
 End Process
 
+Process called "allocator_user_size" takes ptr as Integer returns Integer:
+    @Reasoning
+    Returns the USER-buffer size for an allocation previously returned by
+    allocate(). The user-buffer size is the contiguous byte range starting
+    at ptr that the caller is permitted to read or write. Callers that
+    need to grow or copy an allocation must clamp source reads to this
+    size to avoid out-of-bounds reads past the end of the user region.
+    This is the missing primitive that enables a correct memory_realloc
+    that bounds its source copy.
+
+    Three allocation tiers are dispatched on identically to deallocate's
+    E3 fast path:
+      1. E3 size-class pool slot: ptr is inside a 64-KB-aligned slab; the
+         slab header at slab_base+0 contains POOL_SLAB_SIGNATURE and the
+         slot_size at slab_base+16 IS the user-buffer size (pool slots
+         have no per-allocation header).
+      2. brk owned-heap allocation: ptr-header_size points at the
+         canonical 32-byte (or 48-byte under DEBUG canaries) header; the
+         user-buffer size equals total_size minus header_size minus the
+         optional 16-byte post-canary.
+      3. mmap owned-heap allocation: same header layout as brk arm. The
+         distinction is only relevant for finalization, not for size.
+
+    NULL guard returns 0. Unknown / non-allocator pointers (e.g. a
+    fabricated address that aligns to a 64 KB boundary but does not have
+    POOL_SLAB_SIGNATURE) fall through to the header read path. The
+    header read is unsafe on such pointers; callers MUST only pass
+    pointers previously returned by allocate(). This mirrors the
+    contract on deallocate() exactly.
+    @End Reasoning
+
+    @Implementation
+    1. NULL guard returns 0.
+    2. Bitmask ptr to slab_base. Read 8 bytes at slab_base+0 and compare
+       with POOL_SLAB_SIGNATURE. If match, read slot_size at slab_base+16
+       and return it.
+    3. Otherwise compute header_size (32 or 48 depending on DEBUG flag),
+       read total_size at ptr-header_size+16, subtract header_size and the
+       optional 16-byte post-canary, return the difference.
+    @End Implementation
+
+    @Performance_Hints
+    Pool path: 2 loads, 1 compare, 1 load -> ~3 ns. Brk/mmap path: 2 loads,
+    a few subtractions -> ~3-4 ns. This is a query-only function; no
+    mutation, no syscalls, no locks.
+    @End Performance_Hints
+
+    @Security_Scope
+    The same threat model as deallocate(): caller must pass a pointer
+    previously returned by allocate(). Passing a foreign pointer reads
+    8 bytes at slab_base+0 (potentially fault if unmapped) then 8 bytes
+    at ptr-header_size+16 (same). Both reads are bounded to addresses
+    derived from ptr; no propagation of attacker data into security-
+    critical decisions occurs.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: E3 size-class pool fast path. If ptr is inside a pool slab the
+    Note: slot_size at slab_base+16 is the user-buffer size. Pool slots
+    Note: have no per-allocation header overhead so this IS the full
+    Note: writable range.
+    Let pool_slab_base be proc pool_slab_base_of with ptr
+    If pool_slab_base is not equal to 0:
+        Let pool_sig be proc memory_get_int64 from Memory with pool_slab_base, 0
+        If pool_sig is equal to POOL_SLAB_SIGNATURE:
+            Let slot_size be proc memory_get_int64 from Memory with pool_slab_base, 16
+            Return slot_size
+        End If
+    End If
+
+    Note: Owned-heap (brk/mmap) path. Header sits at ptr-header_size
+    Note: with the canonical four-field layout (allocation_id, generation,
+    Note: total_size, alloc_type) at offsets 0/8/16/24. Under DEBUG the
+    Note: header is expanded to 48 bytes (pre-canary at +32..+47) and a
+    Note: 16-byte post-canary lives at the tail of total_size.
+    Let header_size be ALLOC_HEADER_BASE_SIZE
+    Let post_canary_size be 0
+    If DEBUG_ALLOCATOR_CANARIES_ENABLED is equal to 1:
+        Set header_size to header_size plus ALLOC_HEADER_CANARY_SIZE
+        Set post_canary_size to ALLOC_HEADER_POST_CANARY_SIZE
+    End If
+
+    Let header_ptr be ptr minus header_size
+    Let total_size be proc memory_get_int64 from Memory with header_ptr, 16
+
+    Let user_size be total_size minus header_size
+    Set user_size to user_size minus post_canary_size
+    Return user_size
+End Process
+
 Process called "deallocate" takes ptr as Integer returns Integer:
     @Reasoning
     Releases memory previously returned by allocate(). The owned-heap allocation
