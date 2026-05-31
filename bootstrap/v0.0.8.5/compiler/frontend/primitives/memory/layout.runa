@@ -372,13 +372,35 @@ This registry tracks all live allocations to enable runtime borrow lifetime vali
 It detects use-after-free, use-after-realloc, and out-of-bounds access.
 
 Registry Entry Structure (56 bytes):
-  offset 0:  is_occupied (1=occupied, 0=empty, 8 bytes)
+  offset 0:  slot_state (1=occupied, 0=empty, 2=tombstone, 8 bytes)
   offset 8:  allocation_id (unique ID, 8 bytes)
   offset 16: generation (incremented on reuse, 8 bytes)
   offset 24: base_ptr (user data pointer, 8 bytes)
   offset 32: size (allocation size in bytes, 8 bytes)
   offset 40: alloc_type (1=brk, 2=mmap, 3=shared, 8 bytes)
   offset 48: is_alive (1=allocated, 0=freed, 8 bytes)
+
+The slot_state field uses three values for correct open-addressed probing
+under linear-probe insertion and tombstone removal:
+  0 = empty: slot has never been occupied. Lookups halt here (key not found).
+  1 = occupied: slot holds a live (alloc_id, generation, ...) entry.
+  2 = tombstone: slot was occupied and is now removed. Lookups MUST keep
+      probing past tombstones because the target key may live further
+      down the probe chain. Inserts MAY claim tombstone slots, which
+      keeps tombstone density bounded.
+
+The tombstone discipline is structurally required. Without it, removing
+an entry that ever shared a probe chain with a later collider would
+strand the collider's entry behind an empty slot, causing every lookup
+of the collider to return "not found". That manifests as
+canary_fail_abort(loc=5, CANARY_LOC_QUARANTINE_EVICT) because
+registry_get_generation returns 0 for an entry that exists with
+generation > 0, and the eviction-time canary verify uses the bogus
+generation 0 instead of the real one. The header carries the truth, but
+deallocate goes through registry_get_generation because the evicted
+block's header may legitimately have an arbitrary generation written by
+the most-recent allocate(); the registry was meant to be the
+authoritative copy.
 :End Note
 
 Let registry_table be 0           Note: Pointer to RegistryEntry array
@@ -443,15 +465,23 @@ Process called "registry_lookup" takes alloc_id as Integer returns Integer:
     While probe_count is less than max_probes:
         Let entry_offset be current_index multiplied by REGISTRY_ENTRY_SIZE
         Let entry_ptr be registry_table plus entry_offset
-        Let is_occupied be proc memory_get_int64 from Memory with entry_ptr, 0
+        Let slot_state be proc memory_get_int64 from Memory with entry_ptr, 0
 
-        If is_occupied is equal to 0:
+        Note: Empty slot (state=0) terminates the probe chain - if the
+        Note: target key existed it would have been placed at or before
+        Note: this slot per the linear-probing invariant. Tombstone
+        Note: slots (state=2) are NOT terminators because the target
+        Note: may live further down the chain past prior removals; we
+        Note: continue probing.
+        If slot_state is equal to 0:
             Return 0
         End If
 
-        Let stored_id be proc memory_get_int64 from Memory with entry_ptr, 8
-        If stored_id is equal to alloc_id:
-            Return entry_ptr
+        If slot_state is equal to 1:
+            Let stored_id be proc memory_get_int64 from Memory with entry_ptr, 8
+            If stored_id is equal to alloc_id:
+                Return entry_ptr
+            End If
         End If
 
         Set current_index to current_index plus 1
@@ -488,9 +518,15 @@ Process called "registry_insert" takes alloc_id as Integer, generation as Intege
     While probe_count is less than max_probes:
         Let entry_offset be current_index multiplied by REGISTRY_ENTRY_SIZE
         Let entry_ptr be registry_table plus entry_offset
-        Let is_occupied be proc memory_get_int64 from Memory with entry_ptr, 0
+        Let slot_state be proc memory_get_int64 from Memory with entry_ptr, 0
 
-        If is_occupied is equal to 0:
+        Note: Either an empty slot (state=0) or a tombstoned slot (state=2)
+        Note: is reusable for a new insert. alloc_ids are monotone via
+        Note: registry_allocate_id so no duplicate-key concern arises;
+        Note: each alloc_id is inserted at most once over the program's
+        Note: lifetime. Reclaiming tombstones during insert keeps the
+        Note: tombstone density bounded across long-lived processes.
+        If slot_state is not equal to 1:
             proc memory_set_int64 from Memory with entry_ptr, 0, 1
             proc memory_set_int64 from Memory with entry_ptr, 8, alloc_id
             proc memory_set_int64 from Memory with entry_ptr, 16, generation
@@ -545,7 +581,14 @@ Process called "registry_remove" takes alloc_id as Integer returns Integer:
     If entry_ptr is equal to 0:
         Return 0
     End If
-    proc memory_set_int64 from Memory with entry_ptr, 0, 0
+    Note: Mark the slot as a tombstone (state=2), NOT empty (state=0).
+    Note: A bare empty marker would strand any entry that previously
+    Note: collided with this slot and lives further down the probe
+    Note: chain: a subsequent registry_lookup for that key would stop
+    Note: at this slot, observe state=0, and incorrectly return 0
+    Note: ("not found"). registry_lookup skips tombstones; registry_insert
+    Note: may reclaim them.
+    proc memory_set_int64 from Memory with entry_ptr, 0, 2
     Set registry_count to registry_count minus 1
     Return 1
 End Process
