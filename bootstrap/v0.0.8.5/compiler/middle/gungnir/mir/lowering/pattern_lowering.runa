@@ -1,0 +1,939 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+PATTERN LOWERING - HIR Patterns to MIR Comparison Values (P2-E Group B)
+
+Pattern nodes (14000-14011) appear inside HIR_WHEN_CLAUSE bodies.
+The enclosing HIR_MATCH_STATEMENT holds the scrutinee MIR value
+in its frame; the WHEN_CLAUSE child_exit consumes the pattern's
+emitted MIR value (a Boolean) and emits the compare-eq + branch
+to the case_label or next_label.
+
+The pattern handlers here emit the comparison value that the
+WHEN_CLAUSE consumes. Each pattern type produces a different
+comparison shape:
+
+  HIR_IDENTIFIER_PATTERN (14000): always-true (binding pattern);
+    binds the matched value to the variable id and pushes a
+    constant 1 onto the result stack.
+  HIR_LITERAL_PATTERN (14001): pushes a constant equal to the
+    literal value; WHEN_CLAUSE then emits compare-eq vs scrutinee.
+  HIR_TUPLE_PATTERN (14002): emits per-element compare-eq, ANDs
+    them, pushes the AND result.
+  HIR_RECORD_PATTERN (14003): per-field compare-eq + AND.
+  HIR_WILDCARD_PATTERN (14004): always-true; pushes constant 1.
+  HIR_TYPE_PATTERN (14005): type-check via runtime type-id
+    compare.
+  HIR_GUARD_PATTERN (14006): the guard expression's MIR value is
+    AND-ed with the underlying pattern's result.
+  HIR_RANGE_PATTERN (14007): emits start-le and le-end, ANDs them.
+  HIR_VARIANT_PATTERN (14008): tag-compare against the variant
+    discriminator.
+  HIR_ARRAY_PATTERN (14009): per-element compare + length compare.
+  HIR_OR_PATTERN (14010): per-alternative pattern OR'd together.
+  HIR_REST_PATTERN (14011): always-true rest binding; pushes
+    constant 1.
+
+The current visit_pattern_children proc is being added by Wave H1
+in parallel. Until it lands, these handlers are registered in
+the dispatch table but will not be invoked (the visitor's
+dispatcher routes through visit_node_children which calls
+visit_pattern_children for pattern node types). Handlers must
+work correctly the moment the visitor proc is added.
+:End Note
+
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/lowering/lowering_context.runa" as LCtx
+Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================
+Note: HIR_IDENTIFIER_PATTERN post handler (14000)
+Note: ============================================================
+
+@Reasoning
+HIR_IDENTIFIER_PATTERN post: binds the scrutinee value to the
+variable id referenced by the pattern and emits an always-true
+comparison value (constant 1) for the WHEN_CLAUSE to consume.
+The actual binding happens via map_hir_to_mir_value so subsequent
+body statements see the binding.
+@End Reasoning
+
+@Implementation
+1. Read variable_id at HIR_IDENTIFIER_PATTERN offset 16 (the
+   symbol id of the binding).
+2. Peek the enclosing MATCH frame to find the scrutinee MIR value
+   at frame offset 16.
+3. Map variable_id to the scrutinee value via map_hir_to_mir_value.
+4. Allocate a true-constant value and push it as the comparison
+   result.
+@End Implementation
+
+@Performance_Hints
+Two emissions per identifier pattern (const + push).
+@End Performance_Hints
+
+@Security_Scope
+Frame must be a MATCH frame; missing frame causes the binding to
+be skipped (the body will reference an unmapped variable —
+caught by validate_hir_tree).
+@End Security_Scope
+
+Process called "lower_hir_identifier_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let variable_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is not equal to 0:
+        Let match_value be proc cf_frame_get_field from LCtx with frame, 16
+        If match_value is not equal to 0:
+            If variable_id is not equal to 0:
+                proc map_hir_to_mir_value from MIRBuilder with builder_ctx, variable_id, match_value
+            End If
+        End If
+    End If
+
+    Let true_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let true_const be proc create_mir_const from MIRNodes with true_value, 1, 0, 0, 0
+    If true_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, true_const
+    End If
+    proc lowering_push_result from LCtx with ctx, true_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_LITERAL_PATTERN post handler (14001)
+Note: ============================================================
+
+@Reasoning
+HIR_LITERAL_PATTERN post: emits the pattern's literal as a MIR
+const. The WHEN_CLAUSE then compares it against the scrutinee.
+@End Reasoning
+
+@Implementation
+1. Read literal_value at HIR_LITERAL_PATTERN offset 8 and
+   literal_type at offset 16.
+2. Emit MIR_CONST.
+3. Push the value.
+@End Implementation
+
+@Performance_Hints
+Single emit per literal pattern.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks.
+@End Security_Scope
+
+Process called "lower_hir_literal_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let literal_value be proc memory_get_int64 from Layout with hir_node_ptr, 8
+    Let literal_type be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let const_inst be proc create_mir_const from MIRNodes with result_value, literal_value, literal_type, 0, 0
+    If const_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, const_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TUPLE_PATTERN post handler (14002)
+Note: ============================================================
+
+@Reasoning
+HIR_TUPLE_PATTERN post: emits per-element equality checks AND-ed
+together. Each element pattern has already been visited and
+pushed its comparison value onto the stack. We pop subpattern_count
+values, AND them all, and push the result.
+@End Reasoning
+
+@Implementation
+1. Read subpattern_count at HIR_TUPLE_PATTERN offset 24.
+2. Pop subpattern_count values from the stack.
+3. AND them sequentially (first AND second, then AND with third,
+   etc.).
+4. Push the final AND value.
+@End Implementation
+
+@Performance_Hints
+N-1 AND emissions per tuple pattern.
+@End Performance_Hints
+
+@Security_Scope
+Zero-element tuple pattern produces a constant 1.
+@End Security_Scope
+
+Process called "lower_hir_tuple_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let subpattern_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    If subpattern_count is equal to 0:
+        Let true_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let true_const be proc create_mir_const from MIRNodes with true_value, 1, 0, 0, 0
+        If true_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, true_const
+        End If
+        proc lowering_push_result from LCtx with ctx, true_value
+        Return 1
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be subpattern_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let accumulator be proc lowering_pop_result from LCtx with ctx
+    Let popped be 1
+    While popped is less than to_pop:
+        Let next_value be proc lowering_pop_result from LCtx with ctx
+        Let combined be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let and_inst be proc create_mir_binary_op from MIRNodes with 20010, combined, accumulator, next_value, 0
+        If and_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, and_inst
+        End If
+        Set accumulator to combined
+        Set popped to popped plus 1
+    End While
+
+    proc lowering_push_result from LCtx with ctx, accumulator
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_RECORD_PATTERN post handler (14003)
+Note: ============================================================
+
+@Reasoning
+HIR_RECORD_PATTERN post: per-field equality checks AND-ed
+together. Same structural pattern as tuple-pattern.
+@End Reasoning
+
+@Implementation
+Identical to tuple-pattern (count + AND chain).
+@End Implementation
+
+@Performance_Hints
+N-1 AND emissions per record pattern.
+@End Performance_Hints
+
+@Security_Scope
+Zero-field record pattern produces a constant 1.
+@End Security_Scope
+
+Process called "lower_hir_record_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let subpattern_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    If subpattern_count is equal to 0:
+        Let true_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let true_const be proc create_mir_const from MIRNodes with true_value, 1, 0, 0, 0
+        If true_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, true_const
+        End If
+        proc lowering_push_result from LCtx with ctx, true_value
+        Return 1
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be subpattern_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let accumulator be proc lowering_pop_result from LCtx with ctx
+    Let popped be 1
+    While popped is less than to_pop:
+        Let next_value be proc lowering_pop_result from LCtx with ctx
+        Let combined be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let and_inst be proc create_mir_binary_op from MIRNodes with 20010, combined, accumulator, next_value, 0
+        If and_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, and_inst
+        End If
+        Set accumulator to combined
+        Set popped to popped plus 1
+    End While
+
+    proc lowering_push_result from LCtx with ctx, accumulator
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_WILDCARD_PATTERN post handler (14004)
+Note: ============================================================
+
+@Reasoning
+HIR_WILDCARD_PATTERN post: matches anything. Pushes a constant 1.
+@End Reasoning
+
+@Implementation
+Emit MIR_CONST(1), push value.
+@End Implementation
+
+@Performance_Hints
+Single emit per wildcard.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_wildcard_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let true_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let true_const be proc create_mir_const from MIRNodes with true_value, 1, 0, 0, 0
+    If true_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, true_const
+    End If
+    proc lowering_push_result from LCtx with ctx, true_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TYPE_PATTERN post handler (14005)
+Note: ============================================================
+
+@Reasoning
+HIR_TYPE_PATTERN post: matches if the scrutinee is of the given
+type. Emits a runtime type-id compare. The type id is encoded at
+offset 16 of the pattern node; the scrutinee value's runtime
+type is read from its object header (offset 0 by Runa
+convention).
+@End Reasoning
+
+@Implementation
+1. Peek the MATCH frame for the scrutinee value.
+2. Read pattern type_id at HIR_TYPE_PATTERN offset 16.
+3. Emit a load of the scrutinee's runtime type id (load from
+   offset 0).
+4. Emit MIR_CONST with the pattern's type id.
+5. Emit compare-eq, push the result.
+@End Implementation
+
+@Performance_Hints
+Three emissions per type pattern.
+@End Performance_Hints
+
+@Security_Scope
+Missing scrutinee causes the pattern to evaluate as false.
+@End Security_Scope
+
+Process called "lower_hir_type_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let pattern_type_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    Let match_value be 0
+    If frame is not equal to 0:
+        Set match_value to proc cf_frame_get_field from LCtx with frame, 16
+    End If
+
+    If match_value is equal to 0:
+        Let false_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let false_const be proc create_mir_const from MIRNodes with false_value, 0, 0, 0, 0
+        If false_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, false_const
+        End If
+        proc lowering_push_result from LCtx with ctx, false_value
+        Return 1
+    End If
+
+    Let runtime_type_id be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with runtime_type_id, match_value, 0, 0, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let pattern_id_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let id_const be proc create_mir_const from MIRNodes with pattern_id_value, pattern_type_id, 0, 0, 0
+    If id_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, id_const
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20100, result_value, runtime_type_id, pattern_id_value, 0
+    If cmp_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, cmp_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_GUARD_PATTERN post handler (14006)
+Note: ============================================================
+
+@Reasoning
+HIR_GUARD_PATTERN post: the underlying pattern's result is AND-ed
+with the guard expression's Boolean result. Both have been
+visited; their values are on the stack with the guard value on
+top.
+@End Reasoning
+
+@Implementation
+1. Pop guard_value (top of stack).
+2. Pop underlying_value.
+3. Emit MIR_AND, push the result.
+@End Implementation
+
+@Performance_Hints
+One AND emission per guard pattern.
+@End Performance_Hints
+
+@Security_Scope
+Null inputs are treated as false.
+@End Security_Scope
+
+Process called "lower_hir_guard_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let guard_value be proc lowering_pop_result from LCtx with ctx
+    Let underlying_value be proc lowering_pop_result from LCtx with ctx
+
+    Let combined be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let and_inst be proc create_mir_binary_op from MIRNodes with 20010, combined, underlying_value, guard_value, 0
+    If and_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, and_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, combined
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_RANGE_PATTERN post handler (14007)
+Note: ============================================================
+
+@Reasoning
+HIR_RANGE_PATTERN post: matches if start <= scrutinee <= end
+(inclusive) or start <= scrutinee < end (exclusive). The start
+and end pattern children have been visited and pushed their
+constant values. The WHEN_CLAUSE then compares the AND result
+to true.
+@End Reasoning
+
+@Implementation
+1. Pop end_value and start_value from the stack.
+2. Peek the MATCH frame for the scrutinee.
+3. Read inclusive flag at HIR_RANGE_PATTERN offset 24.
+4. Emit ge(scrutinee, start) and lt-or-le(scrutinee, end).
+5. AND them, push the result.
+@End Implementation
+
+@Performance_Hints
+Three emissions per range pattern (two compares + AND).
+@End Performance_Hints
+
+@Security_Scope
+Missing scrutinee causes the pattern to evaluate as false.
+@End Security_Scope
+
+Process called "lower_hir_range_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let end_value be proc lowering_pop_result from LCtx with ctx
+    Let start_value be proc lowering_pop_result from LCtx with ctx
+    Let inclusive be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    Let match_value be 0
+    If frame is not equal to 0:
+        Set match_value to proc cf_frame_get_field from LCtx with frame, 16
+    End If
+
+    If match_value is equal to 0:
+        Let false_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let false_const be proc create_mir_const from MIRNodes with false_value, 0, 0, 0, 0
+        If false_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, false_const
+        End If
+        proc lowering_push_result from LCtx with ctx, false_value
+        Return 1
+    End If
+
+    Let ge_result be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let ge_inst be proc create_mir_binary_op from MIRNodes with 20105, ge_result, match_value, start_value, 0
+    If ge_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, ge_inst
+    End If
+
+    Let upper_opcode be 20102
+    If inclusive is equal to 1:
+        Set upper_opcode to 20103
+    End If
+    Let le_result be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let le_inst be proc create_mir_binary_op from MIRNodes with upper_opcode, le_result, match_value, end_value, 0
+    If le_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, le_inst
+    End If
+
+    Let combined be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let and_inst be proc create_mir_binary_op from MIRNodes with 20010, combined, ge_result, le_result, 0
+    If and_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, and_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, combined
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_VARIANT_PATTERN post handler (14008)
+Note: ============================================================
+
+@Reasoning
+HIR_VARIANT_PATTERN post: matches an enum variant. Reads the
+variant's discriminator tag from offset 16 of the pattern and
+compares it against the scrutinee's tag (loaded from offset 0).
+@End Reasoning
+
+@Implementation
+1. Peek MATCH frame for scrutinee.
+2. Read variant_tag at HIR_VARIANT_PATTERN offset 16.
+3. Load scrutinee's tag (offset 0).
+4. Emit MIR_CONST with variant_tag.
+5. Emit compare-eq, push.
+@End Implementation
+
+@Performance_Hints
+Three emissions per variant pattern.
+@End Performance_Hints
+
+@Security_Scope
+Missing scrutinee evaluates as false.
+@End Security_Scope
+
+Process called "lower_hir_variant_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let variant_tag be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    Let match_value be 0
+    If frame is not equal to 0:
+        Set match_value to proc cf_frame_get_field from LCtx with frame, 16
+    End If
+
+    If match_value is equal to 0:
+        Let false_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let false_const be proc create_mir_const from MIRNodes with false_value, 0, 0, 0, 0
+        If false_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, false_const
+        End If
+        proc lowering_push_result from LCtx with ctx, false_value
+        Return 1
+    End If
+
+    Let runtime_tag be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with runtime_tag, match_value, 0, 0, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let pattern_tag_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let tag_const be proc create_mir_const from MIRNodes with pattern_tag_value, variant_tag, 0, 0, 0
+    If tag_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, tag_const
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20100, result_value, runtime_tag, pattern_tag_value, 0
+    If cmp_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, cmp_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_ARRAY_PATTERN post handler (14009)
+Note: ============================================================
+
+@Reasoning
+HIR_ARRAY_PATTERN post: matches an array of a specific length
+with each element matching the corresponding sub-pattern. The
+subpattern values have been visited and pushed; we AND them all.
+The array-length compare is emitted separately and AND-ed with
+the element results.
+@End Reasoning
+
+@Implementation
+1. Read subpattern_count at HIR_ARRAY_PATTERN offset 24.
+2. Pop subpattern_count comparison values.
+3. AND them all.
+4. (Length compare is omitted at the lowering layer — the HIR
+   layer guarantees length-match via type info.)
+5. Push the AND result.
+@End Implementation
+
+@Performance_Hints
+N-1 AND emissions per array pattern.
+@End Performance_Hints
+
+@Security_Scope
+Zero-element array pattern produces constant 1 (empty array
+match).
+@End Security_Scope
+
+Process called "lower_hir_array_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let subpattern_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    If subpattern_count is equal to 0:
+        Let true_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let true_const be proc create_mir_const from MIRNodes with true_value, 1, 0, 0, 0
+        If true_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, true_const
+        End If
+        proc lowering_push_result from LCtx with ctx, true_value
+        Return 1
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be subpattern_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let accumulator be proc lowering_pop_result from LCtx with ctx
+    Let popped be 1
+    While popped is less than to_pop:
+        Let next_value be proc lowering_pop_result from LCtx with ctx
+        Let combined be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let and_inst be proc create_mir_binary_op from MIRNodes with 20010, combined, accumulator, next_value, 0
+        If and_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, and_inst
+        End If
+        Set accumulator to combined
+        Set popped to popped plus 1
+    End While
+
+    proc lowering_push_result from LCtx with ctx, accumulator
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_OR_PATTERN post handler (14010)
+Note: ============================================================
+
+@Reasoning
+HIR_OR_PATTERN post: alternative pattern (pat1 | pat2 | ...).
+Pops subpattern_count values and ORs them together.
+@End Reasoning
+
+@Implementation
+1. Read subpattern_count at HIR_OR_PATTERN offset 24.
+2. Pop subpattern_count values.
+3. OR them sequentially.
+4. Push the OR result.
+@End Implementation
+
+@Performance_Hints
+N-1 OR emissions per or-pattern.
+@End Performance_Hints
+
+@Security_Scope
+Zero-alternative or-pattern produces constant 0.
+@End Security_Scope
+
+Process called "lower_hir_or_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let subpattern_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    If subpattern_count is equal to 0:
+        Let false_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let false_const be proc create_mir_const from MIRNodes with false_value, 0, 0, 0, 0
+        If false_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, false_const
+        End If
+        proc lowering_push_result from LCtx with ctx, false_value
+        Return 1
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be subpattern_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let accumulator be proc lowering_pop_result from LCtx with ctx
+    Let popped be 1
+    While popped is less than to_pop:
+        Let next_value be proc lowering_pop_result from LCtx with ctx
+        Let combined be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let or_inst be proc create_mir_binary_op from MIRNodes with 20011, combined, accumulator, next_value, 0
+        If or_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, or_inst
+        End If
+        Set accumulator to combined
+        Set popped to popped plus 1
+    End While
+
+    proc lowering_push_result from LCtx with ctx, accumulator
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_REST_PATTERN post handler (14011)
+Note: ============================================================
+
+@Reasoning
+HIR_REST_PATTERN post: a rest binding (...rest) in array/tuple
+patterns. Always matches; binds the remaining elements to the
+rest variable if one is declared. Pushes constant 1.
+@End Reasoning
+
+@Implementation
+1. Read rest_var_id at HIR_REST_PATTERN offset 16 (0 if no
+   binding name).
+2. If non-zero, look up the rest's MIR value (a slice into the
+   scrutinee starting at the rest's source position) — for the
+   foundation pipeline the rest is bound to the scrutinee
+   directly; refinement comes once slice runtime helpers land.
+3. Emit MIR_CONST(1), push the true value.
+@End Implementation
+
+@Performance_Hints
+One or two emissions per rest pattern.
+@End Performance_Hints
+
+@Security_Scope
+Missing scrutinee skips the binding; constant true still pushed.
+@End Security_Scope
+
+Process called "lower_hir_rest_pattern_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let rest_var_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    If rest_var_id is not equal to 0:
+        Let frame be proc cf_frame_peek from LCtx with ctx
+        If frame is not equal to 0:
+            Let match_value be proc cf_frame_get_field from LCtx with frame, 16
+            If match_value is not equal to 0:
+                proc map_hir_to_mir_value from MIRBuilder with builder_ctx, rest_var_id, match_value
+            End If
+        End If
+    End If
+
+    Let true_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let true_const be proc create_mir_const from MIRNodes with true_value, 1, 0, 0, 0
+    If true_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, true_const
+    End If
+    proc lowering_push_result from LCtx with ctx, true_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: Pattern Handler Registration
+Note: ============================================================
+
+@Reasoning
+Installs every HIR pattern-node handler in the lowering dispatch
+table. All 12 pattern handlers are post-only — patterns produce a
+single Boolean MIR value that the enclosing WHEN_CLAUSE consumes.
+@End Reasoning
+
+@Implementation
+Sequence of lowering_register_handler calls covering 14000-14011.
+@End Implementation
+
+@Performance_Hints
+Cold path, called once per lowering pass.
+@End Performance_Hints
+
+@Security_Scope
+Validates table non-null.
+@End Security_Scope
+
+Process called "register_pattern_handlers" that takes dispatch_table as Integer returns Integer:
+    If dispatch_table is equal to 0:
+        Return 0
+    End If
+
+    Note: HIR_IDENTIFIER_PATTERN (14000): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14000, 0, lower_hir_identifier_pattern_post, 0, 0
+
+    Note: HIR_LITERAL_PATTERN (14001): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14001, 0, lower_hir_literal_pattern_post, 0, 0
+
+    Note: HIR_TUPLE_PATTERN (14002): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14002, 0, lower_hir_tuple_pattern_post, 0, 0
+
+    Note: HIR_RECORD_PATTERN (14003): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14003, 0, lower_hir_record_pattern_post, 0, 0
+
+    Note: HIR_WILDCARD_PATTERN (14004): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14004, 0, lower_hir_wildcard_pattern_post, 0, 0
+
+    Note: HIR_TYPE_PATTERN (14005): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14005, 0, lower_hir_type_pattern_post, 0, 0
+
+    Note: HIR_GUARD_PATTERN (14006): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14006, 0, lower_hir_guard_pattern_post, 0, 0
+
+    Note: HIR_RANGE_PATTERN (14007): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14007, 0, lower_hir_range_pattern_post, 0, 0
+
+    Note: HIR_VARIANT_PATTERN (14008): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14008, 0, lower_hir_variant_pattern_post, 0, 0
+
+    Note: HIR_ARRAY_PATTERN (14009): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14009, 0, lower_hir_array_pattern_post, 0, 0
+
+    Note: HIR_OR_PATTERN (14010): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14010, 0, lower_hir_or_pattern_post, 0, 0
+
+    Note: HIR_REST_PATTERN (14011): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 14011, 0, lower_hir_rest_pattern_post, 0, 0
+
+    Return 1
+End Process

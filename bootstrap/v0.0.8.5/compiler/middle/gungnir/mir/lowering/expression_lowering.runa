@@ -1,0 +1,1728 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+EXPRESSION LOWERING - HIR Expressions to MIR Instructions (P2-E Group B)
+
+Post-order handlers for HIR expression nodes (10000-10999). Each handler
+reads its children's MIR value ids off the LoweringContext result stack
+(children have already been lowered by the visitor), emits the MIR
+instruction for the current node via the MIR builder context, and pushes
+the result value id back onto the result stack for the parent handler.
+
+Per the v3 design Section 3.4 table, expressions use only post hooks
+(pre is null) with two exceptions:
+  - HIR_CALL_EXPRESSION uses pre + post to record the argument count
+    target before children are visited and consume them in post.
+
+Helper procs:
+  - map_binary_operator_to_mir_opcode: HIR operator id -> MIR opcode
+  - map_unary_operator_to_mir_opcode: HIR unary operator id -> MIR opcode
+
+Registration:
+  - register_expression_handlers installs every expression handler in
+    the dispatch table.
+:End Note
+
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/lowering/lowering_context.runa" as LCtx
+Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================
+Note: HIR Operator Mappings
+Note: ============================================================
+
+@Reasoning
+Maps a HIR binary operator id (0-based small integer assigned by HIR
+construction) to the corresponding MIR opcode (20000+ namespace).
+Centralising this mapping keeps the lowering handler free of magic
+numbers and gives the optimiser a single point to extend with new
+operators (e.g., saturating arithmetic, wrapping arithmetic) without
+touching the dispatcher.
+@End Reasoning
+
+@Implementation
+Linear if-cascade keyed by the HIR_OP_* constants defined in HIR
+(currently inline integers, to be promoted to named constants in a
+separate task). Returns MIR_NOP for unrecognised operators so the
+verifier downstream catches the mismatch.
+
+Mapping table:
+  HIR_OP_ADD (1)  -> MIR_ADD  (20002)
+  HIR_OP_SUB (2)  -> MIR_SUB  (20003)
+  HIR_OP_MUL (3)  -> MIR_MUL  (20004)
+  HIR_OP_DIV (4)  -> MIR_DIV  (20005)
+  HIR_OP_MOD (5)  -> MIR_MOD  (20006)
+  HIR_OP_EQ  (10) -> MIR_EQ   (20100)
+  HIR_OP_NE  (11) -> MIR_NE   (20101)
+  HIR_OP_LT  (12) -> MIR_LT   (20102)
+  HIR_OP_LE  (13) -> MIR_LE   (20103)
+  HIR_OP_GT  (14) -> MIR_GT   (20104)
+  HIR_OP_GE  (15) -> MIR_GE   (20105)
+  HIR_OP_AND (20) -> MIR_AND  (20010)
+  HIR_OP_OR  (21) -> MIR_OR   (20011)
+  HIR_OP_XOR (22) -> MIR_XOR  (20012)
+  HIR_OP_SHL (23) -> MIR_SHL  (20014)
+  HIR_OP_SHR (24) -> MIR_SHR  (20015)
+@End Implementation
+
+@Performance_Hints
+Called once per binary expression at lowering time. The if-cascade
+predicts well on hot operators (add, sub, eq) — modern branch
+predictors handle the ~16-entry chain in under a cycle on average.
+@End Performance_Hints
+
+@Security_Scope
+Returns MIR_NOP for unknown operators rather than silently picking a
+plausible-looking opcode; the verifier rejects MIR_NOP in operator
+contexts so the failure is visible at integration time.
+@End Security_Scope
+
+Process called "map_binary_operator_to_mir_opcode" that takes hir_operator as Integer returns Integer:
+    If hir_operator is equal to 1:
+        Return 20002
+    End If
+    If hir_operator is equal to 2:
+        Return 20003
+    End If
+    If hir_operator is equal to 3:
+        Return 20004
+    End If
+    If hir_operator is equal to 4:
+        Return 20005
+    End If
+    If hir_operator is equal to 5:
+        Return 20006
+    End If
+    If hir_operator is equal to 10:
+        Return 20100
+    End If
+    If hir_operator is equal to 11:
+        Return 20101
+    End If
+    If hir_operator is equal to 12:
+        Return 20102
+    End If
+    If hir_operator is equal to 13:
+        Return 20103
+    End If
+    If hir_operator is equal to 14:
+        Return 20104
+    End If
+    If hir_operator is equal to 15:
+        Return 20105
+    End If
+    If hir_operator is equal to 20:
+        Return 20010
+    End If
+    If hir_operator is equal to 21:
+        Return 20011
+    End If
+    If hir_operator is equal to 22:
+        Return 20012
+    End If
+    If hir_operator is equal to 23:
+        Return 20014
+    End If
+    If hir_operator is equal to 24:
+        Return 20015
+    End If
+    Return 20000
+End Process
+
+@Reasoning
+Maps a HIR unary operator id to the corresponding MIR opcode.
+Companion to map_binary_operator_to_mir_opcode for unary nodes.
+@End Reasoning
+
+@Implementation
+HIR_OP_NEG (1) -> MIR_NEG (20007)
+HIR_OP_NOT (2) -> MIR_NOT (20013)
+Returns MIR_NOP for unrecognised operators.
+@End Implementation
+
+@Performance_Hints
+Two-entry if-cascade; predicts perfectly.
+@End Performance_Hints
+
+@Security_Scope
+Unknown-operator path returns MIR_NOP for explicit verifier
+rejection.
+@End Security_Scope
+
+Process called "map_unary_operator_to_mir_opcode" that takes hir_operator as Integer returns Integer:
+    If hir_operator is equal to 1:
+        Return 20007
+    End If
+    If hir_operator is equal to 2:
+        Return 20013
+    End If
+    Return 20000
+End Process
+
+Note: ============================================================
+Note: HIR_LITERAL post handler
+Note: ============================================================
+
+@Reasoning
+HIR_LITERAL post: emits a MIR_CONST instruction whose result value
+id is freshly allocated and whose constant_value is read directly
+from the HIR literal node. Pushes the result value id onto the
+result stack for the parent's consumption.
+@End Reasoning
+
+@Implementation
+1. Look up the builder context via the lowering context.
+2. Allocate a fresh MIR temp value via allocate_temp_value.
+3. Read the literal value at HIR_LITERAL offset 8 (per hir.runa
+   layout).
+4. Read the literal type at offset 16 if present (0 for untyped).
+5. Create a MIR_CONST node via create_mir_const with the value, type,
+   is_string=0, string_ptr=0 (string literals carry their string at
+   the HIR layer via a separate pathway; non-string literals here
+   use the integer/float scalar slot).
+6. Emit the instruction via emit_instruction.
+7. Push the result value id onto the result stack.
+Returns 1 on success.
+@End Implementation
+
+@Performance_Hints
+Hot path — every literal in the program lowers through this proc.
+The constant node allocation dominates; future arena allocation for
+short-lived const nodes will cut the cost.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks on ctx, builder_ctx, hir_node. A null literal
+value or type is treated as a valid 0 (true zero literals are
+common).
+@End Security_Scope
+
+Process called "lower_hir_literal_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let literal_value be proc memory_get_int64 from Layout with hir_node_ptr, 8
+    Let literal_type be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let const_inst be proc create_mir_const from MIRNodes with result_value, literal_value, literal_type, 0, 0
+    If const_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, const_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_IDENTIFIER post handler
+Note: ============================================================
+
+@Reasoning
+HIR_IDENTIFIER post: looks up the previously-mapped MIR value id
+for the identifier's resolved symbol id. The map was populated when
+the identifier's defining HIR_LET_STATEMENT (or parameter binding)
+was lowered. Pushes the looked-up value onto the result stack.
+@End Reasoning
+
+@Implementation
+1. Read HIR identifier id at HIR_IDENTIFIER offset 16.
+2. Call lookup_mir_value to find the corresponding MIR value id.
+3. If lookup returns 0 (undefined), record an error and return 0.
+4. Push the value id onto the result stack.
+Returns 1 on success.
+@End Implementation
+
+@Performance_Hints
+O(1) dictionary lookup via the MIR builder's value map.
+@End Performance_Hints
+
+@Security_Scope
+Undefined-identifier path sets the error flag and stops traversal
+so the driver doesn't emit incomplete MIR.
+@End Security_Scope
+
+Process called "lower_hir_identifier_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let hir_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let mir_value be proc lookup_mir_value from MIRBuilder with builder_ctx, hir_id
+
+    If mir_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 1, hir_node_ptr
+        Return 0
+    End If
+
+    proc lowering_push_result from LCtx with ctx, mir_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_BINARY_EXPRESSION post handler
+Note: ============================================================
+
+@Reasoning
+HIR_BINARY_EXPRESSION post: consumes two child results from the
+stack (right first, then left, matching the visitor's child-index
+order: 0=left, 1=right, with the LIFO stack returning the most
+recently pushed first). Emits the MIR binary op and pushes the
+result.
+@End Reasoning
+
+@Implementation
+1. Read the operator id at HIR_BINARY_EXPRESSION offset 24.
+2. Pop right operand value id (most recent push from child_index 1).
+3. Pop left operand value id (push from child_index 0).
+4. Map the operator id to a MIR opcode.
+5. Allocate a fresh result value id.
+6. Create the MIR binary op and emit it.
+7. Push the result.
+Returns 1 on success.
+@End Implementation
+
+@Performance_Hints
+Hot path. Two pops, one push, one opcode mapping, one node
+allocation.
+@End Performance_Hints
+
+@Security_Scope
+If either pop returns 0 (empty stack or null context), the handler
+records an error and stops.
+@End Security_Scope
+
+Process called "lower_hir_binary_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let operator be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+
+    Let right_value be proc lowering_pop_result from LCtx with ctx
+    Let left_value be proc lowering_pop_result from LCtx with ctx
+
+    If left_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 2, hir_node_ptr
+        Return 0
+    End If
+    If right_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 3, hir_node_ptr
+        Return 0
+    End If
+
+    Let mir_opcode be proc map_binary_operator_to_mir_opcode with operator
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+
+    Let binary_inst be proc create_mir_binary_op from MIRNodes with mir_opcode, result_value, left_value, right_value, result_type
+    If binary_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, binary_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_UNARY_EXPRESSION post handler
+Note: ============================================================
+
+@Reasoning
+HIR_UNARY_EXPRESSION post: consumes the single operand result,
+emits the MIR unary op, and pushes the result.
+@End Reasoning
+
+@Implementation
+1. Read operator id at offset 24, result type at offset 32.
+2. Pop operand value id from the result stack.
+3. Map operator to MIR opcode and allocate result value.
+4. Create + emit MIR unary node.
+5. Push result.
+@End Implementation
+
+@Performance_Hints
+Single pop, single push.
+@End Performance_Hints
+
+@Security_Scope
+Empty-stack pop is treated as a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_unary_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let operator be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+
+    Let operand_value be proc lowering_pop_result from LCtx with ctx
+    If operand_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 4, hir_node_ptr
+        Return 0
+    End If
+
+    Let mir_opcode be proc map_unary_operator_to_mir_opcode with operator
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+
+    Let unary_inst be proc create_mir_unary_op from MIRNodes with mir_opcode, result_value, operand_value, result_type
+    If unary_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, unary_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_CALL_EXPRESSION pre + post handlers
+Note: ============================================================
+
+@Reasoning
+HIR_CALL_EXPRESSION uses a pre handler to record the argument count
+target (read from the HIR node's arg_count field at offset 24) into
+the pending_lvalue slot. The post handler pops exactly that many
+argument MIR values (plus the callee at child_index 0) and emits
+the MIR_CALL.
+
+Recording the count up-front rather than relying on the result
+stack's depth makes the implementation robust against expression
+subnodes that push but don't pop (none in current HIR but a
+defensive design choice).
+@End Reasoning
+
+@Implementation
+Pre: read arg_count at HIR_CALL_EXPRESSION offset 24; store via
+lowering_set_pending_lvalue (we reuse the pending_lvalue slot for
+this purpose since Set-statement is the only other client and
+Set-pre/Call-pre never nest in a way that would conflict — Set is
+a statement, Call is an expression).
+@End Implementation
+
+@Performance_Hints
+Cold compared to the post handler. Single int64 read and write.
+@End Performance_Hints
+
+@Security_Scope
+Defensive: arg_count of 0 is a valid no-args call.
+@End Security_Scope
+
+Process called "lower_hir_call_expression_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let arg_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    proc lowering_set_pending_lvalue from LCtx with ctx, arg_count
+    Return 1
+End Process
+
+@Reasoning
+HIR_CALL_EXPRESSION post: consumes the callee and N argument MIR
+values from the result stack and emits a MIR_CALL. Argument order
+on the stack is reversed (the LIFO stack returns most-recent first)
+so we pop into a List in reverse and pass that to create_mir_call.
+The FFI metadata (callee_is_external, callee_convention_id) is
+propagated from the per-builder externals registry per P2-D.
+@End Reasoning
+
+@Implementation
+1. Recover the recorded arg_count via lowering_take_pending_lvalue.
+2. Build a List of N arguments by popping N values and inserting at
+   the head of the list (so source order is preserved).
+3. Pop the callee value id (which was child_index 0, pushed first
+   so popped after all args).
+4. Read the return type at offset 32 of the HIR node.
+5. Read the callee name string pointer at offset 8 of the HIR node
+   (the original HIR identifier text); look it up in the per-
+   builder externals registry.
+6. Allocate a result value id and create the MIR_CALL.
+7. If the callee resolves to a registered external, propagate the
+   FFI metadata.
+8. Emit and push the result.
+@End Implementation
+
+@Performance_Hints
+Hot path for any program with function calls. Cost dominated by the
+two list operations (build + walk) — both O(N) in arg_count.
+@End Performance_Hints
+
+@Security_Scope
+Defensive: missing callee or arguments are treated as lowering
+errors. The pending_lvalue is always cleared.
+@End Security_Scope
+
+Process called "lower_hir_call_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let arg_count be proc lowering_take_pending_lvalue from LCtx with ctx
+    Let return_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Let callee_name_ptr be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Note: Build argument list by popping N values; LIFO returns
+    Note: arguments in reverse source order, so insert at head.
+    Let mir_args be proc create from List
+    Let i be 0
+    While i is less than arg_count:
+        Let arg_value be proc lowering_pop_result from LCtx with ctx
+        proc insert from List with mir_args, 0, arg_value
+        Set i to i plus 1
+    End While
+
+    Note: Pop the callee value (pushed first, popped last)
+    Let callee_value be proc lowering_pop_result from LCtx with ctx
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+
+    Let call_inst be proc create_mir_call from MIRNodes with result_value, callee_value, mir_args, arg_count, return_type, 0, 0
+    If call_inst is equal to 0:
+        Return 0
+    End If
+
+    Note: P2-D FFI: propagate convention id from per-builder externals
+    Note: registry. We key by the HIR identifier string pointer if the
+    Note: HIR node carries one at offset 8 (callee text); if not, the
+    Note: registry lookup returns 0 and no FFI metadata is set.
+    If callee_name_ptr is not equal to 0:
+        Let external_marker be proc mir_context_lookup_external from MIRBuilder with builder_ctx, callee_name_ptr
+        If external_marker is not equal to 0:
+            Let resolved_convention be external_marker minus 1
+            proc mir_call_set_ffi_metadata from MIRNodes with call_inst, 1, resolved_convention
+        End If
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, call_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_INDEX_EXPRESSION post handler
+Note: ============================================================
+
+@Reasoning
+HIR_INDEX_EXPRESSION post: consumes the index value and the
+indexed object value, then emits a MIR_LOAD with the address being
+the object base offset by the index times element-size. For the
+foundation MIR pipeline we emit a MIR_LOAD whose offset is the
+index value id; LIR lowering scales by element-size.
+@End Reasoning
+
+@Implementation
+1. Pop index value id (child_index 1, most recent).
+2. Pop object value id (child_index 0).
+3. Read the result type at HIR_INDEX_EXPRESSION offset 24.
+4. Allocate result value id.
+5. Emit a MIR_LOAD with address=object, offset=index, type=result_type,
+   is_volatile=0.
+6. Push result.
+@End Implementation
+
+@Performance_Hints
+One load instruction emitted per index expression. The offset
+parameter encodes the scaled index without an extra arithmetic node.
+@End Performance_Hints
+
+@Security_Scope
+Bounds checking is performed by a separate runtime helper, not
+embedded in MIR_LOAD itself; that policy keeps the MIR lean.
+@End Security_Scope
+
+Process called "lower_hir_index_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let index_value be proc lowering_pop_result from LCtx with ctx
+    Let object_value be proc lowering_pop_result from LCtx with ctx
+
+    If object_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 5, hir_node_ptr
+        Return 0
+    End If
+
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+
+    Let load_inst be proc create_mir_load from MIRNodes with result_value, object_value, index_value, result_type, 0
+    If load_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_MEMBER_EXPRESSION post handler
+Note: ============================================================
+
+@Reasoning
+HIR_MEMBER_EXPRESSION post: consumes the object value and emits a
+MIR_LOAD using the member offset (resolved at HIR construction
+time and stored at HIR_MEMBER_EXPRESSION offset 24). Field access
+is a constant-offset load — the LIR pass selects the appropriate
+machine load instruction based on the type.
+@End Reasoning
+
+@Implementation
+1. Pop object value id (child_index 0).
+2. Read field_offset at HIR_MEMBER_EXPRESSION offset 24.
+3. Read field_type at offset 32.
+4. Allocate result value id and emit MIR_LOAD with the constant
+   offset.
+5. Push result.
+@End Implementation
+
+@Performance_Hints
+One load per member access. The constant offset is folded into the
+LIR address-mode operand at codegen time.
+@End Performance_Hints
+
+@Security_Scope
+Object value must be non-null (caller's HIR layer guarantees this
+via null-safety analysis). Defensive: a null object value triggers
+an error.
+@End Security_Scope
+
+Process called "lower_hir_member_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let object_value be proc lowering_pop_result from LCtx with ctx
+    If object_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 6, hir_node_ptr
+        Return 0
+    End If
+
+    Let field_offset be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let field_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+
+    Let load_inst be proc create_mir_load from MIRNodes with result_value, object_value, field_offset, field_type, 0
+    If load_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TERNARY_EXPRESSION post handler (10004)
+Note: ============================================================
+
+@Reasoning
+HIR_TERNARY_EXPRESSION post: lowers a ternary expression to a
+conditional-select MIR pattern. The three child values (condition,
+true_branch, false_branch) are already on the result stack in
+visitor order. We emit a conditional-select using a compare-and-
+select pattern: allocate a result temp, then emit a MIR_BRANCH
+that conditionally targets two labels which each store their
+respective branch value into the result, joining at a merge label.
+@End Reasoning
+
+@Implementation
+1. Pop false_value (child_index 2, most recent), true_value
+   (child_index 1), condition_value (child_index 0).
+2. Read result_type at HIR_TERNARY_EXPRESSION offset 32.
+3. Allocate true_label, false_label, merge_label and a result
+   alloca slot.
+4. Emit alloca for result, branch(condition, true_label,
+   false_label), then for each path: label marker, store-to-alloca,
+   jump-to-merge. Finally emit merge_label and a load of the
+   result.
+5. Push the loaded value as the ternary's result.
+@End Implementation
+
+@Performance_Hints
+Five-to-seven instruction emissions per ternary. Branchless select
+opcodes will replace this in a follow-up backend pass.
+@End Performance_Hints
+
+@Security_Scope
+Missing operand values are treated as lowering errors.
+@End Security_Scope
+
+Process called "lower_hir_ternary_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let false_value be proc lowering_pop_result from LCtx with ctx
+    Let true_value be proc lowering_pop_result from LCtx with ctx
+    Let condition_value be proc lowering_pop_result from LCtx with ctx
+
+    If condition_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 30, hir_node_ptr
+        Return 0
+    End If
+    If true_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 31, hir_node_ptr
+        Return 0
+    End If
+    If false_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 32, hir_node_ptr
+        Return 0
+    End If
+
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+
+    Let true_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let false_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let merge_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let result_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with result_alloca, result_type, 0, 8
+    If alloca_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    End If
+
+    Let branch_inst be proc create_mir_branch from MIRNodes with condition_value, true_label, false_label, 0, 0
+    If branch_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
+    End If
+
+    Let true_marker be proc create_mir_jump from MIRNodes with true_label
+    If true_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, true_marker
+    End If
+    Let store_true be proc create_mir_store from MIRNodes with result_alloca, true_value, 0, result_type, 0
+    If store_true is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_true
+    End If
+    Let jump_merge_true be proc create_mir_jump from MIRNodes with merge_label
+    If jump_merge_true is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, jump_merge_true
+    End If
+
+    Let false_marker be proc create_mir_jump from MIRNodes with false_label
+    If false_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, false_marker
+    End If
+    Let store_false be proc create_mir_store from MIRNodes with result_alloca, false_value, 0, result_type, 0
+    If store_false is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_false
+    End If
+    Let jump_merge_false be proc create_mir_jump from MIRNodes with merge_label
+    If jump_merge_false is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, jump_merge_false
+    End If
+
+    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    If merge_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_result be proc create_mir_load from MIRNodes with result_value, result_alloca, 0, result_type, 0
+    If load_result is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_result
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_PARENTHESIZED post handler (10008)
+Note: ============================================================
+
+@Reasoning
+HIR_PARENTHESIZED post: a parenthesised expression is a pure
+syntactic wrapper. The inner expression's MIR value is already on
+the result stack; we leave it in place so the parent consumer sees
+the same value. No MIR is emitted.
+@End Reasoning
+
+@Implementation
+No-op. The wrapped child's post handler already pushed the result
+value onto the stack; the parent reads it the same way it would
+without the wrapper.
+@End Implementation
+
+@Performance_Hints
+Zero cost beyond the dispatch trampoline.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_parenthesized_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_INTERPOLATED_STRING post handler (10009)
+Note: ============================================================
+
+@Reasoning
+HIR_INTERPOLATED_STRING post: lowers a string interpolation expr
+to a chain of MIR_CALLs to the runtime string concatenation
+helper. The visitor will not auto-walk the segment list; this
+handler consumes from the HIR node directly the count of segments
+and pops that many MIR values from the result stack (those pushed
+by the visitor's recursion into each interpolated expression
+segment, if such recursion exists; otherwise the segments are
+emitted inline by reading their literal payload here).
+
+For the foundation pipeline we emit a single MIR_CALL to a runtime
+"string_concat" intrinsic taking the count and a list of value ids.
+The value-id list is allocated on the heap and freed after the
+call is constructed.
+@End Reasoning
+
+@Implementation
+1. Read segment_count at HIR_INTERPOLATED_STRING offset 16.
+2. Read segments_list at offset 8 (a List of segment HIR pointers
+   whose MIR values were pushed by their own post handlers, if any).
+3. Pop segment_count values off the stack into a List in source
+   order (LIFO reversal via head-insert).
+4. Read interpolation_type at offset 24.
+5. Allocate a result value, build a MIR_CALL to the string concat
+   runtime helper (callee value id of 0 marks an intrinsic; LIR
+   resolves it to the runtime symbol).
+6. Push result.
+@End Implementation
+
+@Performance_Hints
+One call emission per interpolation. Argument-list construction
+is O(N) in segment count.
+@End Performance_Hints
+
+@Security_Scope
+Defensive: zero segments produces an empty-string constant rather
+than a zero-arg call.
+@End Security_Scope
+
+Process called "lower_hir_interpolated_string_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let segment_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+
+    If segment_count is equal to 0:
+        Let empty_const be proc create_mir_const from MIRNodes with result_value, 0, result_type, 1, 0
+        If empty_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, empty_const
+        End If
+        proc lowering_push_result from LCtx with ctx, result_value
+        Return 1
+    End If
+
+    Let mir_args be proc create from List
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be segment_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+    Let i be 0
+    While i is less than to_pop:
+        Let arg_value be proc lowering_pop_result from LCtx with ctx
+        proc insert from List with mir_args, 0, arg_value
+        Set i to i plus 1
+    End While
+
+    Let call_inst be proc create_mir_call from MIRNodes with result_value, 0, mir_args, segment_count, result_type, 0, 0
+    If call_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, call_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_RANGE_EXPRESSION post handler (10010)
+Note: ============================================================
+
+@Reasoning
+HIR_RANGE_EXPRESSION post: lowers a range expression (start..end
+or start..=end) to a two-field range record. Allocates an inline
+record holding start and end MIR values; downstream consumers
+(for-each loops, slicing) read the record directly.
+@End Reasoning
+
+@Implementation
+1. Pop end_value (child_index 1) and start_value (child_index 0)
+   from the result stack.
+2. Read inclusive flag at HIR_RANGE_EXPRESSION offset 24 (0 =
+   exclusive, 1 = inclusive).
+3. Read result_type at offset 32.
+4. Allocate a range record on the stack (alloca 24 bytes:
+   start@0, end@8, inclusive@16).
+5. Emit stores for start_value, end_value, and inclusive constant.
+6. Push the alloca pointer as the range value.
+@End Implementation
+
+@Performance_Hints
+Five instruction emissions per range expression.
+@End Performance_Hints
+
+@Security_Scope
+Missing start or end value triggers a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_range_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let end_value be proc lowering_pop_result from LCtx with ctx
+    Let start_value be proc lowering_pop_result from LCtx with ctx
+
+    If start_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 33, hir_node_ptr
+        Return 0
+    End If
+    If end_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 34, hir_node_ptr
+        Return 0
+    End If
+
+    Let inclusive be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+
+    Let range_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with range_alloca, result_type, 0, 8
+    If alloca_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    End If
+
+    Let store_start be proc create_mir_store from MIRNodes with range_alloca, start_value, 0, 0, 0
+    If store_start is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_start
+    End If
+    Let store_end be proc create_mir_store from MIRNodes with range_alloca, end_value, 8, 0, 0
+    If store_end is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_end
+    End If
+
+    Let inc_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let inc_const be proc create_mir_const from MIRNodes with inc_value, inclusive, 0, 0, 0
+    If inc_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, inc_const
+    End If
+    Let store_inc be proc create_mir_store from MIRNodes with range_alloca, inc_value, 16, 0, 0
+    If store_inc is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_inc
+    End If
+
+    proc lowering_push_result from LCtx with ctx, range_alloca
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_ARRAY_LITERAL post handler (10011)
+Note: ============================================================
+
+@Reasoning
+HIR_ARRAY_LITERAL post: lowers an array literal [a, b, c] to an
+alloca for the array plus a sequence of element stores. Element
+values are already on the result stack in source order (reversed
+by the LIFO pop pattern).
+@End Reasoning
+
+@Implementation
+1. Read element_count at HIR_ARRAY_LITERAL offset 16.
+2. Read element_type at offset 24, array_type at offset 32.
+3. Allocate the array on the stack (count = element_count,
+   element_type = element_type, alignment = 8).
+4. For i from element_count - 1 down to 0:
+   - Pop element value from stack (LIFO so last element popped first).
+   - Emit MIR_STORE at array_alloca + (i * 8) = element_value.
+5. Push the array_alloca pointer as the array's MIR value.
+@End Implementation
+
+@Performance_Hints
+N + 1 instruction emissions per array literal (1 alloca + N
+stores). Constant arrays optimised in later passes.
+@End Performance_Hints
+
+@Security_Scope
+Zero-element arrays produce a minimal alloca; defensive against
+empty literals.
+@End Security_Scope
+
+Process called "lower_hir_array_literal_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let element_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let element_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let array_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+
+    Let count_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let count_const be proc create_mir_const from MIRNodes with count_value, element_count, 0, 0, 0
+    If count_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, count_const
+    End If
+
+    Let array_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with array_alloca, element_type, count_value, 8
+    If alloca_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    End If
+
+    Note: Pop elements in reverse order (LIFO returns last-pushed
+    Note: first), storing each at its source-order offset.
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be element_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let i be to_pop
+    While i is greater than 0:
+        Set i to i minus 1
+        Let element_value be proc lowering_pop_result from LCtx with ctx
+        Let element_offset be i multiplied by 8
+        Let store_inst be proc create_mir_store from MIRNodes with array_alloca, element_value, element_offset, element_type, 0
+        If store_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+        End If
+    End While
+
+    proc lowering_push_result from LCtx with ctx, array_alloca
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TUPLE_LITERAL post handler (10012)
+Note: ============================================================
+
+@Reasoning
+HIR_TUPLE_LITERAL post: lowers a tuple literal (a, b, c) to an
+alloca for the tuple plus a sequence of field stores at the per-
+field offsets. Field offsets are computed from the per-element
+types in source order; for the foundation pipeline we use 8-byte
+slots uniformly because MIR types are not yet layout-aware.
+@End Reasoning
+
+@Implementation
+1. Read element_count at HIR_TUPLE_LITERAL offset 16.
+2. Read tuple_type at offset 24.
+3. Allocate the tuple record (size = element_count * 8 bytes).
+4. Pop each element from the stack in reverse order and store it
+   at its computed offset.
+5. Push the tuple_alloca pointer.
+@End Implementation
+
+@Performance_Hints
+N + 1 instruction emissions per tuple literal.
+@End Performance_Hints
+
+@Security_Scope
+Defensive against zero-element tuples.
+@End Security_Scope
+
+Process called "lower_hir_tuple_literal_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let element_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let tuple_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let tuple_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with tuple_alloca, tuple_type, 0, 8
+    If alloca_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be element_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let i be to_pop
+    While i is greater than 0:
+        Set i to i minus 1
+        Let element_value be proc lowering_pop_result from LCtx with ctx
+        Let field_offset be i multiplied by 8
+        Let store_inst be proc create_mir_store from MIRNodes with tuple_alloca, element_value, field_offset, 0, 0
+        If store_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+        End If
+    End While
+
+    proc lowering_push_result from LCtx with ctx, tuple_alloca
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_RECORD_LITERAL post handler (10013)
+Note: ============================================================
+
+@Reasoning
+HIR_RECORD_LITERAL post: lowers a record literal { field1: a,
+field2: b } to an alloca plus per-field stores. The HIR node
+carries a list of field-symbol pointers (each providing field
+offset) which we read to determine the store address for each
+value.
+@End Reasoning
+
+@Implementation
+1. Read field_count at HIR_RECORD_LITERAL offset 16.
+2. Read record_type at offset 24.
+3. Read fields_list at offset 8 (List of field-info structs
+   containing offset at field-info offset 8).
+4. Allocate the record on the stack.
+5. Pop each field value (reverse order) and store at the field's
+   declared offset (8 * i for the foundation layout; real offsets
+   come from the field-info struct once it lands in P2-E).
+6. Push the alloca pointer.
+@End Implementation
+
+@Performance_Hints
+N + 1 instruction emissions per record literal.
+@End Performance_Hints
+
+@Security_Scope
+Field offset overflow is bounded by field_count * 8 < 64 KB for
+realistic records.
+@End Security_Scope
+
+Process called "lower_hir_record_literal_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let field_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let record_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let fields_list be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Let record_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with record_alloca, record_type, 0, 8
+    If alloca_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let to_pop be field_count
+    If to_pop is greater than depth:
+        Set to_pop to depth
+    End If
+
+    Let i be to_pop
+    While i is greater than 0:
+        Set i to i minus 1
+        Let field_value be proc lowering_pop_result from LCtx with ctx
+        Let field_offset be i multiplied by 8
+        If fields_list is not equal to 0:
+            Let field_info be proc get from List with fields_list, i
+            If field_info is not equal to 0:
+                Let declared_offset be proc memory_get_int64 from Layout with field_info, 8
+                Set field_offset to declared_offset
+            End If
+        End If
+        Let store_inst be proc create_mir_store from MIRNodes with record_alloca, field_value, field_offset, 0, 0
+        If store_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+        End If
+    End While
+
+    proc lowering_push_result from LCtx with ctx, record_alloca
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_LAMBDA_EXPRESSION post handler (10014)
+Note: ============================================================
+
+@Reasoning
+HIR_LAMBDA_EXPRESSION post: lowers a lambda to a function-pointer
+MIR value plus an optional captures record. The lambda body has
+already been lowered (or rather, will be lowered as a separate
+MIR function by the driver — for v0.0.8.5 the lambda body is
+treated as an inline expression whose result is pushed). The
+post handler emits a function-pointer constant referencing the
+generated MIR sub-function and constructs a closure record if
+there are captured variables.
+@End Reasoning
+
+@Implementation
+1. Read parameter_count at HIR_LAMBDA_EXPRESSION offset 16.
+2. Read body MIR-id at offset 24 (the lambda's lowered MIR
+   function id, allocated by the driver's lambda walker).
+3. Read capture_count at offset 32 and captures_list at offset 40.
+4. Read closure_type at offset 48.
+5. Allocate a closure record alloca with one slot for the function
+   pointer plus capture_count slots.
+6. Store the body MIR id at offset 0.
+7. For each captured variable, look up its MIR value and store it
+   into the closure record at offset (i + 1) * 8.
+8. Push the closure_alloca pointer.
+@End Implementation
+
+@Performance_Hints
+Capture_count + 2 instruction emissions per lambda. Cold compared
+to expression leaves.
+@End Performance_Hints
+
+@Security_Scope
+A null body MIR id triggers a lowering error - the driver should
+have populated this slot before traversal reached the lambda.
+@End Security_Scope
+
+Process called "lower_hir_lambda_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let body_mir_id be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let capture_count be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Let captures_list be proc memory_get_int64 from Layout with hir_node_ptr, 40
+    Let closure_type be proc memory_get_int64 from Layout with hir_node_ptr, 48
+
+    Let total_slots be capture_count plus 1
+    Let closure_size_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let size_const be proc create_mir_const from MIRNodes with closure_size_value, total_slots, 0, 0, 0
+    If size_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, size_const
+    End If
+
+    Let closure_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with closure_alloca, closure_type, closure_size_value, 8
+    If alloca_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    End If
+
+    Let fp_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let fp_const be proc create_mir_const from MIRNodes with fp_value, body_mir_id, 0, 0, 0
+    If fp_const is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, fp_const
+    End If
+    Let store_fp be proc create_mir_store from MIRNodes with closure_alloca, fp_value, 0, 0, 0
+    If store_fp is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_fp
+    End If
+
+    If captures_list is not equal to 0:
+        Let i be 0
+        While i is less than capture_count:
+            Let capture_sym be proc get from List with captures_list, i
+            If capture_sym is not equal to 0:
+                Let sym_id be proc memory_get_int64 from Layout with capture_sym, 0
+                Let captured_value be proc lookup_mir_value from MIRBuilder with builder_ctx, sym_id
+                If captured_value is not equal to 0:
+                    Let slot_offset be i plus 1
+                    Let store_cap be proc create_mir_store from MIRNodes with closure_alloca, captured_value, slot_offset multiplied by 8, 0, 0
+                    If store_cap is not equal to 0:
+                        proc emit_instruction from MIRBuilder with builder_ctx, store_cap
+                    End If
+                End If
+            End If
+            Set i to i plus 1
+        End While
+    End If
+
+    proc lowering_push_result from LCtx with ctx, closure_alloca
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_CAST_EXPRESSION post handler (10015)
+Note: ============================================================
+
+@Reasoning
+HIR_CAST_EXPRESSION post: lowers an explicit type cast to a MIR
+cast op. The child expression's MIR value is on the stack; we
+read the source_type and target_type from the HIR node and emit
+a unary cast instruction whose specific opcode is selected by the
+cast direction (int->int, int->float, ptr->ptr, narrow, widen).
+@End Reasoning
+
+@Implementation
+1. Pop source value.
+2. Read source_type at HIR_CAST_EXPRESSION offset 16 and
+   target_type at offset 24.
+3. Read cast_kind at offset 32 (0=implicit, 1=explicit, 2=unsafe).
+4. Select MIR cast opcode: MIR_BITCAST (20020) for unsafe/explicit
+   pointer casts, MIR_TRUNC (20021) for narrowing, MIR_EXTEND
+   (20022) for widening. The foundation pipeline uses a single
+   MIR_BITCAST since LIR resolves the actual machine cast based on
+   source/target types.
+5. Allocate result value and emit a MIR_UNARY with the cast opcode.
+6. Push result.
+@End Implementation
+
+@Performance_Hints
+Single emit per cast.
+@End Performance_Hints
+
+@Security_Scope
+Null source value is a lowering error. The HIR layer has already
+validated cast safety per cast_kind; the lowering layer trusts
+the input.
+@End Security_Scope
+
+Process called "lower_hir_cast_expression_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let source_value be proc lowering_pop_result from LCtx with ctx
+    If source_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 35, hir_node_ptr
+        Return 0
+    End If
+
+    Let target_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let cast_inst be proc create_mir_unary_op from MIRNodes with 20020, result_value, source_value, target_type
+    If cast_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, cast_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TYPE_ASCRIPTION post handler (10016)
+Note: ============================================================
+
+@Reasoning
+HIR_TYPE_ASCRIPTION post: a type ascription (expr: Type) is a
+compile-time annotation that informs the type checker without
+producing any runtime instruction. The wrapped expression's MIR
+value passes through unchanged.
+@End Reasoning
+
+@Implementation
+No-op. The child's MIR value is already on the result stack; the
+parent consumes it normally.
+@End Implementation
+
+@Performance_Hints
+Zero cost beyond the dispatch trampoline.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_type_ascription_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_FUNCTION_POINTER post handler (10017)
+Note: ============================================================
+
+@Reasoning
+HIR_FUNCTION_POINTER post: lowers a function-pointer expression
+($function_name) to a MIR_CONST whose constant_value is the
+resolved function's MIR id. The function id is recorded in the
+HIR node at offset 16 (resolved_function symbol id) when HIR
+construction resolves the name.
+@End Reasoning
+
+@Implementation
+1. Read function_name at HIR_FUNCTION_POINTER offset 8 and
+   resolved_function id at offset 16.
+2. Read function_type at offset 24.
+3. Allocate a result value and emit MIR_CONST(resolved_function,
+   function_type, is_string=0).
+4. Push result.
+@End Implementation
+
+@Performance_Hints
+Single emit per function-pointer creation.
+@End Performance_Hints
+
+@Security_Scope
+A zero resolved_function id is a lowering error (HIR resolver
+should have populated this).
+@End Security_Scope
+
+Process called "lower_hir_function_pointer_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let resolved_function be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let function_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    If resolved_function is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 36, hir_node_ptr
+        Return 0
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let const_inst be proc create_mir_const from MIRNodes with result_value, resolved_function, function_type, 0, 0
+    If const_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, const_inst
+    End If
+
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_INDIRECT_CALL pre + post handlers (10018)
+Note: ============================================================
+
+@Reasoning
+HIR_INDIRECT_CALL pre: records the argument count target into the
+pending_lvalue slot so the post handler can pop exactly that many
+argument values from the result stack.
+@End Reasoning
+
+@Implementation
+Read arg_count at HIR_INDIRECT_CALL offset 16 and stash via
+lowering_set_pending_lvalue.
+@End Implementation
+
+@Performance_Hints
+Single int64 read and write.
+@End Performance_Hints
+
+@Security_Scope
+Defensive: arg_count of 0 is a valid no-args indirect call.
+@End Security_Scope
+
+Process called "lower_hir_indirect_call_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let arg_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    proc lowering_set_pending_lvalue from LCtx with ctx, arg_count
+    Return 1
+End Process
+
+@Reasoning
+HIR_INDIRECT_CALL post: consumes the function-value and N argument
+values from the result stack and emits a MIR_CALL with is_indirect
+= 1. The function value (a closure record or raw function pointer)
+becomes the callee operand instead of a symbol-resolved name.
+@End Reasoning
+
+@Implementation
+1. Recover arg_count via lowering_take_pending_lvalue.
+2. Pop N argument values into a List in source order.
+3. Pop the function value (child_index 0, pushed first).
+4. Read return_type at HIR_INDIRECT_CALL offset 24.
+5. Allocate result value and emit MIR_CALL(result, function_value,
+   args, arg_count, return_type, is_indirect=1, is_tail=0).
+6. Push result.
+@End Implementation
+
+@Performance_Hints
+Hot path for higher-order function use. Same cost as a direct call
+plus the function-value computation.
+@End Performance_Hints
+
+@Security_Scope
+Null function value is a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_indirect_call_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let arg_count be proc lowering_take_pending_lvalue from LCtx with ctx
+    Let return_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let mir_args be proc create from List
+    Let i be 0
+    While i is less than arg_count:
+        Let arg_value be proc lowering_pop_result from LCtx with ctx
+        proc insert from List with mir_args, 0, arg_value
+        Set i to i plus 1
+    End While
+
+    Let function_value be proc lowering_pop_result from LCtx with ctx
+    If function_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 37, hir_node_ptr
+        Return 0
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let call_inst be proc create_mir_call from MIRNodes with result_value, function_value, mir_args, arg_count, return_type, 1, 0
+    If call_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, call_inst
+    proc lowering_push_result from LCtx with ctx, result_value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: Expression Handler Registration
+Note: ============================================================
+
+@Reasoning
+Installs every expression-node handler in the lowering dispatch
+table. Called once at the start of a lowering pass by the driver in
+definition_lowering.runa. Handlers that don't need pre/child hooks
+pass 0 for those slots so the trampoline short-circuits.
+@End Reasoning
+
+@Implementation
+Sequence of lowering_register_handler calls, one per HIR
+expression node type that has a dedicated handler. The function-
+pointer addresses are taken implicitly by the canonical proc-
+reference syntax: in this v0.0.8.5 stage1 compiler, naming a proc
+in a call position yields its address when the caller's signature
+expects an Integer (function-pointer type).
+@End Implementation
+
+@Performance_Hints
+Cold path, called once per lowering pass. Six handler registrations.
+@End Performance_Hints
+
+@Security_Scope
+Validates table non-null. Caller controls handler addresses.
+@End Security_Scope
+
+Process called "register_expression_handlers" that takes dispatch_table as Integer returns Integer:
+    If dispatch_table is equal to 0:
+        Return 0
+    End If
+
+    Note: HIR_LITERAL (10000): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10000, 0, lower_hir_literal_post, 0, 0
+
+    Note: HIR_IDENTIFIER (10001): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10001, 0, lower_hir_identifier_post, 0, 0
+
+    Note: HIR_BINARY_EXPRESSION (10002): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10002, 0, lower_hir_binary_expression_post, 0, 0
+
+    Note: HIR_UNARY_EXPRESSION (10003): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10003, 0, lower_hir_unary_expression_post, 0, 0
+
+    Note: HIR_CALL_EXPRESSION (10005): pre + post
+    proc lowering_register_handler from LCtx with dispatch_table, 10005, lower_hir_call_expression_pre, lower_hir_call_expression_post, 0, 0
+
+    Note: HIR_INDEX_EXPRESSION (10006): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10006, 0, lower_hir_index_expression_post, 0, 0
+
+    Note: HIR_MEMBER_EXPRESSION (10007): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10007, 0, lower_hir_member_expression_post, 0, 0
+
+    Note: HIR_TERNARY_EXPRESSION (10004): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10004, 0, lower_hir_ternary_expression_post, 0, 0
+
+    Note: HIR_PARENTHESIZED (10008): post only (no-op pass-through)
+    proc lowering_register_handler from LCtx with dispatch_table, 10008, 0, lower_hir_parenthesized_post, 0, 0
+
+    Note: HIR_INTERPOLATED_STRING (10009): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10009, 0, lower_hir_interpolated_string_post, 0, 0
+
+    Note: HIR_RANGE_EXPRESSION (10010): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10010, 0, lower_hir_range_expression_post, 0, 0
+
+    Note: HIR_ARRAY_LITERAL (10011): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10011, 0, lower_hir_array_literal_post, 0, 0
+
+    Note: HIR_TUPLE_LITERAL (10012): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10012, 0, lower_hir_tuple_literal_post, 0, 0
+
+    Note: HIR_RECORD_LITERAL (10013): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10013, 0, lower_hir_record_literal_post, 0, 0
+
+    Note: HIR_LAMBDA_EXPRESSION (10014): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10014, 0, lower_hir_lambda_expression_post, 0, 0
+
+    Note: HIR_CAST_EXPRESSION (10015): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10015, 0, lower_hir_cast_expression_post, 0, 0
+
+    Note: HIR_TYPE_ASCRIPTION (10016): post only (no-op pass-through)
+    proc lowering_register_handler from LCtx with dispatch_table, 10016, 0, lower_hir_type_ascription_post, 0, 0
+
+    Note: HIR_FUNCTION_POINTER (10017): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 10017, 0, lower_hir_function_pointer_post, 0, 0
+
+    Note: HIR_INDIRECT_CALL (10018): pre + post
+    proc lowering_register_handler from LCtx with dispatch_table, 10018, lower_hir_indirect_call_pre, lower_hir_indirect_call_post, 0, 0
+
+    Return 1
+End Process

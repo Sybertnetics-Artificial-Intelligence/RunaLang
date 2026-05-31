@@ -55,6 +55,11 @@ Import "compiler/middle/gungnir/mir/optimizations/inlining.runa" as Inlining
 Import "compiler/middle/gungnir/mir/optimizations/devirtualization.runa" as Devirtualization
 Import "compiler/middle/gungnir/mir/optimizations/scalar_replacement.runa" as ScalarReplacement
 Import "compiler/middle/gungnir/mir/optimizations/vectorization.runa" as Vectorization
+Import "compiler/middle/gungnir/mir/optimizations/constant_prop.runa" as ConstantProp
+Import "compiler/middle/gungnir/mir/optimizations/copy_prop.runa" as CopyProp
+Import "compiler/middle/gungnir/mir/optimizations/dce.runa" as DCE
+Import "compiler/middle/gungnir/mir/optimizations/dead_store.runa" as DeadStore
+Import "compiler/middle/gungnir/mir/optimizations/sccp.runa" as SCCP
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 
@@ -125,6 +130,13 @@ Process called "create_optimizer_context" that takes cfg as Integer, function as
     - Initializes all counters to 0
     @End Reasoning
 
+    @Implementation
+    Allocates the 128-byte OptimizerContext block via Layout.allocate, computes the
+    dominator tree once up-front (required by LICM, GVN, SCCP, and branch optimization
+    so they can avoid recomputation per pass), counts initial instructions for stats,
+    and creates empty worklist and value-number-map collections for downstream passes.
+    @End Implementation
+
     If cfg is equal to 0:
         Display "create_optimizer_context: null CFG"
         Return 0
@@ -149,7 +161,7 @@ Process called "create_optimizer_context" that takes cfg as Integer, function as
     proc memory_set_int64 from Layout with context_ptr, 24, 0
 
     Note: Count initial instructions
-    Let inst_count be count_instructions(cfg)
+    Let inst_count be proc count_instructions with cfg
     proc memory_set_int64 from Layout with context_ptr, 32, inst_count
 
     Note: Initialize counters to 0
@@ -174,6 +186,13 @@ Process called "destroy_optimizer_context" that takes context_ptr as Integer ret
     @Reasoning
     Destroys an optimizer context and frees all associated memory.
     @End Reasoning
+
+    @Implementation
+    Releases the worklist list, value-number map list, and dominator tree owned by
+    the context, then frees the 128-byte context block itself via Layout.deallocate.
+    Each owned subresource is checked for null before release to support partial-init
+    failure modes from create_optimizer_context.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -209,6 +228,12 @@ Process called "mark_changed" that takes context_ptr as Integer returns Integer:
     Used to determine if another iteration is needed.
     @End Reasoning
 
+    @Implementation
+    Sets the boolean changed flag at offset 24 of the OptimizerContext to 1 using
+    memory_set_int64. Called by every pass that mutates the IR; the orchestrator
+    reads this via has_changed at iteration boundaries to drive fixpoint termination.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -221,6 +246,11 @@ Process called "has_changed" that takes context_ptr as Integer returns Integer:
     @Reasoning
     Returns whether any optimization made changes.
     @End Reasoning
+
+    @Implementation
+    Reads the boolean changed flag at offset 24 of the OptimizerContext. Returns 0
+    on null context. Used by run_optimization_pipeline to drive the fixpoint loop.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -235,6 +265,12 @@ Process called "reset_changed_flag" that takes context_ptr as Integer returns In
     Resets the changed flag for next iteration.
     @End Reasoning
 
+    @Implementation
+    Writes 0 to offset 24 of the OptimizerContext to clear the changed flag.
+    Called at the start of each fixpoint iteration so the post-iteration has_changed
+    check reflects only the current iteration's pass output.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -248,6 +284,13 @@ Process called "count_instructions" that takes cfg as Integer returns Integer:
     Counts total number of instructions in CFG.
     Used for metrics and progress tracking.
     @End Reasoning
+
+    @Implementation
+    Iterates every basic block in the CFG via get_block_count and get_block, then
+    every instruction in each block via get_block_instructions and List.length,
+    accumulating a running total. Linear O(N) in total IR size, called once at
+    context creation for baseline metrics.
+    @End Implementation
 
     If cfg is equal to 0:
         Return 0
@@ -272,6 +315,14 @@ Process called "print_optimization_stats" that takes context_ptr as Integer retu
     @Reasoning
     Prints optimization statistics for reporting.
     @End Reasoning
+
+    @Implementation
+    Reads the six counters from OptimizerContext (initial-count at offset 32,
+    deleted at 40, simplified at 48, constants-folded at 56, copies-propagated at 64),
+    computes final-count and reduction percentage when the initial count is non-zero,
+    and emits a banner-framed report via Display. Pure read-only summary; never
+    mutates the context.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -339,6 +390,22 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
     Returns number of constants folded.
     @End Reasoning
 
+    @Implementation
+    Walks the CFG in reverse post-order (RPO) so each instruction sees all its
+    operand definitions before being processed. For each instruction, dispatches
+    on opcode range: 20002-20012 routes to try_fold_binary_op, 20100-20105 to
+    try_fold_comparison, 20007/20013 (NEG/NOT) to try_fold_unary_op. Each successful
+    fold increments folded_count and calls mark_changed so the orchestrator re-runs
+    dependent passes (DCE in particular) on the next iteration.
+    @End Implementation
+
+    @Performance_Hints
+    RPO traversal is optimal for forward-dataflow passes because every value's
+    definition is visited before any of its uses, eliminating worklist propagation
+    overhead on straight-line code. The dominator tree is computed once at context
+    creation and cached at offset 16 so this pass can fetch RPO order in O(1).
+    @End Performance_Hints
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -367,28 +434,28 @@ Process called "optimize_constant_folding" that takes context_ptr as Integer ret
 
             Note: Try to fold binary operations
             If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
-                Let result be try_fold_binary_op(context_ptr, inst, opcode)
+                Let result be proc try_fold_binary_op with context_ptr, inst, opcode
                 If result is equal to 1:
                     Set folded_count to folded_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 End If
             End If
 
             Note: Try to fold comparison operations
             If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-                Set result to try_fold_comparison(context_ptr, inst, opcode)
+                Set result to proc try_fold_comparison with context_ptr, inst, opcode
                 If result is equal to 1:
                     Set folded_count to folded_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 End If
             End If
 
             Note: Try to fold unary operations
             If opcode is equal to 20007 or opcode is equal to 20013:  Note: NEG or NOT
-                Set result to try_fold_unary_op(context_ptr, inst, opcode)
+                Set result to proc try_fold_unary_op with context_ptr, inst, opcode
                 If result is equal to 1:
                     Set folded_count to folded_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 End If
             End If
 
@@ -413,6 +480,24 @@ Process called "try_fold_binary_op" that takes context_ptr as Integer, inst as I
     Returns 1 if folded, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Reads left/right operand value-ids from instruction offsets 16/24, queries
+    is_constant_value for each, returns 0 if either is non-constant. Otherwise
+    fetches both constant values, computes the result per opcode dispatch
+    (ADD/SUB/MUL/DIV/MOD/AND/OR/XOR), guards DIV and MOD against zero-divisor,
+    then transforms the instruction in place by overwriting its opcode to
+    MIR_CONST (20001) and storing the computed value at offset 16. The result_id
+    at offset 8 is preserved so all use sites see the folded constant without
+    requiring SSA rewrites.
+    @End Implementation
+
+    @Security_Scope
+    Division-by-zero and modulo-by-zero are explicitly guarded; in both cases the
+    fold is abandoned and the original divide/modulo instruction is preserved so
+    the runtime (or a later pass) still raises the proper trap. Folding through a
+    divide-by-zero would produce a constant that masks a runtime fault.
+    @End Security_Scope
+
     If inst is equal to 0:
         Return 0
     End If
@@ -422,16 +507,16 @@ Process called "try_fold_binary_op" that takes context_ptr as Integer, inst as I
     Let right_operand be proc memory_get_int64 from Layout with inst, 24
 
     Note: Check if both are constants
-    Let left_is_const be is_constant_value(context_ptr, left_operand)
-    Let right_is_const be is_constant_value(context_ptr, right_operand)
+    Let left_is_const be proc is_constant_value with context_ptr, left_operand
+    Let right_is_const be proc is_constant_value with context_ptr, right_operand
 
     If left_is_const is equal to 0 or right_is_const is equal to 0:
         Return 0
     End If
 
     Note: Get constant values
-    Let left_val be get_constant_value(context_ptr, left_operand)
-    Let right_val be get_constant_value(context_ptr, right_operand)
+    Let left_val be proc get_constant_value with context_ptr, left_operand
+    Let right_val be proc get_constant_value with context_ptr, right_operand
 
     Note: Compute result based on opcode
     Let result_val be 0
@@ -498,6 +583,14 @@ Process called "try_fold_comparison" that takes context_ptr as Integer, inst as 
     Result is 1 (true) or 0 (false).
     @End Reasoning
 
+    @Implementation
+    Mirrors try_fold_binary_op but with comparison opcodes 20100-20105 (EQ, NE, LT,
+    LE, GT, GE). Returns early if either operand is non-constant. Computes the
+    boolean result, then transforms the instruction in place into a MIR_CONST
+    holding 0 or 1. This produces a synthesized constant the downstream branch
+    optimizer can use to eliminate dead branches and unify control flow.
+    @End Implementation
+
     If inst is equal to 0:
         Return 0
     End If
@@ -505,15 +598,15 @@ Process called "try_fold_comparison" that takes context_ptr as Integer, inst as 
     Let left_operand be proc memory_get_int64 from Layout with inst, 16
     Let right_operand be proc memory_get_int64 from Layout with inst, 24
 
-    Let left_is_const be is_constant_value(context_ptr, left_operand)
-    Let right_is_const be is_constant_value(context_ptr, right_operand)
+    Let left_is_const be proc is_constant_value with context_ptr, left_operand
+    Let right_is_const be proc is_constant_value with context_ptr, right_operand
 
     If left_is_const is equal to 0 or right_is_const is equal to 0:
         Return 0
     End If
 
-    Let left_val be get_constant_value(context_ptr, left_operand)
-    Let right_val be get_constant_value(context_ptr, right_operand)
+    Let left_val be proc get_constant_value with context_ptr, left_operand
+    Let right_val be proc get_constant_value with context_ptr, right_operand
 
     Let result_val be 0
 
@@ -570,18 +663,25 @@ Process called "try_fold_unary_op" that takes context_ptr as Integer, inst as In
     Attempts to fold a unary operation if operand is constant.
     @End Reasoning
 
+    @Implementation
+    Reads the single operand at offset 16, returns 0 if non-constant. Otherwise
+    computes the unary result: opcode 20007 is arithmetic negation, opcode 20013
+    is bitwise NOT. The instruction is transformed in place to MIR_CONST holding
+    the computed value, with the right operand at offset 24 cleared.
+    @End Implementation
+
     If inst is equal to 0:
         Return 0
     End If
 
     Let operand be proc memory_get_int64 from Layout with inst, 16
-    Let is_const be is_constant_value(context_ptr, operand)
+    Let is_const be proc is_constant_value with context_ptr, operand
 
     If is_const is equal to 0:
         Return 0
     End If
 
-    Let operand_val be get_constant_value(context_ptr, operand)
+    Let operand_val be proc get_constant_value with context_ptr, operand
     Let result_val be 0
 
     If opcode is equal to 20007:  Note: NEG
@@ -767,351 +867,61 @@ Note: ==========================================================================
 
 Process called "optimize_dead_code_elimination" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    **DEAD CODE ELIMINATION (DCE)**
+    **DEAD CODE ELIMINATION (DCE) - PIPELINE WRAPPER**
 
-    Removes instructions that have no effect on program output.
+    Orchestrator-side wrapper that delegates to the canonical aggressive DCE
+    implementation in optimizations/dce.runa. Removes instructions that have no
+    effect on program output by computing transitive liveness from critical
+    instructions (stores, calls, returns, branches, phis) and deleting everything
+    unmarked.
 
-    **ALGORITHM:**
-    ```
-    1. Mark all instructions as dead initially
-    2. Mark critical instructions as live:
-       - Stores (have side effects)
-       - Calls (have side effects)
-       - Returns (affect control flow)
-       - Branches (affect control flow)
-    3. Transitively mark dependencies:
-       - For each live instruction:
-         - Mark all operands' defining instructions as live
-       - Repeat until no new instructions marked
-    4. Delete all unmarked instructions
-    ```
+    **WHY AGGRESSIVE DCE:**
+    - Cross-block liveness propagation via def-use edges
+    - Post-dominance analysis for control-dependent dead code
+    - Proper handling of side-effecting operations
+    - Stronger than per-block sweeps because it sees the whole SSA graph
 
-    **CRITICAL INSTRUCTIONS (always live):**
-    - MIR_STORE (20020) - memory side effects
-    - MIR_CALL (20030) - function call side effects
-    - MIR_RET (20040) - control flow
-    - MIR_BR (20041) - control flow
-    - MIR_COND_BR (20042) - control flow
-    - MIR_PHI (20050) - SSA critical
+    **INTERFACE BRIDGE:**
+    The canonical run_aggressive_dce_pass entry accepts an optimizer_context
+    directly (it reads the CFG at offset 0 and updates the deletion counter at
+    offset 40), so we forward context_ptr unchanged. On a non-zero return we
+    propagate the change signal back via mark_changed so the orchestrator's
+    fixpoint loop re-runs dependent passes.
 
     Returns number of instructions deleted.
     @End Reasoning
+
+    @Implementation
+    Orchestrator-side wrapper for the Wave 2 Group A aggressive DCE pass. Validates
+    the optimizer context pointer, then invokes the canonical entry point
+    proc run_aggressive_dce_pass from DCE with context_ptr. The canonical pass
+    handles CFG extraction, ADCEContext lifecycle, liveness propagation, and
+    deletion-counter accumulation internally. If the canonical pass reports any
+    eliminations (return value greater than 0), we call mark_changed on the
+    OptimizerContext so the orchestrator schedules another iteration.
+    @End Implementation
+
+    @Performance_Hints
+    Liveness propagation in the canonical pass is the dominant cost; the worklist
+    is bounded by SSA value count so total cost is O(N) where N is instruction
+    count. DCE is intentionally re-run after every Tier-2 pass because algebraic
+    simplification, constant folding, and copy propagation routinely render
+    instructions dead.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Display "optimize_dead_code_elimination: starting DCE pass"
+    Display "optimize_dead_code_elimination: invoking aggressive DCE from dce.runa"
 
-    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
-    Let deleted_count be 0
-
-    Note: Create liveness map (value_id -> is_live flag)
-    Let liveness_map be proc create from List
-
-    Note: Step 1: Mark critical instructions as live
-    Let block_count be proc get_block_count from CFG with cfg
-    Let i be 0
-    While i is less than block_count:
-        Let block be proc get_block from CFG with cfg, i
-        Let instructions be proc get_block_instructions from CFG with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc get from List with instructions, j
-            Let opcode be proc get_instruction_opcode from MIRNodes with inst
-
-            Note: Check if instruction is critical
-            Let is_critical be 0
-            If opcode is equal to 20020:  Note: STORE
-                Set is_critical to 1
-            End If
-            If opcode is equal to 20030:  Note: CALL
-                Set is_critical to 1
-            End If
-            If opcode is greater than or equal to 20040 and opcode is less than or equal to 20042:  Note: RET, BR, COND_BR
-                Set is_critical to 1
-            End If
-            If opcode is equal to 20050:  Note: PHI
-                Set is_critical to 1
-            End If
-
-            Note: Mark instruction as live
-            If is_critical is equal to 1:
-                Let result_id be proc memory_get_int64 from Layout with inst, 8
-                mark_value_live(liveness_map, result_id)
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Step 2: Transitively mark dependencies
-    Let changed be 1
-    While changed is equal to 1:
-        Set changed to 0
-
-        Set i to 0
-        While i is less than block_count:
-            Set block to proc get_block from CFG with cfg, i
-            Set instructions to proc get_block_instructions from CFG with block
-            Set inst_count to proc length from List with instructions
-
-            Set j to 0
-            While j is less than inst_count:
-                Set inst to proc get from List with instructions, j
-                Set result_id to proc memory_get_int64 from Layout with inst, 8
-
-                Note: If instruction is live, mark operands as live
-                Let is_live be is_value_live(liveness_map, result_id)
-                If is_live is equal to 1:
-                    Let marked be mark_operands_live(liveness_map, inst)
-                    If marked is greater than 0:
-                        Set changed to 1
-                    End If
-                End If
-
-                Set j to j plus 1
-            End While
-
-            Set i to i plus 1
-        End While
-    End While
-
-    Note: Step 3: Delete dead instructions
-    Set i to 0
-    While i is less than block_count:
-        Set block to proc get_block from CFG with cfg, i
-        Set instructions to proc get_block_instructions from CFG with block
-        Set inst_count to proc length from List with instructions
-
-        Note: Build new instruction list without dead instructions
-        Let new_instructions be proc create from List
-
-        Set j to 0
-        While j is less than inst_count:
-            Set inst to proc get from List with instructions, j
-            Set result_id to proc memory_get_int64 from Layout with inst, 8
-            Set is_live to is_value_live(liveness_map, result_id)
-
-            If is_live is equal to 1:
-                proc append from List with new_instructions, inst
-            Otherwise:
-                Set deleted_count to deleted_count plus 1
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Note: Replace block instructions
-        proc set_block_instructions from CFG with block, new_instructions
-
-        Set i to i plus 1
-    End While
-
-    Note: Cleanup
-    proc destroy from List with liveness_map
-
-    Note: Update counter
-    Let current_count be proc memory_get_int64 from Layout with context_ptr, 40
-    proc memory_set_int64 from Layout with context_ptr, 40, current_count plus deleted_count
+    Let deleted_count be proc run_aggressive_dce_pass from DCE with context_ptr
 
     If deleted_count is greater than 0:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
-    Display "optimize_dead_code_elimination: deleted " joined with deleted_count joined with " dead instructions"
     Return deleted_count
-End Process
-
-Process called "mark_value_live" that takes liveness_map as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Marks a value as live in the liveness map.
-
-    **LIVENESS MAP:**
-    - List of (value_id, is_live) pairs
-    - If value_id found, set is_live to 1
-    - If not found, add new entry
-    @End Reasoning
-
-    If liveness_map is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Note: Search for existing entry
-    Let count be proc length from List with liveness_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with liveness_map, i
-        Let entry_id be proc memory_get_int64 from Layout with entry, 0
-        If entry_id is equal to value_id:
-            proc memory_set_int64 from Layout with entry, 8, 1
-            Return 1
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: Not found, add new entry
-    Set entry to proc allocate from Layout with 16
-    proc memory_set_int64 from Layout with entry, 0, value_id
-    proc memory_set_int64 from Layout with entry, 8, 1
-    proc append from List with liveness_map, entry
-
-    Return 1
-End Process
-
-Process called "is_value_live" that takes liveness_map as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Checks if a value is marked as live.
-
-    Returns 1 if live, 0 if dead.
-    @End Reasoning
-
-    If liveness_map is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Let count be proc length from List with liveness_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with liveness_map, i
-        Let entry_id be proc memory_get_int64 from Layout with entry, 0
-        If entry_id is equal to value_id:
-            Let is_live be proc memory_get_int64 from Layout with entry, 8
-            Return is_live
-        End If
-        Set i to i plus 1
-    End While
-
-    Return 0  Note: Not found, assume dead
-End Process
-
-Process called "mark_operands_live" that takes liveness_map as Integer, inst as Integer returns Integer:
-    @Reasoning
-    Marks all operands of an instruction as live.
-
-    **OPERAND EXTRACTION:**
-    - Binary ops: left and right operands
-    - Unary ops: single operand
-    - Load/Store: address operand
-    - Branch: condition operand
-    - PHI: all incoming values
-
-    Returns number of operands newly marked as live.
-    @End Reasoning
-
-    If inst is equal to 0:
-        Return 0
-    End If
-
-    Let marked_count be 0
-    Let opcode be proc get_instruction_opcode from MIRNodes with inst
-
-    Note: Binary operations (20002-20012)
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
-        Let left_operand be proc memory_get_int64 from Layout with inst, 16
-        Let right_operand be proc memory_get_int64 from Layout with inst, 24
-
-        Let was_live be is_value_live(liveness_map, left_operand)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, left_operand)
-            Set marked_count to marked_count plus 1
-        End If
-
-        Set was_live to is_value_live(liveness_map, right_operand)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, right_operand)
-            Set marked_count to marked_count plus 1
-        End If
-    End If
-
-    Note: Comparison operations (20100-20105)
-    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-        Set left_operand to proc memory_get_int64 from Layout with inst, 16
-        Set right_operand to proc memory_get_int64 from Layout with inst, 24
-
-        Set was_live to is_value_live(liveness_map, left_operand)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, left_operand)
-            Set marked_count to marked_count plus 1
-        End If
-
-        Set was_live to is_value_live(liveness_map, right_operand)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, right_operand)
-            Set marked_count to marked_count plus 1
-        End If
-    End If
-
-    Note: Unary operations (NEG=20007, NOT=20013)
-    If opcode is equal to 20007 or opcode is equal to 20013:
-        Let operand be proc memory_get_int64 from Layout with inst, 16
-        Set was_live to is_value_live(liveness_map, operand)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, operand)
-            Set marked_count to marked_count plus 1
-        End If
-    End If
-
-    Note: Load operation (20019)
-    If opcode is equal to 20019:
-        Let address be proc memory_get_int64 from Layout with inst, 16
-        Set was_live to is_value_live(liveness_map, address)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, address)
-            Set marked_count to marked_count plus 1
-        End If
-    End If
-
-    Note: Store operation (20020)
-    If opcode is equal to 20020:
-        Let value be proc memory_get_int64 from Layout with inst, 16
-        Set address to proc memory_get_int64 from Layout with inst, 24
-
-        Set was_live to is_value_live(liveness_map, value)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, value)
-            Set marked_count to marked_count plus 1
-        End If
-
-        Set was_live to is_value_live(liveness_map, address)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, address)
-            Set marked_count to marked_count plus 1
-        End If
-    End If
-
-    Note: Conditional branch (20042)
-    If opcode is equal to 20042:
-        Let condition be proc memory_get_int64 from Layout with inst, 16
-        Set was_live to is_value_live(liveness_map, condition)
-        If was_live is equal to 0:
-            mark_value_live(liveness_map, condition)
-            Set marked_count to marked_count plus 1
-        End If
-    End If
-
-    Note: PHI node (20050)
-    If opcode is equal to 20050:
-        Let incoming_count be proc memory_get_int64 from Layout with inst, 24
-        Let incoming_values be proc memory_get_int64 from Layout with inst, 32
-
-        Let i be 0
-        While i is less than incoming_count:
-            Set value to proc get from List with incoming_values, i
-            Set was_live to is_value_live(liveness_map, value)
-            If was_live is equal to 0:
-                mark_value_live(liveness_map, value)
-                Set marked_count to marked_count plus 1
-            End If
-            Set i to i plus 1
-        End While
-    End If
-
-    Return marked_count
 End Process
 
 Note: ============================================================================
@@ -1120,268 +930,65 @@ Note: ==========================================================================
 
 Process called "optimize_copy_propagation" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    **COPY PROPAGATION**
+    **COPY PROPAGATION - PIPELINE WRAPPER**
 
-    Eliminates redundant copy operations by replacing uses of copied values
-    with the original value.
+    Orchestrator-side wrapper that delegates to the canonical copy-propagation
+    implementation in optimizations/copy_prop.runa. Eliminates redundant copy
+    operations by rewriting every use of a copied value to refer to the original
+    value, then leaving the dead copy instructions for DCE to sweep.
 
-    **ALGORITHM:**
-    ```
-    For each instruction:
-        If instruction is COPY (x = y):
-            Replace all uses of x with y
-            Delete the copy instruction
-            Mark changed
-    ```
+    **WHY CANONICAL COPY PROP:**
+    - Two-phase RPO walk: build copy_map, then rewrite uses globally
+    - Dominator-aware so the source value's definition is guaranteed live
+    - PHI-safe: refuses to propagate across SSA merge points
+    - Preserves SSA form throughout
 
-    **COPY DETECTION:**
-    - MIR_COPY (20060) - explicit copy instruction
-    - Also handles identity moves from SSA construction
+    **INTERFACE BRIDGE:**
+    The canonical run_copy_prop_pass entry takes the CFG pointer directly. We
+    extract it from OptimizerContext offset 0, invoke the canonical pass, then
+    propagate the change signal back into the OptimizerContext via mark_changed
+    on success so the orchestrator's fixpoint loop schedules dependent passes.
 
-    **CONSTRAINTS:**
-    - Must preserve SSA form
-    - Cannot propagate across phi nodes
-    - Cannot propagate if source is redefined
-
-    Returns number of copies propagated.
+    Returns 1 if changes made, 0 otherwise (pass-manager change indicator).
     @End Reasoning
+
+    @Implementation
+    Orchestrator-side wrapper for the Wave 2 Group A copy propagation pass. Validates
+    the context pointer, reads the CFG at offset 0, and invokes the canonical entry
+    point proc run_copy_prop_pass from CopyProp with cfg. The canonical pass owns
+    the copy_map lifecycle, RPO traversal, and SSA-preserving rewrite logic. On a
+    success return (1) the orchestrator's mark_changed is called so subsequent
+    fixpoint iterations re-run DCE and other dependent passes against the rewritten
+    IR.
+    @End Implementation
+
+    @Performance_Hints
+    Copy propagation is intentionally re-run inside the Tier-1 fixpoint loop because
+    constant folding, algebraic simplification, and scalar replacement frequently
+    introduce fresh copies that this pass eliminates in O(N) time. The pass leaves
+    dead copy instructions in place; DCE on the next iteration removes them.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Display "optimize_copy_propagation: starting copy propagation pass"
-
+    Note: Extract CFG from context
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
-    Let propagated_count be 0
-
-    Note: Get RPO traversal order
-    Let dom_info be proc memory_get_int64 from Layout with context_ptr, 16
-    Let rpo_list be proc get_reverse_postorder from Dominance with dom_info
-    Let block_count be proc length from List with rpo_list
-
-    Note: Build copy map (dest_value -> source_value)
-    Let copy_map be proc create from List
-
-    Note: Step 1: Find all copy instructions
-    Let i be 0
-    While i is less than block_count:
-        Let block_id be proc get from List with rpo_list, i
-        Let block be proc get_block from CFG with cfg, block_id
-        Let instructions be proc get_block_instructions from CFG with block
-        Let inst_count be proc length from List with instructions
-
-        Let j be 0
-        While j is less than inst_count:
-            Let inst be proc get from List with instructions, j
-            Let opcode be proc get_instruction_opcode from MIRNodes with inst
-
-            Note: Check for COPY instruction (20060)
-            If opcode is equal to 20060:
-                Let dest be proc memory_get_int64 from Layout with inst, 8
-                Let source be proc memory_get_int64 from Layout with inst, 16
-
-                Note: Add to copy map
-                add_copy_mapping(copy_map, dest, source)
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Step 2: Replace uses of copied values
-    Set i to 0
-    While i is less than block_count:
-        Set block_id to proc get from List with rpo_list, i
-        Set block to proc get_block from CFG with cfg, block_id
-        Set instructions to proc get_block_instructions from CFG with block
-        Set inst_count to proc length from List with instructions
-
-        Set j to 0
-        While j is less than inst_count:
-            Set inst to proc get from List with instructions, j
-            Let replaced be replace_copy_uses(inst, copy_map)
-            If replaced is greater than 0:
-                Set propagated_count to propagated_count plus replaced
-                mark_changed(context_ptr)
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Step 3: Delete copy instructions
-    Set i to 0
-    While i is less than block_count:
-        Set block_id to proc get from List with rpo_list, i
-        Set block to proc get_block from CFG with cfg, block_id
-        Set instructions to proc get_block_instructions from CFG with block
-        Set inst_count to proc length from List with instructions
-
-        Let new_instructions be proc create from List
-
-        Set j to 0
-        While j is less than inst_count:
-            Set inst to proc get from List with instructions, j
-            Set opcode to proc get_instruction_opcode from MIRNodes with inst
-
-            Note: Keep non-copy instructions
-            If opcode is not equal to 20060:
-                proc append from List with new_instructions, inst
-            End If
-
-            Set j to j plus 1
-        End While
-
-        Note: Replace block instructions
-        proc set_block_instructions from CFG with block, new_instructions
-
-        Set i to i plus 1
-    End While
-
-    Note: Cleanup
-    proc destroy from List with copy_map
-
-    Note: Update counter
-    Let current_count be proc memory_get_int64 from Layout with context_ptr, 64
-    proc memory_set_int64 from Layout with context_ptr, 64, current_count plus propagated_count
-
-    Display "optimize_copy_propagation: propagated " joined with propagated_count joined with " copies"
-    Return propagated_count
-End Process
-
-Process called "add_copy_mapping" that takes copy_map as Integer, dest as Integer, source as Integer returns Integer:
-    @Reasoning
-    Adds a copy mapping to the map.
-
-    **MAP STRUCTURE:**
-    - List of (dest_value, source_value) pairs
-    - Each entry is 16 bytes (2 integers)
-    @End Reasoning
-
-    If copy_map is equal to 0:
+    If cfg is equal to 0:
+        Display "optimize_copy_propagation: null CFG in context"
         Return 0
     End If
 
-    Let entry be proc allocate from Layout with 16
-    proc memory_set_int64 from Layout with entry, 0, dest
-    proc memory_set_int64 from Layout with entry, 8, source
-    proc append from List with copy_map, entry
+    Display "optimize_copy_propagation: invoking copy propagation from copy_prop.runa"
+    Let result be proc run_copy_prop_pass from CopyProp with cfg
 
-    Return 1
-End Process
-
-Process called "get_copy_source" that takes copy_map as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Gets the source value for a copied destination.
-
-    Returns source value ID, or 0 if not found.
-    @End Reasoning
-
-    If copy_map is equal to 0 or value_id is equal to 0:
-        Return 0
+    Note: Mark context as changed if copy prop made modifications
+    If result is equal to 1:
+        proc mark_changed with context_ptr
     End If
 
-    Let count be proc length from List with copy_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with copy_map, i
-        Let dest be proc memory_get_int64 from Layout with entry, 0
-        If dest is equal to value_id:
-            Let source be proc memory_get_int64 from Layout with entry, 8
-            Return source
-        End If
-        Set i to i plus 1
-    End While
-
-    Return 0
-End Process
-
-Process called "replace_copy_uses" that takes inst as Integer, copy_map as Integer returns Integer:
-    @Reasoning
-    Replaces uses of copied values in an instruction.
-
-    **REPLACEMENT:**
-    - For each operand in instruction:
-      - If operand is destination of a copy:
-        - Replace with source of copy
-
-    Returns number of replacements made.
-    @End Reasoning
-
-    If inst is equal to 0:
-        Return 0
-    End If
-
-    Let replaced_count be 0
-    Let opcode be proc get_instruction_opcode from MIRNodes with inst
-
-    Note: Binary operations
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
-        Let left_operand be proc memory_get_int64 from Layout with inst, 16
-        Let source be get_copy_source(copy_map, left_operand)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 16, source
-            Set replaced_count to replaced_count plus 1
-        End If
-
-        Let right_operand be proc memory_get_int64 from Layout with inst, 24
-        Set source to get_copy_source(copy_map, right_operand)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 24, source
-            Set replaced_count to replaced_count plus 1
-        End If
-    End If
-
-    Note: Comparison operations
-    If opcode is greater than or equal to 20100 and opcode is less than or equal to 20105:
-        Set left_operand to proc memory_get_int64 from Layout with inst, 16
-        Set source to get_copy_source(copy_map, left_operand)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 16, source
-            Set replaced_count to replaced_count plus 1
-        End If
-
-        Set right_operand to proc memory_get_int64 from Layout with inst, 24
-        Set source to get_copy_source(copy_map, right_operand)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 24, source
-            Set replaced_count to replaced_count plus 1
-        End If
-    End If
-
-    Note: Unary operations
-    If opcode is equal to 20007 or opcode is equal to 20013:
-        Let operand be proc memory_get_int64 from Layout with inst, 16
-        Set source to get_copy_source(copy_map, operand)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 16, source
-            Set replaced_count to replaced_count plus 1
-        End If
-    End If
-
-    Note: Store operation
-    If opcode is equal to 20020:
-        Let value be proc memory_get_int64 from Layout with inst, 16
-        Set source to get_copy_source(copy_map, value)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 16, source
-            Set replaced_count to replaced_count plus 1
-        End If
-
-        Let address be proc memory_get_int64 from Layout with inst, 24
-        Set source to get_copy_source(copy_map, address)
-        If source is not equal to 0:
-            proc memory_set_int64 from Layout with inst, 24, source
-            Set replaced_count to replaced_count plus 1
-        End If
-    End If
-
-    Return replaced_count
+    Return result
 End Process
 
 Note: ============================================================================
@@ -1424,6 +1031,15 @@ Process called "optimize_algebraic_simplification" that takes context_ptr as Int
     Returns number of simplifications made.
     @End Reasoning
 
+    @Implementation
+    Walks every block of the CFG in flat order (algebraic simplification does not
+    require RPO because each rewrite is local to a single instruction). For each
+    binary or comparison instruction calls try_algebraic_simplify which performs
+    the pattern-match rewrite. Each successful simplification increments the
+    instructions_simplified counter at offset 48 and calls mark_changed so DCE
+    can pick up the resulting unused operands.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1451,10 +1067,10 @@ Process called "optimize_algebraic_simplification" that takes context_ptr as Int
             Let opcode be proc get_instruction_opcode from MIRNodes with inst
 
             Note: Try algebraic simplification
-            Let result be try_algebraic_simplify(context_ptr, inst, opcode)
+            Let result be proc try_algebraic_simplify with context_ptr, inst, opcode
             If result is equal to 1:
                 Set simplified_count to simplified_count plus 1
-                mark_changed(context_ptr)
+                proc mark_changed with context_ptr
             End If
 
             Set j to j plus 1
@@ -1475,8 +1091,19 @@ Process called "try_algebraic_simplify" that takes context_ptr as Integer, inst 
     @Reasoning
     Attempts to simplify an instruction using algebraic identities.
 
-    Returns 1 if , 0 otherwise.
+    Returns 1 if simplified, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Pattern-matches the instruction against a library of arithmetic and Boolean
+    identities. First checks the operand-equal case (X op X) for identities like
+    X-X=0, X xor X=0, X<X=false. Then checks operand-constant patterns by querying
+    is_constant_value and get_constant_value: X+0=X, X*0=0, X*1=X, X|0=X, X|-1=-1,
+    X and 0=0, X and -1=X. Each successful rewrite synthesizes a MIR_CONST or
+    MIR_COPY through MIRNodes.create_mir_const_instruction / create_mir_copy_instruction
+    and returns 1. Operates safely under SSA because all rewrites preserve the
+    original result-id.
+    @End Implementation
 
     If inst is equal to 0:
         Return 0
@@ -1553,9 +1180,9 @@ Process called "try_algebraic_simplify" that takes context_ptr as Integer, inst 
     End If
 
     Note: Check if right operand is constant 0 or 1
-    Let right_is_const be is_constant_value(context_ptr, right_operand)
+    Let right_is_const be proc is_constant_value with context_ptr, right_operand
     If right_is_const is equal to 1:
-        Let right_val be get_constant_value(context_ptr, right_operand)
+        Let right_val be proc get_constant_value with context_ptr, right_operand
 
         Note: X + 0 → X
         If opcode is equal to 20002 and right_val is equal to 0:  Note: ADD
@@ -1604,9 +1231,9 @@ Process called "try_algebraic_simplify" that takes context_ptr as Integer, inst 
     End If
 
     Note: Check if left operand is constant 0 (commutative operations)
-    Let left_is_const be is_constant_value(context_ptr, left_operand)
+    Let left_is_const be proc is_constant_value with context_ptr, left_operand
     If left_is_const is equal to 1:
-        Let left_val be get_constant_value(context_ptr, left_operand)
+        Let left_val be proc get_constant_value with context_ptr, left_operand
 
         Note: 0 + X → X
         If opcode is equal to 20002 and left_val is equal to 0:  Note: ADD
@@ -1676,6 +1303,24 @@ Process called "optimize_strength_reduction" that takes context_ptr as Integer r
     Returns number of reductions performed.
     @End Reasoning
 
+    @Implementation
+    This is the inline simple version retained for fast Tier-1 runs; the
+    comprehensive version lives in strength_reduction.runa and is invoked through
+    optimize_strength_reduction_advanced in Tier 2. Walks the CFG in RPO and for
+    each MUL/DIV/MOD instruction (opcodes 20004, 20005, 20006) delegates to
+    try_strength_reduce which performs the power-of-two check and shift/AND rewrite.
+    The advanced version adds loop-induction-variable strength reduction which is
+    out of scope here.
+    @End Implementation
+
+    @Performance_Hints
+    Power-of-two detection is the inner hot loop; it uses a constant-time bit-and
+    trick (value bitwise and (value minus 1) is zero iff value is a power of two).
+    Strength reduction must run after constant folding so multiplier constants
+    are visible, and before instruction selection so the backend sees the cheaper
+    shift form.
+    @End Performance_Hints
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1704,10 +1349,10 @@ Process called "optimize_strength_reduction" that takes context_ptr as Integer r
 
             Note: Try strength reduction on MUL, DIV, MOD
             If opcode is equal to 20004 or opcode is equal to 20005 or opcode is equal to 20006:
-                Let result be try_strength_reduce(context_ptr, inst, opcode)
+                Let result be proc try_strength_reduce with context_ptr, inst, opcode
                 If result is equal to 1:
                     Set reduced_count to reduced_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 End If
             End If
 
@@ -1732,26 +1377,35 @@ Process called "try_strength_reduce" that takes context_ptr as Integer, inst as 
     Returns 1 if reduced, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Reads the right operand and requires it to be a constant power-of-two; otherwise
+    bails. Computes the log-base-2 once via calculate_log2 and dispatches: MUL
+    becomes MIR_SHL with the log as the shift amount, DIV becomes MIR_SHR, MOD
+    becomes MIR_AND with mask = right_val - 1. All three rewrites preserve the
+    result_id and left operand so SSA form is intact; only the opcode and right
+    operand mutate in place.
+    @End Implementation
+
     If inst is equal to 0:
         Return 0
     End If
 
     Let right_operand be proc memory_get_int64 from Layout with inst, 24
-    Let right_is_const be is_constant_value(context_ptr, right_operand)
+    Let right_is_const be proc is_constant_value with context_ptr, right_operand
 
     If right_is_const is equal to 0:
         Return 0
     End If
 
-    Let right_val be get_constant_value(context_ptr, right_operand)
+    Let right_val be proc get_constant_value with context_ptr, right_operand
 
     Note: Check if right_val is power of 2
-    Let is_power_of_2 be check_power_of_two(right_val)
+    Let is_power_of_2 be proc check_power_of_two with right_val
     If is_power_of_2 is equal to 0:
         Return 0
     End If
 
-    Let shift_amount be calculate_log2(right_val)
+    Let shift_amount be proc calculate_log2 with right_val
 
     Note: X * 2^n → X shifted left by n
     If opcode is equal to 20004:  Note: MUL
@@ -1833,6 +1487,12 @@ Process called "check_power_of_two" that takes value as Integer returns Integer:
     Returns 1 if power of 2, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Implements the canonical bit-trick: a positive value is a power of two iff
+    value bitwise and (value minus 1) equals zero. Rejects zero and negative
+    values up front. Constant time, no memory traffic.
+    @End Implementation
+
     If value is less than or equal to 0:
         Return 0
     End If
@@ -1864,6 +1524,13 @@ Process called "calculate_log2" that takes value as Integer returns Integer:
 
     Returns log2(value).
     @End Reasoning
+
+    @Implementation
+    Counts how many integer halvings it takes to reduce the value to 1, which is
+    log2 for a power-of-two input. Returns 0 for non-positive inputs. Only meant
+    to be called on values that check_power_of_two has already validated;
+    behaviour on non-powers is the floor of log2.
+    @End Implementation
 
     If value is less than or equal to 0:
         Return 0
@@ -1924,6 +1591,17 @@ Process called "optimize_common_subexpression_elimination" that takes context_pt
     Returns number of expressions eliminated.
     @End Reasoning
 
+    @Implementation
+    Local CSE pass used inside this orchestrator file. Cross-block and value-based
+    CSE is handled by the external cse.runa pass wired through optimize_cse_advanced.
+    Walks each block in RPO order; for each pure instruction (is_pure_operation
+    returns 1) computes a value number via compute_value_number against the
+    OptimizerContext's persistent value_map at offset 80. If the value number is
+    already mapped to a result_id (lookup_value_number hits) the instruction is
+    rewritten to reuse the prior result; otherwise the new (value_number,
+    result_id) pair is added via add_value_number.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1954,23 +1632,23 @@ Process called "optimize_common_subexpression_elimination" that takes context_pt
             Let opcode be proc get_instruction_opcode from MIRNodes with inst
 
             Note: Only CSE pure operations (no side effects)
-            Let is_pure be is_pure_operation(opcode)
+            Let is_pure be proc is_pure_operation with opcode
             If is_pure is equal to 1:
                 Note: Compute value number for this expression
-                Let value_number be compute_value_number(inst, opcode, value_map)
+                Let value_number be proc compute_value_number with inst, opcode, value_map
 
                 Note: Check if this value number exists
-                Let existing_result be lookup_value_number(value_map, value_number)
+                Let existing_result be proc lookup_value_number with value_map, value_number
                 If existing_result is not equal to 0:
                     Note: Found common subexpression
                     Let result_id be proc memory_get_int64 from Layout with inst, 8
                     Note: Replace all uses of result_id with existing_result
                     Set eliminated_count to eliminated_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 Otherwise:
                     Note: Add to value number map
                     Set result_id to proc memory_get_int64 from Layout with inst, 8
-                    add_value_number(value_map, value_number, result_id)
+                    proc add_value_number with value_map, value_number, result_id
                 End If
             End If
 
@@ -2008,6 +1686,13 @@ Process called "is_pure_operation" that takes opcode as Integer returns Integer:
     Returns 1 if pure, 0 if impure.
     @End Reasoning
 
+    @Implementation
+    Range-tests the opcode against four pure-instruction bands: arithmetic 20002-
+    20007 (ADD through NEG), bitwise 20008-20013 (SHL through NOT), comparisons
+    20100-20105, and constant 20001. Anything outside those bands (load, store,
+    call, branch, phi, return) is treated as impure and excluded from CSE.
+    @End Implementation
+
     Note: Arithmetic operations (20002-20007)
     If opcode is greater than or equal to 20002 and opcode is less than or equal to 20007:
         Return 1
@@ -2043,6 +1728,16 @@ Process called "compute_value_number" that takes inst as Integer, opcode as Inte
 
     Returns value number (hash).
     @End Reasoning
+
+    @Implementation
+    Builds a deterministic hash from the opcode and operand value-ids. The 31/17/13
+    multipliers are prime and chosen to distribute hash values across the
+    value_map index space. For commutative opcodes (ADD, MUL, AND, OR, XOR) the
+    operands are canonicalized by sorting so that "a op b" and "b op a" hash to the
+    same value. Comparison ops are intentionally not commuted because LT and GT
+    have inverse semantics. Unary ops and constants use a single-operand hash; all
+    others fall through producing only the opcode-scaled hash.
+    @End Implementation
 
     If inst is equal to 0:
         Return 0
@@ -2110,6 +1805,13 @@ Process called "lookup_value_number" that takes value_map as Integer, value_numb
     Returns result value ID if found, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Linear scan of the value_map list comparing value-numbers at entry offset 0
+    against the query. Returns the recorded result_id (offset 8) on hit, 0 on miss.
+    Acceptable complexity because value_map entries are bounded by the number of
+    distinct pure-expression hashes seen in the function.
+    @End Implementation
+
     If value_map is equal to 0 or value_number is equal to 0:
         Return 0
     End If
@@ -2137,6 +1839,12 @@ Process called "add_value_number" that takes value_map as Integer, value_number 
     - List of (value_number, result_id) pairs
     - Each entry is 16 bytes
     @End Reasoning
+
+    @Implementation
+    Allocates a 16-byte (value_number, result_id) record and appends to the
+    value_map list. Called only after lookup_value_number has returned 0,
+    establishing a new equivalence class for the freshly-computed expression.
+    @End Implementation
 
     If value_map is equal to 0:
         Return 0
@@ -2175,6 +1883,14 @@ Process called "optimize_cse_advanced" that takes context_ptr as Integer returns
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Orchestrator-side wrapper for the Wave 2 Group A cross-block CSE pass. Extracts
+    the CFG pointer from OptimizerContext offset 0 and invokes the canonical
+    entry point proc run_cse_pass from CSE with cfg. On a non-zero return,
+    propagates the change signal back into the OptimizerContext via mark_changed
+    so the orchestrator's fixpoint loop re-runs dependent passes.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_cse_advanced: null context"
         Return 0
@@ -2193,7 +1909,7 @@ Process called "optimize_cse_advanced" that takes context_ptr as Integer returns
 
     Note: Mark context as changed if CSE made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2227,6 +1943,14 @@ Process called "optimize_gvn" that takes context_ptr as Integer returns Integer:
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Bridges OptimizerContext to the canonical GVN entry point
+    proc run_gvn_pass from GVN with cfg. GVN runs once per pipeline invocation
+    after the fixpoint loop converges because its hash-consing and congruence-class
+    analyses are O(N log N) and benefit from a stabilized IR. Returns the GVN
+    module's change indicator unchanged after propagating it into context state.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_gvn: null context"
         Return 0
@@ -2245,10 +1969,146 @@ Process called "optimize_gvn" that takes context_ptr as Integer returns Integer:
 
     Note: Mark context as changed if GVN made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
+End Process
+
+Process called "optimize_constant_prop" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **ENHANCED CONSTANT PROPAGATION - PIPELINE WRAPPER**
+
+    Orchestrator-side wrapper that delegates to the canonical enhanced constant
+    propagation implementation in optimizations/constant_prop.runa. Distinct from
+    optimize_constant_folding (which only collapses constant expressions in place)
+    and from optimize_sparse_conditional_constant_propagation (which combines
+    constants with reachability), this pass focuses on cross-block constant
+    propagation for opportunities SCCP did not catch:
+
+    - Global variables and module-level constants
+    - Array and aggregate constants
+    - Interprocedural propagation through call boundaries
+
+    **WHY RUN AFTER SCCP:**
+    SCCP is the strongest single-function constant analyzer, but its lattice is
+    intra-procedural and intra-aggregate. Enhanced constant propagation runs as
+    a follow-up to harvest opportunities exposed by SCCP and by inlining (which
+    can expose interprocedural constants).
+
+    **INTERFACE BRIDGE:**
+    The canonical run_constant_prop_pass entry takes the CFG pointer directly.
+    We extract it from OptimizerContext offset 0, invoke the canonical pass, then
+    propagate the change signal back via mark_changed on success.
+
+    Returns 1 if changes made, 0 otherwise (pass-manager change indicator).
+    @End Reasoning
+
+    @Implementation
+    Orchestrator-side wrapper for the Wave 2 Group A enhanced constant propagation
+    pass. Validates the context pointer, reads the CFG at offset 0, and invokes
+    the canonical entry point proc run_constant_prop_pass from ConstantProp with
+    cfg. The canonical pass owns its ConstantPropContext lifecycle, the worklist
+    iteration, and the value-rewriting transformation. On a success return (1)
+    mark_changed is signalled to the orchestrator so the post-fixpoint DCE cleanup
+    removes any newly-dead instructions.
+    @End Implementation
+
+    @Performance_Hints
+    Enhanced constant propagation runs once after the SCCP/GVN advanced phase
+    rather than inside the Tier-1 fixpoint loop because its cost is dominated by
+    cross-block reachability analysis and re-running it on a stabilized IR rarely
+    discovers further opportunities. Functions with fewer than two basic blocks
+    are skipped by the canonical should_run_constant_prop predicate.
+    @End Performance_Hints
+
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Extract CFG from context
+    Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
+    If cfg is equal to 0:
+        Display "optimize_constant_prop: null CFG in context"
+        Return 0
+    End If
+
+    Display "optimize_constant_prop: invoking enhanced constant propagation from constant_prop.runa"
+    Let result be proc run_constant_prop_pass from ConstantProp with cfg
+
+    Note: Mark context as changed if constant prop made modifications
+    If result is equal to 1:
+        proc mark_changed with context_ptr
+    End If
+
+    Return result
+End Process
+
+Process called "optimize_dead_store_elimination" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    **DEAD STORE ELIMINATION (DSE) - PIPELINE WRAPPER**
+
+    Orchestrator-side wrapper that delegates to the canonical dead-store
+    elimination implementation in optimizations/dead_store.runa. DSE complements
+    DCE by removing memory operations - stores whose written values are killed
+    or never read - that DCE cannot eliminate because stores are flagged as
+    side-effecting.
+
+    **WHY DSE IS DISTINCT FROM DCE:**
+    - DCE preserves all stores because they have memory side effects
+    - DSE proves that specific stores are dead via points-to and liveness analysis
+    - DSE also forwards store-to-load chains and eliminates dead stack stores
+
+    **WHAT DSE PERFORMS:**
+    - Anderson's flow-insensitive points-to alias analysis
+    - Backward store-liveness data-flow analysis
+    - Dead store elimination
+    - Store-to-load forwarding
+    - Dead stack-slot store elimination
+
+    **INTERFACE BRIDGE:**
+    The canonical run_dead_store_elimination_pass entry accepts an
+    optimizer_context directly (it reads the CFG at offset 0 and updates the
+    deletion counter at offset 40), so we forward context_ptr unchanged. The
+    canonical pass returns the total count of (eliminated + forwarded +
+    stack-eliminated) operations; on any non-zero return we propagate the change
+    signal back via mark_changed so the orchestrator's fixpoint loop re-runs
+    dependent passes.
+
+    Returns total number of memory optimizations performed.
+    @End Reasoning
+
+    @Implementation
+    Orchestrator-side wrapper for the Wave 2 Group A dead store elimination pass.
+    Validates the optimizer context pointer, then invokes the canonical entry
+    point proc run_dead_store_elimination_pass from DeadStore with context_ptr.
+    The canonical pass handles CFG extraction, DSEContext lifecycle, points-to
+    analysis, liveness analysis, and deletion-counter accumulation internally. If
+    the canonical pass reports any optimizations (return value greater than 0),
+    mark_changed is signalled so the orchestrator schedules another iteration to
+    re-run DCE and dependent passes against the trimmed memory traffic.
+    @End Implementation
+
+    @Performance_Hints
+    DSE runs after DCE in the post-fixpoint cleanup phase because DCE's
+    elimination of dead loads exposes more store-liveness opportunities. The
+    cost is dominated by Anderson's points-to analysis (O(N^2) in the worst
+    case); re-running DSE inside the Tier-1 fixpoint loop would be wasteful.
+    @End Performance_Hints
+
+    If context_ptr is equal to 0:
+        Return 0
+    End If
+
+    Display "optimize_dead_store_elimination: invoking DSE from dead_store.runa"
+
+    Let total_count be proc run_dead_store_elimination_pass from DeadStore with context_ptr
+
+    If total_count is greater than 0:
+        proc mark_changed with context_ptr
+    End If
+
+    Return total_count
 End Process
 
 Process called "optimize_licm" that takes context_ptr as Integer returns Integer:
@@ -2277,6 +2137,15 @@ Process called "optimize_licm" that takes context_ptr as Integer returns Integer
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Bridges OptimizerContext to the canonical LICM entry point
+    proc run_licm_pass from LICM with cfg. LICM relies on the dominator tree
+    cached at OptimizerContext offset 16 for preheader insertion and exit-block
+    safety analysis, but the LICM pass loads it directly from the CFG so we do
+    not pass the cached pointer through. Re-running this pass after loop
+    unrolling exposes additional invariant motion opportunities.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_licm: null context"
         Return 0
@@ -2295,7 +2164,7 @@ Process called "optimize_licm" that takes context_ptr as Integer returns Integer
 
     Note: Mark context as changed if LICM made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2331,6 +2200,16 @@ Process called "optimize_loop_unrolling" that takes context_ptr as Integer retur
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Bridges OptimizerContext to the canonical loop-unrolling entry point
+    proc run_loop_unrolling_pass from LoopUnroll with cfg. Loop unrolling runs
+    after LICM in the pipeline so invariant motion already shrank the loop body,
+    making unrolling more profitable. Loop unrolling invalidates the dominator
+    tree cached in the OptimizerContext when it introduces new blocks; downstream
+    passes that rely on dominance call into the canonical Dominance module which
+    recomputes lazily.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_loop_unrolling: null context"
         Return 0
@@ -2349,7 +2228,7 @@ Process called "optimize_loop_unrolling" that takes context_ptr as Integer retur
 
     Note: Mark context as changed if loop unrolling made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2380,6 +2259,15 @@ Process called "optimize_strength_reduction_advanced" that takes context_ptr as 
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Bridges OptimizerContext to the canonical strength-reduction entry point
+    proc run_strength_reduction_pass from StrengthReduction with cfg. This is the
+    full pass including loop-induction-variable strength reduction; the inline
+    version (optimize_strength_reduction) is retained for testing and is still
+    callable through run_single_optimization_pass with the "strength_reduction"
+    selector.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_strength_reduction_advanced: null context"
         Return 0
@@ -2398,7 +2286,7 @@ Process called "optimize_strength_reduction_advanced" that takes context_ptr as 
 
     Note: Mark context as changed if strength reduction made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2450,6 +2338,16 @@ Process called "optimize_tail_call" that takes context_ptr as Integer returns In
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Function-scope tail-call wrapper. When a function pointer is available at
+    OptimizerContext offset 8, dispatches to the function-level entry
+    proc optimize_function_with_tail_call from TailCall with function, which can
+    perform tail-recursion-to-loop transformations that require knowledge of the
+    enclosing function header. Otherwise falls back to the canonical pass-level
+    entry proc run_tail_call_pass from TailCall with cfg which marks sibling
+    tail calls without rewriting the function body.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_tail_call: null context"
         Return 0
@@ -2479,7 +2377,7 @@ Process called "optimize_tail_call" that takes context_ptr as Integer returns In
 
     Note: Mark context as changed if tail call optimization made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2529,6 +2427,16 @@ Process called "optimize_inlining" that takes context_ptr as Integer returns Int
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Function-scope inlining wrapper. Dispatches on whether a function pointer is
+    present at OptimizerContext offset 8: function-level uses
+    proc optimize_function_with_inlining from Inlining with function which has
+    visibility into the callee's complete body for cost analysis, while the
+    pass-level fallback proc run_inlining_pass from Inlining with cfg performs
+    a CFG-wide sweep. Inlining is scheduled before LICM and CSE so the inlined
+    code is exposed to subsequent optimization.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_inlining: null context"
         Return 0
@@ -2558,7 +2466,7 @@ Process called "optimize_inlining" that takes context_ptr as Integer returns Int
 
     Note: Mark context as changed if inlining made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2616,6 +2524,25 @@ Process called "optimize_devirtualization" that takes context_ptr as Integer ret
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Function-scope devirtualization wrapper. Extracts both cfg (offset 0) and
+    function (offset 8) and dispatches to
+    proc optimize_function_with_devirtualization from Devirtualization with function
+    when the function context is available; otherwise falls back to
+    proc run_devirtualization_pass from Devirtualization with cfg. Function-level
+    is preferred because type-propagation confidence analysis benefits from
+    visibility into all call sites at once. Devirtualization runs before inlining
+    so direct-call rewrites become inlining candidates.
+    @End Implementation
+
+    @Security_Scope
+    Speculative devirtualization (75-99% confidence) inserts a type guard that
+    must trap or fall through to the slow path on a type mismatch; this preserves
+    soundness even when type-propagation analysis was over-confident. Direct
+    devirtualization (100% confidence) requires the canonical Devirtualization
+    pass to have proved the receiver type, not a heuristic guess.
+    @End Security_Scope
+
     If context_ptr is equal to 0:
         Display "optimize_devirtualization: null context"
         Return 0
@@ -2645,7 +2572,7 @@ Process called "optimize_devirtualization" that takes context_ptr as Integer ret
 
     Note: Mark context as changed if devirtualization made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2688,6 +2615,15 @@ Process called "optimize_scalar_replacement" that takes context_ptr as Integer r
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Bridges OptimizerContext to the SROA function-level entry point
+    proc optimize_function_with_sroa from ScalarReplacement with cfg. SROA runs
+    early in Tier 2 because scalarized struct fields expose substantially more
+    constant propagation, copy propagation, and CSE opportunities. The canonical
+    pass-level entry proc run_sroa_pass from ScalarReplacement is reachable through
+    run_single_optimization_pass via the "scalar_replacement" or "sroa" selectors.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Display "optimize_scalar_replacement: null context"
         Return 0
@@ -2706,7 +2642,7 @@ Process called "optimize_scalar_replacement" that takes context_ptr as Integer r
 
     Note: Mark context as changed if SROA made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2746,6 +2682,23 @@ Process called "optimize_vectorization" that takes context_ptr as Integer return
     Returns 1 if changes made, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Bridges OptimizerContext to the vectorization function-level entry point
+    proc optimize_function_with_vectorization from Vectorization with cfg.
+    Vectorization runs after loop unrolling and LICM so the inner loop body has
+    been hoisted clean and exposed to dependency analysis. The pass-level entry
+    proc run_vectorization_pass from Vectorization is the alternate canonical
+    name reachable via run_single_optimization_pass.
+    @End Implementation
+
+    @Performance_Hints
+    Vectorization yields the largest single-pass speedups (4-16x on hot inner
+    loops) but its cost model is the most conservative; the dependency analysis
+    requires complete induction-variable identification which is why it must run
+    after strength reduction and loop unrolling have stabilized the inner-loop
+    shape.
+    @End Performance_Hints
+
     If context_ptr is equal to 0:
         Display "optimize_vectorization: null context"
         Return 0
@@ -2764,7 +2717,7 @@ Process called "optimize_vectorization" that takes context_ptr as Integer return
 
     Note: Mark context as changed if vectorization made modifications
     If result is equal to 1:
-        mark_changed(context_ptr)
+        proc mark_changed with context_ptr
     End If
 
     Return result
@@ -2815,6 +2768,16 @@ Process called "optimize_branches" that takes context_ptr as Integer returns Int
     Returns number of branches optimized.
     @End Reasoning
 
+    @Implementation
+    Iterates every block in the CFG and inspects only the terminator (last)
+    instruction. Conditional branches (opcode 20042) are dispatched to
+    optimize_conditional_branch which handles constant-condition folding and
+    same-target collapse. Unconditional branches (opcode 20041) dispatch to
+    optimize_unconditional_branch for branch-to-branch and empty-block elimination.
+    The instructions_simplified counter at offset 48 is updated with the total
+    count and mark_changed is invoked so DCE can sweep up newly-unreachable blocks.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -2838,19 +2801,19 @@ Process called "optimize_branches" that takes context_ptr as Integer returns Int
 
             Note: Optimize conditional branch
             If opcode is equal to 20042:  Note: COND_BR
-                Let result be optimize_conditional_branch(context_ptr, block, terminator)
+                Let result be proc optimize_conditional_branch with context_ptr, block, terminator
                 If result is equal to 1:
                     Set optimized_count to optimized_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 End If
             End If
 
             Note: Optimize unconditional branch (branch-to-branch)
             If opcode is equal to 20041:  Note: BR
-                Set result to optimize_unconditional_branch(context_ptr, block, terminator)
+                Set result to proc optimize_unconditional_branch with context_ptr, block, terminator
                 If result is equal to 1:
                     Set optimized_count to optimized_count plus 1
-                    mark_changed(context_ptr)
+                    proc mark_changed with context_ptr
                 End If
             End If
         End If
@@ -2878,6 +2841,16 @@ Process called "optimize_conditional_branch" that takes context_ptr as Integer, 
     Returns 1 if optimized, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Reads the condition operand at offset 16. If is_constant_value reports the
+    condition is a compile-time constant, retrieves its value via
+    get_constant_value and rewrites the branch in place: a non-zero constant
+    converts MIR_COND_BR (20042) to MIR_BR (20041) targeting the true branch,
+    a zero constant rewrites to BR targeting the false branch. The dropped
+    successor block is left to DCE/branch-cleanup on the next pass. SSA form is
+    preserved because we only rewrite control flow, not value definitions.
+    @End Implementation
+
     If branch_inst is equal to 0:
         Return 0
     End If
@@ -2894,9 +2867,9 @@ Process called "optimize_conditional_branch" that takes context_ptr as Integer, 
     End If
 
     Note: Pattern 2: Constant condition
-    Let is_const be is_constant_value(context_ptr, condition)
+    Let is_const be proc is_constant_value with context_ptr, condition
     If is_const is equal to 1:
-        Let const_val be get_constant_value(context_ptr, condition)
+        Let const_val be proc get_constant_value with context_ptr, condition
         If const_val is not equal to 0:
             Note: Condition is true, branch to true_target
             Set new_br to proc create_mir_br_instruction from MIRNodes with true_target
@@ -2925,6 +2898,14 @@ Process called "optimize_unconditional_branch" that takes context_ptr as Integer
 
     Returns 1 if optimized, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Reads the branch target from offset 16 and inspects the target block. If the
+    target contains exactly one instruction and that instruction is also a
+    MIR_BR, the current branch is rewritten to skip the intermediate block by
+    overwriting its target with the final destination. The intermediate block
+    becomes unreachable and is removed by subsequent DCE / dead-block passes.
+    @End Implementation
 
     If branch_inst is equal to 0:
         Return 0
@@ -2961,422 +2942,68 @@ Note: ==========================================================================
 
 Process called "optimize_sparse_conditional_constant_propagation" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    **SPARSE CONDITIONAL CONSTANT PROPAGATION (SCCP)**
+    **SPARSE CONDITIONAL CONSTANT PROPAGATION (SCCP) - PIPELINE WRAPPER**
 
-    More powerful than simple constant folding + propagation.
-    Combines constant propagation with unreachable code elimination.
+    Orchestrator-side wrapper that delegates to the canonical Wegman-Zadeck SCCP
+    implementation in optimizations/sccp.runa. SCCP is more powerful than simple
+    constant folding + propagation because it combines constant propagation with
+    unreachable-block elimination in a single sparse worklist algorithm.
 
-    **ALGORITHM** (Wegman-Zadeck 1991):
-    ```
-    1. Initialize all values as UNDEFINED
-    2. Mark entry block as executable
-    3. While worklist not empty:
-       a. Process executable blocks:
-          - Evaluate instructions
-          - If operands are constant, fold and propagate
-          - Update SSA value lattice
-       b. Mark successor blocks executable based on:
-          - Unconditional branches → mark successor
-          - Conditional branches with constant condition → mark one successor
-          - Conditional branches with unknown condition → mark both successors
-    4. Delete all non-executable blocks and instructions with undefined values
-    ```
+    **WHY CANONICAL SCCP:**
+    - Wegman-Zadeck 1991 algorithm with full lattice (UNDEFINED, CONSTANT, OVERDEFINED)
+    - Reachability and constant propagation interleave so a conditional branch with
+      a CONSTANT condition only marks one successor executable
+    - Discovers more constants than iterate-to-fixpoint passes because dead branches
+      cannot poison phi merges
+    - Eliminates more dead code via the executable-block analysis
 
-    **LATTICE VALUES:**
-    ```
-    UNDEFINED (⊥)  - Not yet analyzed
-    CONSTANT(k)    - Known constant value k
-    OVERDEFINED (⊤) - Not constant (multiple values or unknown)
-    ```
+    **INTERFACE BRIDGE:**
+    The canonical run_sccp_pass entry takes the CFG pointer directly. We extract
+    it from OptimizerContext offset 0, invoke the canonical pass, then propagate
+    the change signal back into the OptimizerContext via mark_changed on success.
 
-    **EXAMPLE:**
-    ```
-    x = 5
-    if (x < 10):        <- Condition is constant true
-        y = x + 1       <- y is constant 6
-        z = y * 2       <- z is constant 12
-    Otherwise:
-        y = x - 1       <- DEAD CODE (never executed)
-        z = y * 3       <- DEAD CODE
-    return z            <- Returns constant 12
-    ```
-
-    **ADVANTAGES OVER SIMPLE CONST PROP:**
-    - Discovers more constants through conditional analysis
-    - Eliminates more dead code
-    - Single pass instead of iterate-to-fixpoint
-
-    Returns number of constants propagated.
+    Returns 1 if changes made, 0 otherwise (pass-manager change indicator).
     @End Reasoning
+
+    @Implementation
+    Orchestrator-side wrapper for the Wave 2 Group A SCCP pass. Validates the
+    context pointer, reads the CFG at offset 0, and invokes the canonical entry
+    point proc run_sccp_pass from SCCP with cfg. The canonical pass owns the
+    lattice_map and executable_blocks lifecycle, the Wegman-Zadeck worklist loop,
+    and the constant-rewriting transformation. On a success return (1) the
+    orchestrator's mark_changed is called so the post-fixpoint cleanup DCE removes
+    any newly-dead instructions.
+    @End Implementation
+
+    @Performance_Hints
+    SCCP runs once after the Tier-1/Tier-2 fixpoint loop converges because its
+    cost is O(N log N) and re-running it generally does not discover new
+    constants once the IR has stabilized. The canonical implementation keeps the
+    lattice state local to a single invocation rather than persisting it on the
+    OptimizerContext, which keeps the orchestrator decoupled from SCCP's internal
+    state representation.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Display "optimize_sparse_conditional_constant_propagation: starting SCCP pass"
-
+    Note: Extract CFG from context
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
-    Let propagated_count be 0
-
-    Note: Create lattice map (value_id -> lattice_state)
-    Note: Lattice states: 0 = UNDEFINED, 1 = CONSTANT, 2 = OVERDEFINED
-    Let lattice_map be proc create from List
-
-    Note: Create executable blocks set
-    Let executable_blocks be proc create from List
-
-    Note: Create SSA edges worklist
-    Let ssa_worklist be proc memory_get_int64 from Layout with context_ptr, 72
-
-    Note: Step 1: Initialize - mark entry block as executable
-    Let entry_block_id be 0
-    proc append from List with executable_blocks, entry_block_id
-
-    Note: Step 2: Process worklist
-    Let changed be 1
-    While changed is equal to 1:
-        Set changed to 0
-
-        Note: Process all executable blocks
-        Let exec_count be proc length from List with executable_blocks
-        Let i be 0
-        While i is less than exec_count:
-            Let block_id be proc get from List with executable_blocks, i
-            Let block be proc get_block from CFG with cfg, block_id
-            Let instructions be proc get_block_instructions from CFG with block
-            Let inst_count be proc length from List with instructions
-
-            Note: Process each instruction in block
-            Let j be 0
-            While j is less than inst_count:
-                Let inst be proc get from List with instructions, j
-                Let updated be sccp_visit_instruction(inst, lattice_map)
-                If updated is equal to 1:
-                    Set changed to 1
-                    Set propagated_count to propagated_count plus 1
-                End If
-                Set j to j plus 1
-            End While
-
-            Note: Process terminator to mark successors executable
-            If inst_count is greater than 0:
-                Let terminator be proc get from List with instructions, inst_count minus 1
-                Let opcode be proc get_instruction_opcode from MIRNodes with terminator
-
-                If opcode is equal to 20041:  Note: Unconditional BR
-                    Let target be proc memory_get_int64 from Layout with terminator, 16
-                    Let is_exec be is_block_executable(executable_blocks, target)
-                    If is_exec is equal to 0:
-                        proc append from List with executable_blocks, target
-                        Set changed to 1
-                    End If
-                End If
-
-                If opcode is equal to 20042:  Note: Conditional BR
-                    Let condition be proc memory_get_int64 from Layout with terminator, 16
-                    Let lattice_state be get_lattice_value(lattice_map, condition)
-                    Let true_target be proc memory_get_int64 from Layout with terminator, 24
-                    Let false_target be proc memory_get_int64 from Layout with terminator, 32
-
-                    If lattice_state is equal to 1:  Note: CONSTANT
-                        Let const_val be get_lattice_constant(lattice_map, condition)
-                        If const_val is not equal to 0:
-                            Set is_exec to is_block_executable(executable_blocks, true_target)
-                            If is_exec is equal to 0:
-                                proc append from List with executable_blocks, true_target
-                                Set changed to 1
-                            Otherwise:
-                            Set is_exec to is_block_executable(executable_blocks, false_target)
-                            If is_exec is equal to 0:
-                                proc append from List with executable_blocks, false_target
-                                Set changed to 1
-                            End If
-                            End If
-                        Otherwise:
-                        Note: OVERDEFINED or UNDEFINED - mark both successors
-                        Set is_exec to is_block_executable(executable_blocks, true_target)
-                        If is_exec is equal to 0:
-                            proc append from List with executable_blocks, true_target
-                            Set changed to 1
-                        End If
-                        Set is_exec to is_block_executable(executable_blocks, false_target)
-                        If is_exec is equal to 0:
-                            proc append from List with executable_blocks, false_target
-                            Set changed to 1
-                        End If
-                    End If
-                End If
-            End If
-            End If
-
-            Set i to i plus 1
-        End While
-    End While
-
-    Note: Step 3: Replace constants and delete dead code
-    Let block_count be proc get_block_count from CFG with cfg
-    Set i to 0
-    While i is less than block_count:
-        Set is_exec to is_block_executable(executable_blocks, i)
-        If is_exec is equal to 1:
-            Set block to proc get_block from CFG with cfg, i
-            Set instructions to proc get_block_instructions from CFG with block
-            Set inst_count to proc length from List with instructions
-
-            Set j to 0
-            While j is less than inst_count:
-                Set inst to proc get from List with instructions, j
-                Let result_id be proc memory_get_int64 from Layout with inst, 8
-                Set lattice_state to get_lattice_value(lattice_map, result_id)
-
-                If lattice_state is equal to 1:  Note: Replace with constant
-                    Set const_val to get_lattice_constant(lattice_map, result_id)
-                    Let const_inst be proc create_mir_const_instruction from MIRNodes with result_id, const_val
-                End If
-
-                Set j to j plus 1
-            End While
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Cleanup
-    proc destroy from List with lattice_map
-    proc destroy from List with executable_blocks
-
-    mark_changed(context_ptr)
-
-    Display "optimize_sparse_conditional_constant_propagation: propagated " joined with propagated_count joined with " constants"
-    Return propagated_count
-End Process
-
-Process called "sccp_visit_instruction" that takes inst as Integer, lattice_map as Integer returns Integer:
-    @Reasoning
-    Visits an instruction and updates lattice values.
-
-    Returns 1 if lattice was updated, 0 otherwise.
-    @End Reasoning
-
-    If inst is equal to 0:
+    If cfg is equal to 0:
+        Display "optimize_sparse_conditional_constant_propagation: null CFG in context"
         Return 0
     End If
 
-    Let opcode be proc get_instruction_opcode from MIRNodes with inst
-    Let result_id be proc memory_get_int64 from Layout with inst, 8
+    Display "optimize_sparse_conditional_constant_propagation: invoking SCCP from sccp.runa"
+    Let result be proc run_sccp_pass from SCCP with cfg
 
-    Note: Constant instruction
-    If opcode is equal to 20001:  Note: MIR_CONST
-        Let const_val be proc memory_get_int64 from Layout with inst, 16
-        Return set_lattice_constant(lattice_map, result_id, const_val)
+    Note: Mark context as changed if SCCP made modifications
+    If result is equal to 1:
+        proc mark_changed with context_ptr
     End If
 
-    Note: Binary operations
-    If opcode is greater than or equal to 20002 and opcode is less than or equal to 20012:
-        Let left_operand be proc memory_get_int64 from Layout with inst, 16
-        Let right_operand be proc memory_get_int64 from Layout with inst, 24
-
-        Let left_state be get_lattice_value(lattice_map, left_operand)
-        Let right_state be get_lattice_value(lattice_map, right_operand)
-
-        Note: If either operand is OVERDEFINED, result is OVERDEFINED
-        If left_state is equal to 2 or right_state is equal to 2:
-            Return set_lattice_overdefined(lattice_map, result_id)
-        End If
-
-        Note: If both operands are CONSTANT, fold
-        If left_state is equal to 1 and right_state is equal to 1:
-            Let left_val be get_lattice_constant(lattice_map, left_operand)
-            Let right_val be get_lattice_constant(lattice_map, right_operand)
-
-            Let result_val be 0
-            If opcode is equal to 20002:  Note: ADD
-                Set result_val to left_val plus right_val
-            End If
-            If opcode is equal to 20003:  Note: SUB
-                Set result_val to left_val minus right_val
-            End If
-            If opcode is equal to 20004:  Note: MUL
-                Set result_val to left_val multiplied by right_val
-            End If
-
-            Return set_lattice_constant(lattice_map, result_id, result_val)
-        End If
-
-        Note: Otherwise, stay UNDEFINED
-        Return 0
-    End If
-
-    Note: PHI nodes require special handling
-    If opcode is equal to 20050:  Note: PHI
-        Note: PHI is constant if all executable predecessors have same constant
-        Return 0
-    End If
-
-    Note: All other instructions are OVERDEFINED
-    Return set_lattice_overdefined(lattice_map, result_id)
-End Process
-
-Process called "get_lattice_value" that takes lattice_map as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Gets lattice state for a value.
-
-    Returns: 0 = UNDEFINED, 1 = CONSTANT, 2 = OVERDEFINED.
-    @End Reasoning
-
-    If lattice_map is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Let count be proc length from List with lattice_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with lattice_map, i
-        Let entry_id be proc memory_get_int64 from Layout with entry, 0
-        If entry_id is equal to value_id:
-            Let state be proc memory_get_int64 from Layout with entry, 8
-            Return state
-        End If
-        Set i to i plus 1
-    End While
-
-    Return 0  Note: UNDEFINED by default
-End Process
-
-Process called "get_lattice_constant" that takes lattice_map as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Gets constant value for a CONSTANT lattice entry.
-
-    Returns constant value, or 0 if not found.
-    @End Reasoning
-
-    If lattice_map is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Let count be proc length from List with lattice_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with lattice_map, i
-        Let entry_id be proc memory_get_int64 from Layout with entry, 0
-        If entry_id is equal to value_id:
-            Let const_val be proc memory_get_int64 from Layout with entry, 16
-            Return const_val
-        End If
-        Set i to i plus 1
-    End While
-
-    Return 0
-End Process
-
-Process called "set_lattice_constant" that takes lattice_map as Integer, value_id as Integer, const_val as Integer returns Integer:
-    @Reasoning
-    Sets a value to CONSTANT state with given value.
-
-    Returns 1 if changed, 0 if already at that state.
-    @End Reasoning
-
-    If lattice_map is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Note: Search for existing entry
-    Let count be proc length from List with lattice_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with lattice_map, i
-        Let entry_id be proc memory_get_int64 from Layout with entry, 0
-        If entry_id is equal to value_id:
-            Let current_state be proc memory_get_int64 from Layout with entry, 8
-            If current_state is equal to 1:  Note: Already CONSTANT
-                Let current_val be proc memory_get_int64 from Layout with entry, 16
-                If current_val is equal to const_val:
-                    Return 0  Note: No change
-                Otherwise:
-                    Note: Different constant - promote to OVERDEFINED
-                    proc memory_set_int64 from Layout with entry, 8, 2
-                    Return 1
-                End If
-            End If
-            If current_state is equal to 2:  Note: Already OVERDEFINED
-                Return 0
-            End If
-            Note: Was UNDEFINED, now CONSTANT
-            proc memory_set_int64 from Layout with entry, 8, 1
-            proc memory_set_int64 from Layout with entry, 16, const_val
-            Return 1
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: Not found, add new entry
-    Set entry to proc allocate from Layout with 24
-    proc memory_set_int64 from Layout with entry, 0, value_id
-    proc memory_set_int64 from Layout with entry, 8, 1 Note: CONSTANT
-    proc memory_set_int64 from Layout with entry, 16, const_val
-    proc append from List with lattice_map, entry
-    Return 1
-End Process
-
-Process called "set_lattice_overdefined" that takes lattice_map as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Sets a value to OVERDEFINED state.
-
-    Returns 1 if changed, 0 if already OVERDEFINED.
-    @End Reasoning
-
-    If lattice_map is equal to 0 or value_id is equal to 0:
-        Return 0
-    End If
-
-    Note: Search for existing entry
-    Let count be proc length from List with lattice_map
-    Let i be 0
-    While i is less than count:
-        Let entry be proc get from List with lattice_map, i
-        Let entry_id be proc memory_get_int64 from Layout with entry, 0
-        If entry_id is equal to value_id:
-            Let current_state be proc memory_get_int64 from Layout with entry, 8
-            If current_state is equal to 2:  Note: Already OVERDEFINED
-                Return 0
-            End If
-            Note: Promote to OVERDEFINED
-            proc memory_set_int64 from Layout with entry, 8, 2
-            Return 1
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: Not found, add new entry
-    Set entry to proc allocate from Layout with 24
-    proc memory_set_int64 from Layout with entry, 0, value_id
-    proc memory_set_int64 from Layout with entry, 8, 2 Note: OVERDEFINED
-    proc append from List with lattice_map, entry
-    Return 1
-End Process
-
-Process called "is_block_executable" that takes executable_blocks as Integer, block_id as Integer returns Integer:
-    @Reasoning
-    Checks if a block is marked as executable.
-
-    Returns 1 if executable, 0 otherwise.
-    @End Reasoning
-
-    If executable_blocks is equal to 0:
-        Return 0
-    End If
-
-    Let count be proc length from List with executable_blocks
-    Let i be 0
-    While i is less than count:
-        Let exec_id be proc get from List with executable_blocks, i
-        If exec_id is equal to block_id:
-            Return 1
-        End If
-        Set i to i plus 1
-    End While
-
-    Return 0
+    Return result
 End Process
 
 Note: ============================================================================
@@ -3394,8 +3021,8 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
     1. Create optimizer context
     2. Run Tier 1 optimizations (fast, foundational):
        - Constant folding
-       - Dead code elimination
-       - Copy propagation
+       - Dead code elimination (aggressive DCE from dce.runa)
+       - Copy propagation (from copy_prop.runa)
     3. Run Tier 2 optimizations (medium cost, high value):
        - Scalar Replacement of Aggregates (SROA from scalar_replacement.runa)
        - Algebraic simplification
@@ -3409,12 +3036,14 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
        - Cross-block CSE (from cse.runa)
        - Branch optimization
     4. Run Advanced optimizations (expensive, powerful):
-       - Sparse conditional constant propagation (SCCP)
+       - Sparse conditional constant propagation (SCCP from sccp.runa)
+       - Enhanced constant propagation (from constant_prop.runa)
        - Global Value Numbering (GVN from gvn.runa)
     5. Iterate until fixed point (no more changes)
-    6. Verify MIR correctness
-    7. Print optimization statistics
-    8. Cleanup and return
+    6. Final cleanup (DCE from dce.runa, DSE from dead_store.runa)
+    7. Verify MIR correctness
+    8. Print optimization statistics
+    9. Cleanup and return
     ```
 
     **ITERATION STRATEGY:**
@@ -3423,8 +3052,54 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
     - Each iteration can enable new optimizations
     - Example: Constant fold → DCE → more constant fold
 
+    **PHASE ORDERING RATIONALE:**
+    Tier 1 runs first because constant folding and DCE produce the smallest,
+    most-canonical IR for Tier 2 to operate on. Within Tier 2, SROA precedes
+    everything else so scalarized fields expose more constants. Algebraic
+    simplification and strength reduction precede inlining so the inlined
+    callee has already been simplified. Devirtualization precedes inlining so
+    direct-call rewrites become inlining candidates. LICM precedes loop unrolling
+    so invariant motion shrinks the body before duplication. Vectorization comes
+    last in Tier 2 because its dependency analysis requires the inner-loop shape
+    to have stabilized.
+
+    **FIXPOINT TERMINATION:**
+    The iteration loop terminates when no pass calls mark_changed during a full
+    iteration. The 10-iteration cap protects against pathological cases where
+    two passes oscillate. SCCP and GVN run outside the fixpoint loop because
+    their cost is O(N log N) and they generally do not benefit from re-running.
+
+    **ANALYSIS INVALIDATION:**
+    The dominator tree is cached in the OptimizerContext at offset 16 by
+    create_optimizer_context and used by constant folding, copy propagation, CSE,
+    and SCCP. Passes that mutate CFG topology (loop unrolling, branch optimization,
+    inlining) invalidate this cache. The canonical pass modules call into the
+    Dominance module directly and recompute on demand rather than reading the
+    cached pointer, so cache staleness is contained.
+
     Returns 1 if successful, 0 if failed.
     @End Reasoning
+
+    @Implementation
+    Creates the OptimizerContext via create_optimizer_context, runs the bounded
+    fixpoint loop over Tier 1 and Tier 2 passes (with DCE delegated to the
+    canonical run_aggressive_dce_pass from dce.runa and copy propagation delegated
+    to run_copy_prop_pass from copy_prop.runa), then runs SCCP (from sccp.runa),
+    enhanced constant propagation (from constant_prop.runa), and GVN once after
+    convergence, then a final DCE cleanup followed by dead store elimination (from
+    dead_store.runa), then mir_verifier.verify_mir to confirm the optimized IR is
+    well-formed, then print_optimization_stats, then destroy_optimizer_context.
+    Returns 1 only when verification passed; verification failure logs an error
+    and returns 0 because it indicates an optimizer bug (correctness violation,
+    not a missed optimization).
+    @End Implementation
+
+    @Performance_Hints
+    The 10-iteration cap is a safety bound, not the expected count; well-shaped
+    code converges in 2-3 iterations. The expensive passes (SCCP, GVN,
+    vectorization, inlining) are gated to single invocations or to specific
+    pipeline phases to bound total compile time.
+    @End Performance_Hints
 
     If cfg is equal to 0:
         Display "run_optimization_pipeline: null CFG"
@@ -3437,7 +3112,7 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
     Display ""
 
     Note: Create optimizer context
-    Let context_ptr be create_optimizer_context(cfg, function)
+    Let context_ptr be proc create_optimizer_context with cfg, function
     If context_ptr is equal to 0:
         Display "run_optimization_pipeline: failed to create context"
         Return 0
@@ -3453,30 +3128,30 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
         Display "--- Iteration " joined with iteration joined with " ---"
 
         Note: Reset changed flag for this iteration
-        reset_changed_flag(context_ptr)
+        proc reset_changed_flag with context_ptr
 
         Note: Tier 1: Fast foundational optimizations
         Display "Running Tier 1 optimizations..."
-        optimize_constant_folding(context_ptr)
-        optimize_dead_code_elimination(context_ptr)
-        optimize_copy_propagation(context_ptr)
+        proc optimize_constant_folding with context_ptr
+        proc optimize_dead_code_elimination with context_ptr
+        proc optimize_copy_propagation with context_ptr
 
         Note: Tier 2: Medium-cost high-value optimizations
         Display "Running Tier 2 optimizations..."
-        optimize_scalar_replacement(context_ptr)
-        optimize_algebraic_simplification(context_ptr)
-        optimize_strength_reduction_advanced(context_ptr)
-        optimize_devirtualization(context_ptr)
-        optimize_inlining(context_ptr)
-        optimize_tail_call(context_ptr)
-        optimize_licm(context_ptr)
-        optimize_loop_unrolling(context_ptr)
-        optimize_vectorization(context_ptr)
-        optimize_cse_advanced(context_ptr)
-        optimize_branches(context_ptr)
+        proc optimize_scalar_replacement with context_ptr
+        proc optimize_algebraic_simplification with context_ptr
+        proc optimize_strength_reduction_advanced with context_ptr
+        proc optimize_devirtualization with context_ptr
+        proc optimize_inlining with context_ptr
+        proc optimize_tail_call with context_ptr
+        proc optimize_licm with context_ptr
+        proc optimize_loop_unrolling with context_ptr
+        proc optimize_vectorization with context_ptr
+        proc optimize_cse_advanced with context_ptr
+        proc optimize_branches with context_ptr
 
         Note: Check if any pass made changes
-        Set pipeline_changed to has_changed(context_ptr)
+        Set pipeline_changed to proc has_changed with context_ptr
 
         If pipeline_changed is equal to 1:
             Display "Changes made, continuing optimization..."
@@ -3493,12 +3168,14 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
 
     Note: Advanced optimization pass (run once after convergence)
     Display "Running advanced optimizations..."
-    optimize_sparse_conditional_constant_propagation(context_ptr)
-    optimize_gvn(context_ptr)
+    proc optimize_sparse_conditional_constant_propagation with context_ptr
+    proc optimize_constant_prop with context_ptr
+    proc optimize_gvn with context_ptr
 
     Note: Final cleanup pass
     Display "Running final cleanup..."
-    optimize_dead_code_elimination(context_ptr)
+    proc optimize_dead_code_elimination with context_ptr
+    proc optimize_dead_store_elimination with context_ptr
 
     Note: Verify MIR correctness
     Display ""
@@ -3507,17 +3184,17 @@ Process called "run_optimization_pipeline" that takes cfg as Integer, function a
     If verification_result is equal to 0:
         Display "ERROR: MIR verification failed after optimization"
         Display "This indicates a bug in the optimizer"
-        destroy_optimizer_context(context_ptr)
+        proc destroy_optimizer_context with context_ptr
         Return 0
     End If
     Display "MIR verification passed"
 
     Note: Print optimization statistics
     Display ""
-    print_optimization_stats(context_ptr)
+    proc print_optimization_stats with context_ptr
 
     Note: Cleanup
-    destroy_optimizer_context(context_ptr)
+    proc destroy_optimizer_context with context_ptr
 
     Display ""
     Display "============================================"
@@ -3536,15 +3213,23 @@ Process called "optimize_mir" that takes cfg as Integer returns Integer:
 
     **USAGE:**
     ```
-    Let cfg be mir_builder_build(hir_function)
-    Let success be optimize_mir(cfg)
+    Let cfg be proc mir_builder_build with hir_function
+    Let success be proc optimize_mir with cfg
     If success is equal to 1:
-        Let backend_result be backend_codegen(cfg)
+        Let backend_result be proc backend_codegen with cfg
     End If
     ```
 
     Returns 1 if successful, 0 if failed.
     @End Reasoning
+
+    @Implementation
+    Public main entry point. Validates the cfg pointer, then delegates to
+    run_optimization_pipeline passing 0 as the function pointer. The pipeline
+    extracts function context from the CFG itself when needed for function-level
+    passes (inlining, tail call, devirtualization), which fall back to their
+    pass-level canonical entries when no function pointer is available.
+    @End Implementation
 
     If cfg is equal to 0:
         Display "optimize_mir: null CFG"
@@ -3552,7 +3237,7 @@ Process called "optimize_mir" that takes cfg as Integer returns Integer:
     End If
 
     Note: Run optimization pipeline with null function (will extract from CFG if needed)
-    Let result be run_optimization_pipeline(cfg, 0)
+    Let result be proc run_optimization_pipeline with cfg, 0
 
     Return result
 End Process
@@ -3566,12 +3251,21 @@ Process called "optimize_mir_function" that takes cfg as Integer, function as In
     Returns 1 if successful, 0 if failed.
     @End Reasoning
 
+    @Implementation
+    Function-level main entry. Forwards both cfg and function to
+    run_optimization_pipeline. Use this entry point when the caller already has
+    a MIRFunction pointer, because the function-level optimizations (inlining,
+    tail call elimination, devirtualization) can then take their richer
+    function-scope code paths via optimize_function_with_inlining,
+    optimize_function_with_tail_call, optimize_function_with_devirtualization.
+    @End Implementation
+
     If cfg is equal to 0:
         Display "optimize_mir_function: null CFG"
         Return 0
     End If
 
-    Let result be run_optimization_pipeline(cfg, function)
+    Let result be proc run_optimization_pipeline with cfg, function
 
     Return result
 End Process
@@ -3584,8 +3278,8 @@ Process called "run_single_optimization_pass" that takes cfg as Integer, pass_na
 
     **SUPPORTED PASSES:**
     - "constant_folding"
-    - "dce" (dead code elimination)
-    - "copy_propagation"
+    - "dce" (aggressive dead code elimination from dce.runa)
+    - "copy_propagation" (from copy_prop.runa)
     - "algebraic_simplification"
     - "strength_reduction" (inline simple version)
     - "strength_reduction_advanced" (external advanced version)
@@ -3594,20 +3288,33 @@ Process called "run_single_optimization_pass" that takes cfg as Integer, pass_na
     - "loop_unrolling"
     - "cse" (cross-block common subexpression elimination)
     - "branch_optimization"
-    - "sccp" (sparse conditional constant propagation)
+    - "sccp" (sparse conditional constant propagation from sccp.runa)
+    - "constant_prop" (enhanced constant propagation from constant_prop.runa)
     - "gvn" (global value numbering)
     - "scalar_replacement" or "sroa" (scalar replacement of aggregates)
     - "vectorization" (loop vectorization)
+    - "dead_store" or "dse" (dead store elimination from dead_store.runa)
 
     Returns 1 if successful, 0 if failed.
     @End Reasoning
+
+    @Implementation
+    Test/debug entry point that runs a single named pass instead of the full
+    pipeline. Creates a transient OptimizerContext, dispatches on the pass_name
+    string through a sequence of string_equals comparisons to the matching local
+    wrapper (which then forwards to the canonical pass entry in the relevant
+    Wave 2 Group A module), captures the result, then destroys the context. The
+    "scalar_replacement" and "sroa" selectors are aliases for the same pass. Used
+    by the test harness and the --opt-pass developer flag; not part of the normal
+    compilation pipeline.
+    @End Implementation
 
     If cfg is equal to 0 or pass_name is equal to 0:
         Return 0
     End If
 
     Note: Create context
-    Let context_ptr be create_optimizer_context(cfg, 0)
+    Let context_ptr be proc create_optimizer_context with cfg, 0
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -3615,76 +3322,84 @@ Process called "run_single_optimization_pass" that takes cfg as Integer, pass_na
     Note: Determine which pass to run
     Let result be 0
 
-    If string_equals(pass_name, "constant_folding") is equal to 1:
-        Set result to optimize_constant_folding(context_ptr)
+    If proc string_equals with pass_name, "constant_folding" is equal to 1:
+        Set result to proc optimize_constant_folding with context_ptr
     End If
 
-    If string_equals(pass_name, "dce") is equal to 1:
-        Set result to optimize_dead_code_elimination(context_ptr)
+    If proc string_equals with pass_name, "dce" is equal to 1:
+        Set result to proc optimize_dead_code_elimination with context_ptr
     End If
 
-    If string_equals(pass_name, "copy_propagation") is equal to 1:
-        Set result to optimize_copy_propagation(context_ptr)
+    If proc string_equals with pass_name, "copy_propagation" is equal to 1:
+        Set result to proc optimize_copy_propagation with context_ptr
     End If
 
-    If string_equals(pass_name, "algebraic_simplification") is equal to 1:
-        Set result to optimize_algebraic_simplification(context_ptr)
+    If proc string_equals with pass_name, "algebraic_simplification" is equal to 1:
+        Set result to proc optimize_algebraic_simplification with context_ptr
     End If
 
-    If string_equals(pass_name, "strength_reduction") is equal to 1:
-        Set result to optimize_strength_reduction(context_ptr)
+    If proc string_equals with pass_name, "strength_reduction" is equal to 1:
+        Set result to proc optimize_strength_reduction with context_ptr
     End If
 
-    If string_equals(pass_name, "strength_reduction_advanced") is equal to 1:
-        Set result to optimize_strength_reduction_advanced(context_ptr)
+    If proc string_equals with pass_name, "strength_reduction_advanced" is equal to 1:
+        Set result to proc optimize_strength_reduction_advanced with context_ptr
     End If
 
-    If string_equals(pass_name, "tail_call") is equal to 1:
-        Set result to optimize_tail_call(context_ptr)
+    If proc string_equals with pass_name, "tail_call" is equal to 1:
+        Set result to proc optimize_tail_call with context_ptr
     End If
 
-    If string_equals(pass_name, "inlining") is equal to 1:
-        Set result to optimize_inlining(context_ptr)
+    If proc string_equals with pass_name, "inlining" is equal to 1:
+        Set result to proc optimize_inlining with context_ptr
     End If
 
-    If string_equals(pass_name, "devirtualization") is equal to 1:
-        Set result to optimize_devirtualization(context_ptr)
+    If proc string_equals with pass_name, "devirtualization" is equal to 1:
+        Set result to proc optimize_devirtualization with context_ptr
     End If
 
-    If string_equals(pass_name, "licm") is equal to 1:
-        Set result to optimize_licm(context_ptr)
+    If proc string_equals with pass_name, "licm" is equal to 1:
+        Set result to proc optimize_licm with context_ptr
     End If
 
-    If string_equals(pass_name, "loop_unrolling") is equal to 1:
-        Set result to optimize_loop_unrolling(context_ptr)
+    If proc string_equals with pass_name, "loop_unrolling" is equal to 1:
+        Set result to proc optimize_loop_unrolling with context_ptr
     End If
 
-    If string_equals(pass_name, "cse") is equal to 1:
-        Set result to optimize_cse_advanced(context_ptr)
+    If proc string_equals with pass_name, "cse" is equal to 1:
+        Set result to proc optimize_cse_advanced with context_ptr
     End If
 
-    If string_equals(pass_name, "branch_optimization") is equal to 1:
-        Set result to optimize_branches(context_ptr)
+    If proc string_equals with pass_name, "branch_optimization" is equal to 1:
+        Set result to proc optimize_branches with context_ptr
     End If
 
-    If string_equals(pass_name, "sccp") is equal to 1:
-        Set result to optimize_sparse_conditional_constant_propagation(context_ptr)
+    If proc string_equals with pass_name, "sccp" is equal to 1:
+        Set result to proc optimize_sparse_conditional_constant_propagation with context_ptr
     End If
 
-    If string_equals(pass_name, "gvn") is equal to 1:
-        Set result to optimize_gvn(context_ptr)
+    If proc string_equals with pass_name, "gvn" is equal to 1:
+        Set result to proc optimize_gvn with context_ptr
     End If
 
-    If string_equals(pass_name, "scalar_replacement") is equal to 1 or string_equals(pass_name, "sroa") is equal to 1:
-        Set result to optimize_scalar_replacement(context_ptr)
+    If proc string_equals with pass_name, "scalar_replacement" is equal to 1 or proc string_equals with pass_name, "sroa" is equal to 1:
+        Set result to proc optimize_scalar_replacement with context_ptr
     End If
 
-    If string_equals(pass_name, "vectorization") is equal to 1:
-        Set result to optimize_vectorization(context_ptr)
+    If proc string_equals with pass_name, "vectorization" is equal to 1:
+        Set result to proc optimize_vectorization with context_ptr
+    End If
+
+    If proc string_equals with pass_name, "constant_prop" is equal to 1:
+        Set result to proc optimize_constant_prop with context_ptr
+    End If
+
+    If proc string_equals with pass_name, "dead_store" is equal to 1 or proc string_equals with pass_name, "dse" is equal to 1:
+        Set result to proc optimize_dead_store_elimination with context_ptr
     End If
 
     Note: Cleanup
-    destroy_optimizer_context(context_ptr)
+    proc destroy_optimizer_context with context_ptr
 
     Return result
 End Process
@@ -3695,6 +3410,14 @@ Process called "string_equals" that takes str1 as Integer, str2 as Integer retur
 
     Returns 1 if equal, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Length-prefixed string comparison. Reads the 8-byte length header at offset 0
+    of each string, returns 0 immediately on length mismatch (no comparison cost
+    when sizes differ), otherwise compares character-by-character from the data
+    bytes starting at offset 8. Used exclusively by run_single_optimization_pass
+    to match pass-name selectors; not a general-purpose string utility.
+    @End Implementation
 
     If str1 is equal to 0 or str2 is equal to 0:
         Return 0

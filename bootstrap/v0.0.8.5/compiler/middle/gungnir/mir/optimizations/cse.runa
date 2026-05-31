@@ -154,17 +154,62 @@ Note: ==========================================================================
 
 Process called "create_cse_context" that takes cfg as Integer returns Integer:
     @Reasoning
-    Creates and initializes CSE context.
+    Creates and initializes the CSE context container that holds the
+    full set of bookkeeping structures required for cross-block common
+    subexpression elimination.
 
-    **INITIALIZATION:**
-    - Allocates 112-byte context structure
-    - Creates expression table for hash lookup
-    - Creates availability sets for dataflow analysis
-    - Creates GEN/KILL sets for each block
-    - Initializes all counters to 0
+    **WHY A SEPARATE CONTEXT:**
+    Available-expression analysis is a four-set dataflow problem
+    (GEN, KILL, AVAIL_IN, AVAIL_OUT) layered on top of a hash-indexed
+    expression table. Keeping each set as a discrete dictionary keyed
+    by block_id makes propagation across the dataflow lattice O(|set|)
+    per block per iteration rather than requiring a packed bitvector
+    that would have to be re-sized whenever new value numbers appear.
+
+    **WHY 112 BYTES:**
+    The 14 long-word slots (cfg, expression_table, expression_to_value,
+    value_to_expression, available_in, available_out, gen_set, kill_set,
+    expressions_eliminated, expressions_replaced, blocks_processed,
+    ssa_ptr, dominance_ptr, use_def_chains) match the documented
+    memory layout exactly. Allocating in a single chunk keeps the
+    context cache-warm and avoids per-field heap fragmentation.
 
     Returns context pointer or 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Process: "create_cse_context"
+    Steps:
+        1. Reject cfg == 0 (CSE requires a CFG to traverse)
+        2. Allocate a 112-byte block via the Layout allocate proc
+        3. Store cfg pointer at offset 0
+        4. Create four hash dictionaries (expression_table at +8,
+           expression_to_value at +16, value_to_expression at +24,
+           available_in at +32)
+        5. Create three more dictionaries for the dataflow lattice
+           (available_out at +40, gen_set at +48, kill_set at +56)
+        6. Zero-initialize the three statistics counters
+           (expressions_eliminated at +64, expressions_replaced at +72,
+           blocks_processed at +80)
+        7. Null-initialize the three external-analysis hooks
+           (ssa_ptr at +88, dominance_ptr at +96, use_def_chains at +104)
+           — these are wired in by the caller before optimization runs
+        8. Return the populated context pointer
+    @End Implementation
+
+    @Performance_Hints
+    Heavy work happens during compute_available_expressions; this
+    constructor is O(1) plus 7 dictionary allocations. The Layout
+    allocator is bump-pointer style so the 112-byte block lands in
+    the same cache line family as recent allocations.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure must be detected via the explicit 0 check
+    before any subsequent field stores; writing into a NULL context
+    would corrupt arbitrary memory. The function deliberately does
+    not leak a partially-initialized context on failure.
+    @End Security_Scope
 
     If cfg is equal to 0:
         Display "create_cse_context: null CFG"
@@ -224,8 +269,50 @@ End Process
 
 Process called "destroy_cse_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Destroys CSE context and frees all memory.
+    Tears down a CSE context and reclaims every allocation made on its
+    behalf. Because the context holds nested containers (dictionaries
+    of Sets, dictionaries of ExpressionNode pointers) a naive
+    deallocate of the outer block would leak every inner Set / Dict
+    and every ExpressionNode previously inserted. The teardown walks
+    each compound field, frees the contained leaves, then frees the
+    dictionary itself, and finally releases the 112-byte context.
     @End Reasoning
+
+    @Implementation
+    Process: "destroy_cse_context"
+    Steps:
+        1. Return 0 immediately on null context (idempotent destroy)
+        2. For expression_table (+8): iterate keys, deallocate each
+           ExpressionNode (48 bytes), destroy key list, destroy dict
+        3. For expression_to_value (+16): destroy dict (values are
+           plain integers, no deep free needed)
+        4. For value_to_expression (+24): destroy dict (same — plain
+           integer payloads)
+        5. For available_in (+32), available_out (+40), gen_set (+48),
+           kill_set (+56): iterate keys, destroy each contained Set,
+           destroy key list, destroy dict
+        6. Free the context block itself via the Layout deallocate
+           proc
+        7. Return 1
+    @End Implementation
+
+    @Performance_Hints
+    Linear in (block_count × average_set_size + expression_count).
+    For functions with a few thousand expressions and a few hundred
+    blocks this is sub-millisecond. The traversal pattern uses a
+    fresh `keys` list per dictionary; this trades a small allocation
+    for traversal safety (iterating a dictionary mid-mutation is
+    undefined behaviour in our collections layer).
+    @End Performance_Hints
+
+    @Security_Scope
+    Double-free is prevented by the leading null check — callers that
+    invoke destroy on an already-released context get a no-op return.
+    Each freed sub-allocation is reached exactly once because the
+    outer dictionaries own their values; no aliasing path can resurrect
+    a freed ExpressionNode through the value_to_expression mirror,
+    which stores integer IDs, not pointers.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -354,8 +441,35 @@ End Process
 
 Process called "print_cse_stats" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Prints CSE optimization statistics.
+    Emits the three running counters maintained by the CSE pass so a
+    compilation log can report how many redundancies were removed.
+    Stats are read directly from the context (offsets 64, 72, 80) and
+    summed to give a "total optimizations" figure used by the pipeline
+    smoke tests to assert that the pass made forward progress.
     @End Reasoning
+
+    @Implementation
+    Process: "print_cse_stats"
+    Steps:
+        1. Return 0 if context is null (nothing to report)
+        2. Load expressions_eliminated from offset 64
+        3. Load expressions_replaced from offset 72
+        4. Load blocks_processed from offset 80
+        5. Emit a bordered, single-screen statistics block
+        6. Display the sum eliminated + replaced as "total"
+        7. Return 1
+    @End Implementation
+
+    @Performance_Hints
+    Three field loads plus six Display calls. Negligible cost; only
+    invoked once per function compilation.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only with respect to the context. Defensive null check
+    prevents any field load against a freed or absent context.
+    No user-controlled data is rendered, only integer counters.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -383,15 +497,43 @@ Note: ==========================================================================
 
 Process called "is_commutative_opcode" that takes opcode as Integer returns Integer:
     @Reasoning
-    Determines if an opcode is commutative (operand order doesn't matter).
+    Determines whether an opcode is mathematically commutative so the
+    canonicalizer can sort operands and produce a stable hash for
+    semantically-equivalent expressions like `x + y` and `y + x`.
 
-    **COMMUTATIVE OPERATIONS:**
-    - ADD, MUL: Arithmetic
-    - AND, OR, XOR: Bitwise
-    - EQ, NE: Equality comparisons
+    **WHY THIS LIST IS EXACT:**
+    - ADD / MUL are commutative on integers and IEEE-754 floats
+      (a + b == b + a; a * b == b * a). SUB and DIV are deliberately
+      excluded.
+    - AND / OR / XOR are commutative bitwise operations.
+    - EQ and NE are commutative (`a == b` ↔ `b == a`); LT/LE/GT/GE
+      are NOT — swapping operands inverts the predicate, so they
+      are deliberately excluded.
 
     Returns 1 if commutative, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "is_commutative_opcode"
+    Steps:
+        1. Compare opcode against MIR_ADD, MIR_MUL, MIR_AND, MIR_OR,
+           MIR_XOR, MIR_EQ, MIR_NE in turn
+        2. Return 1 on first match
+        3. If no match, return 0
+    @End Implementation
+
+    @Performance_Hints
+    Seven integer comparisons in the worst case. The hot path
+    (compute_expression_hash) calls this once per expression, so
+    keeping it as a simple linear sequence rather than a table
+    lookup avoids an extra memory load.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure function over an integer opcode. No memory access, no
+    side effects, no information leak. Unknown opcodes safely
+    fall through to the 0 return without referencing memory.
+    @End Security_Scope
 
     If opcode is equal to MIR.MIR_ADD:
         Return 1
@@ -420,22 +562,71 @@ End Process
 
 Process called "compute_expression_hash" that takes opcode as Integer, op1 as Integer, op2 as Integer returns Integer:
     @Reasoning
-    Computes hash for an expression.
+    Computes a deterministic integer hash that uniquely identifies an
+    (opcode, op1, op2) triple modulo the commutativity rule.
 
-    **HASH COMPUTATION:**
-    hash = (opcode * PRIME1) bitwise xor (op1 * PRIME2) bitwise xor (op2 * PRIME3)
+    **THE HASH FUNCTION:**
+    The hash combines opcode multiplied by 31, canonicalized op1
+    multiplied by 37, and canonicalized op2 multiplied by 41. The
+    canonicalization step swaps op1 and op2 when the opcode is
+    commutative and op1 exceeds op2.
+
+    **WHY THIS FORM:**
+    - The three multipliers (31, 37, 41) are small coprime primes,
+      a classic choice that decorrelates the contributions of the
+      three fields without an expensive mix.
+    - The addition (rather than XOR) lets the multipliers genuinely
+      shift contributions into separate bit ranges, which avoids the
+      classic XOR-collapse where `opcode == op1 == op2` would zero
+      everything out.
+    - The output is used as a dictionary key (stringified) so we do
+      not need cryptographic strength — collision frequency only
+      affects performance, not correctness, because
+      `find_existing_expression` always falls through to a structural
+      equality check.
 
     **CANONICALIZATION:**
-    For commutative operations, ensure op1 < or equal to op2 to normalize ordering.
+    For commutative operations, ensure op1 ≤ op2 to normalize ordering.
+    This is the critical invariant that lets `a + b` and `b + a` hash
+    to the same bucket and then prove equal in expressions_equal.
 
     Returns computed hash value.
     @End Reasoning
+
+    @Implementation
+    Process: "compute_expression_hash"
+    Steps:
+        1. Copy op1 and op2 into local operand1, operand2
+        2. Query is_commutative_opcode with opcode; if the result is 1
+           and op1 exceeds op2, swap operand1 and operand2
+        3. Initialize hash as opcode multiplied by HASH_PRIME_1
+        4. Add operand1 multiplied by HASH_PRIME_2
+        5. Add operand2 multiplied by HASH_PRIME_3
+        6. Return hash
+    @End Implementation
+
+    @Performance_Hints
+    Three integer multiplies and two additions on the canonical path.
+    Called once per CSE candidate per pass — total invocations
+    ≈ candidate_count, so the cost stays linear in MIR size. The
+    pre-swap branch is the only non-trivial control flow and is
+    well-predicted by modern CPUs once the surrounding loop is
+    warm.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure integer computation; no memory dereference. Hash collisions
+    are tolerated by design — `find_existing_expression` performs a
+    full structural comparison before treating two hashes as the
+    same expression, so a deliberate collision injected by adversarial
+    MIR cannot cause an incorrect substitution.
+    @End Security_Scope
 
     Let operand1 be op1
     Let operand2 be op2
 
     Note: Canonicalize commutative operations
-    Let is_commutative be is_commutative_opcode(opcode)
+    Let is_commutative be proc is_commutative_opcode with opcode
     If is_commutative is equal to 1:
         If op1 is greater than op2:
             Set operand1 to op2
@@ -453,13 +644,55 @@ End Process
 
 Process called "create_expression_node" that takes opcode as Integer, op1 as Integer, op2 as Integer, result_id as Integer returns Integer:
     @Reasoning
-    Creates an ExpressionNode structure.
+    Allocates a 48-byte ExpressionNode that records the canonical
+    form of a binary MIR expression together with its precomputed
+    hash and the SSA value ID of its result. ExpressionNodes are the
+    individual cells of the expression table; one is created for
+    every CSE candidate encountered during block analysis.
 
     **CANONICALIZATION:**
-    For commutative operations, operands are sorted (op1 < or equal to op2).
+    For commutative operations, operands are sorted so that op1 ≤ op2.
+    Storing the canonical form (not the source order) is what makes
+    `a + b` and `b + a` collide both in hashing and in
+    expressions_equal's per-field comparison.
 
     Returns ExpressionNode pointer or 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Process: "create_expression_node"
+    Steps:
+        1. Allocate 48 bytes via the Layout allocate proc; bail
+           with 0 on failure
+        2. Copy op1, op2 to operand1, operand2
+        3. If the opcode is commutative and op1 exceeds op2, swap them
+        4. Compute hash via compute_expression_hash on opcode,
+           operand1, operand2
+        5. Store fields at the documented offsets:
+           +0  opcode
+           +8  operand_count (2 for binary ops)
+           +16 operand1
+           +24 operand2
+           +32 hash
+           +40 result_id
+        6. Return the node pointer
+    @End Implementation
+
+    @Performance_Hints
+    One allocation plus six int64 stores plus the hash computation.
+    Allocator-dominated cost; ExpressionNodes are short-lived during
+    block analysis (per perform_cse_on_block they are freed after
+    the lookup-or-insert decision) so an arena would in principle be
+    faster, but the current layout allocator already uses
+    bump-pointer reuse on small fixed sizes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Allocation failure is detected and propagated as 0; the caller
+    (analyze_expressions_in_block / perform_cse_on_block) treats a
+    0 return as "skip this candidate" without dereferencing it.
+    No untrusted data flows into the size argument.
+    @End Security_Scope
 
     Let expr_ptr be proc allocate from Layout with 48
     If expr_ptr is equal to 0:
@@ -470,7 +703,7 @@ Process called "create_expression_node" that takes opcode as Integer, op1 as Int
     Let operand2 be op2
 
     Note: Canonicalize commutative operations
-    Let is_commutative be is_commutative_opcode(opcode)
+    Let is_commutative be proc is_commutative_opcode with opcode
     If is_commutative is equal to 1:
         If op1 is greater than op2:
             Set operand1 to op2
@@ -479,7 +712,7 @@ Process called "create_expression_node" that takes opcode as Integer, op1 as Int
     End If
 
     Note: Compute hash
-    Let hash be compute_expression_hash(opcode, operand1, operand2)
+    Let hash be proc compute_expression_hash with opcode, operand1, operand2
 
     Note: Store fields
     proc memory_set_int64 from Layout with expr_ptr, 0, opcode
@@ -494,15 +727,46 @@ End Process
 
 Process called "expressions_equal" that takes expr1 as Integer, expr2 as Integer returns Integer:
     @Reasoning
-    Checks if two expressions are structurally equal.
+    Decides structural equality of two ExpressionNodes. Because every
+    node was canonicalized at construction time, two equivalent
+    expressions hash to the same bucket and pass this check; two
+    semantically-distinct expressions that collide on hash will fail
+    here and the CSE pass will correctly refuse to substitute them.
 
     **EQUALITY:**
     Expressions are equal if:
     - Same opcode
-    - Same operands (in canonical order)
+    - Same operand count
+    - Same operand1 (in canonical order)
+    - Same operand2 (in canonical order)
 
     Returns 1 if equal, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "expressions_equal"
+    Steps:
+        1. Reject either pointer == 0 (defensive null guard)
+        2. Compare opcode words at offset 0; bail if unequal
+        3. Compare operand_count at offset 8; bail if unequal
+        4. Compare operand1 at offset 16; bail if unequal
+        5. Compare operand2 at offset 24; bail if unequal
+        6. All four fields matched — return 1
+    @End Implementation
+
+    @Performance_Hints
+    Four int64 loads from each side plus the four comparisons. Early
+    exit on the first mismatch keeps the average cost low — opcode
+    mismatch is the common case during hash collisions, so it is
+    checked first.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only access into two ExpressionNode allocations the caller
+    must own. The null guard prevents a wild dereference if a stale
+    pointer is passed. No data is written and no operand value is
+    interpreted as a pointer.
+    @End Security_Scope
 
     If expr1 is equal to 0:
         Return 0
@@ -544,10 +808,44 @@ End Process
 
 Process called "lookup_expression" that takes context_ptr as Integer, hash as Integer returns Integer:
     @Reasoning
-    Looks up an expression in the expression table by hash.
+    Performs a hash-bucket lookup in the context's expression table.
+    The table is keyed by the stringified hash (Dictionary keys are
+    strings in our collections layer), and each entry stores a
+    pointer to a previously-allocated ExpressionNode whose
+    `result_value_id` field tells later passes what SSA value to
+    reuse instead of recomputing the redundant operation.
 
     Returns ExpressionNode pointer if found, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "lookup_expression"
+    Steps:
+        1. Reject context_ptr == 0
+        2. Load expression_table dictionary from offset 8
+        3. Convert hash to its decimal string form via the String
+           integer_to_string proc (matches the convention used by
+           insert_expression so keys are byte-identical)
+        4. Probe the dictionary with the hash string via the
+           Dictionary contains proc; return 0 if the bucket is empty
+        5. Otherwise fetch the entry with the Dictionary get proc on
+           the same key
+    @End Implementation
+
+    @Performance_Hints
+    Two dictionary operations (contains then get) — both O(1) expected
+    on the underlying hashmap. The intermediate string conversion is
+    the dominant cost; a future optimization could key the
+    dictionary by raw integer.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only against the expression_table; the contains-then-get
+    pattern avoids triggering the dictionary's missing-key fault
+    path. The integer-to-string conversion has bounded output size
+    (signed 64-bit max → 20 chars + sign) so no buffer overrun is
+    possible.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -568,10 +866,42 @@ End Process
 
 Process called "insert_expression" that takes context_ptr as Integer, expr_ptr as Integer returns Integer:
     @Reasoning
-    Inserts an expression into the expression table.
+    Records an ExpressionNode in the context's expression table so
+    later occurrences of the same canonical expression can be
+    detected by find_existing_expression. Two parallel dictionaries
+    are maintained: the primary `expression_table` (hash → node) and
+    the mirror `expression_to_value` (hash → result_value_id), which
+    is the cheap lookup used by the dataflow analysis when only the
+    SSA value is needed.
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Process: "insert_expression"
+    Steps:
+        1. Reject context_ptr == 0 or expr_ptr == 0
+        2. Load expression_table at +8 and expression_to_value at +16
+        3. Read hash from expr_ptr + 32 and result_id from expr_ptr + 40
+        4. Stringify both for use as dictionary keys
+        5. Store expr_ptr in expression_table keyed by hash_str
+        6. Store result_id in expression_to_value keyed by hash_str
+        7. Display an insertion trace for debug builds
+        8. Return 1
+    @End Implementation
+
+    @Performance_Hints
+    Two dictionary writes plus two integer-to-string conversions.
+    Insertion is amortized O(1); the underlying hashmap rehashes
+    geometrically so growth cost is bounded.
+    @End Performance_Hints
+
+    @Security_Scope
+    Caller retains ownership of expr_ptr — the table stores the
+    pointer, so the caller must NOT free expr_ptr while it remains
+    in the table. destroy_cse_context walks the table and is the
+    sole owner of these allocations during teardown.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -604,16 +934,54 @@ End Process
 
 Process called "find_existing_expression" that takes context_ptr as Integer, expr_ptr as Integer returns Integer:
     @Reasoning
-    Finds an existing equivalent expression in the table.
+    Implements the core "have I seen this expression already?" probe
+    used by the CSE transformer. The lookup is two-stage:
+    1. Hash-based bucket retrieval (constant time).
+    2. Structural equality check on the retrieved ExpressionNode,
+       which guards against hash collisions and is the reason the
+       overall pass is sound even with a non-cryptographic hash.
+
+    Returning the existing result_value_id (rather than the
+    ExpressionNode pointer) is what makes the CSE substitution
+    trivial: the caller simply rewrites operand references from
+    the redundant value ID to the existing one.
 
     **ALGORITHM:**
-    1. Compute hash of new expression
+    1. Read hash from the candidate expression node
     2. Look up hash in expression table
     3. If found and structurally equal, return existing value ID
     4. Otherwise, return 0
 
     Returns existing value_id if found, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "find_existing_expression"
+    Steps:
+        1. Reject context_ptr == 0 or expr_ptr == 0
+        2. Read hash from expr_ptr + 32
+        3. Invoke lookup_expression with context_ptr and hash; on a
+           zero return, bail out (no equivalent recorded yet)
+        4. Invoke expressions_equal with expr_ptr and existing_expr;
+           on a zero return, treat as a hash collision and bail
+        5. Read the existing ExpressionNode's result_value_id at +40
+        6. Display a debug trace and return that value ID
+    @End Implementation
+
+    @Performance_Hints
+    Hot path; dominated by lookup_expression's dictionary access.
+    The structural check is short-circuit at the opcode comparison,
+    so collisions are detected with one int load before further
+    work. This procedure is invoked once per CSE candidate per
+    block in both analysis and transformation passes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only over both the candidate expression node and any
+    table entry. The two-stage check (hash + structural equality)
+    is the integrity barrier that prevents an adversarially-crafted
+    hash collision from inducing an incorrect SSA value substitution.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -626,13 +994,13 @@ Process called "find_existing_expression" that takes context_ptr as Integer, exp
     Let hash be proc memory_get_int64 from Layout with expr_ptr, 32
 
     Note: Look up existing expression
-    Let existing_expr be lookup_expression(context_ptr, hash)
+    Let existing_expr be proc lookup_expression with context_ptr, hash
     If existing_expr is equal to 0:
         Return 0  Note: No existing expression
     End If
 
     Note: Check structural equality
-    Let are_equal be expressions_equal(expr_ptr, existing_expr)
+    Let are_equal be proc expressions_equal with expr_ptr, existing_expr
     If are_equal is equal to 0:
         Return 0  Note: Hash collision minus expressions not equal
     End If
@@ -647,21 +1015,54 @@ End Process
 
 Process called "is_cse_candidate" that takes inst_ptr as Integer returns Integer:
     @Reasoning
-    Determines if an instruction is a candidate for CSE.
+    Filters MIR instructions to the subset that is safe to eliminate
+    via simple value-numbering CSE. The "pure" criterion is the key:
+    only operations whose result depends solely on their operand
+    values (no implicit dependence on memory state, no possibility
+    of trapping) may be coalesced without an alias analysis.
 
-    **CSE CANDIDATES:**
-    - Pure arithmetic operations (ADD, SUB, MUL, DIV, MOD)
-    - Bitwise operations (AND, OR, XOR, NOT, SHL, SHR)
+    **CSE CANDIDATES (pure, total functions of operands):**
+    - Pure arithmetic operations (ADD, SUB, MUL)
+    - Bitwise operations (AND, OR, XOR, SHL, SHR)
     - Comparison operations (EQ, NE, LT, LE, GT, GE)
-    - Type conversions (ZEXT, SEXT, TRUNC, BITCAST)
 
     **NOT CANDIDATES:**
-    - Memory operations (LOAD, STORE) - handled by GVN with alias analysis
-    - Side-effecting operations (CALL, DIV if can trap)
-    - PHI nodes - handled separately
+    - Memory operations (LOAD, STORE) - handled by GVN with alias
+      analysis; LOAD is not pure because an intervening STORE can
+      change its value.
+    - Side-effecting operations (CALL, DIV / MOD because they can
+      trap on zero)
+    - PHI nodes - handled separately because their semantic equality
+      depends on predecessor block identity, not just operand IDs.
 
     Returns 1 if candidate, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "is_cse_candidate"
+    Steps:
+        1. Reject inst_ptr == 0
+        2. Read opcode via the MIR get_mir_node_opcode accessor
+        3. Linearly compare against the candidate opcode set:
+           MIR_ADD, MIR_SUB, MIR_MUL, MIR_AND, MIR_OR, MIR_XOR,
+           MIR_SHL, MIR_SHR, MIR_EQ, MIR_NE, MIR_LT, MIR_LE,
+           MIR_GT, MIR_GE
+        4. Return 1 on the first match; 0 after all comparisons fail
+    @End Implementation
+
+    @Performance_Hints
+    Up to 14 integer comparisons in the worst case. Called on every
+    instruction of every block, so it is genuinely a hot predicate;
+    a future pass could promote it to a bit-set membership test if
+    profiling shows it dominant.
+    @End Performance_Hints
+
+    @Security_Scope
+    Side-effect-free predicate. The opcode read goes through the
+    typed MIR accessor, which validates that inst_ptr points at a
+    well-formed node header before returning. Unknown opcodes
+    safely fall through to 0.
+    @End Security_Scope
 
     If inst_ptr is equal to 0:
         Return 0
@@ -727,17 +1128,65 @@ Note: ==========================================================================
 
 Process called "compute_gen_kill_sets" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Computes GEN and KILL sets for each basic block.
+    Computes the per-block GEN and KILL sets that drive the
+    available-expression dataflow. The dataflow equations are:
 
-    **GEN SET:**
-    Expressions generated (computed) in this block.
+        AVAIL_IN[B]  = ∩ AVAIL_OUT[P]   for every predecessor P of B
+        AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] \\ KILL[B])
 
-    **KILL SET:**
-    Expressions killed (invalidated) in this block.
-    An expression is killed if any of its operands are redefined.
+    GEN[B] is the set of expression hashes generated by block B.
+    Conceptually, "B generated h" means "if execution exits block B
+    through any successor, the expression with hash h has been most
+    recently computed by B and its result SSA value is live."
+
+    KILL[B] is the set of expression hashes invalidated by block B.
+    An expression is killed when any of its operands is redefined,
+    because a downstream reuse of the cached hash would refer to
+    the wrong SSA value.
 
     Returns number of blocks processed.
     @End Reasoning
+
+    @Implementation
+    Process: "compute_gen_kill_sets"
+    Steps:
+        1. Reject null context or null cfg
+        2. Load gen_set dict (+48) and kill_set dict (+56)
+        3. Get all blocks from the CFG; bail on null
+        4. For each block B (outer i loop):
+             a. Get block_id and stringify as the dictionary key
+             b. Create a fresh GEN set and a fresh KILL set
+             c. Walk the block's instructions (inner j loop):
+                  i.   If is_cse_candidate, compute hash from the
+                       instruction's opcode and two operands, add the
+                       stringified hash to GEN[B]
+                  ii.  Get the result_id this instruction defines;
+                       if non-zero, scan the global expression_to_value
+                       table (inner k loop). For each recorded
+                       expression whose operand1 or operand2 equals
+                       result_id, that expression is killed by B —
+                       add its hash to KILL[B].
+             d. Store GEN[B] in gen_set_dict[block_id], KILL[B] in
+                kill_set_dict[block_id]
+        5. Display the block count and return it
+    @End Implementation
+
+    @Performance_Hints
+    Worst-case O(B × I × E) where B = block count, I = instructions
+    per block, E = global expression table size. For most functions
+    E stays small (under a few hundred), so the cubic factor is
+    not realised in practice. The kill scan is the dominant cost
+    on large units of compilation; future tuning could index
+    expressions by operand ID to make kill O(uses-of-operand)
+    instead of O(E).
+    @End Performance_Hints
+
+    @Security_Scope
+    All set operations go through the typed collections layer.
+    The block_id string keys are bounded-length. The scan over
+    expression_to_value reads the operand fields of each stored
+    ExpressionNode but never writes to them.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -777,7 +1226,7 @@ Process called "compute_gen_kill_sets" that takes context_ptr as Integer, cfg_pt
                 Let inst_ptr be proc get from List with inst_list, j
 
                 Note: Check if instruction is CSE candidate
-                Let is_candidate be is_cse_candidate(inst_ptr)
+                Let is_candidate be proc is_cse_candidate with inst_ptr
                 If is_candidate is equal to 1:
                     Note: Add to GEN set
                     Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
@@ -788,7 +1237,7 @@ Process called "compute_gen_kill_sets" that takes context_ptr as Integer, cfg_pt
                     Let op2 be proc memory_get_int64 from Layout with inst_ptr, 24
 
                     Note: Compute hash
-                    Let hash be compute_expression_hash(opcode, op1, op2)
+                    Let hash be proc compute_expression_hash with opcode, op1, op2
                     Let hash_str be proc integer_to_string from String with hash
 
                     Note: Add hash to GEN set
@@ -842,31 +1291,99 @@ End Process
 
 Process called "compute_available_expressions" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Computes available expressions using dataflow analysis.
+    Solves the forward available-expression dataflow problem to
+    fixed-point. After this routine returns, the available_in /
+    available_out dictionaries on the context describe, for every
+    block, which expression hashes are guaranteed to have been
+    computed (and not killed) on every path reaching the block.
 
     **DATAFLOW EQUATIONS:**
     ```
     AVAIL_IN[B] = ∩ AVAIL_OUT[P] for all predecessors P of B
-    AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] - KILL[B])
+    AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] \\ KILL[B])
     ```
 
-    **ALGORITHM:**
-    1. Initialize AVAIL_OUT[entry] = ∅
-    2. Initialize AVAIL_OUT[B] = U (universal set) for all other blocks
-    3. Iterate until fixed point:
-       - For each block B:
-         - Compute AVAIL_IN[B] = ∩ AVAIL_OUT[predecessors]
-         - Compute AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] - KILL[B])
-    4. Stop when no changes occur
+    **WHY INTERSECTION AT MERGES:**
+    An expression is available at B's entry only if every path into
+    B carries it. Taking the intersection of predecessor AVAIL_OUTs
+    is the soundness-preserving choice — a union would let CSE
+    substitute a value that might not have been computed on some
+    incoming edge.
 
-    Returns number of iterations.
+    **ALGORITHM:**
+    1. Initialize AVAIL_OUT[B] = ∅ for all blocks (this is a
+       round-trip-safe initialization; the entry block has no
+       predecessors so its AVAIL_IN stays empty by definition,
+       and the fixed-point iteration grows AVAIL_OUT monotonically
+       from there).
+    2. Iterate until fixed point (bounded by max_iterations = 100
+       as a runaway-safety cap):
+       - For each block B:
+         - AVAIL_IN[B] = intersection of AVAIL_OUT[predecessors]
+           (seed from the first predecessor, then for every
+           remaining predecessor remove anything not in their
+           AVAIL_OUT)
+         - AVAIL_OUT[B] = GEN[B] ∪ (AVAIL_IN[B] \\ KILL[B])
+         - Compare new AVAIL_OUT to previous; if any change, set
+           the changed-flag to force another iteration
+    3. Stop when an iteration produces no changes
+
+    Returns the iteration count (useful as a smoke metric — runaway
+    means the dataflow lattice did not stabilize, which would
+    indicate a bug in GEN/KILL construction).
     @End Reasoning
 
+    @Implementation
+    Process: "compute_available_expressions"
+    Steps:
+        1. Reject null context or null cfg
+        2. Load available_in, available_out, gen_set_dict, kill_set_dict
+           from offsets 32, 40, 48, 56
+        3. Get all blocks; bail on empty CFG
+        4. Initialization sweep: create empty avail_in and avail_out
+           Sets for every block_id
+        5. Fixed-point loop:
+           a. Stop if iteration_count >= 100 (safety cap)
+           b. Reset changed = 0
+           c. For each block B:
+              - Read predecessors; if any:
+                  · Seed AVAIL_IN with the first predecessor's
+                    AVAIL_OUT (members iteration)
+                  · For each remaining predecessor, remove from
+                    AVAIL_IN any element not in that predecessor's
+                    AVAIL_OUT (intersection step)
+              - Build new_avail_out as a fresh Set:
+                  · For each member of AVAIL_IN not in KILL[B], add
+                  · For every member of GEN[B], add (set semantics
+                    deduplicate)
+              - Compare new_avail_out to old AVAIL_OUT: if sizes
+                differ or any member is absent from the old set,
+                set changed = 1
+              - Clear AVAIL_OUT and copy new_avail_out's members in
+           d. Loop while changed
+        6. Display convergence message; return iteration_count
+    @End Implementation
+
     @Performance_Hints
-    Available expression analysis is a forward dataflow problem.
-    Convergence is typically fast (< 10 iterations for most functions).
-    Use worklist algorithm for efficiency on large CFGs.
+    Forward dataflow. Convergence is typically fast (under 10
+    iterations for most functions) because available expressions
+    is a "may" analysis with set-intersection at merges; once a
+    block's predecessors stabilize, the block stabilizes one
+    iteration later. A worklist algorithm (rather than the simple
+    round-robin sweep used here) would cut wasted work on large
+    CFGs by only revisiting blocks whose predecessors actually
+    changed; the 100-iteration safety cap covers pathological
+    inputs.
     @End Performance_Hints
+
+    @Security_Scope
+    All set construction goes through the typed Set API. The
+    intersection step uses a snapshot of avail_in_set's members
+    before removal so the iteration is not invalidated by
+    mid-loop mutation. The safety cap on iteration_count
+    prevents an infinite loop on a malformed CFG (e.g. cyclic
+    predecessor references without a fixed point).
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1060,14 +1577,51 @@ End Process
 
 Process called "is_expression_available" that takes context_ptr as Integer, block_id as Integer, hash as Integer returns Integer:
     @Reasoning
-    Checks if an expression is available at the start of a block.
+    Returns whether a specific expression hash is in AVAIL_IN[block].
+    This is the membership query the CSE transformer asks before
+    deciding whether a candidate operation can be replaced by a
+    reuse of an earlier result.
 
     **AVAILABILITY:**
-    An expression is available if it has been computed on all paths
-    reaching this point and none of its operands have been modified.
+    An expression is available if it has been computed on every
+    path reaching this point and none of its operands have been
+    modified since that computation. By definition AVAIL_IN[B]
+    already encodes both conditions (the intersection at merges
+    guarantees the first; the KILL[B] subtraction guarantees the
+    second).
 
     Returns 1 if available, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "is_expression_available"
+    Steps:
+        1. Reject context_ptr == 0
+        2. Load available_in dict from offset 32
+        3. Stringify block_id to use as the dictionary key
+        4. Probe with the Dictionary contains proc; return 0 if the
+           block has no recorded AVAIL_IN set (defensive case for
+           blocks that the dataflow pass did not visit)
+        5. Fetch via the Dictionary get proc to retrieve AVAIL_IN
+           for the block
+        6. Stringify hash; query membership via the Set contains
+           proc against AVAIL_IN for the block
+        7. Return 1 on hit, 0 on miss
+    @End Implementation
+
+    @Performance_Hints
+    Two dictionary contains/get pairs plus a Set membership test
+    — all amortized O(1). Called once per CSE candidate per block
+    during the transformation pass; not the dominant cost in the
+    pipeline.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only over the AVAIL_IN dataflow result. Both string
+    conversions are bounded length so no buffer overflow exposure.
+    The defensive null and missing-bucket checks ensure a stale
+    block_id cannot trigger a dereference of a freed Set.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1097,15 +1651,55 @@ End Process
 
 Process called "check_dominance" that takes context_ptr as Integer, defining_block as Integer, use_block as Integer returns Integer:
     @Reasoning
-    Checks if defining_block dominates use_block.
+    Tests whether defining_block dominates use_block, delegating to
+    the Dominance analysis attached to the context when one is
+    available. Dominance is the soundness predicate for CSE: replacing
+    a use's operand with a previously-computed value is only legal if
+    the producing block reaches the use on every execution path, and
+    "dominates" is exactly that property in the SSA dominator tree.
 
     **DOMINANCE:**
-    Block A dominates block B if all paths from entry to B pass through A.
-    For CSE, we can only replace an expression if the defining computation
-    dominates the use.
+    Block A dominates block B if every path from entry to B passes
+    through A. Equivalently, A appears on every dynamic execution
+    that reaches B. For CSE, we can only replace an expression if
+    the defining computation dominates the use; otherwise some paths
+    would reference a value that was never computed on that path.
 
     Returns 1 if dominates, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "check_dominance"
+    Steps:
+        1. Reject context_ptr == 0
+        2. Load dominance_ptr from offset 96
+        3. If dominance_ptr == 0, fall back to the conservative
+           "self-dominates" predicate (defining_block == use_block);
+           this is the only block ID known to dominate itself
+           without an external analysis. Return 0 in every other
+           case.
+        4. If dominance_ptr is non-zero, delegate to the Dominance
+           module's dominates predicate using dominance_ptr,
+           defining_block, and use_block, returning its verdict
+           directly
+    @End Implementation
+
+    @Performance_Hints
+    The Dominance analysis precomputes a dominator tree (DJ-graph
+    or simple parent-pointer encoding); membership queries are
+    O(log n) or O(1) depending on the chosen representation, so
+    this is a cheap predicate. The conservative fallback is also
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only over the Dominance analysis. The conservative
+    fallback path is mandatory: if no dominance analysis was
+    wired in, the function MUST refuse all non-self substitutions
+    rather than guess, because reporting a false positive would
+    cause CSE to substitute across non-dominating control edges
+    and corrupt program semantics.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1128,17 +1722,64 @@ End Process
 
 Process called "analyze_expressions_in_block" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
     @Reasoning
-    Analyzes expressions in a basic block for CSE opportunities.
+    First-pass scan that populates the expression table for one
+    basic block and counts the redundant expressions discovered.
+    Analysis is read-mostly with respect to the MIR — it allocates
+    ExpressionNodes, registers new ones in the table, and frees the
+    duplicates it found, but it does NOT mutate any instruction.
+    The follow-up transformation pass (perform_cse_on_block) is
+    where the actual rewrites happen.
 
     **ALGORITHM:**
     1. For each instruction in block:
        - If CSE candidate, create expression node
        - Check if equivalent expression exists
-       - If exists and dominates, mark for replacement
-       - Otherwise, insert into expression table
+       - If exists, count as an opportunity (the node we just
+         allocated is freed because the existing one is reused)
+       - Otherwise, insert into expression table (ownership of the
+         new node transfers to the table)
 
-    Returns number of CSE opportunities found.
+    Returns the number of CSE opportunities found in this block.
     @End Reasoning
+
+    @Implementation
+    Process: "analyze_expressions_in_block"
+    Steps:
+        1. Reject null context or null block
+        2. Initialize opportunities_found = 0
+        3. Get block instructions; bail if list is empty
+        4. For each instruction:
+           a. Skip if not is_cse_candidate
+           b. Read opcode and result_id from the typed MIR accessors
+           c. Read raw operands at offsets 16 and 24
+           d. Build a node via create_expression_node using opcode,
+              op1, op2, result_id — skip if allocation failed
+           e. Query find_existing_expression with the context and
+              the new node
+              - On non-zero existing_value_id: increment
+                opportunity counter, emit debug trace, deallocate
+                the freshly-created node
+              - On zero: call insert_expression with the context
+                and the node — the table now owns the node, do not
+                free it
+        5. Return opportunities_found
+    @End Implementation
+
+    @Performance_Hints
+    Linear in (instruction_count) per block. Allocation traffic is
+    proportional to (candidate_count): one ExpressionNode is
+    allocated per candidate, then either freed (duplicate found)
+    or transferred to the table (new). The hot inner work is the
+    dictionary access inside find_existing_expression.
+    @End Performance_Hints
+
+    @Security_Scope
+    Memory ownership is explicit: every successful allocation is
+    paired with either a deallocate (duplicate path) or a transfer
+    of ownership to the expression table (insert path). The
+    deallocate decision is gated by the existing_value_id check so
+    a node cannot be both freed and retained.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1162,7 +1803,7 @@ Process called "analyze_expressions_in_block" that takes context_ptr as Integer,
         Let inst_ptr be proc get from List with inst_list, i
 
         Note: Check if CSE candidate
-        Let is_candidate be is_cse_candidate(inst_ptr)
+        Let is_candidate be proc is_cse_candidate with inst_ptr
         If is_candidate is equal to 1:
             Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
             Let result_id be proc get_mir_node_value_id from MIR with inst_ptr
@@ -1172,10 +1813,10 @@ Process called "analyze_expressions_in_block" that takes context_ptr as Integer,
             Let op2 be proc memory_get_int64 from Layout with inst_ptr, 24
 
             Note: Create expression node
-            Let expr_ptr be create_expression_node(opcode, op1, op2, result_id)
+            Let expr_ptr be proc create_expression_node with opcode, op1, op2, result_id
             If expr_ptr is not equal to 0:
                 Note: Check if existing expression exists
-                Let existing_value_id be find_existing_expression(context_ptr, expr_ptr)
+                Let existing_value_id be proc find_existing_expression with context_ptr, expr_ptr
 
                 If existing_value_id is not equal to 0:
                     Note: Found CSE opportunity
@@ -1184,7 +1825,7 @@ Process called "analyze_expressions_in_block" that takes context_ptr as Integer,
                     Display "analyze_expressions_in_block: CSE opportunity - replace " joined with result_id joined with " with " joined with existing_value_id
                 Otherwise:
                     Note: Insert new expression
-                    insert_expression(context_ptr, expr_ptr)
+                    proc insert_expression with context_ptr, expr_ptr
                 End If
 
                 Note: Free expression node if not inserted
@@ -1206,16 +1847,72 @@ Note: ==========================================================================
 
 Process called "replace_redundant_expression" that takes context_ptr as Integer, inst_ptr as Integer, replacement_value_id as Integer returns Integer:
     @Reasoning
-    Replaces a redundant expression with an existing value.
+    Rewrites every consumer of a redundant SSA value to reference
+    the existing value instead, then neutralises the redundant
+    instruction by converting its opcode to NOP. This is the
+    "perform the substitution" half of CSE; the analysis half has
+    already proven that the substitution is sound (the existing
+    value dominates the use, and operand canonicalization guarantees
+    structural equivalence).
 
     **REPLACEMENT:**
-    1. Get all uses of the redundant value
-    2. Replace each use with the replacement value
-    3. Mark instruction for deletion
-    4. Update use-def chains
+    1. Look up the def-use chain for the redundant value
+    2. For each user instruction, scan its three operand slots and
+       rewrite any reference to the redundant value
+    3. Mark the redundant instruction as deleted (opcode = NOP = 0)
+       so the next DCE sweep can remove it
+    4. Increment expressions_replaced statistic
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Process: "replace_redundant_expression"
+    Steps:
+        1. Reject null context or null instruction
+        2. Read redundant_value_id via the MIR get_mir_node_value_id
+           accessor
+        3. Emit a debug trace identifying the replacement pair
+        4. Load def_use_chains from offset 96 (note: the context
+           dictionary at +96 stores the chain map; if zero, skip
+           the use-rewrite — the surrounding DCE pass will still
+           catch the dead store via the opcode-zero marker)
+        5. If chains are present:
+           a. Stringify redundant_value_id; fetch the use list for
+              that value via the Dictionary get proc
+           b. If the list exists, iterate every using instruction:
+                · If operand1 (+16) equals redundant_value_id,
+                  store replacement_value_id and trace
+                · Same for operand2 (+24)
+                · Same for operand3 (+32) — covers ternary ops
+                  such as Select
+        6. Mark the redundant instruction as a NOP by writing 0 to
+           its opcode field (offset 0)
+        7. Load expressions_replaced from +72, increment, store back
+        8. Return 1
+    @End Implementation
+
+    @Performance_Hints
+    Cost is O(uses-of-value). The three explicit operand-slot
+    checks are unrolled rather than looped because every MIR
+    binary/ternary node has these slots at fixed offsets; this
+    avoids the dispatch-on-opcode overhead a generic walker
+    would incur. The chain lookup short-circuits when no chain
+    is registered so callers that lack a use-def chain do not
+    pay an unnecessary dictionary probe.
+    @End Performance_Hints
+
+    @Security_Scope
+    Mutates MIR nodes in place. Writes are confined to:
+      - operand slots at offsets 16, 24, 32 of user instructions
+        (only when the slot's current value matches the redundant
+        ID, so foreign data is never overwritten)
+      - the opcode field at offset 0 of the redundant instruction
+        (overwriting it with the NOP marker so no later pass mistakes
+        it for live work)
+      - the statistics counter at offset 72 of the context
+    No write goes beyond these documented offsets.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1285,17 +1982,77 @@ End Process
 
 Process called "perform_cse_on_block" that takes context_ptr as Integer, block_ptr as Integer returns Integer:
     @Reasoning
-    Performs CSE transformation on a basic block.
+    Walks one basic block instruction-by-instruction and rewrites
+    every redundant computation into a reuse of the existing
+    equivalent value. This is the transformation entry point per
+    block (the surrounding perform_cse_transformation iterates over
+    all blocks in CFG order).
+
+    Each candidate is hashed into the canonical form, the
+    expression table is queried, and on a hit the existing
+    result_value_id is substituted via replace_redundant_expression.
+    Both the eliminated counter (overall optimisation count) and
+    the replaced counter (use-rewrite count, maintained inside
+    replace_redundant_expression) are updated.
 
     **ALGORITHM:**
-    1. Analyze expressions to find CSE opportunities
-    2. For each redundant expression:
-       - Verify dominance
-       - Perform replacement
-       - Mark instruction as dead
+    1. For every instruction in block:
+       - Skip non-CSE-candidates
+       - Build a canonical expression node from the instruction
+       - Look up the table; if a different SSA value already
+         produces the same expression, run the replacement
+       - Free the throwaway expression node afterwards (this
+         per-block table query does not retain new nodes — that's
+         the job of analyze_expressions_in_block during the
+         analysis sweep)
 
-    Returns number of replacements made.
+    Returns number of replacements made in this block.
     @End Reasoning
+
+    @Implementation
+    Process: "perform_cse_on_block"
+    Steps:
+        1. Reject null context or null block
+        2. Initialize replacements_made = 0
+        3. Get block_id (for the diagnostic trace) and the
+           instruction list
+        4. For each instruction:
+           a. Skip if not is_cse_candidate
+           b. Read opcode, result_id, op1, op2
+           c. Build a node via create_expression_node using opcode,
+              op1, op2, result_id
+           d. Query find_existing_expression with the context and
+              the new node
+           e. If existing_value_id is non-zero AND differs from
+              result_id (guards against the trivial self-match
+              where an expression was just inserted with this exact
+              result_id):
+                · Call replace_redundant_expression; on success,
+                  replacements_made++ and increment
+                  expressions_eliminated counter at +64
+           f. Deallocate the temporary expression node
+        5. Display the per-block replacement count and return it
+    @End Implementation
+
+    @Performance_Hints
+    Linear in (instruction_count). Allocator traffic is proportional
+    to candidate_count — every candidate allocates and deallocates
+    one ExpressionNode for the lookup, which is acceptable because
+    the layout allocator uses bump-pointer reuse on small sizes.
+    The self-match guard (existing_value_id != result_id) is the
+    critical early exit; without it an instruction that just
+    inserted itself into the table during the analysis sweep would
+    immediately match itself here and replace itself with itself.
+    @End Performance_Hints
+
+    @Security_Scope
+    The expression nodes built here are short-lived and never
+    inserted into the table — only the analysis sweep transfers
+    ownership. Every allocation is deallocated unconditionally
+    after the lookup attempt, so no leak path exists. Writes
+    into MIR happen only through replace_redundant_expression,
+    which constrains its writes to the documented offsets.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1322,7 +2079,7 @@ Process called "perform_cse_on_block" that takes context_ptr as Integer, block_p
         Let inst_ptr be proc get from List with inst_list, i
 
         Note: Check if CSE candidate
-        Let is_candidate be is_cse_candidate(inst_ptr)
+        Let is_candidate be proc is_cse_candidate with inst_ptr
         If is_candidate is equal to 1:
             Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
             Let result_id be proc get_mir_node_value_id from MIR with inst_ptr
@@ -1332,15 +2089,15 @@ Process called "perform_cse_on_block" that takes context_ptr as Integer, block_p
             Let op2 be proc memory_get_int64 from Layout with inst_ptr, 24
 
             Note: Create expression node
-            Let expr_ptr be create_expression_node(opcode, op1, op2, result_id)
+            Let expr_ptr be proc create_expression_node with opcode, op1, op2, result_id
             If expr_ptr is not equal to 0:
                 Note: Check if existing expression exists
-                Let existing_value_id be find_existing_expression(context_ptr, expr_ptr)
+                Let existing_value_id be proc find_existing_expression with context_ptr, expr_ptr
 
                 If existing_value_id is not equal to 0:
                     If existing_value_id is not equal to result_id:
                         Note: Perform replacement
-                        Let replaced be replace_redundant_expression(context_ptr, inst_ptr, existing_value_id)
+                        Let replaced be proc replace_redundant_expression with context_ptr, inst_ptr, existing_value_id
                         If replaced is equal to 1:
                             Set replacements_made to replacements_made plus 1
 
@@ -1366,15 +2123,57 @@ End Process
 
 Process called "perform_cse_transformation" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Performs CSE transformation on entire CFG.
+    Drives the per-block CSE transformation across an entire CFG.
+    The ordering choice (linear over the block list as returned by
+    the CFG, which approximates dominator-tree pre-order) matters
+    for the propagation of opportunities: a producing block must be
+    visited before any block that consumes its value, otherwise the
+    consumer would see an empty expression table and miss the
+    substitution. The expression table is shared across all blocks
+    so an insertion in block A is visible to a lookup in block B
+    when A precedes B in the iteration order.
 
     **ALGORITHM:**
-    1. Process blocks in dominator tree order (dominators before dominated)
+    1. Process blocks in CFG iteration order (pre-order over the
+       dominator tree in practice, given how get_all_blocks lists
+       them)
     2. For each block, perform CSE
-    3. Accumulate statistics
+    3. Accumulate statistics — replacements per block and the
+       blocks_processed counter at offset 80
 
-    Returns total number of replacements.
+    Returns total number of replacements across the CFG.
     @End Reasoning
+
+    @Implementation
+    Process: "perform_cse_transformation"
+    Steps:
+        1. Reject null context or null cfg
+        2. Emit a header banner for the transformation log
+        3. Initialize total_replacements = 0
+        4. Get all blocks; bail on empty CFG
+        5. For each block:
+           a. Call perform_cse_on_block, accumulate its return into
+              total_replacements
+           b. Increment blocks_processed at +80
+        6. Emit a footer with the total and return it
+    @End Implementation
+
+    @Performance_Hints
+    Total cost equals the sum of per-block CSE work — linear in
+    total instruction count. The single-pass design (rather than
+    fix-pointing the whole transformation) is sound because each
+    replacement strictly shrinks the live computation set; no
+    additional opportunities are created by the rewrite that
+    were not already discoverable on the first pass over the
+    shared expression table.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only over the CFG block list; the actual MIR mutations
+    are confined to perform_cse_on_block and its callees. The
+    only write to the context is the increment of blocks_processed
+    at offset 80, which is a documented statistic slot.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1405,7 +2204,7 @@ Process called "perform_cse_transformation" that takes context_ptr as Integer, c
         Let block_ptr be proc get from List with all_blocks, i
 
         Note: Perform CSE on block
-        Let replacements be perform_cse_on_block(context_ptr, block_ptr)
+        Let replacements be proc perform_cse_on_block with context_ptr, block_ptr
         Set total_replacements to total_replacements plus replacements
 
         Note: Increment blocks_processed counter
@@ -1429,28 +2228,61 @@ Note: ==========================================================================
 
 Process called "optimize_function_with_cse" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Main entry point for CSE optimization on a single function.
+    Top-level entry point: optimises a single function's CFG by
+    running the full CSE pipeline end-to-end. The pipeline is
+    structured as analysis → transformation → reporting →
+    teardown so that every stage has a single responsibility and
+    failures in early stages bail without corrupting later ones.
 
     **COMPLETE PIPELINE:**
-    1. Create CSE context
-    2. Compute GEN/KILL sets
-    3. Compute available expressions (dataflow analysis)
-    4. Analyze expressions for CSE opportunities
-    5. Perform CSE transformation
-    6. Print statistics
-    7. Destroy context
+    1. Create CSE context (allocates dataflow scaffolding)
+    2. Compute GEN/KILL sets (per-block dataflow inputs)
+    3. Compute available expressions (forward dataflow fixed-point)
+    4. Analyze expressions for CSE opportunities (populate the
+       expression table by walking each block)
+    5. Perform CSE transformation (rewrite redundant computations)
+    6. Print statistics (eliminated / replaced / blocks_processed)
+    7. Destroy context (free every allocation)
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
 
+    @Implementation
+    Process: "optimize_function_with_cse"
+    Steps:
+        1. Reject null cfg_ptr with an explicit error display
+        2. Emit pass banner
+        3. Call create_cse_context with cfg_ptr; bail on zero return
+        4. Display "Step 1" banner; compute_gen_kill_sets
+        5. Display "Step 2" banner; compute_available_expressions
+        6. Display "Step 3" banner; for every block in
+           get_all_blocks, call analyze_expressions_in_block
+        7. Display "Step 4" banner; perform_cse_transformation
+        8. print_cse_stats
+        9. destroy_cse_context
+       10. Emit completion banner; return 1
+    @End Implementation
+
     @Performance_Hints
     CSE is effective after constant propagation has exposed more
-    equivalent expressions. Run CSE before copy propagation to
-    create more copy elimination opportunities.
+    equivalent expressions; running CSE before copy propagation
+    then creates extra copy-elimination opportunities. The full
+    pipeline cost on a typical function is dominated by the
+    dataflow fixed-point inside compute_available_expressions
+    (sub-millisecond for functions under a few hundred blocks).
 
     **PIPELINE POSITION:**
     SCCP → Constant Prop → **CSE** → Copy Prop → DCE
     @End Performance_Hints
+
+    @Security_Scope
+    The pipeline guarantees the context is destroyed on every
+    successful return so no leak exists on the happy path. The
+    early null-cfg return path has no allocation to leak. Each
+    stage's @Security_Scope holds the line on memory ownership
+    transitions (allocate in create, transfer to the table in
+    analyze, free in destroy).
+    @End Security_Scope
 
     If cfg_ptr is equal to 0:
         Display "optimize_function_with_cse: null CFG"
@@ -1464,7 +2296,7 @@ Process called "optimize_function_with_cse" that takes cfg_ptr as Integer return
     Display ""
 
     Note: Step 1: Create context
-    Let context_ptr be create_cse_context(cfg_ptr)
+    Let context_ptr be proc create_cse_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "optimize_function_with_cse: failed to create context"
         Return 0
@@ -1472,11 +2304,11 @@ Process called "optimize_function_with_cse" that takes cfg_ptr as Integer return
 
     Note: Step 2: Compute GEN/KILL sets
     Display "Step 1: Computing GEN/KILL sets..."
-    compute_gen_kill_sets(context_ptr, cfg_ptr)
+    proc compute_gen_kill_sets with context_ptr, cfg_ptr
 
     Note: Step 3: Compute available expressions
     Display "Step 2: Computing available expressions..."
-    compute_available_expressions(context_ptr, cfg_ptr)
+    proc compute_available_expressions with context_ptr, cfg_ptr
 
     Note: Step 4: Analyze expressions
     Display "Step 3: Analyzing expressions for CSE opportunities..."
@@ -1487,20 +2319,20 @@ Process called "optimize_function_with_cse" that takes cfg_ptr as Integer return
 
         While i is less than block_count:
             Let block_ptr be proc get from List with all_blocks, i
-            analyze_expressions_in_block(context_ptr, block_ptr)
+            proc analyze_expressions_in_block with context_ptr, block_ptr
             Set i to i plus 1
         End While
     End If
 
     Note: Step 5: Perform transformation
     Display "Step 4: Performing CSE transformation..."
-    perform_cse_transformation(context_ptr, cfg_ptr)
+    proc perform_cse_transformation with context_ptr, cfg_ptr
 
     Note: Step 6: Print statistics
-    print_cse_stats(context_ptr)
+    proc print_cse_stats with context_ptr
 
     Note: Step 7: Destroy context
-    destroy_cse_context(context_ptr)
+    proc destroy_cse_context with context_ptr
 
     Display ""
     Display "COMMON SUBEXPRESSION ELIMINATION COMPLETE"
@@ -1511,25 +2343,77 @@ End Process
 
 Process called "run_cse_pass" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Convenience wrapper for running CSE as an optimization pass.
+    Pipeline-facing wrapper that the MIR optimizer driver calls when
+    dispatching the CSE pass. Keeping a separate name from
+    optimize_function_with_cse lets the driver register passes
+    uniformly (every pass exposes a `run_*_pass` symbol) without
+    coupling the internal entry point's signature to the dispatcher
+    convention.
 
     Returns 1 if CFG was modified, 0 if no changes.
     @End Reasoning
 
-    Return optimize_function_with_cse(cfg_ptr)
+    @Implementation
+    Process: "run_cse_pass"
+    Steps:
+        1. Delegate directly to optimize_function_with_cse passing
+           cfg_ptr
+        2. Return its result as the pass's modification flag
+    @End Implementation
+
+    @Performance_Hints
+    Zero overhead beyond the tail call into the real implementation.
+    The indirection exists for naming uniformity in the pass
+    registry, not for any runtime purpose.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure delegation. All input validation and resource management
+    happen inside optimize_function_with_cse.
+    @End Security_Scope
+
+    Return proc optimize_function_with_cse with cfg_ptr
 End Process
 
 Process called "should_run_cse" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Determines if CSE should be run.
+    Cheap profitability gate that the pass scheduler can use to skip
+    CSE on trivial functions where the dataflow setup cost would
+    outweigh any benefit. The current heuristic is "at least 2
+    basic blocks" — a single-block function gets all the benefit of
+    CSE for free from local value numbering inside another pass
+    (GVN), so spending the cross-block analysis on it is wasted
+    work.
 
     **PROFITABILITY:**
     CSE is profitable on most functions except:
     - Trivial functions (< 2 basic blocks)
-    - Functions with no arithmetic/logical operations
+    - Functions with no arithmetic/logical operations (caught
+      implicitly: zero candidates produce zero replacements,
+      paying only the dataflow setup cost)
 
     Returns 1 if should run, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Process: "should_run_cse"
+    Steps:
+        1. Reject null cfg_ptr by returning 0
+        2. Get block count via the CFG get_block_count accessor
+        3. If block_count < 2, display skip message and return 0
+        4. Otherwise return 1
+    @End Implementation
+
+    @Performance_Hints
+    Single CFG accessor call plus a comparison. Constant-time
+    profitability check; called once per function by the pass
+    scheduler.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only access to the CFG block count. No allocation, no
+    mutation, no exposure to caller-supplied data.
+    @End Security_Scope
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -1550,16 +2434,52 @@ End Process
 
 Process called "get_cse_pass_name" returns Integer:
     @Reasoning
-    Returns the name of this optimization pass.
+    Returns the canonical short name of this optimization pass.
+    Used by the pass registry, diagnostics, and the pipeline log
+    so the pass appears consistently across all tooling.
     @End Reasoning
+
+    @Implementation
+    Process: "get_cse_pass_name"
+    Steps:
+        1. Return the literal string "Common Subexpression
+           Elimination"
+    @End Implementation
+
+    @Performance_Hints
+    Constant string return. No measurable cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns a static string literal. No mutable state involved.
+    @End Security_Scope
 
     Return "Common Subexpression Elimination"
 End Process
 
 Process called "get_cse_pass_description" returns Integer:
     @Reasoning
-    Returns a description of this optimization pass.
+    Returns a one-line description of this pass for the pass
+    registry's help/listing output. The description summarizes
+    both what the pass does (cross-block CSE) and how
+    (dominator-tree-based availability analysis) so a developer
+    inspecting the pipeline knows the pass's scope at a glance.
     @End Reasoning
+
+    @Implementation
+    Process: "get_cse_pass_description"
+    Steps:
+        1. Return the literal string "Cross-block CSE with
+           dominator-tree-based availability analysis"
+    @End Implementation
+
+    @Performance_Hints
+    Constant string return. No measurable cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Returns a static string literal. No mutable state involved.
+    @End Security_Scope
 
     Return "Cross-block CSE with dominator-tree-based availability analysis"
 End Process

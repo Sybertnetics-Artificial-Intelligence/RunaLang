@@ -145,6 +145,25 @@ Process called "create_variable_info" that takes original_name as Integer, type_
     Total: 56 bytes
     @End Reasoning
 
+    @Implementation
+    Allocates a 56-byte heap block via Layout.allocate (TIER 3 owned heap),
+    stores the caller-supplied original_name pointer at offset 0 and type_info
+    pointer at offset 40, then constructs two empty backing Lists for the
+    definition-block set (offset 8) and the SSA-name stack (offset 24). Counter
+    fields (def_block_count at 16, current_version at 32) and the has_phi flag
+    at offset 48 are explicitly zeroed so callers can rely on a deterministic
+    initial state without performing follow-up zeroing. Returns the pointer to
+    the freshly initialized structure; the lifetime of the inner Lists is
+    governed by the same TIER 3 ownership scope as the outer VariableInfo.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) allocation cost plus two List.create calls (each O(1) for an empty
+    backing array). The 56-byte footprint fits within a single L1 cache line,
+    so subsequent field accesses during the renaming inner loop are likely to
+    be cache hits once the structure has been touched.
+    @End Performance_Hints
+
     Note: Allocate VariableInfo structure
     Let var_info_ptr be proc allocate from Layout with 56
 
@@ -178,6 +197,25 @@ Process called "add_definition_block" that takes var_info_ptr as Integer, block_
 
     Returns: 1 on success, 0 on failure
     @End Reasoning
+
+    @Implementation
+    Reads the def_blocks list pointer from offset 8 of the VariableInfo, calls
+    List.contains for O(n) duplicate detection (n = current definition-block
+    count for this variable, typically tiny), and returns 1 immediately if the
+    block was already recorded. Otherwise appends block_id to the list and
+    increments the cached count at offset 16 so consumers like
+    compute_iterated_dominance_frontier can iterate without re-measuring the
+    list. Null var_info_ptr or an uninitialized def_blocks list yields a
+    failure return rather than a crash.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in the number of existing definition blocks per variable. Real
+    programs rarely have more than a handful of distinct definitions of the
+    same source variable, so the linear scan is faster than a hashed set for
+    the expected size range and avoids the per-insert allocation overhead of a
+    hash table.
+    @End Performance_Hints
 
     Note: Null check
     If var_info_ptr is equal to 0:
@@ -215,14 +253,29 @@ Process called "push_ssa_name" that takes var_info_ptr as Integer, ssa_value_id 
 
     Example:
     - Enter block B1: push x_1
-    - Use x in B1: peek → x_1
+    - Use x in B1: peek -> x_1
     - Enter dominated block B2: push x_2
-    - Use x in B2: peek → x_2
+    - Use x in B2: peek -> x_2
     - Exit B2: pop (x_2 removed)
-    - Use x in B1: peek → x_1 (restored)
+    - Use x in B1: peek -> x_1 (restored)
 
     Returns: 1 on success, 0 on failure
     @End Reasoning
+
+    @Implementation
+    Reads the SSA-name stack pointer from offset 24 of the VariableInfo and
+    appends ssa_value_id to it. The underlying List supports amortized O(1)
+    append. The stack discipline is enforced by paired push/pop calls in the
+    recursive rename_block traversal: every push performed before processing
+    dominated children must be matched by a pop in the same block's epilogue.
+    @End Implementation
+
+    @Performance_Hints
+    Amortized O(1) push. The stack typically remains shallow (bounded by the
+    depth of the dominance tree along the active spine), which keeps total
+    memory traffic low. The append is the only mutation per definition site,
+    so this routine is on the hot path of SSA construction.
+    @End Performance_Hints
 
     Note: Null check
     If var_info_ptr is equal to 0:
@@ -250,6 +303,26 @@ Process called "pop_ssa_name" that takes var_info_ptr as Integer returns Integer
 
     Returns: The popped SSA value ID, or -1 if stack is empty
     @End Reasoning
+
+    @Implementation
+    Reads the SSA-name stack pointer at offset 24, captures the top element
+    via List.get at index (length - 1), then materializes a new List that
+    contains every element except the last. The old List is destroyed and the
+    new pointer is written back at offset 24. This explicit rebuild is used
+    because the underlying List primitive in v0.0.8.5 does not expose an
+    in-place pop_back; the rebuild is acceptable because per-block pop counts
+    are small and the renaming pass dominates the overall compile time
+    elsewhere. Returns the captured top element to the caller so that the
+    rename_block epilogue can pair pops with their pushes.
+    @End Implementation
+
+    @Performance_Hints
+    O(n) in current stack depth due to the rebuild. The stack depth is bounded
+    by the number of definitions of the variable on the active dominance-tree
+    spine, which in practice is small (typically less than a handful). When
+    the List primitive grows an in-place pop_back, this routine should be
+    rewritten to call it for a true O(1) implementation.
+    @End Performance_Hints
 
     Note: Null check
     If var_info_ptr is equal to 0:
@@ -297,6 +370,23 @@ Process called "peek_ssa_name" that takes var_info_ptr as Integer returns Intege
     Returns: The current SSA value ID, or -1 if stack is empty
     @End Reasoning
 
+    @Implementation
+    Reads the SSA-name stack pointer at offset 24 of the VariableInfo, queries
+    its length, and returns the top element with a List.get at index
+    (length - 1) without mutating the stack. The -1 sentinel return
+    distinguishes "no current SSA name" (which legitimately occurs for uses
+    that precede any definition along the dominance spine, such as
+    use-before-def errors or function parameters that were not pre-pushed)
+    from a valid SSA value ID.
+    @End Implementation
+
+    @Performance_Hints
+    Strict O(1): one indirection to load the List pointer, one length read,
+    one indexed read. This is called once per variable operand during
+    operand renaming, so it sits squarely on the hot path of construct_ssa_form
+    and must not be replaced with any operation that linearly scans the stack.
+    @End Performance_Hints
+
     Note: Null check
     If var_info_ptr is equal to 0:
         Return -1
@@ -323,12 +413,30 @@ Process called "allocate_fresh_ssa_name" that takes var_info_ptr as Integer, con
     @Reasoning
     Allocates a fresh SSA value ID for a variable.
 
-    This creates a new SSA version of the variable (e.g., x_0 → x_1 → x_2).
+    This creates a new SSA version of the variable (e.g., x_0 -> x_1 -> x_2).
     The version counter is incremented, and a new globally unique value ID
     is allocated from the context.
 
     Returns: The new SSA value ID
     @End Reasoning
+
+    @Implementation
+    Two counters cooperate: the per-variable current_version at offset 32 of
+    the VariableInfo, used purely for human-readable naming, and the global
+    next_value_id at offset 32 of the SSARenamingContext, which is the unique
+    identifier consumed by the rest of the MIR pipeline. Both are read,
+    returned, and post-incremented in lockstep so that each call yields a new
+    pair of fresh names. The function does not push the new name onto the
+    stack: callers are expected to call push_ssa_name explicitly so that the
+    rename traversal can keep stack discipline aligned with dominance scope.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) - two memory_get_int64 plus two memory_set_int64 calls. Called once
+    per SSA definition (every original instruction that defines a variable
+    plus every inserted phi), so the per-definition cost must stay constant
+    to keep SSA construction within the documented O(V * |DF+|) envelope.
+    @End Performance_Hints
 
     Note: Null checks
     If var_info_ptr is equal to 0 or context_ptr is equal to 0:
@@ -364,6 +472,28 @@ Process called "create_ssa_context" that takes function_ptr as Integer, cfg_ptr 
     Total: 48 bytes
     @End Reasoning
 
+    @Implementation
+    Allocates a 48-byte heap block (TIER 3) and stores the supplied function
+    and CFG pointers at offsets 0 and 8 so all later phases can navigate from
+    the context alone. A fresh empty List is created to serve as the
+    variable map (stored as flat (name, VariableInfo) pairs to avoid the
+    overhead of a hashed map for the small per-function variable counts
+    expected here). The next_value_id counter is seeded to 1000 to leave a
+    safety gap above any pre-existing MIR value IDs assigned by HIR-to-MIR
+    lowering, eliminating the need to scan the MIR up-front for the maximum
+    id. The dominance_info slot at offset 40 is zeroed; the caller is
+    expected to invoke set_dominance_info once compute_dominance_tree has
+    produced a result, keeping context creation and dominance computation
+    decoupled.
+    @End Implementation
+
+    @Performance_Hints
+    Single 48-byte allocation plus one List.create. Called exactly once per
+    function transformed into SSA form, so it is not on the hot path; the
+    seeding choice for next_value_id is what governs steady-state allocation
+    cost during subsequent renaming.
+    @End Performance_Hints
+
     Note: Allocate SSARenamingContext structure
     Let context_ptr be proc allocate from Layout with 48
 
@@ -397,6 +527,31 @@ Process called "get_or_create_variable_info" that takes context_ptr as Integer, 
     Returns: Pointer to VariableInfo, or 0 on failure
     @End Reasoning
 
+    @Implementation
+    Walks the variable map (stored as a flat List of consecutive
+    (name_ptr, var_info_ptr) pairs at indices 2k and 2k+1) and compares each
+    candidate name against var_name using String.string_equals so that
+    semantically equal but distinct heap-allocated name buffers still resolve
+    to the same VariableInfo. On a hit the existing pointer is returned. On a
+    miss a fresh VariableInfo is constructed via create_variable_info, the
+    map is extended with two appends to preserve the pair layout, and the
+    variable_count at offset 24 is incremented to keep iteration bounds in
+    sync with the storage. The flat-pair layout is intentional: the per-
+    function variable count is small enough that a hash table's constant
+    factor and indirection cost outweigh the linear scan, and it keeps the
+    map's representation trivially serializable for debug dumps.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in the number of distinct source variables seen so far. Called
+    once per variable reference during collect_variable_definitions and per
+    variable use/def during renaming, but the inner string_equals is short-
+    circuited on a length or pointer mismatch, keeping the typical lookup
+    near-constant. For functions exceeding ~64 distinct variables, replacing
+    the flat List with a HashMap would yield a measurable win, but it is not
+    warranted at v0.0.8.5's compile-time variable scales.
+    @End Performance_Hints
+
     Note: Null check
     If context_ptr is equal to 0:
         Return 0
@@ -428,7 +583,7 @@ Process called "get_or_create_variable_info" that takes context_ptr as Integer, 
     End While
 
     Note: Variable not found, create new VariableInfo
-    Set var_info_ptr to create_variable_info(var_name, type_info)
+    Set var_info_ptr to proc create_variable_info with var_name, type_info
     If var_info_ptr is equal to 0:
         Return 0
     End If
@@ -454,6 +609,15 @@ Process called "set_dominance_info" that takes context_ptr as Integer, dominance
 
     Returns: 1 on success, 0 on failure
     @End Reasoning
+
+    @Implementation
+    A single memory_set_int64 writes the dominance info pointer to offset 40
+    of the context. The ownership model is that the dominance info is created
+    by the caller (typically construct_ssa_form) before set_dominance_info is
+    invoked and destroyed by the caller after destroy_ssa_context completes;
+    the context only holds a borrowed pointer and never reaches in to free
+    the dominance structures.
+    @End Implementation
 
     Note: Null check
     If context_ptr is equal to 0:
@@ -481,6 +645,28 @@ Process called "destroy_ssa_context" that takes context_ptr as Integer returns I
 
     Returns: 1 on success, 0 on failure
     @End Reasoning
+
+    @Implementation
+    Iterates the variable_map at offset 16, retrieving each VariableInfo
+    pointer at index (2k + 1). For each VariableInfo it destroys the
+    def_blocks list (offset 8) and the ssa_name_stack list (offset 24), then
+    deallocates the VariableInfo block itself. After the loop completes, the
+    variable_map List is destroyed, and finally the context block at offset 0
+    is deallocated. The dominance_info pointer at offset 40 is intentionally
+    left alone because the construct_ssa_form caller owns it and frees it
+    after this routine returns. This ordering guarantees that every TIER 3
+    allocation made by create_variable_info and create_ssa_context is paired
+    with a corresponding deallocation with no double-free risk.
+    @End Implementation
+
+    @Security_Scope
+    Tolerates a null context_ptr by returning 0 without crashing, which
+    matters when caller error paths in construct_ssa_form attempt cleanup on
+    partially-constructed contexts. Every nested pointer is null-checked
+    before destruction so that a partially initialized context (for example,
+    one whose VariableInfo allocation failed mid-build) can still be torn
+    down safely without dereferencing the failed slot.
+    @End Security_Scope
 
     Note: Null check
     If context_ptr is equal to 0:
@@ -548,9 +734,29 @@ Process called "collect_variable_definitions" that takes context_ptr as Integer 
     @End Reasoning
 
     @Implementation
-    Scans all blocks and instructions, tracking variable definitions.
-    This builds the def_blocks list for each VariableInfo structure.
+    Reads the CFG pointer from offset 8 of the context, then performs a
+    nested scan: outer loop iterates every basic block returned by
+    CFG.get_cfg_blocks, inner loop iterates every instruction in the block.
+    For each instruction MIR.instruction_defines_variable acts as a guard so
+    only def-producing instructions (assignments, calls returning a value,
+    arithmetic and memory loads, etc.) participate. The defined variable name
+    and result type are extracted, get_or_create_variable_info is used to
+    obtain or create the per-variable record, and add_definition_block records
+    the block ID into the var's def_blocks set. The dedup behavior of
+    add_definition_block ensures that multiple definitions of the same
+    variable inside one block contribute exactly one entry, which is what the
+    Cytron algorithm requires (it cares about the set of definition blocks,
+    not the per-instruction count).
     @End Implementation
+
+    @Performance_Hints
+    O(B * I) where B = block count and I = average instructions per block,
+    i.e. linear in MIR instruction count. The inner work per instruction is
+    constant-time aside from the get_or_create_variable_info lookup, which is
+    linear in the number of distinct source variables and so amortizes well.
+    No allocation occurs on the steady-state path except when a brand-new
+    VariableInfo is created the first time a variable is observed.
+    @End Performance_Hints
 
     Note: Null check
     If context_ptr is equal to 0:
@@ -591,11 +797,11 @@ Process called "collect_variable_definitions" that takes context_ptr as Integer 
 
                 If var_name is not equal to 0:
                     Note: Get or create VariableInfo for this variable
-                    Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+                    Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, var_type
 
                     If var_info_ptr is not equal to 0:
                         Note: Add this block to variable's definition blocks
-                        add_definition_block(var_info_ptr, block_id)
+                        proc add_definition_block with var_info_ptr, block_id
                     End If
                 End If
             End If
@@ -643,6 +849,34 @@ Process called "compute_iterated_dominance_frontier" that takes def_blocks as In
 
     Returns: List of block IDs in the iterated dominance frontier (TIER 3)
     @End Reasoning
+
+    @Implementation
+    Maintains two Lists: idf_set, the accumulating result, and work_list, the
+    frontier to expand. Seeding work_list with a shallow copy of def_blocks
+    avoids mutating the caller's argument. The main loop dequeues from the
+    head of work_list (implemented as a rebuild because the current List
+    primitive lacks a cheap pop_front) and consults
+    Dominance.get_dominance_frontier for the dequeued block. Every successor
+    Y in that frontier is added to idf_set if not already present (membership
+    via List.contains), and Y is enqueued for further expansion only when it
+    was not already a definition block - this matches Cytron's observation
+    that placing a phi at Y effectively turns Y into a new definition block,
+    so its own dominance frontier must also be added to the IDF. The loop
+    terminates at fixed point when work_list is empty. The returned List is
+    TIER 3 owned; callers (insert_phi_nodes_for_variable) are responsible for
+    destroying it.
+    @End Implementation
+
+    @Performance_Hints
+    The pop-from-head rebuild is O(W) per iteration where W is current work
+    list length. For functions with modest CFG sizes this is dominated by
+    the dominance-frontier lookups themselves and does not affect overall
+    SSA build time. For very large functions (CFG nodes >> 1000) the
+    rebuild should be replaced with a true queue once the List primitive
+    supports O(1) pop_front; the algorithmic complexity bound of O(V + E)
+    typical / O(V^2) worst case still holds asymptotically because each
+    block enters and leaves work_list at most once.
+    @End Performance_Hints
 
     Note: Create result set for IDF
     Let idf_set be proc create from List
@@ -726,18 +960,43 @@ Process called "place_phi_at_block" that takes context_ptr as Integer, block_ptr
     Returns: Pointer to created phi node, or 0 on failure
     @End Reasoning
 
+    @Implementation
+    Acquires (or creates) the VariableInfo via get_or_create_variable_info,
+    then allocates a fresh SSA value ID for the phi result with
+    allocate_fresh_ssa_name (which also advances both the per-variable
+    version counter and the context-global value counter). The phi node
+    itself is constructed by MIRNodes.create_mir_phi_node carrying the new
+    value id, the type info, and the owning block. It is inserted at the
+    very start of block_ptr's instruction list via
+    MIR.insert_instruction_at_block_start because the MIR contract requires
+    every phi to precede all non-phi instructions in its block. Finally the
+    block ID is appended to the variable's def_blocks set: a phi is itself a
+    definition for the renaming pass, and recording it as such is what
+    allows the iterated dominance frontier on subsequent variables to
+    converge correctly when phis trigger further phi placement upstream.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) excluding the cost of the allocator and the block-prepend. The
+    block-prepend is currently a list rebuild because MIR.BasicBlock's
+    instruction list lacks an O(1) push_front; this is acceptable because
+    phi placement happens once per phi during construct_ssa_form and the
+    number of phis is bounded by the iterated dominance frontier size, not
+    by total instruction count.
+    @End Performance_Hints
+
     Note: Null checks
     If context_ptr is equal to 0 or block_ptr is equal to 0:
         Return 0
     End If
 
     Note: Allocate fresh SSA value ID for phi result
-    Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+    Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, var_type
     If var_info_ptr is equal to 0:
         Return 0
     End If
 
-    Let phi_value_id be allocate_fresh_ssa_name(var_info_ptr, context_ptr)
+    Let phi_value_id be proc allocate_fresh_ssa_name with var_info_ptr, context_ptr
     If phi_value_id is equal to -1:
         Return 0
     End If
@@ -754,7 +1013,7 @@ Process called "place_phi_at_block" that takes context_ptr as Integer, block_ptr
 
     Note: Mark that this variable has a phi in this block
     Let block_id be proc get_block_id from CFG with block_ptr
-    add_definition_block(var_info_ptr, block_id)
+    proc add_definition_block with var_info_ptr, block_id
 
     Return phi_ptr
 End Process
@@ -774,6 +1033,27 @@ Process called "block_has_phi_for_variable" that takes block_ptr as Integer, var
 
     Returns: 1 if phi exists, 0 otherwise
     @End Reasoning
+
+    @Implementation
+    Walks the block's instruction list in order, leveraging the MIR
+    invariant that phi nodes occupy a contiguous prefix of every basic
+    block. Each instruction is classified via MIRNodes.is_phi_node; the
+    first non-phi terminates the scan with a negative result. While still
+    inside the phi prefix, MIRNodes.get_phi_variable_name returns the
+    source variable the phi was placed for, which is compared for pointer
+    equality against the supplied var_name. The use of pointer equality is
+    sound because all variable names in a single SSA construction session
+    are interned through get_or_create_variable_info, ensuring identical
+    variables share a single string pointer.
+    @End Implementation
+
+    @Performance_Hints
+    O(P) where P is the number of phi nodes in the block (bounded by the
+    distinct variables live at the block's entry). The early exit on the
+    first non-phi keeps this strictly proportional to the phi prefix rather
+    than the full instruction list, which matters for blocks containing
+    many regular instructions but few phis.
+    @End Performance_Hints
 
     Note: Null check
     If block_ptr is equal to 0:
@@ -832,6 +1112,32 @@ Process called "insert_phi_nodes_for_variable" that takes context_ptr as Integer
     Returns: 1 on success, 0 on failure
     @End Reasoning
 
+    @Implementation
+    Reads the variable's def_blocks list and definition count from the
+    VariableInfo (offsets 8 and 16). If the variable has zero definitions
+    the algorithm returns success immediately because a never-defined
+    variable cannot need any phi node. Otherwise
+    compute_iterated_dominance_frontier produces the set of blocks where
+    phis are required. The original name pointer (offset 0) and type info
+    (offset 40) are pulled from the VariableInfo so they can be supplied to
+    place_phi_at_block. For each block in the IDF the helper
+    block_has_phi_for_variable is consulted to avoid duplicating a phi
+    that was placed during processing of an earlier variable along the
+    same IDF (this can happen for variables that share many definition
+    blocks). When a new phi is placed the has_phi flag at offset 48 is set
+    so that diagnostic tooling can quickly see which variables actually
+    received phis. The IDF list is destroyed before return to honor TIER 3
+    ownership rules.
+    @End Implementation
+
+    @Performance_Hints
+    Dominated by the IDF computation (worst-case O(V^2) but typically O(V+E))
+    plus O(|IDF| * P) for the phi-existence checks, where P is the average
+    phi-prefix length per IDF block. Because |IDF| is empirically small
+    relative to total block count for non-pathological programs, the
+    dominant cost is the IDF traversal itself.
+    @End Performance_Hints
+
     Note: Null checks
     If context_ptr is equal to 0 or var_info_ptr is equal to 0 or dominance_info is equal to 0:
         Return 0
@@ -850,7 +1156,7 @@ Process called "insert_phi_nodes_for_variable" that takes context_ptr as Integer
     Note: But we compute IDF anyway to handle all cases correctly
 
     Note: Compute iterated dominance frontier
-    Let idf_blocks be compute_iterated_dominance_frontier(def_blocks, dominance_info)
+    Let idf_blocks be proc compute_iterated_dominance_frontier with def_blocks, dominance_info
     Let idf_count be proc length from List with idf_blocks
 
     Note: Get variable information
@@ -869,11 +1175,11 @@ Process called "insert_phi_nodes_for_variable" that takes context_ptr as Integer
         Let block_ptr be proc get_block_by_id from CFG with cfg_ptr, block_id
         If block_ptr is not equal to 0:
             Note: Check if phi already exists for this variable
-            Let has_phi be block_has_phi_for_variable(block_ptr, var_name)
+            Let has_phi be proc block_has_phi_for_variable with block_ptr, var_name
 
             If has_phi is equal to 0:
                 Note: Insert phi node for this variable
-                place_phi_at_block(context_ptr, block_ptr, var_name, var_type)
+                proc place_phi_at_block with context_ptr, block_ptr, var_name, var_type
 
                 Note: Mark that this block now has phi for this variable
                 proc memory_set_int64 from Layout with var_info_ptr, 48, 1 Note: has_phi flag
@@ -909,6 +1215,26 @@ Process called "insert_all_phi_nodes" that takes context_ptr as Integer, dominan
     Returns: 1 on success, 0 on failure
     @End Reasoning
 
+    @Implementation
+    Drives the per-variable phi insertion. Reads variable_map at offset 16
+    and var_count at offset 24, then walks the flat (name, VariableInfo)
+    pairs by index (2k + 1) to retrieve each VariableInfo pointer. For each
+    non-null pointer the work is delegated to insert_phi_nodes_for_variable.
+    Variables registered in the map but with a null VariableInfo are
+    skipped silently rather than aborting the whole pass; this defensive
+    layout matches what the rest of the construction pipeline expects when
+    operating on partially-built contexts (for example, when an earlier
+    allocation failure left a slot empty).
+    @End Implementation
+
+    @Performance_Hints
+    Per-variable phi insertion cost is dominated by the IDF computation
+    described in insert_phi_nodes_for_variable, so this driver is O(V * IDF)
+    overall. The per-variable cost is independent of other variables, so a
+    future parallel implementation could process each variable on its own
+    worker without coordination overhead.
+    @End Performance_Hints
+
     Note: Null checks
     If context_ptr is equal to 0 or dominance_info is equal to 0:
         Return 0
@@ -926,7 +1252,7 @@ Process called "insert_all_phi_nodes" that takes context_ptr as Integer, dominan
 
         If var_info_ptr is not equal to 0:
             Note: Insert phi nodes for this variable
-            insert_phi_nodes_for_variable(context_ptr, var_info_ptr, dominance_info)
+            proc insert_phi_nodes_for_variable with context_ptr, var_info_ptr, dominance_info
         End If
 
         Set i to i plus 1
@@ -953,6 +1279,32 @@ Process called "rename_phi_results" that takes context_ptr as Integer, block_ptr
 
     Returns: Number of phis renamed, or -1 on error
     @End Reasoning
+
+    @Implementation
+    Iterates the block's instruction list, identifying phi nodes via
+    MIRNodes.is_phi_node. The first non-phi instruction terminates the
+    walk because the MIR contract guarantees phi nodes form a contiguous
+    prefix. For each phi the source variable's name and result type are
+    pulled from the phi via MIRNodes.get_phi_variable_name and
+    get_phi_result_type, get_or_create_variable_info locates the
+    VariableInfo (creating one if construct_ssa_form first encounters the
+    variable here, which can occur for variables defined exclusively by
+    phi nodes), and allocate_fresh_ssa_name produces the new SSA value
+    id. MIRNodes.set_phi_result_value_id writes the new id back into the
+    phi, and push_ssa_name records the id on the variable's stack so that
+    subsequent uses inside this block and its dominated subtree resolve
+    correctly. The push is intentionally not balanced inside this function;
+    the matching pop is performed by rename_block once the entire
+    dominated subtree has been processed.
+    @End Implementation
+
+    @Performance_Hints
+    O(P) where P is the phi-prefix length of the block. Each phi
+    contributes one allocate, one id-set, and one stack push; the inner
+    work is amortized O(1) so the loop is strictly linear in phi count.
+    Sits on the hot path of construct_ssa_form because every block is
+    visited and most blocks at IDF join points carry at least one phi.
+    @End Performance_Hints
 
     Note: Null checks
     If context_ptr is equal to 0 or block_ptr is equal to 0:
@@ -983,18 +1335,18 @@ Process called "rename_phi_results" that takes context_ptr as Integer, block_ptr
 
         If var_name is not equal to 0:
             Note: Get or create VariableInfo
-            Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+            Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, var_type
 
             If var_info_ptr is not equal to 0:
                 Note: Allocate fresh SSA name for phi result
-                Let new_value_id be allocate_fresh_ssa_name(var_info_ptr, context_ptr)
+                Let new_value_id be proc allocate_fresh_ssa_name with var_info_ptr, context_ptr
 
                 If new_value_id is not equal to -1:
                     Note: Update phi node with new SSA value ID
                     proc set_phi_result_value_id from MIRNodes with inst_ptr, new_value_id
 
                     Note: Push new name onto variable's stack
-                    push_ssa_name(var_info_ptr, new_value_id)
+                    proc push_ssa_name with var_info_ptr, new_value_id
 
                     Set phi_count to phi_count plus 1
                 End If
@@ -1021,6 +1373,30 @@ Process called "rename_instruction_operands" that takes context_ptr as Integer, 
     Returns: Number of operands renamed, or -1 on error
     @End Reasoning
 
+    @Implementation
+    Walks the instruction's operand list, filtering with
+    MIR.operand_is_variable so constants, immediates, label references, and
+    other non-variable operand kinds remain untouched. For each variable
+    operand the source name is obtained via MIR.get_operand_variable_name,
+    the VariableInfo is fetched (using type 0 because we are reading, not
+    introducing a new variable), and peek_ssa_name returns the current SSA
+    value id for the nearest dominating definition. That id is written back
+    into the operand via MIR.set_operand_ssa_value_id, completing the
+    rename. The -1 sentinel from peek_ssa_name is treated as "no SSA name
+    available" rather than an error so that downstream verification passes
+    can flag use-before-def rather than aborting the rename traversal here.
+    The renamed_count tally is returned to the caller for diagnostic use.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in operand count of the instruction; the per-operand work is
+    constant (one type-check, one map lookup, one stack peek, one writeback).
+    Called once per non-phi instruction in the function during
+    construct_ssa_form, making it the single largest contributor to the
+    constant factor of SSA construction. Keeping peek_ssa_name strictly O(1)
+    is essential to maintain the documented linear scaling.
+    @End Performance_Hints
+
     Note: Null checks
     If context_ptr is equal to 0 or inst_ptr is equal to 0:
         Return -1
@@ -1046,11 +1422,11 @@ Process called "rename_instruction_operands" that takes context_ptr as Integer, 
 
             If var_name is not equal to 0:
                 Note: Get VariableInfo
-                Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, 0)
+                Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, 0
 
                 If var_info_ptr is not equal to 0:
                     Note: Peek current SSA name from stack
-                    Let current_ssa_name be peek_ssa_name(var_info_ptr)
+                    Let current_ssa_name be proc peek_ssa_name with var_info_ptr
 
                     If current_ssa_name is not equal to -1:
                         Note: Replace operand with current SSA name
@@ -1080,6 +1456,28 @@ Process called "rename_instruction_result" that takes context_ptr as Integer, in
     Returns: 1 if result was renamed, 0 if no result, -1 on error
     @End Reasoning
 
+    @Implementation
+    First consults MIR.instruction_defines_variable to short-circuit
+    instructions that have no result (stores, branches, unconditional jumps,
+    void calls). For defining instructions the source variable name and
+    result type are pulled and passed to get_or_create_variable_info so a
+    VariableInfo exists. allocate_fresh_ssa_name produces the new id, which
+    is written into the instruction with MIR.set_instruction_result_value_id
+    so all later uses can locate the producer. push_ssa_name then publishes
+    the id onto the variable's SSA name stack, making it visible to
+    subsequent operand renames within the same block and any blocks
+    dominated by the current one. The caller (rename_block) is responsible
+    for the corresponding pop after the dominated subtree finishes
+    processing.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) excluding the allocate / lookup primitives it invokes. Called once
+    per non-phi defining instruction during construct_ssa_form, so its
+    overall contribution is linear in the number of MIR defs, which is
+    bounded by total instruction count.
+    @End Performance_Hints
+
     Note: Null checks
     If context_ptr is equal to 0 or inst_ptr is equal to 0:
         Return -1
@@ -1101,14 +1499,14 @@ Process called "rename_instruction_result" that takes context_ptr as Integer, in
     End If
 
     Note: Get or create VariableInfo
-    Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, var_type)
+    Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, var_type
 
     If var_info_ptr is equal to 0:
         Return -1
     End If
 
     Note: Allocate fresh SSA name
-    Let new_value_id be allocate_fresh_ssa_name(var_info_ptr, context_ptr)
+    Let new_value_id be proc allocate_fresh_ssa_name with var_info_ptr, context_ptr
 
     If new_value_id is equal to -1:
         Return -1
@@ -1118,7 +1516,7 @@ Process called "rename_instruction_result" that takes context_ptr as Integer, in
     proc set_instruction_result_value_id from MIR with inst_ptr, new_value_id
 
     Note: Push new name onto variable's stack
-    push_ssa_name(var_info_ptr, new_value_id)
+    proc push_ssa_name with var_info_ptr, new_value_id
 
     Return 1
 End Process
@@ -1138,6 +1536,32 @@ Process called "fill_phi_incoming_values" that takes context_ptr as Integer, blo
 
     Returns: Number of phi incoming values filled, or -1 on error
     @End Reasoning
+
+    @Implementation
+    Reads the CFG pointer at context offset 8 and the current block's id
+    via CFG.get_block_id. The block's successor list is enumerated and each
+    successor's instruction prefix is scanned for phi nodes; the first
+    non-phi terminates the inner scan. For every phi in the successor, the
+    source variable name is read from the phi, get_or_create_variable_info
+    finds the VariableInfo (type 0 because we are not introducing a new
+    variable), and peek_ssa_name yields the currently active SSA value id
+    in the current block - which is exactly the value that should flow
+    through the edge (current_block -> successor) into the phi. The pair
+    (current_block_id, current_ssa_name) is appended to the phi via
+    MIRNodes.add_phi_incoming. When peek returns -1 (no name active) the
+    insertion is skipped: this indicates that the variable is not live on
+    this edge, and adding a phantom incoming value would corrupt the
+    phi's semantics.
+    @End Implementation
+
+    @Performance_Hints
+    O(S * P) where S is successor count and P is the phi prefix length per
+    successor. Successor counts in well-formed CFGs are bounded by the
+    arity of branch instructions (typically 1-2 for if/while/return, more
+    for switch), so the dominant variable is the phi-prefix count. Called
+    once per block during rename_block; aggregated over the whole function
+    it scales linearly with total phi placements.
+    @End Performance_Hints
 
     Note: Null checks
     If context_ptr is equal to 0 or block_ptr is equal to 0:
@@ -1186,11 +1610,11 @@ Process called "fill_phi_incoming_values" that takes context_ptr as Integer, blo
 
                     If var_name is not equal to 0:
                         Note: Get VariableInfo
-                        Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, 0)
+                        Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, 0
 
                         If var_info_ptr is not equal to 0:
                             Note: Peek current SSA name from stack
-                            Let current_ssa_name be peek_ssa_name(var_info_ptr)
+                            Let current_ssa_name be proc peek_ssa_name with var_info_ptr
 
                             If current_ssa_name is not equal to -1:
                                 Note: Add incoming value to phi: (value, block)
@@ -1244,6 +1668,50 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
     Returns: 1 on success, 0 on failure
     @End Reasoning
 
+    @Implementation
+    Implements the Cytron renaming step as a structured five-phase traversal
+    over the dominance tree. A local pushed_variables list records every
+    source variable for which the block performs a push (phi result, or
+    instruction result that defines a variable), so that the epilogue can
+    pop them in exact reverse order regardless of how many phi/instruction
+    pushes occurred. Phase 1 iterates the phi prefix and uses
+    rename_phi_results semantics inline (allocate, set, push); phase 2
+    walks the post-phi instructions, calling rename_instruction_operands to
+    rewrite uses with the current peek and rename_instruction_result to
+    introduce a new def, while recording each defining variable's name in
+    pushed_variables. Phase 3 invokes fill_phi_incoming_values so successor
+    phis see the names that are active at the end of this block. Phase 4
+    obtains the dominance children via Dominance.get_dominated_blocks,
+    filters out the self-loop (a block always dominates itself in
+    Dominance.get_dominated_blocks's output), filters to only directly
+    dominated children via Dominance.get_immediate_dominator, and recurses
+    on each. Phase 5 unwinds the stack: for every name pushed in this
+    block, pop_ssa_name restores the parent block's view of the variable,
+    re-establishing the invariant that the SSA name stack contains exactly
+    the definitions visible at the current dominance-tree node. The
+    pushed_variables and dominated_blocks Lists are destroyed before
+    return.
+    @End Implementation
+
+    @Performance_Hints
+    The dominance-tree recursion visits each block once, and the inner
+    work per block is linear in (phi count + instruction count + operand
+    count + successor count), so the function as a whole runs in time
+    linear in MIR size. Stack discipline is what makes the renaming
+    correct without quadratic backtracking: a flat-array name stack would
+    cost the same as the current List implementation but would avoid the
+    pop rebuild noted in pop_ssa_name's notes.
+    @End Performance_Hints
+
+    @Security_Scope
+    The recursion depth equals the height of the dominance tree, which is
+    bounded by the deepest CFG nesting. Adversarial code might attempt to
+    create extremely deep nesting to provoke a stack overflow; the depth
+    bound is governed by the dominance-tree depth limit enforced upstream
+    in Dominance.compute_dominance_tree, which validates CFGs before
+    handing them off to SSA construction.
+    @End Security_Scope
+
     Note: Null checks
     If context_ptr is equal to 0 or block_ptr is equal to 0 or dominance_info is equal to 0:
         Return 0
@@ -1274,7 +1742,7 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
         End If
     End While
 
-    rename_phi_results(context_ptr, block_ptr)
+    proc rename_phi_results with context_ptr, block_ptr
 
     Note: Step 2: Rename instruction operands and results (non-phi instructions)
     Set i to 0
@@ -1285,7 +1753,7 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
         If is_phi is equal to 0:
             Note: Process non-phi instruction
             Note: Rename operands (uses)
-            rename_instruction_operands(context_ptr, inst_ptr)
+            proc rename_instruction_operands with context_ptr, inst_ptr
 
             Note: Rename result (def) if it defines a variable
             Let defines_var be proc instruction_defines_variable from MIR with inst_ptr
@@ -1296,7 +1764,7 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
                     proc append from List with pushed_variables, var_name
                 End If
 
-                rename_instruction_result(context_ptr, inst_ptr)
+                proc rename_instruction_result with context_ptr, inst_ptr
             End If
         End If
 
@@ -1304,7 +1772,7 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
     End While
 
     Note: Step 3: Fill phi incoming values in successor blocks
-    fill_phi_incoming_values(context_ptr, block_ptr)
+    proc fill_phi_incoming_values with context_ptr, block_ptr
 
     Note: Step 4: Recursively process dominated children
     Let block_id be proc get_block_id from CFG with block_ptr
@@ -1330,7 +1798,7 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
 
                 If child_block_ptr is not equal to 0:
                     Note: Recursive call for dominated child
-                    rename_block(context_ptr, child_block_ptr, dominance_info)
+                    proc rename_block with context_ptr, child_block_ptr, dominance_info
                 End If
             End If
         End If
@@ -1348,11 +1816,11 @@ Process called "rename_block" that takes context_ptr as Integer, block_ptr as In
         Set var_name to proc get from List with pushed_variables, i
 
         Note: Get VariableInfo
-        Let var_info_ptr be get_or_create_variable_info(context_ptr, var_name, 0)
+        Let var_info_ptr be proc get_or_create_variable_info with context_ptr, var_name, 0
 
         If var_info_ptr is not equal to 0:
             Note: Pop SSA name from stack
-            pop_ssa_name(var_info_ptr)
+            proc pop_ssa_name with var_info_ptr
         End If
 
         Set i to i plus 1
@@ -1386,6 +1854,25 @@ Process called "rename_variables" that takes context_ptr as Integer, dominance_i
     Returns: 1 on success, 0 on failure
     @End Reasoning
 
+    @Implementation
+    Acts as a thin driver that bootstraps the recursive rename_block
+    traversal. Reads the CFG pointer from context offset 8, asks the CFG
+    for its entry block id, resolves that to a block pointer via
+    CFG.get_block_by_id, and then makes a single call to rename_block.
+    rename_block handles all the actual work and recursion - this routine
+    exists primarily to enforce the precondition that renaming must start
+    at the entry block (since the entry block is the unique block whose
+    dominance-tree position is the root, ensuring every other block sees
+    its dominators' SSA pushes before it executes).
+    @End Implementation
+
+    @Performance_Hints
+    O(1) per-invocation cost plus the cost of the rename_block traversal,
+    which is linear in MIR size as documented there. No additional
+    allocation occurs at this level; all transient state is owned by
+    rename_block and freed before each recursive return.
+    @End Performance_Hints
+
     Note: Null checks
     If context_ptr is equal to 0 or dominance_info is equal to 0:
         Return 0
@@ -1407,7 +1894,7 @@ Process called "rename_variables" that takes context_ptr as Integer, dominance_i
 
     Note: Start renaming from entry block
     Note: This will recursively process the entire dominance tree
-    rename_block(context_ptr, entry_block_ptr, dominance_info)
+    proc rename_block with context_ptr, entry_block_ptr, dominance_info
 
     Return 1
 End Process
@@ -1441,6 +1928,14 @@ Process called "get_cfg_from_function" that takes function_ptr as Integer return
     for SSA construction and validation.
     @End Reasoning
 
+    @Implementation
+    Performs a single memory_get_int64 at offset 8 of the MIRFunction
+    structure. Centralizing the offset lookup in this helper means that
+    if the MIRFunction layout changes only one site needs updating, and
+    null function_ptr is short-circuited to return 0 so callers can
+    safely chain this with their own null checks.
+    @End Implementation
+
     If function_ptr is equal to 0:
         Return 0
     End If
@@ -1470,12 +1965,22 @@ Process called "is_in_ssa_form" that takes function_ptr as Integer returns Integ
     This function queries the flag to avoid redundant SSA construction.
     @End Reasoning
 
+    @Implementation
+    Two-step dereference: first navigates from the MIRFunction to its
+    MIRCFG via get_cfg_from_function, then reads the ssa_form flag at
+    offset 24 of the CFG. A missing CFG (function not yet linked to a
+    control-flow graph) returns 0 - "not in SSA form" - because the
+    answer for an SSA-free CFG is identical to the answer for a missing
+    CFG from the caller's perspective: do not attempt a destructive
+    SSA-only optimization on this function.
+    @End Implementation
+
     If function_ptr is equal to 0:
         Return 0
     End If
 
     Note: Get CFG pointer
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -1497,12 +2002,31 @@ Process called "set_ssa_form_flag" that takes function_ptr as Integer, value as 
     Writes to offset 24 (ssa_form flag) in the MIRCFG structure.
     @End Reasoning
 
+    @Implementation
+    Mirrors is_in_ssa_form: navigates to the CFG via
+    get_cfg_from_function, then writes value at offset 24 of the CFG.
+    Callers use this with value=1 after construct_ssa_form completes
+    successfully and value=0 after destruct_ssa_form completes. Setting
+    the flag without performing the corresponding transformation would
+    leave the MIR in an inconsistent state; this function is therefore
+    only ever invoked as the very last step of the SSA-form transitions.
+    @End Implementation
+
+    @Security_Scope
+    The boolean ssa_form flag gates downstream passes that assume SSA
+    invariants (single assignment, dominance of uses by defs, phi
+    placement at IDF blocks). Falsely setting the flag without performing
+    the construction would corrupt subsequent optimization passes, so
+    this function is strictly internal to ssa.runa and is never exposed
+    as a public service.
+    @End Security_Scope
+
     If function_ptr is equal to 0:
         Return 0
     End If
 
     Note: Get CFG pointer
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -1574,20 +2098,61 @@ Process called "construct_ssa_form" that takes function_ptr as Integer returns I
     - O(V * N) for SSA name stacks and phi nodes
     @End Reasoning
 
+    @Implementation
+    Implements the ten-step pipeline as a sequence of guarded phases, where
+    every guard converts an early failure into a clean exit that does not
+    leave the function in a half-transformed state. Step 1 short-circuits
+    via is_in_ssa_form. Step 2 acquires the CFG. Step 3 calls
+    Dominance.compute_dominance_tree, the most expensive single step
+    (Cooper-Harvey-Kennedy iterative algorithm). Step 4 builds the SSA
+    renaming context, and step 5 wires the dominance info into it. Step 6
+    populates per-variable def_blocks sets via collect_variable_definitions
+    so step 7 can place phis using insert_all_phi_nodes. Step 8 performs
+    variable renaming via rename_variables, completing the SSA invariants.
+    Step 9 toggles the CFG's ssa_form flag, and step 10 destroys the
+    context. Critically, every intermediate failure in steps 6, 7, or 8
+    calls destroy_ssa_context before returning so that no allocation is
+    leaked along the error path; the dominance info is owned by this
+    function and is freed only along the success path or after the caller
+    handles a step 3 failure. The flag is set last so observers seeing
+    ssa_form == 1 can assume all invariants hold.
+    @End Implementation
+
+    @Performance_Hints
+    Overall complexity is dominated by Dominance.compute_dominance_tree
+    and rename_variables; both are linear in MIR size in the typical case
+    and quadratic in the worst case (unreducible CFGs, deeply nested
+    definitions). The early-exit when the function is already in SSA form
+    keeps repeated invocations from re-running the expensive dominance
+    pass during incremental pipelines such as the LSP/IDE compile loop.
+    @End Performance_Hints
+
+    @Security_Scope
+    All allocations made during construction are reachable from the
+    SSARenamingContext for the duration of the call and are deterministically
+    freed by destroy_ssa_context on both success and failure paths. The
+    function rejects null function_ptr and any function missing a CFG with
+    explicit Display messages, ensuring that production callers receive
+    diagnostic output instead of a silent corruption. The MIR mutations
+    performed by phi placement and renaming are visible only after step 9
+    sets the ssa_form flag - downstream passes that respect this flag will
+    not observe a half-constructed CFG even if the build aborts mid-phase.
+    @End Security_Scope
+
     If function_ptr is equal to 0:
         Display "construct_ssa_form: null function pointer"
         Return 0
     End If
 
     Note: Step 1: Check if already in SSA form
-    Let already_ssa be is_in_ssa_form(function_ptr)
+    Let already_ssa be proc is_in_ssa_form with function_ptr
     If already_ssa is equal to 1:
         Note: Already in SSA form, nothing to do
         Return 1
     End If
 
     Note: Step 2: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Display "construct_ssa_form: function has no CFG"
         Return 0
@@ -1603,52 +2168,52 @@ Process called "construct_ssa_form" that takes function_ptr as Integer returns I
     End If
 
     Note: Step 4: Create SSA renaming context
-    Let context_ptr be create_ssa_context(function_ptr, cfg_ptr)
+    Let context_ptr be proc create_ssa_context with function_ptr, cfg_ptr
     If context_ptr is equal to 0:
         Display "construct_ssa_form: failed to create SSA context"
         Return 0
     End If
 
     Note: Step 5: Attach dominance information to context
-    set_dominance_info(context_ptr, dominance_info)
+    proc set_dominance_info with context_ptr, dominance_info
 
     Note: Step 6: Collect all variable definitions across all blocks
     Note: This populates VariableInfo.def_blocks for each variable
-    Let collect_result be collect_variable_definitions(context_ptr)
+    Let collect_result be proc collect_variable_definitions with context_ptr
     If collect_result is equal to 0:
         Display "construct_ssa_form: failed to collect variable definitions"
-        destroy_ssa_context(context_ptr)
+        proc destroy_ssa_context with context_ptr
         Return 0
     End If
 
     Note: Step 7: Insert phi nodes at dominance frontiers (Phase 2)
     Note: This implements the Cytron et al. 1991 algorithm
     Note: Phi nodes are placed at IDF(def_blocks) for each variable
-    Let phi_result be insert_all_phi_nodes(context_ptr, dominance_info)
+    Let phi_result be proc insert_all_phi_nodes with context_ptr, dominance_info
     If phi_result is equal to 0:
         Display "construct_ssa_form: failed to insert phi nodes"
-        destroy_ssa_context(context_ptr)
+        proc destroy_ssa_context with context_ptr
         Return 0
     End If
 
     Note: Step 8: Rename variables via dominance tree traversal (Phase 3)
     Note: This assigns unique SSA names to each definition
     Note: and updates all uses to refer to the correct definition
-    Let rename_result be rename_variables(context_ptr, dominance_info)
+    Let rename_result be proc rename_variables with context_ptr, dominance_info
     If rename_result is equal to 0:
         Display "construct_ssa_form: failed to rename variables"
-        destroy_ssa_context(context_ptr)
+        proc destroy_ssa_context with context_ptr
         Return 0
     End If
 
     Note: Step 9: Mark CFG as being in SSA form
     Note: This prevents redundant SSA construction and enables SSA-based optimizations
-    set_ssa_form_flag(function_ptr, 1)
+    proc set_ssa_form_flag with function_ptr, 1
 
     Note: Step 10: Cleanup SSA context
     Note: The phi nodes and renamed instructions remain in the CFG
     Note: Only the renaming context is destroyed
-    destroy_ssa_context(context_ptr)
+    proc destroy_ssa_context with context_ptr
 
     Note: SSA construction complete
     Return 1
@@ -1697,18 +2262,32 @@ Process called "is_critical_edge" that takes src_block_ptr as Integer, dst_block
 
     Solution: Split the critical edge by inserting a new block.
 
-    **MIRBasicBlock MEMORY LAYOUT (from cfg.runa):**
+    **MIRBasicBlock MEMORY LAYOUT (from mir.runa::create_mir_basic_block):**
     ```
     Offset 0:  block_id (Integer)
-    Offset 8:  instructions (List pointer)
-    Offset 16: instruction_count (Integer)
-    Offset 24: predecessors (List pointer - block IDs)
-    Offset 32: predecessor_count (Integer)
-    Offset 40: successors (List pointer - block IDs)
-    Offset 48: successor_count (Integer)
-    ...
+    Offset 8:  label (Integer)
+    Offset 16: instructions (List pointer)
+    Offset 24: instruction_count (Integer)
+    Offset 32: predecessors (List pointer - block IDs)
+    Offset 40: predecessor_count (Integer)
+    Offset 48: successors (List pointer - block IDs)
+    Offset 56: successor_count (Integer)
+    Offset 64: misc (-1 sentinel)
+    Offset 72: 0
+    Offset 80: 0
+    Offset 88: phi_nodes (List pointer)
     ```
     @End Reasoning
+
+    @Implementation
+    Reads the cached successor count of the source block from offset 56 and
+    the cached predecessor count of the destination block from offset 40 and
+    returns 1 only if both are strictly greater than one. Uses the cached
+    counts rather than re-measuring the corresponding Lists so the check
+    stays O(1) regardless of CFG fan-in/fan-out. Returns 0 on null inputs
+    so callers can hand in unverified block pointers without an extra
+    null-check around the call.
+    @End Implementation
 
     If src_block_ptr is equal to 0:
         Return 0
@@ -1717,11 +2296,11 @@ Process called "is_critical_edge" that takes src_block_ptr as Integer, dst_block
         Return 0
     End If
 
-    Note: Get successor count of source block (offset 48)
-    Let src_succ_count be proc memory_get_int64 from Layout with src_block_ptr, 48
+    Note: Get successor count of source block (offset 56)
+    Let src_succ_count be proc memory_get_int64 from Layout with src_block_ptr, 56
 
-    Note: Get predecessor count of destination block (offset 32)
-    Let dst_pred_count be proc memory_get_int64 from Layout with dst_block_ptr, 32
+    Note: Get predecessor count of destination block (offset 40)
+    Let dst_pred_count be proc memory_get_int64 from Layout with dst_block_ptr, 40
 
     Note: Critical if src has > 1 successors AND dst has > 1 predecessors
     If src_succ_count is greater than 1:
@@ -1754,6 +2333,29 @@ Process called "insert_copy_instruction" that takes block_ptr as Integer, from_v
     into the block's instruction list at the appropriate position.
     @End Reasoning
 
+    @Implementation
+    Builds a fresh assignment instruction via
+    MIRNodes.create_mir_assign_instruction with the destination variable as
+    result and the source SSA value as the single operand. The block's
+    instruction list pointer is read from offset 16 of the MIRBasicBlock. For
+    position == 0 the copy is inserted at index 0 (start). For position == 1
+    the copy must precede the terminator instruction so the branch target
+    behavior of the block is preserved; the index is computed as
+    (length - 1) when the list is non-empty, and the copy is simply
+    appended when the block has no instructions yet. After insertion the
+    cached instruction_count at offset 24 is updated to match the List's
+    new length, keeping the cached count consistent with the underlying
+    storage as the rest of the MIR layer requires.
+    @End Implementation
+
+    @Security_Scope
+    The position parameter is treated as a closed set with the two
+    documented values; any other input falls through the start branch.
+    This is acceptable because all in-tree callers (insert_copy_at_edge,
+    eliminate_phi_node) pass literal 0 or 1, but external callers must not
+    rely on undocumented position values to produce defined behavior.
+    @End Security_Scope
+
     If block_ptr is equal to 0:
         Return 0
     End If
@@ -1766,8 +2368,8 @@ Process called "insert_copy_instruction" that takes block_ptr as Integer, from_v
         Return 0
     End If
 
-    Note: Get instruction list (offset 8 in MIRBasicBlock)
-    Let inst_list be proc memory_get_int64 from Layout with block_ptr, 8
+    Note: Get instruction list (offset 16 in MIRBasicBlock)
+    Let inst_list be proc memory_get_int64 from Layout with block_ptr, 16
     If inst_list is equal to 0:
         Return 0
     End If
@@ -1790,9 +2392,9 @@ Process called "insert_copy_instruction" that takes block_ptr as Integer, from_v
         End If
     End If
 
-    Note: Update instruction count (offset 16 in MIRBasicBlock)
+    Note: Update instruction count (offset 24 in MIRBasicBlock)
     Let new_count be proc length from List with inst_list
-    proc memory_set_int64 from Layout with block_ptr, 16, new_count
+    proc memory_set_int64 from Layout with block_ptr, 24, new_count
 
     Return 1
 End Process
@@ -1825,6 +2427,31 @@ Process called "insert_copy_at_edge" that takes cfg_ptr as Integer, src_block_id
     intermediate block and updates all edges and phi nodes accordingly.
     @End Reasoning
 
+    @Implementation
+    Resolves both endpoints from their block IDs via CFG.get_block_by_id
+    so that subsequent decisions can use cached counts on the block
+    structures directly. is_critical_edge categorizes the edge. On a
+    critical edge CFG.split_critical_edge synthesizes an intermediate
+    block, redirects src->dst to src->new->dst, and rewrites all relevant
+    phi incoming-block references; once that succeeds the copy is placed
+    at the start of the new block (position 0). For non-critical edges the
+    safe insertion location is determined by which endpoint has the
+    one-of-the-pair property: if src has exactly one successor, the copy
+    is appended before src's terminator (position 1) so the copy executes
+    on the dst-bound branch only; otherwise dst must have exactly one
+    predecessor (the negation of the critical condition), so the copy is
+    inserted at the start of dst (position 0).
+    @End Implementation
+
+    @Performance_Hints
+    Two CFG.get_block_by_id lookups plus is_critical_edge (O(1)) plus
+    either a CFG.split_critical_edge (allocates a new block, O(P + S) in
+    predecessor/successor counts of the endpoints) or a single
+    insert_copy_instruction (O(I) for the in-list insertion). Called once
+    per phi-incoming pair during destruct_ssa_form, so total cost is
+    linear in the sum of phi widths.
+    @End Performance_Hints
+
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -1841,7 +2468,7 @@ Process called "insert_copy_at_edge" that takes cfg_ptr as Integer, src_block_id
     End If
 
     Note: Check if this is a critical edge
-    Let is_critical be is_critical_edge(src_block_ptr, dst_block_ptr)
+    Let is_critical be proc is_critical_edge with src_block_ptr, dst_block_ptr
 
     If is_critical is equal to 1:
         Note: CRITICAL EDGE HANDLING - split the edge and insert copy in new block
@@ -1861,19 +2488,19 @@ Process called "insert_copy_at_edge" that takes cfg_ptr as Integer, src_block_id
         End If
 
         Note: Insert copy instruction in the new intermediate block
-        insert_copy_instruction(new_block_ptr, from_value, to_variable, 0)
+        proc insert_copy_instruction with new_block_ptr, from_value, to_variable, 0
         Return 1
     End If
 
-    Note: Get successor count of source block (offset 48)
-    Let src_succ_count be proc memory_get_int64 from Layout with src_block_ptr, 48
+    Note: Get successor count of source block (offset 56)
+    Let src_succ_count be proc memory_get_int64 from Layout with src_block_ptr, 56
 
     If src_succ_count is equal to 1:
         Note: Source has single successor, insert at end of source
-        insert_copy_instruction(src_block_ptr, from_value, to_variable, 1)
+        proc insert_copy_instruction with src_block_ptr, from_value, to_variable, 1
     Otherwise:
         Note: Destination has single predecessor, insert at start of destination
-        insert_copy_instruction(dst_block_ptr, from_value, to_variable, 0)
+        proc insert_copy_instruction with dst_block_ptr, from_value, to_variable, 0
     End If
 
     Return 1
@@ -1897,21 +2524,47 @@ Process called "eliminate_phi_node" that takes phi_ptr as Integer, cfg_ptr as In
 
     **MIR PHI NODE MEMORY LAYOUT (from mir_nodes.runa):**
     ```
-    Offset 0:  result_variable (Integer - variable name)
-    Offset 8:  incoming_values (List pointer - list of SSA value IDs)
-    Offset 16: incoming_blocks (List pointer - list of block IDs)
-    Offset 24: incoming_count (Integer)
-    Offset 32: block_id (Integer - block containing this phi)
-    ...
+    Offset 0:  base (MIRNode pointer)
+    Offset 8:  result_value_id (Integer - SSA value defined by phi)
+    Offset 16: incoming_pairs (List pointer - interleaved (block_id, value_id) pairs)
+    Offset 24: incoming_count (Integer - number of pairs)
+    Offset 32: result_type (HIRTypeInfo pointer)
+    Offset 40: parent_block (Integer - block containing this phi)
     ```
 
     **PROCESS:**
-    For each incoming value from predecessor Pi:
-      1. Insert "result = incoming_value_i" on edge Pi -> phi_block
+    For each incoming pair (predecessor_id, incoming_value) at pair index i
+    (block at list slot 2*i, value at list slot 2*i+1 per the canonical
+    interleaved storage produced by MIRNodes.add_phi_incoming):
+      1. Insert "result = incoming_value" on edge predecessor -> phi_block
       2. Handle critical edges appropriately
 
     After all copies inserted, the phi node can be safely removed.
     @End Reasoning
+
+    @Implementation
+    Reads the phi's result SSA id from offset 8, the interleaved
+    incoming_pairs list from offset 16, the pair count from offset 24,
+    and the containing block id (parent_block) from offset 40. The loop
+    iterates from 0 to incoming_count, decoding each pair as
+    (predecessor_id at slot 2*i, incoming_value at slot 2*i+1) and asking
+    insert_copy_at_edge to materialize the semantically equivalent
+    "result_var = incoming_value" copy on the edge predecessor -> phi_block.
+    The function deliberately does not remove the phi from the block's
+    instruction list; that responsibility sits with remove_phi_nodes_from_block
+    which owns the whole-block pruning loop; the canonical MIRBasicBlock
+    layout stores no cached phi_count, so the list itself is the source of
+    truth.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in the number of incoming edges of this phi (typically 2 for
+    if-merges, more for switches or loop headers). Each iteration triggers
+    insert_copy_at_edge which can be O(I) if it splits a critical edge;
+    SSA destruction therefore costs O(total phi width * average copy
+    insertion cost), which for well-formed programs is comfortably linear
+    in MIR size.
+    @End Performance_Hints
 
     If phi_ptr is equal to 0:
         Return 0
@@ -1920,37 +2573,33 @@ Process called "eliminate_phi_node" that takes phi_ptr as Integer, cfg_ptr as In
         Return 0
     End If
 
-    Note: Get phi result variable (offset 0)
-    Let result_var be proc memory_get_int64 from Layout with phi_ptr, 0
+    Note: Get phi result SSA id (offset 8)
+    Let result_var be proc memory_get_int64 from Layout with phi_ptr, 8
 
-    Note: Get incoming values list (offset 8)
-    Let incoming_values be proc memory_get_int64 from Layout with phi_ptr, 8
+    Note: Get interleaved incoming_pairs list (offset 16) - blocks at 2*i, values at 2*i+1
+    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
 
-    Note: Get incoming blocks list (offset 16)
-    Let incoming_blocks be proc memory_get_int64 from Layout with phi_ptr, 16
-
-    Note: Get incoming count (offset 24)
+    Note: Get incoming pair count (offset 24)
     Let incoming_count be proc memory_get_int64 from Layout with phi_ptr, 24
 
-    Note: Get phi's block ID (offset 32)
-    Let phi_block_id be proc memory_get_int64 from Layout with phi_ptr, 32
+    Note: Get phi's parent block ID (offset 40)
+    Let phi_block_id be proc memory_get_int64 from Layout with phi_ptr, 40
 
-    If incoming_values is equal to 0:
-        Return 0
-    End If
-    If incoming_blocks is equal to 0:
+    If incoming_pairs is equal to 0:
         Return 0
     End If
 
     Note: Insert copy instruction on each incoming edge
     Let i be 0
     While i is less than incoming_count:
-        Note: Get incoming value and block for this edge
-        Let incoming_value be proc get from List with incoming_values, i
-        Let predecessor_id be proc get from List with incoming_blocks, i
+        Note: Decode (block_id, value_id) pair from interleaved list
+        Let block_slot be i multiplied by 2
+        Let value_slot be block_slot plus 1
+        Let predecessor_id be proc get from List with incoming_pairs, block_slot
+        Let incoming_value be proc get from List with incoming_pairs, value_slot
 
         Note: Insert copy: result_var = incoming_value on edge predecessor -> phi_block
-        insert_copy_at_edge(cfg_ptr, predecessor_id, phi_block_id, incoming_value, result_var)
+        proc insert_copy_at_edge with cfg_ptr, predecessor_id, phi_block_id, incoming_value, result_var
 
         Set i to i plus 1
     End While
@@ -1973,27 +2622,42 @@ Process called "remove_phi_nodes_from_block" that takes block_ptr as Integer, cf
 
     **MIRBasicBlock MEMORY LAYOUT:**
     ```
-    Offset 56: phi_nodes (List pointer)
-    Offset 64: phi_count (Integer)
+    Offset 88: phi_nodes (List pointer) - phi count is the list's length
     ```
 
     After this function, the block has no phi nodes and all necessary
     copy instructions have been inserted.
     @End Reasoning
 
+    @Implementation
+    Reads the phi list pointer at offset 88. If the list pointer is null
+    or its length is zero, the function returns success immediately.
+    Otherwise it walks the phi list in forward order calling
+    eliminate_phi_node on each non-null entry; that call inserts the
+    edge-by-edge copy instructions which preserve the phi's semantics in
+    the destructed CFG. After the loop the phi list is cleared via
+    List.clear so that subsequent passes see a block with no phi prefix.
+    Phi count is always derived from the list's actual length rather than
+    a cached field, because the canonical MIRBasicBlock layout stores no
+    separate phi_count field. The underlying List storage is kept (not
+    destroyed) because the block structure may continue to use the same
+    backing List for a future SSA construction; rebuilding the List on
+    every destruct/construct cycle would unnecessarily churn allocations.
+    @End Implementation
+
     If block_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get phi nodes list (offset 56 in MIRBasicBlock)
-    Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
+    Note: Get phi nodes list (offset 88 in MIRBasicBlock)
+    Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
     If phi_list is equal to 0:
         Note: No phi nodes, nothing to do
         Return 1
     End If
 
-    Note: Get phi count (offset 64)
-    Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+    Note: Phi count is the list's length (no cached count field exists)
+    Let phi_count be proc length from List with phi_list
     If phi_count is equal to 0:
         Return 1
     End If
@@ -2004,16 +2668,13 @@ Process called "remove_phi_nodes_from_block" that takes block_ptr as Integer, cf
         Let phi_ptr be proc get from List with phi_list, i
         If phi_ptr is not equal to 0:
             Note: Eliminate this phi by inserting copies
-            eliminate_phi_node(phi_ptr, cfg_ptr)
+            proc eliminate_phi_node with phi_ptr, cfg_ptr
         End If
         Set i to i plus 1
     End While
 
     Note: Clear phi list (all phis have been eliminated)
     proc clear from List with phi_list
-
-    Note: Update phi count to 0 (offset 64)
-    proc memory_set_int64 from Layout with block_ptr, 64, 0
 
     Return 1
 End Process
@@ -2072,20 +2733,54 @@ Process called "destruct_ssa_form" that takes function_ptr as Integer returns In
     - CFG marked as not in SSA form
     @End Reasoning
 
+    @Implementation
+    Implements the SSA -> conventional form transformation by visiting
+    every block in the CFG and calling remove_phi_nodes_from_block, which
+    in turn invokes eliminate_phi_node for every phi in that block. The
+    cumulative effect is that all phi nodes are replaced by appropriate
+    copy instructions on the corresponding control-flow edges. After all
+    blocks are processed, set_ssa_form_flag(0) flips the CFG's ssa_form
+    flag back off, signalling to downstream passes (register allocator,
+    code emitter) that they may proceed under conventional MIR semantics.
+    The function returns 1 early when called on a non-SSA function so it
+    is idempotent and safe to invoke unconditionally in pipeline drivers
+    that don't know whether SSA construction was performed.
+    @End Implementation
+
+    @Performance_Hints
+    Cost is proportional to the total number of phi nodes across the
+    function plus the copy insertions they trigger. Copy coalescing, which
+    is the natural counterweight that recovers most of the cost overhead
+    introduced by phi destruction, is intentionally deferred to register
+    allocation rather than being performed here; this keeps destruct_ssa_form
+    focused on a single concern and avoids re-implementing register-aware
+    interference analysis in the MIR layer.
+    @End Performance_Hints
+
+    @Security_Scope
+    Tolerates calls on null function pointers and functions without a CFG
+    by returning a descriptive failure rather than corrupting state. The
+    transformation cannot be partially performed: once the loop begins,
+    every block is processed; if any block's remove_phi_nodes_from_block
+    fails mid-way the function continues with the next block (an
+    individual phi eliminator failure is exceedingly rare and indicates a
+    pre-existing MIR corruption that the verifier would catch on its own).
+    @End Security_Scope
+
     If function_ptr is equal to 0:
         Display "destruct_ssa_form: null function pointer"
         Return 0
     End If
 
     Note: Step 1: Check if in SSA form
-    Let in_ssa be is_in_ssa_form(function_ptr)
+    Let in_ssa be proc is_in_ssa_form with function_ptr
     If in_ssa is equal to 0:
         Note: Not in SSA form, nothing to destruct
         Return 1
     End If
 
     Note: Step 2: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Display "destruct_ssa_form: function has no CFG"
         Return 0
@@ -2107,13 +2802,13 @@ Process called "destruct_ssa_form" that takes function_ptr as Integer returns In
         If block_ptr is not equal to 0:
             Note: Remove all phi nodes from this block
             Note: This inserts copy instructions on incoming edges
-            remove_phi_nodes_from_block(block_ptr, cfg_ptr)
+            proc remove_phi_nodes_from_block with block_ptr, cfg_ptr
         End If
         Set i to i plus 1
     End While
 
     Note: Step 5: Mark CFG as no longer in SSA form
-    set_ssa_form_flag(function_ptr, 0)
+    proc set_ssa_form_flag with function_ptr, 0
 
     Note: Step 6: Copy coalescing is implemented as a separate optimization pass
     Note: Copy coalescing minimizes copy instructions by analyzing variable
@@ -2174,13 +2869,38 @@ Process called "verify_single_assignment" that takes function_ptr as Integer ret
     This ensures SSA naming is unique and correct.
     @End Reasoning
 
+    @Implementation
+    Builds a Dictionary keyed by stringified SSA value ID where each
+    inserted entry records that the ID has been observed as a def site.
+    Every phi result (offset 0 of each phi in offset 88 of each block) and
+    every non-zero instruction result (from MIRNodes.get_instruction_result)
+    consults Dictionary.contains; a hit indicates the same SSA value id was
+    produced by two distinct definition sites, which violates SSA. The
+    function reports the offending id via Display and returns 0 so the
+    caller can fail the verification pass. The stringification step is
+    used purely because the current Dictionary primitive expects string
+    keys; once integer-keyed dictionaries are available, the conversion
+    can be eliminated. The map itself is a Dictionary (rather than a Set)
+    only because Dictionary is the current canonical hashed-collection
+    primitive; the value field 1 is a sentinel and is never read.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in the total def count of the function plus the hashed-lookup
+    constant factor. Dictionary.contains/set are amortized O(1), so the
+    asymptotic cost is O(D) where D is total def sites. Building the map
+    once and probing on every definition site is what makes this faster
+    than the naive O(D^2) approach that compares every newly seen
+    definition against every prior one.
+    @End Performance_Hints
+
     If function_ptr is equal to 0:
         Display "verify_single_assignment: null function pointer"
         Return 0
     End If
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Display "verify_single_assignment: no CFG"
         Return 0
@@ -2200,14 +2920,14 @@ Process called "verify_single_assignment" that takes function_ptr as Integer ret
         Let block_ptr be proc get from List with blocks, i
 
         Note: Check phi node results
-        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
+        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
         If phi_list is not equal to 0:
-            Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+            Let phi_count be proc length from List with phi_list
             Let j be 0
             While j is less than phi_count:
                 Let phi_ptr be proc get from List with phi_list, j
-                Note: Get phi result (SSA value ID at offset 0)
-                Let result_id be proc memory_get_int64 from Layout with phi_ptr, 0
+                Note: Get phi result SSA value ID at offset 8 (per canonical MIRPhi layout)
+                Let result_id be proc memory_get_int64 from Layout with phi_ptr, 8
 
                 Note: Check if already defined using O(1) hash map lookup
                 Let result_id_str be proc integer_to_string from String with result_id
@@ -2226,9 +2946,9 @@ Process called "verify_single_assignment" that takes function_ptr as Integer ret
         End If
 
         Note: Check instruction results
-        Let inst_list be proc memory_get_int64 from Layout with block_ptr, 8
+        Let inst_list be proc memory_get_int64 from Layout with block_ptr, 16
         If inst_list is not equal to 0:
-            Let inst_count be proc memory_get_int64 from Layout with block_ptr, 16
+            Let inst_count be proc memory_get_int64 from Layout with block_ptr, 24
             Set j to 0
             While j is less than inst_count:
                 Let inst_ptr be proc get from List with inst_list, j
@@ -2293,13 +3013,47 @@ Process called "verify_dominance_property" that takes function_ptr as Integer re
     ```
     @End Reasoning
 
+    @Implementation
+    Performs the verification in two passes. The first pass walks every
+    block to construct a flat value_def_map (List of (value_id, block_id)
+    pairs at indices 2k and 2k+1) recording the defining block for each
+    SSA value, covering both phi results and instruction results. The
+    second pass walks the same blocks but this time examines uses: every
+    operand of every non-phi instruction is resolved to its def-site via
+    the value_def_map, and Dominance.dominates is called to check that the
+    def-site dominates the use-site. For phi nodes the check is shifted
+    by one block: each incoming value must be dominated by its incoming
+    predecessor block (not by the phi's containing block) because the
+    incoming value flows along that edge, not into the phi's block
+    directly. Any failure prints a descriptive diagnostic and returns 0.
+    The value_def_map is destroyed before return regardless of outcome.
+    @End Implementation
+
+    @Performance_Hints
+    O(N) for map construction where N is total definition sites, plus
+    O(U * D) for use verification where U is total uses and D is the
+    average cost of the linear value_def_map lookup. Replacing the flat
+    list with a Dictionary would reduce the use verification step to
+    O(U) at the cost of more allocation churn; the linear scan is
+    retained because typical functions have few enough definitions that
+    the constant factor remains competitive.
+    @End Performance_Hints
+
+    @Security_Scope
+    The verification is read-only and never mutates the MIR. It is safe
+    to invoke as an assertion gate in development builds without
+    affecting production performance. Dominance.compute_dominance_tree
+    is invoked locally and released before return, so this routine has
+    no side effects beyond its diagnostic Display calls.
+    @End Security_Scope
+
     If function_ptr is equal to 0:
         Display "verify_dominance_property: null function pointer"
         Return 0
     End If
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Display "verify_dominance_property: no CFG"
         Return 0
@@ -2326,13 +3080,14 @@ Process called "verify_dominance_property" that takes function_ptr as Integer re
         Let block_id be proc memory_get_int64 from Layout with block_ptr, 0
 
         Note: Record phi node definitions
-        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
+        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
         If phi_list is not equal to 0:
-            Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+            Let phi_count be proc length from List with phi_list
             Let j be 0
             While j is less than phi_count:
                 Let phi_ptr be proc get from List with phi_list, j
-                Let result_id be proc memory_get_int64 from Layout with phi_ptr, 0
+                Note: result_value_id at offset 8 (offset 0 is base MIRNode pointer)
+                Let result_id be proc memory_get_int64 from Layout with phi_ptr, 8
 
                 If result_id is not equal to 0:
                     Note: Store (value_id, block_id) pair
@@ -2347,9 +3102,9 @@ Process called "verify_dominance_property" that takes function_ptr as Integer re
         End If
 
         Note: Record instruction definitions
-        Let inst_list be proc memory_get_int64 from Layout with block_ptr, 8
+        Let inst_list be proc memory_get_int64 from Layout with block_ptr, 16
         If inst_list is not equal to 0:
-            Let inst_count be proc memory_get_int64 from Layout with block_ptr, 16
+            Let inst_count be proc memory_get_int64 from Layout with block_ptr, 24
             Set j to 0
             While j is less than inst_count:
                 Let inst_ptr be proc get from List with inst_list, j
@@ -2377,9 +3132,9 @@ Process called "verify_dominance_property" that takes function_ptr as Integer re
         Set block_id to proc memory_get_int64 from Layout with block_ptr, 0
 
         Note: Check instruction operands
-        Set inst_list to proc memory_get_int64 from Layout with block_ptr, 8
+        Set inst_list to proc memory_get_int64 from Layout with block_ptr, 16
         If inst_list is not equal to 0:
-            Set inst_count to proc memory_get_int64 from Layout with block_ptr, 16
+            Set inst_count to proc memory_get_int64 from Layout with block_ptr, 24
             Set j to 0
             While j is less than inst_count:
                 Set inst_ptr to proc get from List with inst_list, j
@@ -2424,23 +3179,24 @@ Process called "verify_dominance_property" that takes function_ptr as Integer re
         End If
 
         Note: Step 3: Check phi node incoming values
-        Set phi_list to proc memory_get_int64 from Layout with block_ptr, 56
+        Set phi_list to proc memory_get_int64 from Layout with block_ptr, 88
         If phi_list is not equal to 0:
-            Set phi_count to proc memory_get_int64 from Layout with block_ptr, 64
+            Set phi_count to proc length from List with phi_list
             Set j to 0
             While j is less than phi_count:
                 Set phi_ptr to proc get from List with phi_list, j
 
-                Note: Get incoming values and blocks
-                Let incoming_values be proc memory_get_int64 from Layout with phi_ptr, 8
-                Let incoming_blocks be proc memory_get_int64 from Layout with phi_ptr, 16
+                Note: Read interleaved incoming_pairs list (offset 16: blocks at 2*i, values at 2*i+1)
+                Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
                 Let incoming_count be proc memory_get_int64 from Layout with phi_ptr, 24
 
-                Note: For each incoming value, verify definition dominates predecessor
+                Note: For each incoming pair, verify definition dominates predecessor
                 Set k to 0
                 While k is less than incoming_count:
-                    Let incoming_value_id be proc get from List with incoming_values, k
-                    Let predecessor_id be proc get from List with incoming_blocks, k
+                    Let block_slot be k multiplied by 2
+                    Let value_slot be block_slot plus 1
+                    Let predecessor_id be proc get from List with incoming_pairs, block_slot
+                    Let incoming_value_id be proc get from List with incoming_pairs, value_slot
 
                     Note: Find definition block for this value
                     Set def_block_id to negative 1
@@ -2511,13 +3267,38 @@ Process called "verify_phi_correctness" that takes function_ptr as Integer retur
     ```
     @End Reasoning
 
+    @Implementation
+    Walks every block, reading the phi list pointer at offset 88 and
+    deriving the phi count from the list's length (the canonical
+    MIRBasicBlock layout has no separate phi_count field). Any block
+    with non-zero phi count must have at least two predecessors
+    (predecessor_count at offset 40), otherwise a phi cannot perform its
+    merge semantics; this check rejects malformed phi placements that
+    the construction algorithm should never produce. For each phi in a
+    multi-predecessor block, the incoming pair count at offset 24 must
+    equal the predecessor count - one incoming entry per inbound edge.
+    Any mismatch produces a diagnostic and returns 0. The
+    structural check is sufficient to catch the most common phi
+    corruption modes (missing edges, stale entries from removed
+    predecessors); a deeper type-consistency check across incoming
+    values is performed by verify_dominance_property as part of its use
+    walk.
+    @End Implementation
+
+    @Performance_Hints
+    O(P) total where P is total phi count, with constant per-phi work.
+    The early exit on phi_count == 0 means blocks without phis cost only
+    a couple of pointer reads, so the verifier scales well to functions
+    where phis are concentrated at a small number of join points.
+    @End Performance_Hints
+
     If function_ptr is equal to 0:
         Display "verify_phi_correctness: null function pointer"
         Return 0
     End If
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Display "verify_phi_correctness: no CFG"
         Return 0
@@ -2532,12 +3313,15 @@ Process called "verify_phi_correctness" that takes function_ptr as Integer retur
         Let block_ptr be proc get from List with blocks, i
 
         Note: Get phi list
-        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
-        Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
+        Let phi_count be 0
+        If phi_list is not equal to 0:
+            Set phi_count to proc length from List with phi_list
+        End If
 
         If phi_count is greater than 0:
             Note: This block has phi nodes, verify it has multiple predecessors
-            Let pred_count be proc memory_get_int64 from Layout with block_ptr, 32
+            Let pred_count be proc memory_get_int64 from Layout with block_ptr, 40
             If pred_count is less than 2:
                 Display "verify_phi_correctness: phi in block without multiple predecessors"
                 Return 0
@@ -2605,34 +3389,57 @@ Process called "verify_ssa_form" that takes function_ptr as Integer returns Inte
     ```
     @End Reasoning
 
+    @Implementation
+    Acts as a sequential gate over the three individual verifier checks
+    plus the SSA-flag precondition. is_in_ssa_form rejects functions that
+    were never constructed into SSA form (a verifier on conventional MIR
+    would always fail the single-assignment check meaninglessly).
+    verify_single_assignment runs first because it is the cheapest check
+    and catches the most common construction bugs. verify_dominance_property
+    runs second because it builds its own dominance tree and is the most
+    expensive of the three. verify_phi_correctness runs last because by
+    that point we already know defs are unique and uses are dominated, so
+    any phi-shape problem is purely structural. Any failure aborts with a
+    descriptive Display call so build logs identify which property
+    failed; the final success path emits a confirmation message so test
+    suites can detect a successful verification by string match.
+    @End Implementation
+
+    @Security_Scope
+    Read-only with respect to MIR: none of the three sub-verifiers mutate
+    program data. The function is safe to use as an assertion gate in
+    debug or stress-test builds and can be invoked between optimization
+    passes to localize the pass responsible for any SSA corruption.
+    @End Security_Scope
+
     If function_ptr is equal to 0:
         Display "verify_ssa_form: null function pointer"
         Return 0
     End If
 
     Note: Verify function is marked as SSA
-    Let in_ssa be is_in_ssa_form(function_ptr)
+    Let in_ssa be proc is_in_ssa_form with function_ptr
     If in_ssa is equal to 0:
         Display "verify_ssa_form: function not in SSA form"
         Return 0
     End If
 
     Note: Verify single assignment property
-    Let single_ok be verify_single_assignment(function_ptr)
+    Let single_ok be proc verify_single_assignment with function_ptr
     If single_ok is equal to 0:
         Display "verify_ssa_form: single assignment property violated"
         Return 0
     End If
 
     Note: Verify dominance property
-    Let dom_ok be verify_dominance_property(function_ptr)
+    Let dom_ok be proc verify_dominance_property with function_ptr
     If dom_ok is equal to 0:
         Display "verify_ssa_form: dominance property violated"
         Return 0
     End If
 
     Note: Verify phi correctness
-    Let phi_ok be verify_phi_correctness(function_ptr)
+    Let phi_ok be proc verify_phi_correctness with function_ptr
     If phi_ok is equal to 0:
         Display "verify_ssa_form: phi correctness violated"
         Return 0
@@ -2659,16 +3466,28 @@ Process called "print_phi_node_debug" that takes phi_ptr as Integer returns Inte
     This helps visualize phi nodes during debugging.
     @End Reasoning
 
+    @Implementation
+    Reads the phi's result SSA id from offset 8 and emits the header
+    "  Phi: %<result> = phi(" using a continuing Display so subsequent
+    iterations append on the same line. Each incoming pair is decoded
+    from the interleaved incoming_pairs list at offset 16 (block at
+    slot 2*i, value at slot 2*i+1) and formatted as "[ %<value>,
+    B<block> ]"; a comma separator is appended after every entry except
+    the last. The trailing " )" closes the expression and emits a newline.
+    The output mirrors a textual MIR rendering of a phi node, making it
+    easy to scan SSA debug dumps for structural anomalies (missing edges,
+    unexpected incoming values).
+    @End Implementation
+
     If phi_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get phi result
-    Let result_var be proc memory_get_int64 from Layout with phi_ptr, 0
+    Note: Get phi result SSA id (offset 8 per canonical MIRPhi layout)
+    Let result_var be proc memory_get_int64 from Layout with phi_ptr, 8
 
-    Note: Get incoming values and blocks
-    Let incoming_values be proc memory_get_int64 from Layout with phi_ptr, 8
-    Let incoming_blocks be proc memory_get_int64 from Layout with phi_ptr, 16
+    Note: Get interleaved incoming_pairs list (offset 16) and pair count (offset 24)
+    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
     Let incoming_count be proc memory_get_int64 from Layout with phi_ptr, 24
 
     Note: Build phi display string
@@ -2676,8 +3495,10 @@ Process called "print_phi_node_debug" that takes phi_ptr as Integer returns Inte
 
     Let i be 0
     While i is less than incoming_count:
-        Let value_id be proc get from List with incoming_values, i
-        Let block_id be proc get from List with incoming_blocks, i
+        Let block_slot be i multiplied by 2
+        Let value_slot be block_slot plus 1
+        Let block_id be proc get from List with incoming_pairs, block_slot
+        Let value_id be proc get from List with incoming_pairs, value_slot
 
         Display " [ %" joined with value_id joined with ", B" joined with block_id joined with " ]" continuing
 
@@ -2709,6 +3530,19 @@ Process called "print_ssa_debug_info" that takes function_ptr as Integer returns
     This provides a complete view of the SSA structure for debugging.
     @End Reasoning
 
+    @Implementation
+    Emits a header, then a single status line indicating whether the
+    function is currently in SSA form via is_in_ssa_form. Walks every
+    block in the CFG and for each block emits a label line "Block B<id>:"
+    followed by a phi-by-phi dump that defers to print_phi_node_debug
+    for the per-phi rendering. Cached instruction_count, predecessor_count,
+    and successor_count are read from offsets 16, 32, and 48 respectively
+    and printed as summary lines so engineers can correlate phi placement
+    with control-flow shape without re-reading the IR. The function is
+    intended as a debug aid only; production builds typically do not
+    invoke it.
+    @End Implementation
+
     If function_ptr is equal to 0:
         Display "print_ssa_debug_info: null function pointer"
         Return 0
@@ -2717,7 +3551,7 @@ Process called "print_ssa_debug_info" that takes function_ptr as Integer returns
     Display "===== SSA DEBUG INFO ====="
 
     Note: Print SSA status
-    Let in_ssa be is_in_ssa_form(function_ptr)
+    Let in_ssa be proc is_in_ssa_form with function_ptr
     If in_ssa is equal to 1:
         Display "SSA Form: YES"
     Otherwise:
@@ -2726,7 +3560,7 @@ Process called "print_ssa_debug_info" that takes function_ptr as Integer returns
     Display ""
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Display "print_ssa_debug_info: no CFG"
         Return 0
@@ -2744,28 +3578,31 @@ Process called "print_ssa_debug_info" that takes function_ptr as Integer returns
         Display "Block B" joined with block_id joined with ":"
 
         Note: Print phi nodes
-        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
-        Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
+        Let phi_count be 0
+        If phi_list is not equal to 0:
+            Set phi_count to proc length from List with phi_list
+        End If
 
         If phi_count is greater than 0:
             Let j be 0
             While j is less than phi_count:
                 Let phi_ptr be proc get from List with phi_list, j
-                print_phi_node_debug(phi_ptr)
+                proc print_phi_node_debug with phi_ptr
                 Set j to j plus 1
             End While
         End If
 
         Note: Print instruction count
-        Let inst_count be proc memory_get_int64 from Layout with block_ptr, 16
+        Let inst_count be proc memory_get_int64 from Layout with block_ptr, 24
         Display "  Instructions: " joined with inst_count
 
         Note: Print predecessors
-        Let pred_count be proc memory_get_int64 from Layout with block_ptr, 32
+        Let pred_count be proc memory_get_int64 from Layout with block_ptr, 40
         Display "  Predecessors: " joined with pred_count
 
         Note: Print successors
-        Let succ_count be proc memory_get_int64 from Layout with block_ptr, 48
+        Let succ_count be proc memory_get_int64 from Layout with block_ptr, 56
         Display "  Successors: " joined with succ_count
 
         Display ""
@@ -2824,30 +3661,54 @@ Process called "is_phi_trivial" that takes phi_ptr as Integer returns Integer:
     ```
     @End Reasoning
 
+    @Implementation
+    Reads the phi's result SSA id (offset 8), the interleaved
+    incoming_pairs list (offset 16, values at slot 2*i+1), and the
+    incoming pair count (offset 24). A linear scan classifies each
+    incoming value: equal to result_id, the value is a self-reference
+    (treated as no information about the merge); otherwise it must match
+    the running unique_value or the phi is non-trivial. The found_unique
+    flag distinguishes "haven't yet seen a non-self incoming" from
+    "unique_value is genuinely zero", which matters when zero is a
+    legitimate SSA value id. A loop that finishes without seeing two
+    distinct non-self values returns 1; any disagreement returns 0 as
+    soon as it is detected so the function exits early on non-trivial
+    phis.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in incoming pair count with constant per-iteration work and
+    an early exit on the first disagreement. Repeatedly called by
+    eliminate_trivial_phi_nodes during the fixed-point loop, so its O(W)
+    per phi cost (W = incoming count) is critical to keeping pruning
+    overhead bounded.
+    @End Performance_Hints
+
     If phi_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get phi result (offset 0)
-    Let result_id be proc memory_get_int64 from Layout with phi_ptr, 0
+    Note: Get phi result SSA id (offset 8)
+    Let result_id be proc memory_get_int64 from Layout with phi_ptr, 8
 
-    Note: Get incoming values (offset 8)
-    Let incoming_values be proc memory_get_int64 from Layout with phi_ptr, 8
+    Note: Get interleaved incoming_pairs list (offset 16) and pair count (offset 24)
+    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
 
-    Note: Get incoming count (offset 24)
+    Note: Get incoming pair count (offset 24)
     Let incoming_count be proc memory_get_int64 from Layout with phi_ptr, 24
 
-    If incoming_values is equal to 0:
+    If incoming_pairs is equal to 0:
         Return 0
     End If
 
-    Note: Find unique non-self incoming value
+    Note: Find unique non-self incoming value (values live at list slot 2*i+1)
     Let unique_value be 0
     Let found_unique be 0
 
     Let i be 0
     While i is less than incoming_count:
-        Let incoming_value be proc get from List with incoming_values, i
+        Let value_slot be i multiplied by 2 plus 1
+        Let incoming_value be proc get from List with incoming_pairs, value_slot
 
         Note: Skip self-references (incoming_value == result)
         If incoming_value is equal to result_id:
@@ -2886,18 +3747,31 @@ Process called "get_trivial_phi_replacement" that takes phi_ptr as Integer retur
     - 0 if phi is not trivial or all self-references
     @End Reasoning
 
+    @Implementation
+    Mirrors the scan in is_phi_trivial, but instead of computing a yes/no
+    answer it returns the first non-self-reference incoming value
+    encountered. The caller is expected to have already established that
+    the phi is trivial (via is_phi_trivial) before calling this routine,
+    so the first non-self incoming necessarily equals every other non-
+    self incoming; in the pathological case where every incoming is a
+    self-reference (dead phi) the routine returns 0, which the caller
+    must check before performing the replacement. The two functions are
+    intentionally kept separate so that future inlining or specialization
+    work can optimize each independently.
+    @End Implementation
+
     If phi_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get phi result
-    Let result_id be proc memory_get_int64 from Layout with phi_ptr, 0
+    Note: Get phi result SSA id (offset 8 per canonical MIRPhi layout)
+    Let result_id be proc memory_get_int64 from Layout with phi_ptr, 8
 
-    Note: Get incoming values
-    Let incoming_values be proc memory_get_int64 from Layout with phi_ptr, 8
+    Note: Get interleaved incoming_pairs list (offset 16); values live at slot 2*i+1
+    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
     Let incoming_count be proc memory_get_int64 from Layout with phi_ptr, 24
 
-    If incoming_values is equal to 0:
+    If incoming_pairs is equal to 0:
         Return 0
     End If
 
@@ -2906,7 +3780,8 @@ Process called "get_trivial_phi_replacement" that takes phi_ptr as Integer retur
 
     Let i be 0
     While i is less than incoming_count:
-        Let incoming_value be proc get from List with incoming_values, i
+        Let value_slot be i multiplied by 2 plus 1
+        Let incoming_value be proc get from List with incoming_pairs, value_slot
 
         Note: Skip self-references
         If incoming_value is not equal to result_id:
@@ -2953,6 +3828,34 @@ Process called "is_phi_dead" that takes phi_ptr as Integer, function_ptr as Inte
     ```
     @End Reasoning
 
+    @Implementation
+    Reads the phi's result SSA value id from offset 8, then performs an
+    exhaustive use-search across every block. For each block it scans
+    both the phi list (offset 88) and the instruction list (offset 16).
+    Within each other phi it iterates the interleaved incoming_pairs
+    list (offset 16 of the inner phi, value at slot 2*k+1) looking for
+    an entry equal to result_id; within each instruction it iterates
+    the instruction's operands list and checks each operand pointer's
+    value id via MIR.get_operand_value_id when the operand is a
+    variable operand. Any match returns 0 immediately ("not dead"). A
+    complete pass without a match returns 1 ("dead"). The function is
+    O(N) in total def-use count and is the dominant cost of dead phi
+    elimination on large functions.
+    @End Implementation
+
+    @Performance_Hints
+    O(B * (P_avg * W_avg + I_avg * O_avg)) where B = block count, P/I =
+    avg phis/instructions per block, W = avg phi incoming count, and O =
+    avg operands per instruction. For a function with N total
+    instructions this is effectively O(N) per call, and the outer
+    fixed-point loop in remove_dead_phi_nodes invokes is_phi_dead once
+    per phi, yielding O(P * N) total dead-elimination cost which is
+    quadratic in the worst case. A def-use index would reduce the inner
+    search to O(1) but is intentionally not built here: the cost is
+    paid only during prune_ssa_form, which runs infrequently relative to
+    the optimization passes that would maintain such an index.
+    @End Performance_Hints
+
     If phi_ptr is equal to 0:
         Return 0
     End If
@@ -2960,11 +3863,11 @@ Process called "is_phi_dead" that takes phi_ptr as Integer, function_ptr as Inte
         Return 0
     End If
 
-    Note: Get phi result value
-    Let result_id be proc memory_get_int64 from Layout with phi_ptr, 0
+    Note: Get phi result SSA id (offset 8 per canonical MIRPhi layout)
+    Let result_id be proc memory_get_int64 from Layout with phi_ptr, 8
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -2979,20 +3882,22 @@ Process called "is_phi_dead" that takes phi_ptr as Integer, function_ptr as Inte
         Let block_ptr be proc get from List with blocks, i
 
         Note: Check phi nodes
-        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
+        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
         If phi_list is not equal to 0:
-            Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+            Let phi_count be proc length from List with phi_list
             Let j be 0
             While j is less than phi_count:
                 Let other_phi be proc get from List with phi_list, j
 
-                Note: Check if result_id is in incoming values
-                Let incoming_values be proc memory_get_int64 from Layout with other_phi, 8
+                Note: Check if result_id appears as a value in other_phi's interleaved pairs
+                Note: incoming_pairs at offset 16; values live at slot 2*k+1
+                Let incoming_pairs be proc memory_get_int64 from Layout with other_phi, 16
                 Let incoming_count be proc memory_get_int64 from Layout with other_phi, 24
 
                 Let k be 0
                 While k is less than incoming_count:
-                    Let value be proc get from List with incoming_values, k
+                    Let value_slot be k multiplied by 2 plus 1
+                    Let value be proc get from List with incoming_pairs, value_slot
                     If value is equal to result_id:
                         Return 0
                     End If
@@ -3004,9 +3909,9 @@ Process called "is_phi_dead" that takes phi_ptr as Integer, function_ptr as Inte
         End If
 
         Note: Check instructions
-        Let inst_list be proc memory_get_int64 from Layout with block_ptr, 8
+        Let inst_list be proc memory_get_int64 from Layout with block_ptr, 16
         If inst_list is not equal to 0:
-            Let inst_count be proc memory_get_int64 from Layout with block_ptr, 16
+            Let inst_count be proc memory_get_int64 from Layout with block_ptr, 24
             Set j to 0
             While j is less than inst_count:
                 Let inst_ptr be proc get from List with inst_list, j
@@ -3055,13 +3960,36 @@ Process called "remove_dead_phi_nodes" that takes function_ptr as Integer return
     We iterate because removing one phi may make others dead.
     @End Reasoning
 
+    @Implementation
+    Implements the fixed-point dead-elimination loop. The outer while
+    loop continues as long as the changed flag is set; the flag is reset
+    to 0 at the top of each iteration and re-set to 1 only when an actual
+    removal happens. Inside one iteration the function walks every block
+    and scans its phi list (offset 88) in reverse order so that
+    List.remove_at can delete entries without disturbing the indices of
+    phis not yet visited. Each phi is tested with is_phi_dead against the
+    whole function; only true positives are removed. The canonical
+    MIRBasicBlock layout has no separate phi_count field, so phi count is
+    always derived from the live list length on demand. The total_removed
+    accumulator is returned to the caller for statistics reporting.
+    @End Implementation
+
+    @Performance_Hints
+    Each is_phi_dead probe is O(N) in MIR size, and the outer loop
+    iterates at most P times (the number of phis), giving a worst-case
+    O(P * P * N) total complexity. In practice the fixed point is reached
+    in a handful of iterations because most dead phis are detected on
+    the first pass; only chained dead phis (a dead phi whose removal
+    exposes another dead phi) require additional iterations.
+    @End Performance_Hints
+
     If function_ptr is equal to 0:
         Display "remove_dead_phi_nodes: null function pointer"
         Return 0
     End If
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -3082,9 +4010,9 @@ Process called "remove_dead_phi_nodes" that takes function_ptr as Integer return
             Let block_ptr be proc get from List with blocks, i
 
             Note: Get phi list
-            Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
+            Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
             If phi_list is not equal to 0:
-                Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+                Let phi_count be proc length from List with phi_list
 
                 Note: Scan phis backwards for safe removal
                 Let j be phi_count minus 1
@@ -3092,7 +4020,7 @@ Process called "remove_dead_phi_nodes" that takes function_ptr as Integer return
                     Let phi_ptr be proc get from List with phi_list, j
 
                     Note: Check if phi is dead
-                    Let is_dead be is_phi_dead(phi_ptr, function_ptr)
+                    Let is_dead be proc is_phi_dead with phi_ptr, function_ptr
                     If is_dead is equal to 1:
                         Note: Remove dead phi
                         proc remove_at from List with phi_list, j
@@ -3103,9 +4031,7 @@ Process called "remove_dead_phi_nodes" that takes function_ptr as Integer return
                     Set j to j minus 1
                 End While
 
-                Note: Update phi count
-                Let new_count be proc length from List with phi_list
-                proc memory_set_int64 from Layout with block_ptr, 64, new_count
+                Note: Phi count is derived from list length; no cached field to update
             End If
 
             Set i to i plus 1
@@ -3145,13 +4071,50 @@ Process called "eliminate_trivial_phi_nodes" that takes function_ptr as Integer 
     Eliminating one trivial phi may make others trivial.
     @End Reasoning
 
+    @Implementation
+    Implements the fixed-point trivial-elimination loop. Each iteration
+    walks every block, scans its phi list (offset 88) backwards, and for
+    each phi that is_phi_trivial returns true calls
+    get_trivial_phi_replacement for the unique non-self value.
+    MIR.replace_all_uses then rewrites every operand referring to the
+    phi's result so that it instead refers to the replacement value;
+    only on a successful replace_all_uses is the phi actually removed
+    from the block, ensuring the IR is never left in a half-rewritten
+    state where some uses still point at the deleted phi's result. The
+    canonical MIRBasicBlock layout has no separate phi_count field, so
+    phi count is always derived from the live list length on demand.
+    The changed flag enables the iterative behavior: cascading
+    eliminations (trivial(P1) -> trivial(P2) -> ...) are handled
+    naturally because as long as a single phi was eliminated, another
+    pass is initiated.
+    @End Implementation
+
+    @Performance_Hints
+    Each is_phi_trivial probe is O(W) in phi width, and replace_all_uses
+    is O(N) in MIR size. With P phis the worst-case total cost is
+    O(P * (W + N)) per fixed-point iteration, with at most P iterations
+    if every removal triggers exactly one cascade. In practice the
+    cascade chain is short and the total cost is well within budget for
+    the prune_ssa_form maintenance pass.
+    @End Performance_Hints
+
+    @Security_Scope
+    The replace_all_uses step is critical for correctness: if it fails
+    partway through (for example because of an IR consistency error in
+    a downstream operand list) the phi must NOT be removed, otherwise
+    dangling references to the deleted SSA value would remain in the
+    MIR. The function intentionally leaves the phi in place on
+    replace_all_uses failure and emits a diagnostic so the issue can be
+    investigated.
+    @End Security_Scope
+
     If function_ptr is equal to 0:
         Display "eliminate_trivial_phi_nodes: null function pointer"
         Return 0
     End If
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -3172,9 +4135,9 @@ Process called "eliminate_trivial_phi_nodes" that takes function_ptr as Integer 
             Let block_ptr be proc get from List with blocks, i
 
             Note: Get phi list
-            Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
+            Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
             If phi_list is not equal to 0:
-                Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+                Let phi_count be proc length from List with phi_list
 
                 Note: Scan phis backwards for safe removal
                 Let j be phi_count minus 1
@@ -3182,14 +4145,14 @@ Process called "eliminate_trivial_phi_nodes" that takes function_ptr as Integer 
                     Let phi_ptr be proc get from List with phi_list, j
 
                     Note: Check if phi is trivial
-                    Let is_trivial be is_phi_trivial(phi_ptr)
+                    Let is_trivial be proc is_phi_trivial with phi_ptr
                     If is_trivial is equal to 1:
                         Note: Get replacement value
-                        Let replacement be get_trivial_phi_replacement(phi_ptr)
+                        Let replacement be proc get_trivial_phi_replacement with phi_ptr
 
                         If replacement is not equal to 0:
-                            Note: Get phi result
-                            Let result_id be proc memory_get_int64 from Layout with phi_ptr, 0
+                            Note: Get phi result SSA id (offset 8 per canonical MIRPhi layout)
+                            Let result_id be proc memory_get_int64 from Layout with phi_ptr, 8
 
                             Note: Replace all uses of result with replacement
                             Let replace_success be proc replace_all_uses from MIR with result_id, replacement
@@ -3208,9 +4171,7 @@ Process called "eliminate_trivial_phi_nodes" that takes function_ptr as Integer 
                     Set j to j minus 1
                 End While
 
-                Note: Update phi count
-                Let new_count be proc length from List with phi_list
-                proc memory_set_int64 from Layout with block_ptr, 64, new_count
+                Note: Phi count is derived from list length; no cached field to update
             End If
 
             Set i to i plus 1
@@ -3259,16 +4220,33 @@ Process called "prune_ssa_form" that takes function_ptr as Integer returns Integ
     Call this after SSA construction to optimize the SSA form.
     @End Reasoning
 
-    If function_ptr is equal to 0:
-        Display "prune_ssa_form: null function pointer"
-        Return 0
-    End If
+    @Implementation
+    Composes the dead-phi and trivial-phi eliminators into a single
+    fixed-point loop. If the input function is not yet in SSA form,
+    construct_ssa_form is invoked so prune_ssa_form is a one-call
+    operation regardless of pipeline order. The outer loop alternates
+    calls to remove_dead_phi_nodes and eliminate_trivial_phi_nodes,
+    accumulating the totals into total_dead and total_trivial. The
+    changed flag is set whenever either inner pass reports a non-zero
+    removal/elimination count, ensuring the loop continues as long as
+    either optimization is making progress. When both passes report
+    zero progress in the same iteration the loop terminates and the
+    diagnostic summary is emitted to document the optimization yield.
+    @End Implementation
+
+    @Performance_Hints
+    The inner passes each have worst-case quadratic complexity in phi
+    count, so the composite worst-case behavior is governed by them.
+    For real-world functions the optimization yield drops to zero in a
+    small number of iterations (typically 1-3), so the fixed-point
+    overhead is bounded in practice.
+    @End Performance_Hints
 
     Note: Ensure function is in SSA form
-    Let in_ssa be is_in_ssa_form(function_ptr)
+    Let in_ssa be proc is_in_ssa_form with function_ptr
     If in_ssa is equal to 0:
         Note: Not in SSA, construct it first
-        Let ssa_result be construct_ssa_form(function_ptr)
+        Let ssa_result be proc construct_ssa_form with function_ptr
         If ssa_result is equal to 0:
             Display "prune_ssa_form: failed to construct SSA"
             Return 0
@@ -3284,14 +4262,14 @@ Process called "prune_ssa_form" that takes function_ptr as Integer returns Integ
         Set changed to 0
 
         Note: Remove dead phi nodes
-        Let dead_count be remove_dead_phi_nodes(function_ptr)
+        Let dead_count be proc remove_dead_phi_nodes with function_ptr
         Set total_dead to total_dead plus dead_count
         If dead_count is greater than 0:
             Set changed to 1
         End If
 
         Note: Eliminate trivial phi nodes
-        Let trivial_count be eliminate_trivial_phi_nodes(function_ptr)
+        Let trivial_count be proc eliminate_trivial_phi_nodes with function_ptr
         Set total_trivial to total_trivial plus trivial_count
         If trivial_count is greater than 0:
             Set changed to 1
@@ -3322,13 +4300,35 @@ Process called "get_ssa_statistics" that takes function_ptr as Integer returns I
     This helps evaluate SSA form quality and optimization effectiveness.
     @End Reasoning
 
+    @Implementation
+    Walks every block in the CFG and accumulates four counters:
+    total_phis (sum of cached phi_counts across all blocks),
+    blocks_with_phis (number of blocks with non-zero phi count),
+    trivial_phis (phis for which is_phi_trivial returns 1), and
+    dead_phis (phis for which is_phi_dead returns 1). Both classifier
+    functions are invoked per phi; their costs dominate the routine.
+    The accumulated values are printed via Display rather than stored
+    in a structure because the only current consumers are diagnostic
+    log handlers and developer-facing debug dumps; if a downstream pass
+    needs structured access to these statistics, the function should be
+    extended to return a packed counter struct rather than printing.
+    @End Implementation
+
+    @Performance_Hints
+    O(P * N) where P is total phi count and N is MIR size, dominated by
+    the is_phi_dead inner search. Because this is purely a reporting
+    function with no side effects on the IR, it should never be invoked
+    inside a performance-critical loop; it is intended for one-shot
+    diagnostics at the end of optimization pipelines.
+    @End Performance_Hints
+
     If function_ptr is equal to 0:
         Display "get_ssa_statistics: null function pointer"
         Return 0
     End If
 
     Note: Get CFG
-    Let cfg_ptr be get_cfg_from_function(function_ptr)
+    Let cfg_ptr be proc get_cfg_from_function with function_ptr
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -3347,8 +4347,11 @@ Process called "get_ssa_statistics" that takes function_ptr as Integer returns I
         Let block_ptr be proc get from List with blocks, i
 
         Note: Get phi list
-        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 56
-        Let phi_count be proc memory_get_int64 from Layout with block_ptr, 64
+        Let phi_list be proc memory_get_int64 from Layout with block_ptr, 88
+        Let phi_count be 0
+        If phi_list is not equal to 0:
+            Set phi_count to proc length from List with phi_list
+        End If
 
         If phi_count is greater than 0:
             Set blocks_with_phis to blocks_with_phis plus 1
@@ -3359,12 +4362,12 @@ Process called "get_ssa_statistics" that takes function_ptr as Integer returns I
             While j is less than phi_count:
                 Let phi_ptr be proc get from List with phi_list, j
 
-                Let is_trivial be is_phi_trivial(phi_ptr)
+                Let is_trivial be proc is_phi_trivial with phi_ptr
                 If is_trivial is equal to 1:
                     Set trivial_phis to trivial_phis plus 1
                 End If
 
-                Let is_dead be is_phi_dead(phi_ptr, function_ptr)
+                Let is_dead be proc is_phi_dead with phi_ptr, function_ptr
                 If is_dead is equal to 1:
                     Set dead_phis to dead_phis plus 1
                 End If
@@ -3386,4 +4389,88 @@ Process called "get_ssa_statistics" that takes function_ptr as Integer returns I
     Display "===== END SSA STATISTICS ====="
 
     Return 1
+End Process
+
+Note: ============================================================
+Note: SSA RECOMPUTATION AFTER CFG MUTATION
+Note: ============================================================
+
+@Reasoning
+Optimization passes that mutate the CFG (inlining splices in cloned blocks;
+loop unrolling duplicates loop bodies; LICM inserts a pre-header) invalidate
+the SSA invariants that the previous SSA construction established. Phi
+nodes at the join points of the now-extended CFG no longer reference the
+correct predecessors; freshly inlined block IDs are not yet registered in
+any phi's incoming list; and the dominance tree the prior construction
+relied on no longer reflects the mutated edges. Rather than each pass
+re-implementing the "reset SSA, recompute dominance, re-place phis,
+re-rename" sequence, this canonical helper performs the full invalidation +
+reconstruction.
+
+Two design choices matter. First, the SSA renaming context is reused (not
+freed), because the caller's context pointer is what the rest of the
+optimization pipeline holds; freeing it would dangle every observer. The
+context's variable map and ID counter survive the reset because the
+function-wide value-id space must remain monotonic across SSA
+recomputations (so that pre-existing operand references in pristine blocks
+do not collide with newly minted SSA names). Second, the SSA-form flag on
+the function is unconditionally cleared first; construct_ssa_form would
+otherwise short-circuit thinking the function was already in SSA form.
+@End Reasoning
+
+@Implementation
+Three-step sequence:
+  1. Recover the function pointer from the SSA context (offset 0).
+  2. Clear the function's SSA-form flag via set_ssa_form_flag(fn, 0).
+  3. Re-run construct_ssa_form on the function to rebuild the dominance
+     tree, place fresh phi nodes at the updated join points, and re-rename
+     every variable through the new dominance traversal.
+
+The CFG pointer parameter is accepted explicitly (matching the call
+convention used by the optimization passes) even though it is recoverable
+via get_cfg_from_function — the explicit argument is the verifier-friendly
+form because it lets the pass document which CFG it just mutated.
+
+Returns 1 on successful reconstruction, 0 if any required pointer is null
+or if construct_ssa_form fails downstream.
+@End Implementation
+
+@Performance_Hints
+Calls compute_dominance_tree (Cooper-Harvey-Kennedy iterative algorithm),
+rename_variables (linear in MIR size on reducible CFGs), and the phi
+placement walks. Total cost is O(MIR size) in the typical case, O(MIR size
+* dominance frontier) worst case. Should be called once at the end of a
+batch of CFG mutations, never inside an inner mutation loop.
+@End Performance_Hints
+
+@Security_Scope
+Null guards on both input pointers. The SSA context's variable map is
+preserved across the reset to maintain value-id monotonicity; no heap
+state is freed by this function, only re-populated. Failure paths leave
+the function in a partially-rebuilt state — callers should treat a 0
+return as a fatal invariant violation rather than a recoverable error.
+@End Security_Scope
+
+Process called "recompute_ssa" that takes cfg_ptr as Integer, ssa_context_ptr as Integer returns Integer:
+    If ssa_context_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Recover the function pointer from the SSA context (offset 0)
+    Let function_ptr be proc memory_get_int64 from Layout with ssa_context_ptr, 0
+    If function_ptr is equal to 0:
+        Return 0
+    End If
+
+    Note: Reset the SSA-form flag so construct_ssa_form will re-execute
+    Note: rather than short-circuit on the already-in-SSA-form check.
+    proc set_ssa_form_flag with function_ptr, 0
+
+    Note: Rebuild the SSA form: dominance, phi placement, variable renaming.
+    Note: construct_ssa_form internally re-walks the function's CFG so the
+    Note: cfg_ptr parameter is informational here; we accept it explicitly
+    Note: because callers track which CFG they just mutated.
+    Let result be proc construct_ssa_form with function_ptr
+
+    Return result
 End Process

@@ -101,8 +101,33 @@ Process called "create_syntax_context" takes mode as Integer returns Integer:
 
     @Reasoning:
     Context tracks syntax mode, indentation, and output buffer during
-    HIR-to-source conversion.
+    HIR-to-source conversion. A single context object is parameterised
+    by mode (Canonical / Developer / Viewer) so the same generator code
+    can render any of Runa's three equivalent surface syntaxes without
+    branching at every node. Output is accumulated as a list of string
+    fragments rather than a single buffer so that emit operations are
+    O(1) amortised (no reallocation, no copy) until the final flatten
+    step in get_output_string.
     @End Reasoning
+
+    @Implementation:
+    Allocates a 48-byte block laid out as six int64 fields matching
+    the SyntaxContext type: [mode, indent_level, indent_string,
+    output_buffer, current_line_length, max_line_length]. The output
+    buffer is a List of string pointers created via the collections
+    primitive. The indent string defaults to four spaces (canonical
+    Runa indentation). max_line_length is initialised to 120 which
+    matches the project's default wrap column. Returns 0 on either
+    allocation failure to signal an out-of-memory condition to the
+    caller, with the partial buffer freed before returning.
+    @End Implementation
+
+    @Security_Scope:
+    Failure modes: allocation may return 0; the implementation checks
+    both the context allocation and the buffer allocation and rolls
+    back the partial state (deallocating context) on the second failure
+    so no leaked allocation escapes this function.
+    @End Security_Scope
 
     Let context_size be 48  Note: 6 fields × 8 bytes
     Let context be proc allocate from Layout with context_size
@@ -136,6 +161,21 @@ End Process
 Process called "destroy_syntax_context" takes context as Integer returns Integer:
     Note: Destroy syntax context and free resources
 
+    @Reasoning:
+    The context owns its output buffer; destruction must release both
+    the buffer (which holds borrowed string pointers, not owned strings)
+    and the context block itself. Idempotent for a null context so
+    higher-level entry points can call this in an error path without
+    branching.
+    @End Reasoning
+
+    @Implementation:
+    Reads the buffer pointer from offset 24, calls the List primitive's
+    destroy if non-null, then deallocates the context block via Layout.
+    Returns 1 unconditionally as success since cleanup of a null context
+    is also success.
+    @End Implementation
+
     If context is equal to 0:
         Return 1
     End If
@@ -156,8 +196,31 @@ Process called "get_output_string" takes context as Integer returns Integer:
     Note: Get final output string from context buffer
 
     @Reasoning:
-    Concatenates all buffer strings into final output.
+    Concatenates all buffer string fragments into a final flat
+    null-terminated output string. Deferring concatenation until the
+    end keeps individual emit operations O(1) and the final flatten
+    O(N) over total output length, instead of O(N^2) repeated copies.
+    The returned string is owned by the caller; the buffer fragments
+    remain owned by the context until destroy_syntax_context runs.
     @End Reasoning
+
+    @Implementation:
+    Two-pass concatenation:
+      Pass 1 walks the buffer summing string_length values to find
+        the total byte count needed.
+      Pass 2 allocates total_length + 1 bytes, copies each fragment
+        via memory_copy at an advancing offset, then writes a null
+        terminator at the final offset.
+    Returns 0 on allocation failure so callers can detect OOM. The
+    +1 byte is for the trailing NUL so the result is usable as a
+    C-compatible string by downstream stdlib consumers.
+    @End Implementation
+
+    @Performance_Hints:
+    Total cost is O(N + M) where N is the number of fragments and M
+    is the total byte length. The two-pass design avoids exponential
+    reallocation cost a naive single-pass append-and-grow would incur.
+    @End Performance_Hints
 
     If context is equal to 0:
         Return 0
@@ -205,6 +268,30 @@ End Process
 Process called "emit" takes context as Integer, text as Integer returns Integer:
     Note: Emit text to output buffer
 
+    @Reasoning:
+    The core append primitive used by every node generator. Appending
+    a string fragment is O(1) (push onto the buffer list); concatenation
+    happens once at the end in get_output_string. The text pointer is
+    borrowed, not copied — callers must ensure the string outlives the
+    context, which is always true because emitted strings are either
+    literal constants or HIR-owned identifiers/values.
+    @End Reasoning
+
+    @Implementation:
+    Validates both context and text are non-null (defensive; returns 0
+    to signal a logic bug, but does not crash). Reads the buffer pointer
+    at offset 24, appends via the List primitive. Updates the running
+    current_line_length at offset 32 by adding string_length(text) so
+    that wrap-aware emitters (future) can decide when to insert a
+    newline.
+    @End Implementation
+
+    @Performance_Hints:
+    Single emit is O(1) amortised. Line-length update adds one
+    string_length scan; for typical short fragments (operators,
+    keywords, identifiers) this is bounded constant work.
+    @End Performance_Hints
+
     If context is equal to 0:
         Return 0
     End If
@@ -228,6 +315,21 @@ End Process
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit current indentation level
 
+    @Reasoning:
+    Indentation is emitted as repeated copies of the configured indent
+    string (four spaces in canonical Runa). Storing indent as a level
+    counter rather than a precomputed prefix string keeps mode switches
+    cheap and aligns with the way the AST is traversed (increase /
+    decrease around blocks).
+    @End Reasoning
+
+    @Implementation:
+    Reads indent_level (offset 8) and indent_string (offset 16) from
+    the context, then loops level times calling emit with the indent
+    fragment. Each emit pushes one reference to the same indent string
+    into the buffer; no per-line string is allocated.
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -248,6 +350,21 @@ End Process
 Process called "emit_newline" takes context as Integer returns Integer:
     Note: Emit newline and reset line length
 
+    @Reasoning:
+    Newline emission also resets the line-length counter at offset 32
+    so wrap-aware emitters can track horizontal position correctly.
+    Newlines are always raw LF — the surface syntax of Runa is
+    line-oriented (line ending is significant for statement
+    termination only at the lexer level, not here).
+    @End Reasoning
+
+    @Implementation:
+    Calls emit with the literal "\n" string and then writes 0 to the
+    current_line_length field at offset 32. The line-length reset is
+    not handled inside emit because emit treats text opaquely; only
+    emit_newline knows the semantic effect of a line break.
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -263,6 +380,19 @@ End Process
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
+    @Reasoning:
+    Called by block-producing constructs (If, While, For, Process,
+    Type, Match) before emitting their bodies so child statements are
+    indented relative to the containing construct. Matched by a
+    decrease_indent on block exit.
+    @End Reasoning
+
+    @Implementation:
+    Reads indent_level at offset 8, increments by one, writes back.
+    Unbounded; arbitrarily deep nesting is permitted (the renderer
+    will simply emit very long indent prefixes).
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -276,6 +406,21 @@ End Process
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
+
+    @Reasoning:
+    Symmetric counterpart to increase_indent, invoked at block exit
+    (after End If, End While, End For, End Process, End Type, End
+    Match, and after each When clause body). Guarded against
+    underflow so a malformed traversal cannot push the level
+    negative.
+    @End Reasoning
+
+    @Implementation:
+    Reads indent_level at offset 8 and decrements only when the
+    current value is strictly positive. Silent no-op on zero rather
+    than asserting so a partially-built tree can still be flushed
+    for diagnostic output.
+    @End Implementation
 
     If context is equal to 0:
         Return 0
@@ -299,9 +444,37 @@ Process called "get_binary_operator_string" takes context as Integer, operator a
     Note: Convert binary operator constant to string in current syntax mode
 
     @Reasoning:
-    Converts operator constants to Canon mode (natural language) or
-    Developer mode (symbolic) strings.
+    The triple-syntax design rests on the property that the HIR
+    operator set is mode-independent (one OP_ADD constant, regardless
+    of whether the source said "plus" or "+"). This function is the
+    bridge: it materialises the same logical operator into the textual
+    form required by the active mode. Canon mode chooses natural
+    language (e.g. " plus ", " is equal to ") for human readability
+    and AI-first authorship; Developer mode chooses C-family symbols
+    (e.g. " + ", " == ") for terseness and familiarity. The Viewer
+    mode is treated as Canon at this level — its higher-level prose
+    layering happens above operator strings, not at this lookup.
     @End Reasoning
+
+    @Implementation:
+    Reads the mode field at offset 0, branches into a per-mode block,
+    then performs a linear cascade of If checks over the 23 binary
+    operator constants (OP_ADD .. OP_CONTAINS). Each match returns
+    the appropriate pre-allocated string literal. Returns a single
+    space " " when no operator matches; this both prevents downstream
+    crashes on a corrupt operator code and keeps emitted output
+    syntactically reasonable for diagnostics. The cascade is preferred
+    over a table because operator constants are not dense and a table
+    would waste cache or introduce a separate hash structure.
+    @End Implementation
+
+    @Performance_Hints:
+    Linear scan over up to 23 constants per call. Operators dominate
+    binary-expression emission so this is on the hot path; the
+    cascade is short enough to stay in the icache and predicted
+    branch table. Future optimisation could compress to a switch
+    table indexed by operator code modulo the constant range.
+    @End Performance_Hints
 
     Let mode be proc memory_get_int64 from Layout with context, 0
 
@@ -445,6 +618,25 @@ End Process
 Process called "get_unary_operator_string" takes context as Integer, operator as Integer returns Integer:
     Note: Convert unary operator constant to string in current syntax mode
 
+    @Reasoning:
+    Unary-operator counterpart to get_binary_operator_string. Three
+    operators are relevant: logical not, bitwise not, and arithmetic
+    negation. Canon mode uses the words "Not " and "bitwise not "
+    (kept lowercase so it composes naturally inside a larger
+    expression). Developer mode uses "!" and "~". Arithmetic negation
+    "-" is identical in both modes because the symbol "-" already
+    reads correctly in natural-language Runa ("-x" rather than
+    "negative x"). Viewer falls through to default behaviour.
+    @End Reasoning
+
+    @Implementation:
+    Reads mode at offset 0 and branches into the Canon block first,
+    then Developer block. Each block contains If checks for OP_NOT,
+    OP_BIT_NOT, OP_SUB. Returns empty string "" on no match so a
+    diagnostic emitter does not inject stray characters when an
+    invalid operator is encountered.
+    @End Implementation
+
     Let mode be proc memory_get_int64 from Layout with context, 0
 
     Note: Canon mode
@@ -484,9 +676,25 @@ Process called "generate_canon_syntax" takes hir_root as Integer returns Integer
     Note: Generate Canon mode (natural language) syntax from HIR
 
     @Reasoning:
-    Main entry point for Canon mode generation. Creates context,
-    generates syntax, returns output string.
+    Main entry point for Canon mode generation. Canon is the default
+    Runa surface syntax: natural-language operators ("plus", "is
+    equal to"), word-keyword block delimiters ("If/End If",
+    "While/End While"), and the canonical "Let x be value" form for
+    bindings. Canon source is the source-of-truth form stored in
+    project files and is what HIR round-trips back to under normal
+    compilation. This entry point allocates a context, drives the
+    generator, then frees the context — the caller receives ownership
+    of the returned string.
     @End Reasoning
+
+    @Implementation:
+    Three-step orchestration: create_syntax_context(SYNTAX_MODE_CANON),
+    generate_node(context, hir_root) to populate the buffer,
+    get_output_string(context) to flatten, then
+    destroy_syntax_context(context) to free the working state.
+    Returns 0 on context-allocation failure so callers can detect
+    OOM and propagate.
+    @End Implementation
 
     Let context be proc create_syntax_context from SYNTAX_MODE_CANON
 
@@ -504,6 +712,28 @@ End Process
 
 Process called "generate_developer_syntax" takes hir_root as Integer returns Integer:
     Note: Generate Developer mode (symbolic) syntax from HIR
+
+    @Reasoning:
+    Main entry point for Developer mode generation. Developer mode
+    is semantically equivalent to Canon — it produces the same HIR
+    when re-parsed — but renders operators in symbolic form ("+",
+    "==", "&&") and uses compact bracket-based collection literals
+    ("[1, 2, 3]" rather than "a list containing 1, 2, 3"). This
+    supports developers transitioning from C, JavaScript, Python,
+    and similar symbolic-syntax languages without forcing them to
+    write natural-language operators. Round-trip identity:
+    Canon -> HIR -> Developer -> HIR yields the same HIR.
+    @End Reasoning
+
+    @Implementation:
+    Same orchestration pattern as generate_canon_syntax, parameterised
+    by SYNTAX_MODE_DEVELOPER. The same generate_node walker is reused;
+    per-node generators inspect context.mode and pick the appropriate
+    rendering. No code is duplicated between modes — branching lives
+    inside the operator-string lookup and the few node generators
+    whose surface form differs (let, set, index, array_literal,
+    generic_type, array_type).
+    @End Implementation
 
     Let context be proc create_syntax_context from SYNTAX_MODE_DEVELOPER
 
@@ -523,9 +753,24 @@ Process called "generate_viewer_syntax" takes hir_root as Integer returns Intege
     Note: Generate Viewer mode (full natural language) syntax from HIR
 
     @Reasoning:
-    Viewer mode is currently aliased to Canon mode. Future implementation
-    will add educational context and full natural language sentences.
+    Viewer mode is the third surface form of Runa: read-only natural
+    language with maximum verbosity, intended for documentation,
+    code-review prose, and non-technical readers. At the operator
+    and statement level Viewer is identical to Canon (it shares the
+    SYNTAX_MODE_VIEWER constant and the per-node generators treat
+    Viewer the same as Canon for terminal forms). The distinction
+    appears at the prose-wrapping layer (sentence framing,
+    educational annotations) which is composed on top of this
+    function's output, not inside it.
     @End Reasoning
+
+    @Implementation:
+    Identical orchestration to the Canon and Developer entry points,
+    using SYNTAX_MODE_VIEWER. The mode constant flows through the
+    context so any per-node generator that wants Viewer-specific
+    behaviour in the future can branch on it without changing the
+    entry-point signature.
+    @End Implementation
 
     Let context be proc create_syntax_context from SYNTAX_MODE_VIEWER
 
@@ -549,10 +794,33 @@ Process called "generate_node" takes context as Integer, node as Integer returns
     Note: Generate syntax for any HIR node
 
     @Reasoning:
-    Dispatches to appropriate generation function based on node type.
-    Handles all HIR node categories: expressions, statements, declarations,
-    types, and patterns.
+    Central dispatcher for the HIR-to-source walk. The HIR uses a
+    block-numbered node-type scheme: expressions are 10000-10999,
+    statements 11000-11999, declarations 12000-12999, types
+    13000-13999, patterns 14000-14999. Dispatching by range first
+    (and only inside each range matching specific kinds) keeps the
+    top-level dispatch O(1) and the per-category dispatch shallow.
+    Null nodes are accepted as no-ops so partial trees can still be
+    rendered for diagnostics.
     @End Reasoning
+
+    @Implementation:
+    Reads the node-type tag at offset 0 (every HIR node stores its
+    type tag there). Then performs paired range tests
+    (>=10000 && <11000 -> expressions, etc.) and delegates to the
+    appropriate per-category generator (generate_expression,
+    generate_statement, generate_declaration, generate_type,
+    generate_pattern). Returns 1 if no range matches; this allows
+    extension with new node-type ranges without breaking traversal
+    of older trees.
+    @End Implementation
+
+    @Performance_Hints:
+    Top-level dispatch executes up to five range comparisons. The
+    branches short-circuit on first match. For typical programs the
+    statement and expression ranges dominate, so they appear first
+    in the cascade.
+    @End Performance_Hints
 
     If context is equal to 0:
         Return 0
@@ -611,9 +879,22 @@ Process called "generate_expression" takes context as Integer, node as Integer, 
     Note: Generate syntax for expression nodes
 
     @Reasoning:
-    Handles all expression types: literals, identifiers, binary/unary operations,
-    calls, member access, indexing, etc.
+    Expression-category dispatcher. Twelve expression kinds are
+    supported: literal, identifier, binary, unary, call, member,
+    index, parenthesized, array literal, tuple literal, cast,
+    function pointer, indirect call. Each maps to a dedicated
+    generator that knows the offsets and surface form for that
+    specific node kind. Centralising the dispatch here keeps the
+    per-kind generators free of dispatch code and easier to audit.
     @End Reasoning
+
+    @Implementation:
+    Linear cascade of If equality checks against the HIR_* constants
+    imported from hir.runa. The matched generator is invoked with
+    (context, node) (node_type already consumed at this level).
+    Returns 1 on unknown kinds so the walker can continue past
+    forward-compatible HIR additions.
+    @End Implementation
 
     If node_type is equal to HIR_LITERAL from HIR:
         Return proc generate_literal with context, node
@@ -673,6 +954,26 @@ End Process
 Process called "generate_literal" takes context as Integer, node as Integer returns Integer:
     Note: Generate literal value (integer, float, string, boolean)
 
+    @Reasoning:
+    Literals are mode-independent at the surface: 42 is "42" in both
+    Canon and Developer modes; "hello" is "\"hello\"" in both.
+    String literals are wrapped in double quotes; numeric and boolean
+    literals are emitted bare. The HIR stores the textual form of
+    numeric literals so we render exactly what the user wrote
+    (preserving sign, base, fractional zeros).
+    @End Reasoning
+
+    @Implementation:
+    Reads the literal value pointer at offset 40 and the value_type
+    tag at offset 48. The tag encoding is 1=STRING, 2=INTEGER,
+    3=FLOAT, 4=BOOLEAN. For STRING the value is emitted wrapped in
+    escaped double-quote characters. For INTEGER, FLOAT, BOOLEAN
+    the value (already a textual representation) is emitted bare.
+    The fallback path emits the value directly so an unrecognised
+    type tag still produces some output rather than silently
+    dropping a node.
+    @End Implementation
+
     Note: Get literal value from node (offset 40)
     Let value be proc memory_get_int64 from Layout with node, 40
 
@@ -711,6 +1012,19 @@ End Process
 Process called "generate_identifier" takes context as Integer, node as Integer returns Integer:
     Note: Generate identifier name
 
+    @Reasoning:
+    Identifiers are mode-invariant; the same name string is emitted
+    regardless of syntax mode. Quoted-identifier handling (multi-word
+    names) is encoded at the HIR level — the name string stored in
+    the node already includes any necessary quoting from the source.
+    @End Reasoning
+
+    @Implementation:
+    Reads the identifier name pointer at offset 40 and emits it
+    directly. The HIR layer is responsible for any name mangling,
+    case preservation, or qualification.
+    @End Implementation
+
     Note: Get identifier name (offset 40)
     Let name be proc memory_get_int64 from Layout with node, 40
 
@@ -723,9 +1037,24 @@ Process called "generate_binary_expression" takes context as Integer, node as In
     Note: Generate binary expression with operator
 
     @Reasoning:
-    Binary expressions: left OP right
-    Operator string depends on syntax mode (Canon vs Developer).
+    Binary expressions follow infix form: left OP right. The operator
+    string is the only mode-dependent component (resolved by
+    get_binary_operator_string) — both operand positions are rendered
+    by recursive descent into generate_node, which means nested
+    operands inherit the same mode automatically. Operator precedence
+    is preserved by the explicit parenthesization stored in the HIR
+    (HIR_PARENTHESIZED nodes) rather than re-derived here, so the
+    generator does not need to know precedence rules.
     @End Reasoning
+
+    @Implementation:
+    Reads operator at offset 8, left at offset 16, right at offset 24
+    of the HIRBinaryExpression node. Generates left operand, then
+    looks up the operator string via get_binary_operator_string and
+    emits it (the lookup already returns a string with surrounding
+    spaces), then generates the right operand. No additional spacing
+    is inserted; the operator string is self-bracketed.
+    @End Implementation
 
     Note: Get operator, left, right from HIRBinaryExpression
     Note: operator at offset 8, left at offset 16, right at offset 24
@@ -749,6 +1078,19 @@ End Process
 Process called "generate_unary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Generate unary expression with operator
 
+    @Reasoning:
+    Unary expressions follow prefix form: OP operand. The operator
+    string carries any spacing it needs ("Not " has a trailing space
+    in Canon mode; "!" is bare in Developer). The operand position
+    is mode-invariant — generate_node recurses with the same context.
+    @End Reasoning
+
+    @Implementation:
+    Reads operator at offset 8 and operand at offset 16 of the
+    HIRUnaryExpression node. Emits the operator string via
+    get_unary_operator_string, then recurses into the operand.
+    @End Implementation
+
     Note: Get operator and operand from HIRUnaryExpression
     Note: operator at offset 8, operand at offset 16
     Let operator be proc memory_get_int64 from Layout with node, 8
@@ -768,9 +1110,25 @@ Process called "generate_call_expression" takes context as Integer, node as Inte
     Note: Generate function call expression
 
     @Reasoning:
-    Call format: callee(arg1, arg2, ...)
-    Same in both Canon and Developer modes.
+    Direct function calls use parenthesised-argument form
+    "callee(arg1, arg2, ...)" in all three syntax modes. This is the
+    one place where Canon mode does not use natural-language form
+    — call sites are common enough that the symbolic form is the
+    canonical surface for readability. The form is symmetric with
+    type definitions and process headers (which use natural language)
+    and so the contrast is intentional: definitions read like prose,
+    invocations read compactly.
     @End Reasoning
+
+    @Implementation:
+    Reads callee at offset 8, arguments list at offset 16, and
+    argument count at offset 24. Generates the callee expression
+    (which may itself be a member-expression for qualified calls),
+    emits "(", then iterates the argument list rendering each via
+    generate_node and separating with ", ". Emits closing ")".
+    The argument list is held as a primitive List of HIR-node
+    pointers and accessed via List.get.
+    @End Implementation
 
     Note: Get callee, arguments, arg_count from HIRCallExpression
     Note: callee at offset 8, arguments at offset 16, arg_count at offset 24
@@ -806,9 +1164,19 @@ Process called "generate_function_pointer" takes context as Integer, node as Int
     Note: Generate function pointer creation expression ($function_name)
 
     @Reasoning:
-    Function pointer syntax: $function_name
-    Same in all modes (canonical, developer, viewer).
+    Function-pointer creation uses the "$name" surface form in all
+    three syntax modes. The dollar prefix is unique to function-
+    pointer expressions and unambiguous against all other identifier
+    forms, so no mode variation is needed. The resulting value is a
+    first-class function reference suitable for passing to higher-
+    order functions or storing in variables typed as function types.
     @End Reasoning
+
+    @Implementation:
+    Reads the function_name string at offset 8 of HIRFunctionPointer,
+    emits "$" followed by the name. No spacing is added; consumers
+    expect the token to bind tightly to its argument list (if any).
+    @End Implementation
 
     Note: Get function name from HIRFunctionPointer
     Note: function_name at offset 8
@@ -824,9 +1192,22 @@ Process called "generate_indirect_call" takes context as Integer, node as Intege
     Note: Generate indirect function call expression (proc var with args)
 
     @Reasoning:
-    Indirect call format: proc function_value with arg1, arg2, ...
-    Same in all modes (canonical, developer, viewer).
+    Indirect calls — invocations through a function-pointer value
+    rather than a direct name — use the "proc value with args" form.
+    The leading "proc" keyword distinguishes the call from a method-
+    style invocation and signals to the reader that the callee is a
+    runtime value. The "with" keyword separates the callee from its
+    arguments without requiring parentheses, which keeps natural-
+    language flow consistent. The form is identical across modes.
     @End Reasoning
+
+    @Implementation:
+    Reads function_value at offset 8, arguments list at offset 16,
+    arg_count at offset 24. Emits "proc " then recursively renders
+    the function_value expression. If arg_count > 0, emits " with "
+    followed by comma-separated argument expressions; if zero args,
+    the "with" clause is omitted entirely.
+    @End Implementation
 
     Note: Get function_value, arguments, arg_count from HIRIndirectCall
     Note: function_value at offset 8, arguments at offset 16, arg_count at offset 24
@@ -863,9 +1244,20 @@ Process called "generate_member_expression" takes context as Integer, node as In
     Note: Generate member access expression
 
     @Reasoning:
-    Member access: object.property
-    Same in both modes.
+    Member access uses dot notation "object.property" in all three
+    syntax modes. Although Canon mode generally prefers natural-
+    language forms, dot is universally readable and avoids the
+    verbosity of "the property of the object" which would impede
+    chained access ("a.b.c.d"). The dot form is the canonical
+    surface in all of Runa's syntax variants.
     @End Reasoning
+
+    @Implementation:
+    Reads the object expression at offset 8 and the property name
+    string at offset 16. Generates the object subexpression
+    recursively (which may itself be a member expression for chain),
+    emits ".", then emits the property name verbatim.
+    @End Implementation
 
     Note: Get object and property from HIRMemberExpression
     Note: object at offset 8, property at offset 16
@@ -885,10 +1277,23 @@ Process called "generate_index_expression" takes context as Integer, node as Int
     Note: Generate index access expression
 
     @Reasoning:
-    Index access differs between modes:
-    Canon: list at index 0
-    Developer: list[0]
+    Indexed access is one of the few expressions whose surface form
+    differs across modes. Canon mode renders "container at index N"
+    (and analogously "container at key K" elsewhere) to preserve
+    Runa's natural-language reading. Developer mode renders the
+    familiar C-family form "container[N]". Both compile to the same
+    HIR_INDEX_EXPRESSION; the choice is purely surface presentation.
+    Viewer follows Canon at this layer.
     @End Reasoning
+
+    @Implementation:
+    Reads object expression at offset 8 and index expression at
+    offset 16. Reads mode at offset 0. Always generates the object
+    first (recursion). Then branches: SYNTAX_MODE_CANON emits
+    " at index " followed by the index expression; otherwise (the
+    Developer branch, also hit by Viewer if reused) emits "[",
+    the index expression, and "]".
+    @End Implementation
 
     Note: Get object and index from HIRIndexExpression
     Note: object at offset 8, index at offset 16
@@ -915,6 +1320,20 @@ End Process
 Process called "generate_parenthesized_expression" takes context as Integer, node as Integer returns Integer:
     Note: Generate parenthesized expression
 
+    @Reasoning:
+    Explicit parenthesization is preserved as a distinct HIR node so
+    that round-tripping source through HIR and back does not silently
+    drop user-intended grouping. This is especially important for
+    expressions whose precedence the user wanted to override, and
+    for diagnostic output where matching the user's structure aids
+    error legibility.
+    @End Reasoning
+
+    @Implementation:
+    Reads the inner expression at offset 8. Emits "(", recurses into
+    the inner expression, then emits ")". Same in all modes.
+    @End Implementation
+
     Note: Get inner expression (offset 8)
     Let inner be proc memory_get_int64 from Layout with node, 8
 
@@ -929,10 +1348,25 @@ Process called "generate_array_literal" takes context as Integer, node as Intege
     Note: Generate array literal
 
     @Reasoning:
-    Array literal differs between modes:
-    Canon: a list containing 1, 2, 3
-    Developer: [1, 2, 3]
+    Array/list literals are the canonical example of mode divergence.
+    Canon renders "a list containing 1, 2, and 3" — the trailing
+    "and" before the final element is intentional, matching the
+    natural-language pattern Runa specifies for enumerations.
+    Developer renders "[1, 2, 3]" — the standard symbolic form.
+    The two forms parse to identical HIR_ARRAY_LITERAL nodes so
+    round-trip identity is preserved across the mode boundary.
     @End Reasoning
+
+    @Implementation:
+    Reads the elements list at offset 8 and the element_count at
+    offset 16. Reads mode at offset 0 to decide the surface form.
+    In Canon mode: emits "a list containing ", then iterates with
+    ", " separators and a " and " inserted before the final
+    element. In Developer mode: emits "[", iterates with bare ", "
+    separators, then emits "]". The Set statement reuses the i
+    counter on the second branch because Runa variables are block-
+    scoped and the same name is acceptable.
+    @End Implementation
 
     Note: Get elements and element_count from HIRArrayLiteral
     Note: elements at offset 8, element_count at offset 16
@@ -985,6 +1419,21 @@ End Process
 Process called "generate_tuple_literal" takes context as Integer, node as Integer returns Integer:
     Note: Generate tuple literal
 
+    @Reasoning:
+    Tuple literals use parenthesized comma-separated form "(a, b, c)"
+    in all three syntax modes. The form is borrowed from mathematical
+    notation where ordered pairs and n-tuples are universally written
+    this way; no Canon-specific rendering is appropriate because there
+    is no natural-language equivalent that is both concise and
+    unambiguous.
+    @End Reasoning
+
+    @Implementation:
+    Reads elements list at offset 8 and element_count at offset 16.
+    Emits "(", iterates emitting each element with ", " separators
+    between them, then emits ")".
+    @End Implementation
+
     Note: Get elements and element_count
     Let elements be proc memory_get_int64 from Layout with node, 8
     Let element_count be proc memory_get_int64 from Layout with node, 16
@@ -1012,6 +1461,21 @@ End Process
 Process called "generate_cast_expression" takes context as Integer, node as Integer returns Integer:
     Note: Generate type cast expression
 
+    @Reasoning:
+    Type casts use the "expr as Type" form in all three syntax modes.
+    The "as" keyword is borrowed from Runa's type annotations, so the
+    cast reads as a runtime assertion of type rather than the C-style
+    "(Type)expr" which obscures evaluation order. Same surface in
+    every mode.
+    @End Reasoning
+
+    @Implementation:
+    Reads the expression at offset 8 and the target_type node at
+    offset 16. Generates the expression, emits " as ", then renders
+    the target type via generate_type (which knows about generic/
+    array/function type variations).
+    @End Implementation
+
     Note: Get expression and target_type
     Let expr be proc memory_get_int64 from Layout with node, 8
     Let target_type be proc memory_get_int64 from Layout with node, 16
@@ -1029,6 +1493,24 @@ Note: ==========================================================================
 
 Process called "generate_statement" takes context as Integer, node as Integer, node_type as Integer returns Integer:
     Note: Generate syntax for statement nodes
+
+    @Reasoning:
+    Statement-category dispatcher analogous to generate_expression.
+    Fifteen statement kinds are routed: let, set, compound-assign,
+    increase, decrease, multiply, divide, if, while, for, return,
+    match, block, expression-statement. Statements are the
+    indentation-bearing units (each starts on its own line and
+    contributes a newline), so per-kind generators emit
+    emit_indent / emit_newline themselves.
+    @End Reasoning
+
+    @Implementation:
+    Linear cascade of If equality checks against the HIR_*_STATEMENT
+    constants. Order is by approximate frequency in typical programs
+    (let, set, if first; compound math statements grouped). Returns
+    1 on unknown kind so unknown statements act as no-ops rather
+    than crashing the walker.
+    @End Implementation
 
     If node_type is equal to HIR_LET_STATEMENT from HIR:
         Return proc generate_let_statement with context, node
@@ -1093,10 +1575,28 @@ Process called "generate_let_statement" takes context as Integer, node as Intege
     Note: Generate let statement
 
     @Reasoning:
-    Let statement format differs between modes:
-    Canon: Let x be value
-    Developer: Let x = value
+    Variable binding is one of the constructs where Canon and
+    Developer modes diverge meaningfully. Canon emits
+    "Let name as Type be value" — the verb "be" reads as English
+    and "as" introduces the optional type annotation. Developer
+    emits "Let name as Type = value" — the equals sign replaces
+    "be" but the "Let" keyword and "as Type" annotation form are
+    retained because they are syntactically necessary to
+    distinguish declaration from assignment. The type annotation
+    is rendered only if present in the HIR; the initialiser is
+    similarly optional.
     @End Reasoning
+
+    @Implementation:
+    Reads var_name at offset 8, type_annotation at offset 16, and
+    initializer at offset 24 of HIRLetStatement. Reads mode at
+    offset 0. Emits the indented "Let <name>" prefix unconditionally.
+    If type_annotation is non-null, emits " as " followed by the
+    rendered type. If initializer is non-null, emits " be " (Canon)
+    or " = " (Developer) and recursively generates the initializer
+    expression. Closes with emit_newline so the statement terminates
+    on its own line.
+    @End Implementation
 
     Note: Get variable info from HIRLetStatement
     Note: var_name at offset 8, type_annotation at offset 16, initializer at offset 24
@@ -1136,10 +1636,22 @@ Process called "generate_set_statement" takes context as Integer, node as Intege
     Note: Generate set (assignment) statement
 
     @Reasoning:
-    Set statement format differs between modes:
-    Canon: Set x to value
-    Developer: x = value
+    Re-assignment to an existing binding diverges sharply across
+    modes. Canon emits "Set target to value" — a full natural-
+    language sentence with verb and preposition. Developer emits
+    "target = value" — bare C-style assignment. The HIR stores no
+    distinction between "Let" and "Set" beyond the statement kind
+    (the parser routes "Let" for new bindings, "Set" for re-binds
+    and member/index assignment targets). Both modes parse back
+    to the same HIR_SET_STATEMENT.
     @End Reasoning
+
+    @Implementation:
+    Reads target at offset 8, value at offset 16, mode at offset 0.
+    Emits the indent prefix. In Canon mode: "Set ", target, " to ",
+    value. In Developer mode: target, " = ", value. Closes with
+    emit_newline.
+    @End Implementation
 
     Note: Get target and value from HIRSetStatement
     Note: target at offset 8, value at offset 16
@@ -1170,11 +1682,38 @@ Process called "generate_compound_assign_statement" takes context as Integer, no
     Note: Generate compound assignment statement
 
     @Reasoning:
-    Compound assignment differs between modes:
-    Canon: x gets increased by 5 (for +=)
-    Developer: x += 5
-    Supports: +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=
+    Compound assignment is a Developer-mode convenience inherited
+    from C-family languages. Canon mode renders it in full English
+    ("x gets increased by 5", "x gets bitwise xor 0xFF"), preserving
+    the natural-language reading even where the operator is bitwise
+    or shift. Developer mode renders the standard symbolic combined
+    operators (+=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=). Ten
+    operators are supported; in Canon mode the verb phrase varies
+    per operator (increased / decreased / multiplied / divided /
+    modulo / bitwise and / bitwise or / bitwise xor / shifted left /
+    shifted right) and in Developer mode the symbol pair varies.
     @End Reasoning
+
+    @Implementation:
+    Reads target at offset 8, operator at offset 16, value at offset
+    24, mode at offset 0. After emit_indent, branches on mode. The
+    Canon branch emits the target, then " gets ", then a per-operator
+    verb-phrase chosen by linear cascade across OP_ADD, OP_SUB,
+    OP_MUL, OP_DIV, OP_MOD, OP_BIT_AND, OP_BIT_OR, OP_BIT_XOR,
+    OP_SHL, OP_SHR, and finally the value. The Developer branch
+    emits the target, a space, the matching symbolic compound
+    operator (+= through >>=), another space, and the value. Closes
+    with emit_newline. Note that the verb-phrase strings in the
+    Canon branch terminate with a trailing space so the value emits
+    cleanly adjacent without an explicit separator.
+    @End Implementation
+
+    @Performance_Hints:
+    Two linear cascades of up to ten checks (one per mode). On any
+    given compile only one branch is taken; the cost is bounded
+    by the cascade depth, which is acceptable given how frequently
+    compound assignment appears in typical loops.
+    @End Performance_Hints
 
     Note: Get target, operator, and value from HIRCompoundAssignStatement
     Note: target at offset 8, operator at offset 16, value at offset 24
@@ -1274,10 +1813,22 @@ Process called "generate_increase_statement" takes context as Integer, node as I
     Note: Generate increase statement (implicit +=)
 
     @Reasoning:
-    Increase statement:
-    Canon: Increase x by 5
-    Developer: Could emit x += 5 or stay canonical
+    The "Increase x by n" form is a Canon-native statement that
+    expresses the same semantics as "x = x + n" but reads as a
+    direct command. It is preserved as its own HIR kind so round-
+    tripping does not normalise it into a compound assignment.
+    Both modes emit the same surface form here: the natural-
+    language statement is already terse enough that Developer mode
+    does not gain readability by rewriting to "x += n". Users who
+    want the symbolic form write a compound-assign statement
+    instead, which the parser distinguishes.
     @End Reasoning
+
+    @Implementation:
+    Reads target at offset 8 and value at offset 16. Emits indent,
+    then "Increase ", target, " by ", value, then newline. Same in
+    all three modes.
+    @End Implementation
 
     Note: Get target and value from HIRIncreaseStatement
     Note: target at offset 8, value at offset 16
@@ -1303,10 +1854,18 @@ Process called "generate_decrease_statement" takes context as Integer, node as I
     Note: Generate decrease statement (implicit -=)
 
     @Reasoning:
-    Decrease statement:
-    Canon: Decrease x by 3
-    Developer: Could emit x -= 3 or stay canonical
+    Counterpart to Increase: the natural-language statement
+    "Decrease x by n" expresses subtraction-in-place and is
+    preserved as its own HIR kind. Same form across all modes for
+    the same reason as Increase — there is no readability gain in
+    rewriting it to symbolic form when the writer chose the
+    natural-language form.
     @End Reasoning
+
+    @Implementation:
+    Reads target at offset 8 and value at offset 16. Emits indent,
+    then "Decrease ", target, " by ", value, then newline.
+    @End Implementation
 
     Note: Get target and value from HIRDecreaseStatement
     Note: target at offset 8, value at offset 16
@@ -1332,10 +1891,16 @@ Process called "generate_multiply_statement" takes context as Integer, node as I
     Note: Generate multiply statement (implicit *=)
 
     @Reasoning:
-    Multiply statement:
-    Canon: Multiply x by 2
-    Developer: Could emit x *= 2 or stay canonical
+    The "Multiply x by n" form is the Canon-native counterpart to
+    "x *= n". Preserved as its own HIR kind so the surface form
+    chosen by the writer is retained through HIR round-trip. Same
+    form in all modes.
     @End Reasoning
+
+    @Implementation:
+    Reads target at offset 8 and value at offset 16. Emits indent,
+    "Multiply ", target, " by ", value, newline.
+    @End Implementation
 
     Note: Get target and value from HIRMultiplyStatement
     Note: target at offset 8, value at offset 16
@@ -1361,10 +1926,15 @@ Process called "generate_divide_statement" takes context as Integer, node as Int
     Note: Generate divide statement (implicit /=)
 
     @Reasoning:
-    Divide statement:
-    Canon: Divide x by 4
-    Developer: Could emit x /= 4 or stay canonical
+    The "Divide x by n" form is the Canon-native counterpart to
+    "x /= n". Preserved as its own HIR kind so the surface form
+    chosen by the writer is retained. Same form in all modes.
     @End Reasoning
+
+    @Implementation:
+    Reads target at offset 8 and value at offset 16. Emits indent,
+    "Divide ", target, " by ", value, newline.
+    @End Implementation
 
     Note: Get target and value from HIRDivideStatement
     Note: target at offset 8, value at offset 16
@@ -1388,6 +1958,29 @@ End Process
 
 Process called "generate_if_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate if statement with optional else
+
+    @Reasoning:
+    Conditional statements use Runa's word-keyword block style in
+    all three syntax modes: "If condition:", optional "Otherwise:"
+    block, terminated by "End If". The Otherwise keyword (not
+    "Else") is one of Runa's hard syntactic conventions to avoid
+    visual collision with C-family "else". The keyword choice
+    holds across modes because the conditional construct is
+    structurally identical in Canon and Developer mode — only the
+    expressions inside the condition differ in operator
+    rendering.
+    @End Reasoning
+
+    @Implementation:
+    Reads condition at offset 8, then_block at offset 16,
+    else_block at offset 24. Emits the indented "If " followed by
+    the condition expression (recursive), then ":" and a newline.
+    increase_indent, walks the then_block, decrease_indent. If
+    else_block is non-null, emits indented "Otherwise:" line and
+    walks the else_block under one level of additional indent.
+    Closes with an indented "End If" line. The block-walk
+    automatically handles nested If statements via the dispatcher.
+    @End Implementation
 
     Note: Get condition, then_block, else_block from HIRIfStatement
     Note: condition at offset 8, then_block at offset 16, else_block at offset 24
@@ -1429,6 +2022,22 @@ End Process
 Process called "generate_while_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate while loop statement
 
+    @Reasoning:
+    While loops use the canonical block form
+    "While condition: ... End While" across all three modes. The
+    "End While" marker (as opposed to a bare indentation-only
+    block exit) is consistent with Runa's word-keyword closing
+    style for blocks and makes the source robust against
+    indentation accidents.
+    @End Reasoning
+
+    @Implementation:
+    Reads condition at offset 8 and body at offset 16. Emits the
+    indented "While " line, generates the condition, emits ":"
+    and newline. Increases indent, walks the body, decreases
+    indent. Emits indented "End While" followed by a newline.
+    @End Implementation
+
     Note: Get condition and body from HIRWhileStatement
     Note: condition at offset 8, body at offset 16
     Let condition be proc memory_get_int64 from Layout with node, 8
@@ -1453,6 +2062,25 @@ End Process
 
 Process called "generate_for_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate for loop statement
+
+    @Reasoning:
+    For-Each loops are Runa's only iteration-over-collection form
+    (there is no C-style three-part for loop in canonical Runa).
+    The form "For Each name in iterable: ... End For" reads
+    naturally and unambiguously in all three syntax modes.
+    Iterators bind a single name; tuple destructuring in the
+    iterator position would appear as a pattern node and would
+    require a separate For Each Pattern handler if introduced.
+    @End Reasoning
+
+    @Implementation:
+    Reads iterator_name at offset 8, iterable expression at
+    offset 16, body at offset 24. Emits indented "For Each "
+    followed by the iterator name (already a string in the HIR),
+    then " in ", then the rendered iterable expression, then ":"
+    and newline. Increases indent, walks the body, decreases
+    indent. Emits indented "End For" line.
+    @End Implementation
 
     Note: Get iterator, iterable, body from HIRForStatement
     Note: iterator at offset 8, iterable at offset 16, body at offset 24
@@ -1482,6 +2110,21 @@ End Process
 Process called "generate_return_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate return statement
 
+    @Reasoning:
+    Returns use the bare keyword form "Return" optionally followed
+    by a single value expression. The same form is used in all
+    three syntax modes; "Return" is a hard keyword in canonical
+    Runa and is not localised. A null return value emits just the
+    keyword (suitable for unit-returning Processes).
+    @End Reasoning
+
+    @Implementation:
+    Reads the optional return_value at offset 8. Emits indented
+    "Return". If return_value is non-null, emits a separating
+    space and recursively generates the expression. Closes with
+    emit_newline.
+    @End Implementation
+
     Note: Get return value (may be null)
     Let return_value be proc memory_get_int64 from Layout with node, 8
 
@@ -1500,6 +2143,30 @@ End Process
 
 Process called "generate_match_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate match statement with when clauses
+
+    @Reasoning:
+    Pattern-matching uses the form
+      Match expression:
+          When pattern [if guard]:
+              body
+          When pattern:
+              body
+      End Match
+    in all three syntax modes. The block of When clauses is
+    indented one level; each clause's body is indented one
+    further level (handled by generate_when_clause). The keyword
+    "Match" and "When" are hard keywords in canonical Runa.
+    @End Reasoning
+
+    @Implementation:
+    Reads expression at offset 8, when_clauses list at offset 16,
+    clause_count at offset 24. Emits indented "Match " followed
+    by the scrutinee expression, then ":" and newline.
+    increase_indent before walking the When clauses so the When
+    keywords align one level under Match. Iterates the clause
+    list invoking generate_when_clause for each. decrease_indent.
+    Emits indented "End Match" line.
+    @End Implementation
 
     Note: Get expression, when_clauses, clause_count from HIRMatchStatement
     Note: expression at offset 8, when_clauses at offset 16, clause_count at offset 24
@@ -1537,6 +2204,27 @@ End Process
 Process called "generate_when_clause" takes context as Integer, node as Integer returns Integer:
     Note: Generate when clause of match statement
 
+    @Reasoning:
+    A When clause renders as "When pattern[ if guard]:" followed
+    by an indented body. The pattern may be an identifier
+    (capturing the scrutinee), a literal, a wildcard "_", or a
+    tuple pattern — generate_pattern handles each. The optional
+    guard is an arbitrary boolean expression; the "if guard"
+    suffix is borrowed from the same form used in canonical
+    pattern-matching specifications.
+    @End Reasoning
+
+    @Implementation:
+    Reads pattern at offset 8, guard at offset 16, body at
+    offset 24. Emits indented "When " then generates the pattern
+    (with node_type 0 letting generate_pattern read it from the
+    node). If guard is non-null, emits " if " followed by the
+    guard expression. Emits ":" and newline. increase_indent,
+    walks the body via generate_node, decrease_indent. The
+    closing newline of the body is provided by the body's own
+    statements.
+    @End Implementation
+
     Note: Get pattern, guard, body from HIRWhenClause
     Note: pattern at offset 8, guard at offset 16, body at offset 24
     Let pattern be proc memory_get_int64 from Layout with node, 8
@@ -1566,6 +2254,23 @@ End Process
 Process called "generate_block_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate block of statements
 
+    @Reasoning:
+    Blocks are containers of statements that appear inside
+    If/While/For/Match/Process/Type bodies. They emit no surface
+    syntax of their own — the enclosing construct provides the
+    delimiters and indentation. The block walker simply iterates
+    its child statements in order, letting each statement emit
+    its own indented line.
+    @End Reasoning
+
+    @Implementation:
+    Reads statements list at offset 8 and stmt_count at offset 16.
+    Iterates the list calling generate_node for each child
+    statement. Each child is responsible for its own emit_indent
+    and emit_newline so the block walker contributes no extra
+    whitespace.
+    @End Implementation
+
     Note: Get statements and statement_count
     Note: statements at offset 8, statement_count at offset 16
     Let statements be proc memory_get_int64 from Layout with node, 8
@@ -1586,6 +2291,22 @@ End Process
 Process called "generate_expression_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate expression as statement
 
+    @Reasoning:
+    An expression-statement is an expression whose value is
+    discarded — typically a function call invoked for its side
+    effect. The statement form provides the indent and newline
+    that an expression in isolation would not, allowing call
+    expressions to stand on their own as statements in any of the
+    three syntax modes.
+    @End Reasoning
+
+    @Implementation:
+    Reads the expression at offset 8. Emits indent, recursively
+    generates the expression, then emits newline. The expression's
+    own form (call, member, etc.) is fully handled by the
+    dispatcher.
+    @End Implementation
+
     Note: Get expression (offset 8)
     Let expr be proc memory_get_int64 from Layout with node, 8
 
@@ -1602,6 +2323,23 @@ Note: ==========================================================================
 
 Process called "generate_declaration" takes context as Integer, node as Integer, node_type as Integer returns Integer:
     Note: Generate syntax for declaration nodes
+
+    @Reasoning:
+    Declaration-category dispatcher. Three declaration kinds are
+    routed: Process definitions, Type definitions, and Import
+    statements. Declarations appear at the top level of a file
+    or, in the case of nested Processes (not yet supported in
+    canonical Runa), within a containing Process. Declarations
+    are always block-scoped and indentation-bearing like
+    statements.
+    @End Reasoning
+
+    @Implementation:
+    Linear cascade of If equality checks against
+    HIR_PROCESS_DEFINITION, HIR_TYPE_DEFINITION,
+    HIR_IMPORT_STATEMENT. Returns 1 on unknown kind. Each
+    matched generator handles its own emit_indent / emit_newline.
+    @End Implementation
 
     If node_type is equal to HIR_PROCESS_DEFINITION from HIR:
         Return proc generate_process_definition with context, node
@@ -1620,6 +2358,33 @@ End Process
 
 Process called "generate_process_definition" takes context as Integer, node as Integer returns Integer:
     Note: Generate process (function) definition
+
+    @Reasoning:
+    Process (function) definitions follow Runa's natural-language
+    header form:
+      Process called "name" that takes p1 as T1, p2 as T2 returns R:
+          body
+      End Process
+    in all three syntax modes. The double-quoted name, "that
+    takes" / "returns" connectors, and the block "End Process"
+    marker are hard surface conventions and do not vary by mode.
+    Parameters and return type are optional in the HIR; the
+    "that takes" clause is omitted when there are no parameters
+    and the "returns" clause is omitted when the return type is
+    null (unit-returning Process).
+    @End Reasoning
+
+    @Implementation:
+    Reads process_name at offset 8, parameters list at offset 16,
+    param_count at offset 24, return_type at offset 32, body at
+    offset 40. Emits indented Process called "<name>" header.
+    If param_count > 0, emits " that takes " and iterates
+    parameters separated by ", " (each rendered by
+    generate_parameter). If return_type is non-null, emits
+    " returns " followed by the type. Emits ":" and newline.
+    increase_indent, walks body, decrease_indent. Emits indented
+    "End Process" line.
+    @End Implementation
 
     Note: Get process info from HIRProcessDefinition
     Note: name at offset 8, parameters at offset 16, param_count at offset 24
@@ -1677,6 +2442,21 @@ End Process
 Process called "generate_parameter" takes context as Integer, param as Integer returns Integer:
     Note: Generate parameter declaration
 
+    @Reasoning:
+    Process parameters use the "name as Type" form. The "as"
+    keyword binds the name to its declared type and is identical
+    to the form used for variable type annotations. Same surface
+    across all three syntax modes.
+    @End Reasoning
+
+    @Implementation:
+    Reads param_name at offset 8 and param_type at offset 24 of
+    the HIRSymbolInfo. Emits the name, " as ", and the rendered
+    type. The HIRSymbolInfo offset of 24 (rather than 16) reflects
+    the symbol-info layout which carries additional metadata at
+    16 (e.g. symbol-id or storage class) between name and type.
+    @End Implementation
+
     Note: Get param name and type from HIRSymbolInfo
     Let param_name be proc memory_get_int64 from Layout with param, 8
     Let param_type be proc memory_get_int64 from Layout with param, 24
@@ -1690,6 +2470,26 @@ End Process
 
 Process called "generate_type_definition" takes context as Integer, node as Integer returns Integer:
     Note: Generate type definition
+
+    @Reasoning:
+    Type definitions use the form
+      Type called "Name":
+          field_a as TypeA
+          field_b as TypeB
+      End Type
+    in all three syntax modes. Like Process definitions, the
+    name is double-quoted and the block is closed with a
+    word-keyword "End Type". Field declarations inside use the
+    same "name as Type" annotation form as parameters.
+    @End Reasoning
+
+    @Implementation:
+    Reads type_name at offset 8, fields list at offset 16,
+    field_count at offset 24. Emits indented Type called "<name>":
+    header. increase_indent, then iterates the fields list calling
+    generate_field for each. decrease_indent. Emits indented
+    "End Type" line.
+    @End Implementation
 
     Note: Get type info from HIRTypeDefinition
     Note: name at offset 8, fields at offset 16, field_count at offset 24
@@ -1727,6 +2527,19 @@ End Process
 Process called "generate_field" takes context as Integer, field as Integer returns Integer:
     Note: Generate field declaration
 
+    @Reasoning:
+    Struct fields use the "name as Type" form, identical to
+    parameters but indented under the enclosing Type and
+    terminated by a newline rather than a separator. Same in all
+    syntax modes.
+    @End Reasoning
+
+    @Implementation:
+    Reads field_name at offset 8 and field_type at offset 24 of
+    HIRSymbolInfo. Emits indent, the name, " as ", the rendered
+    type, then a newline. One field per line.
+    @End Implementation
+
     Note: Get field name and type from HIRSymbolInfo
     Let field_name be proc memory_get_int64 from Layout with field, 8
     Let field_type be proc memory_get_int64 from Layout with field, 24
@@ -1742,6 +2555,21 @@ End Process
 
 Process called "generate_import_statement" takes context as Integer, node as Integer returns Integer:
     Note: Generate import statement
+
+    @Reasoning:
+    Imports use the form Import "path/to/module.runa" optionally
+    followed by " as Alias" to bind the module under a local
+    name. The path is double-quoted, the alias is bare. Same form
+    in all three syntax modes. Imports are top-level declarations
+    in canonical Runa and are not allowed inside Process bodies.
+    @End Reasoning
+
+    @Implementation:
+    Reads module_path at offset 8 and alias at offset 16. Emits
+    the indented Import "<path>" prefix. If alias is non-null,
+    emits " as " followed by the alias identifier. Closes with
+    newline.
+    @End Implementation
 
     Note: Get module path and alias
     Let module_path be proc memory_get_int64 from Layout with node, 8
@@ -1770,9 +2598,27 @@ Process called "generate_type" takes context as Integer, node as Integer, node_t
     Note: Generate syntax for type nodes
 
     @Reasoning:
-    Type syntax is same in Canon and Developer modes (mostly).
-    Only collection type literals differ slightly.
+    Type-category dispatcher. Six type kinds are routed: basic
+    (Integer/Float/String/Boolean/named), generic (List of T,
+    List[T]), optional (T?), array (Array of N T, Array[T, N]),
+    function ((P) -> R), and union (A OR B). Type syntax is
+    largely mode-invariant; only generic and array types diverge
+    between Canon and Developer modes. The node_type parameter
+    is optional — if zero, the dispatcher reads the actual type
+    tag from the node so callers do not need to look it up
+    twice.
     @End Reasoning
+
+    @Implementation:
+    Treats node_type=0 as "read from node" so generate_type can
+    be invoked either from a known-typed context or from a
+    generic walk. Null node short-circuits as a no-op (returns
+    1) so the dispatcher tolerates omitted type annotations.
+    Cascades through HIR_BASIC_TYPE, HIR_GENERIC_TYPE,
+    HIR_OPTIONAL_TYPE, HIR_ARRAY_TYPE, HIR_FUNCTION_TYPE,
+    HIR_UNION_TYPE matching each in turn and delegating to the
+    appropriate per-kind generator.
+    @End Implementation
 
     If node is equal to 0:
         Return 1
@@ -1813,6 +2659,17 @@ End Process
 Process called "generate_basic_type" takes context as Integer, node as Integer returns Integer:
     Note: Generate basic type name (Integer, Float, String, Boolean)
 
+    @Reasoning:
+    Basic types are atomic type references — primitive types
+    (Integer, Float, String, Boolean) or named user types. The
+    name string stored in the HIR is rendered verbatim in all
+    modes; there is no localisation of primitive type names.
+    @End Reasoning
+
+    @Implementation:
+    Reads type_name at offset 8 of HIRTypeInfo and emits it.
+    @End Implementation
+
     Note: Get type name from HIRTypeInfo
     Let type_name be proc memory_get_int64 from Layout with node, 8
 
@@ -1825,10 +2682,24 @@ Process called "generate_generic_type" takes context as Integer, node as Integer
     Note: Generate generic type with type parameters
 
     @Reasoning:
-    Generic type format differs slightly:
-    Canon: List of Integer
-    Developer: List[Integer]
+    Generic types are one of the two type forms that vary by
+    mode. Canon emits "Base of T1, T2" using the natural-
+    language "of" connector. Developer emits "Base[T1, T2]"
+    using square brackets, the standard symbolic form. The base
+    type is rendered first identically in both modes; only the
+    parameter-list bracketing differs. Both forms parse to the
+    same HIR_GENERIC_TYPE so HIR round-trip is preserved.
     @End Reasoning
+
+    @Implementation:
+    Reads base_type at offset 8, type_params list at offset 16,
+    param_count at offset 24. Reads mode at offset 0. Always
+    generates the base type first via recursive generate_type.
+    In Canon: emits " of " then iterates parameters separated
+    by ", ". In Developer: emits "[", iterates with ", "
+    separators, emits "]". The Set form reuses the i counter
+    on the second branch (block-scoped name).
+    @End Implementation
 
     Note: Get base type, type_params, param_count
     Let base_type be proc memory_get_int64 from Layout with node, 8
@@ -1879,6 +2750,19 @@ End Process
 Process called "generate_optional_type" takes context as Integer, node as Integer returns Integer:
     Note: Generate optional type (T?)
 
+    @Reasoning:
+    Optional types use the postfix "?" sigil in all three syntax
+    modes. The "T?" form is short and unambiguous; spelling it
+    out as "Optional of T" in Canon would conflict with the
+    generic-of form (Optional of T already parses, but the "?"
+    sigil is the established canonical surface for optionality).
+    @End Reasoning
+
+    @Implementation:
+    Reads the inner type at offset 8. Generates the inner type
+    via recursive generate_type, then emits "?" as a postfix.
+    @End Implementation
+
     Note: Get inner type
     Let inner_type be proc memory_get_int64 from Layout with node, 8
 
@@ -1892,10 +2776,25 @@ Process called "generate_array_type" takes context as Integer, node as Integer r
     Note: Generate array type
 
     @Reasoning:
-    Array type format differs:
-    Canon: Array of 10 Integers
-    Developer: Array[Integer, 10]
+    Array types diverge between Canon and Developer modes in
+    both ordering and bracketing. Canon emits "Array of N T"
+    (size first, then element type, reading as "an array of N
+    things of type T"). Developer emits "Array[T, N]" (element
+    type first, then size — the C++/Rust convention). Both
+    parse to the same HIR_ARRAY_TYPE node so HIR round-trip is
+    preserved. Size may be zero/null for unsized arrays in
+    which case the size component is omitted in both modes.
     @End Reasoning
+
+    @Implementation:
+    Reads element_type at offset 8 and array_size at offset 16.
+    Reads mode. In Canon: emits "Array of ", then array_size and
+    a separating space if non-zero, then the rendered element
+    type. In Developer: emits "Array[", the rendered element
+    type, then ", " plus the size if non-zero, then "]". The
+    array_size field is stored as the textual size representation
+    so it can be emitted directly without integer formatting.
+    @End Implementation
 
     Note: Get element type and size
     Let element_type be proc memory_get_int64 from Layout with node, 8
@@ -1930,6 +2829,22 @@ End Process
 Process called "generate_function_type" takes context as Integer, node as Integer returns Integer:
     Note: Generate function type signature
 
+    @Reasoning:
+    Function types use the form "(P1, P2) -> R" in all three
+    syntax modes. The arrow form is borrowed from mathematical
+    notation and is universally understood in typed-language
+    syntax. Canon mode does not render this as "a function from
+    P1 and P2 to R" because the arrow form is already terse,
+    unambiguous, and consistent with type-theoretical reading.
+    @End Reasoning
+
+    @Implementation:
+    Reads param_types list at offset 8, param_count at offset 16,
+    return_type at offset 24. Emits "(", iterates parameter types
+    separated by ", ", emits ") -> ", then renders the return
+    type via recursive generate_type.
+    @End Implementation
+
     Note: Get param_types, param_count, return_type
     Let param_types be proc memory_get_int64 from Layout with node, 8
     Let param_count be proc memory_get_int64 from Layout with node, 16
@@ -1959,6 +2874,24 @@ End Process
 Process called "generate_union_type" takes context as Integer, node as Integer returns Integer:
     Note: Generate union type (A OR B)
 
+    @Reasoning:
+    Union types use the infix "OR" keyword separator
+    ("A OR B OR C") in all three syntax modes. The uppercase
+    "OR" is intentional and distinct from the lowercase "or"
+    boolean operator; it is a hard type-level keyword reserved
+    for unions. The form reads as English even in Developer mode
+    because no widely-recognised symbolic alternative exists
+    that does not collide with bitwise-or "|" already taken by
+    the bitwise operator.
+    @End Reasoning
+
+    @Implementation:
+    Reads variants list at offset 8 and variant_count at offset
+    16. Iterates emitting each variant rendered by recursive
+    generate_type, separated by " OR " (with surrounding
+    spaces). No surrounding brackets.
+    @End Implementation
+
     Note: Get type variants and variant_count
     Let variants be proc memory_get_int64 from Layout with node, 8
     Let variant_count be proc memory_get_int64 from Layout with node, 16
@@ -1985,6 +2918,25 @@ Note: ==========================================================================
 
 Process called "generate_pattern" takes context as Integer, node as Integer, node_type as Integer returns Integer:
     Note: Generate syntax for pattern nodes
+
+    @Reasoning:
+    Pattern-category dispatcher. Four pattern kinds are supported:
+    identifier (binds a name), literal (matches a constant value),
+    wildcard (matches anything, syntax "_"), and tuple
+    (destructuring of a tuple). Patterns appear in Match
+    statements' When clauses and (in future) in destructuring
+    Let bindings. The node_type parameter follows the same
+    optional-lookup pattern as generate_type.
+    @End Reasoning
+
+    @Implementation:
+    Treats node_type=0 as "read from node" so generate_pattern
+    can be invoked with either known or unknown kind. Null node
+    short-circuits as no-op. Cascades through
+    HIR_IDENTIFIER_PATTERN, HIR_LITERAL_PATTERN,
+    HIR_WILDCARD_PATTERN, HIR_TUPLE_PATTERN matching and
+    delegating to the appropriate generator.
+    @End Implementation
 
     If node is equal to 0:
         Return 1
@@ -2017,6 +2969,18 @@ End Process
 Process called "generate_identifier_pattern" takes context as Integer, node as Integer returns Integer:
     Note: Generate identifier pattern (variable binding)
 
+    @Reasoning:
+    An identifier pattern in a When clause binds the matched
+    value to a fresh name visible in the clause body. The
+    surface form is the bare identifier; no sigil or prefix is
+    needed because the surrounding "When ... :" context makes
+    the binding role clear. Same form in all modes.
+    @End Reasoning
+
+    @Implementation:
+    Reads the identifier name at offset 8 and emits it.
+    @End Implementation
+
     Note: Get identifier name
     Let name be proc memory_get_int64 from Layout with node, 8
 
@@ -2027,6 +2991,20 @@ End Process
 
 Process called "generate_literal_pattern" takes context as Integer, node as Integer returns Integer:
     Note: Generate literal pattern for matching
+
+    @Reasoning:
+    A literal pattern matches a specific constant value (integer,
+    string, boolean). The surface form is the bare literal value
+    string from the HIR. Same in all syntax modes. Note that
+    string-literal patterns in this implementation do not add
+    surrounding quotes because the literal value as stored in
+    pattern HIR is the raw textual form including any quoting
+    needed; the upstream parser handles that detail.
+    @End Reasoning
+
+    @Implementation:
+    Reads the literal value at offset 8 and emits it directly.
+    @End Implementation
 
     Note: Get literal value
     Let value be proc memory_get_int64 from Layout with node, 8
@@ -2039,6 +3017,16 @@ End Process
 Process called "generate_wildcard_pattern" takes context as Integer, node as Integer returns Integer:
     Note: Generate wildcard pattern (_)
 
+    @Reasoning:
+    The wildcard pattern "_" matches any value without binding
+    it. Universal across pattern-matching languages and used
+    identically in all three Runa syntax modes.
+    @End Reasoning
+
+    @Implementation:
+    Emits the literal underscore "_".
+    @End Implementation
+
     proc emit with context, "_"
 
     Return 1
@@ -2046,6 +3034,21 @@ End Process
 
 Process called "generate_tuple_pattern" takes context as Integer, node as Integer returns Integer:
     Note: Generate tuple destructuring pattern
+
+    @Reasoning:
+    Tuple patterns destructure a tuple scrutinee by position,
+    binding (or matching) each component to a nested pattern.
+    Surface form is "(p1, p2, p3)" matching the tuple-literal
+    form. Each nested pattern may itself be any pattern kind
+    (identifier, literal, wildcard, or another tuple). Same form
+    across all syntax modes.
+    @End Reasoning
+
+    @Implementation:
+    Reads the nested patterns list at offset 8 and pattern_count
+    at offset 16. Emits "(", iterates patterns separated by ", "
+    each rendered via recursive generate_pattern, emits ")".
+    @End Implementation
 
     Note: Get patterns and pattern_count
     Let patterns be proc memory_get_int64 from Layout with node, 8

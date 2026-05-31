@@ -1,0 +1,1119 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+STATEMENT LOWERING - HIR Statements to MIR Instructions (P2-E Group B)
+
+Pre/post handlers for HIR straight-line statement nodes (no control
+flow): LET, SET, RETURN, BREAK, CONTINUE, BLOCK.
+
+Per the v3 design Section 3.4 table:
+  - LET, SET use pre + post: pre allocates the destination MIR value
+    or seeds the lvalue marker; post consumes the initializer/value
+    from the result stack and emits the store.
+  - RETURN uses post only.
+  - BREAK, CONTINUE use post only and read the current loop frame
+    from the cf_frame_stack via the control_flow_lowering module's
+    helpers.
+  - BLOCK uses post only and is a no-op (its child statements emit
+    themselves directly).
+:End Note
+
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/lowering/lowering_context.runa" as LCtx
+Import "compiler/middle/gungnir/mir/lowering/expression_lowering.runa" as ExprLow
+Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================
+Note: HIR_LET_STATEMENT pre/post handlers
+Note: ============================================================
+
+@Reasoning
+HIR_LET_STATEMENT pre: allocates a fresh MIR alloca for the variable
+slot and maps the HIR variable id to that alloca's value id. Doing
+this before children are visited ensures the initializer expression
+can reference the binding by id if it is recursive (rare for Let,
+but supported).
+@End Reasoning
+
+@Implementation
+1. Read var_id at HIR_LET_STATEMENT offset 16.
+2. Read type_info at offset 8.
+3. Allocate a fresh value id and emit a MIR_ALLOCA whose
+   element_type = type_info, count_value_id = 0, alignment = 8 (the
+   default integer alignment; smaller types use the same alloca
+   slot — the LIR pass narrows the store width).
+4. map_hir_to_mir_value(var_id, alloca_value).
+5. Push a sentinel value id (alloca_value) onto the result stack so
+   the matching post handler can recover the alloca pointer.
+@End Implementation
+
+@Performance_Hints
+One alloca per Let. The alloca node is small (24 bytes) and the
+dictionary insert is O(1).
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks on ctx and hir_node_ptr.
+@End Security_Scope
+
+Process called "lower_hir_let_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let var_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let type_info be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Let alloca_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with alloca_value, type_info, 0, 8
+    If alloca_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    proc map_hir_to_mir_value from MIRBuilder with builder_ctx, var_id, alloca_value
+
+    Note: Stash the alloca_value into pending_lvalue so the post
+    Note: handler can emit the store without re-deriving it.
+    proc lowering_set_pending_lvalue from LCtx with ctx, alloca_value
+    Return 1
+End Process
+
+@Reasoning
+HIR_LET_STATEMENT post: consumes the initializer value (if any)
+from the result stack and emits a MIR_STORE to the alloca created
+in pre. If the initializer was absent (init child was null and
+therefore skipped by the visitor), there is no value on the stack
+and no store is emitted — the alloca holds whatever default the
+type system has assigned.
+@End Reasoning
+
+@Implementation
+1. Recover alloca_value via lowering_take_pending_lvalue.
+2. If the result stack is non-empty (the initializer pushed a
+   value), pop it; otherwise skip emission.
+3. Read type_info at offset 8 of the HIR node for the store's
+   value_type.
+4. Emit MIR_STORE with address=alloca, value=init_value.
+@End Implementation
+
+@Performance_Hints
+At most one pop, one store, per Let with initializer. No-init Let
+is a fast path (no MIR emitted in post).
+@End Performance_Hints
+
+@Security_Scope
+Bounded by the result stack depth; defensive against absent
+initializers.
+@End Security_Scope
+
+Process called "lower_hir_let_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let alloca_value be proc lowering_take_pending_lvalue from LCtx with ctx
+    If alloca_value is equal to 0:
+        Return 1
+    End If
+
+    Note: Check if the initializer pushed a value (lowering_result_depth
+    Note: returns >=1 only when the init child ran).
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    If depth is equal to 0:
+        Return 1
+    End If
+
+    Let init_value be proc lowering_pop_result from LCtx with ctx
+    Let type_info be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Let store_inst be proc create_mir_store from MIRNodes with alloca_value, init_value, 0, type_info, 0
+    If store_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_SET_STATEMENT pre/post handlers
+Note: ============================================================
+
+@Reasoning
+HIR_SET_STATEMENT pre: records the lvalue target id so the post
+handler can emit the store without re-traversing the HIR. For Set
+the target is an HIR sub-tree (could be identifier, member, or
+index), so we delegate the actual lookup to the child traversal —
+the target value is pushed by its post handler and the store
+address comes from that.
+@End Reasoning
+
+@Implementation
+Pre is a no-op for Set in the visitor-driven model: the target
+child's lowering produces an addressable MIR value (alloca pointer
+or computed address) on the stack, and the value child's lowering
+produces the value-to-store. The post handler consumes both.
+
+The visitor's per-child child_index sequence is: 0 = target,
+1 = value. After visiting, the stack contains [target_addr,
+value_to_store] with value_to_store on top (LIFO).
+@End Implementation
+
+@Performance_Hints
+Pre is currently a no-op so the trampoline can skip the dispatch
+entirely. We register a non-null pre to reserve the slot for
+future expansion (e.g., recording a "target is index" flag).
+@End Performance_Hints
+
+@Security_Scope
+No state mutation in pre. The post handler validates both stack
+slots before emitting.
+@End Security_Scope
+
+Process called "lower_hir_set_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning
+HIR_SET_STATEMENT post: pops value-to-store then target address
+and emits a MIR_STORE. Type info is read from the HIR node at
+offset 8.
+@End Reasoning
+
+@Implementation
+1. Pop value (top of LIFO = child_index 1 = value).
+2. Pop target (= child_index 0 = address).
+3. Emit MIR_STORE with address=target, value=value, type=type_info.
+@End Implementation
+
+@Performance_Hints
+Two pops, one store.
+@End Performance_Hints
+
+@Security_Scope
+Null target or value triggers a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_set_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let value_to_store be proc lowering_pop_result from LCtx with ctx
+    Let target_addr be proc lowering_pop_result from LCtx with ctx
+
+    If target_addr is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 7, hir_node_ptr
+        Return 0
+    End If
+    If value_to_store is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 8, hir_node_ptr
+        Return 0
+    End If
+
+    Let type_info be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Let store_inst be proc create_mir_store from MIRNodes with target_addr, value_to_store, 0, type_info, 0
+    If store_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_RETURN_STATEMENT post handler
+Note: ============================================================
+
+@Reasoning
+HIR_RETURN_STATEMENT post: emits MIR_RETURN consuming the optional
+return value from the result stack. Void return (no value child)
+emits MIR_RETURN(0, type=0).
+@End Reasoning
+
+@Implementation
+1. Check result stack depth: if >= 1, pop the return value.
+2. Read function_return_type from the builder context offset 72
+   (the return type was recorded when the enclosing
+   HIR_PROCESS_DEFINITION's pre handler ran).
+3. Emit MIR_RETURN(value, type).
+@End Implementation
+
+@Performance_Hints
+At most one pop and one emit per return.
+@End Performance_Hints
+
+@Security_Scope
+A void-returning Return inside a non-void function is a HIR-layer
+error caught earlier by the type checker; the lowering layer
+trusts the input.
+@End Security_Scope
+
+Process called "lower_hir_return_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let return_value be 0
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    If depth is greater than 0:
+        Set return_value to proc lowering_pop_result from LCtx with ctx
+    End If
+
+    Let return_type be proc memory_get_int64 from Layout with builder_ctx, 72
+
+    Let return_inst be proc create_mir_return from MIRNodes with return_value, return_type
+    If return_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, return_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_BREAK_STATEMENT post handler
+Note: ============================================================
+
+@Reasoning
+HIR_BREAK_STATEMENT post: emits an unconditional jump to the
+current loop frame's exit_label. The break target is recorded in
+the MIR builder context at offset 56 by the enclosing loop's pre
+handler; if it is -1 the break is outside any loop and is a
+lowering error.
+@End Reasoning
+
+@Implementation
+1. Read break_target from builder_ctx offset 56.
+2. If -1, set the error flag and stop.
+3. Emit MIR_JUMP(break_target).
+@End Implementation
+
+@Performance_Hints
+Single instruction emission.
+@End Performance_Hints
+
+@Security_Scope
+Outside-loop Break is rejected at lowering time; HIR-layer scope
+checks should catch this earlier but the defensive check stays.
+@End Security_Scope
+
+Process called "lower_hir_break_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let break_target be proc memory_get_int64 from Layout with builder_ctx, 56
+
+    If break_target is equal to 0 minus 1:
+        proc lowering_set_error from LCtx with ctx, 9, hir_node_ptr
+        Return 0
+    End If
+
+    Let jump_inst be proc create_mir_jump from MIRNodes with break_target
+    If jump_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, jump_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_CONTINUE_STATEMENT post handler
+Note: ============================================================
+
+@Reasoning
+HIR_CONTINUE_STATEMENT post: emits an unconditional jump to the
+current loop frame's continue_target (header_label). Recorded in
+the MIR builder context at offset 64.
+@End Reasoning
+
+@Implementation
+1. Read continue_target from builder_ctx offset 64.
+2. If -1, set error flag.
+3. Emit MIR_JUMP(continue_target).
+@End Implementation
+
+@Performance_Hints
+Single instruction emission.
+@End Performance_Hints
+
+@Security_Scope
+Outside-loop Continue is rejected.
+@End Security_Scope
+
+Process called "lower_hir_continue_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let continue_target be proc memory_get_int64 from Layout with builder_ctx, 64
+
+    If continue_target is equal to 0 minus 1:
+        proc lowering_set_error from LCtx with ctx, 10, hir_node_ptr
+        Return 0
+    End If
+
+    Let jump_inst be proc create_mir_jump from MIRNodes with continue_target
+    If jump_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, jump_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_BLOCK_STATEMENT post handler
+Note: ============================================================
+
+@Reasoning
+HIR_BLOCK_STATEMENT post: no-op. Block statements are
+syntactic groupings; their child statements are visited in source
+order and each emits its own MIR. The block contributes nothing
+beyond child traversal, so there is no work to do in post.
+@End Reasoning
+
+@Implementation
+Returns 1 immediately. Registration of this handler is for symmetry
+— future scope-tracking extensions (debug info scope spans,
+defer-statement emission) plug into this slot.
+@End Implementation
+
+@Performance_Hints
+Effectively free. The trampoline still pays a dispatch cost; if
+that ever becomes hot the slot can be left null instead.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_block_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_EXPRESSION_STATEMENT post handler
+Note: ============================================================
+
+@Reasoning
+HIR_EXPRESSION_STATEMENT post: an expression used as a statement
+(value discarded). The child expression's post handler pushed its
+result onto the stack; we pop and discard it so the stack remains
+balanced for the next statement.
+@End Reasoning
+
+@Implementation
+Pop one value from the result stack and discard. No MIR is emitted
+— the side effects of the child expression already produced their
+instructions; the residual value is not used.
+@End Implementation
+
+@Performance_Hints
+Single pop.
+@End Performance_Hints
+
+@Security_Scope
+Empty-stack pop returns 0 silently (no error — a void-valued
+expression statement is valid).
+@End Security_Scope
+
+Process called "lower_hir_expression_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    If depth is greater than 0:
+        proc lowering_pop_result from LCtx with ctx
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_DEFINE_STATEMENT pre + post handlers (11002)
+Note: ============================================================
+
+@Reasoning
+HIR_DEFINE_STATEMENT pre/post: a Define declares a constant. The
+constant value is a compile-time expression; lowering it is
+identical in shape to HIR_LET_STATEMENT — allocate, then store
+the initializer in post. The difference at the HIR layer is that
+Define enforces immutability, which is a HIR-level concern; MIR
+sees a normal alloca + store. Future optimisation will replace
+the alloca with a global constant value when the initializer is
+itself constant.
+@End Reasoning
+
+@Implementation
+Pre: read const_id at offset 16 and type_info at offset 8, allocate
+an alloca and map_hir_to_mir_value the constant's id to it. Stash
+the alloca_value into pending_lvalue so post can emit the store.
+
+Post: pop the initializer value (always present for Define) and
+emit MIR_STORE.
+@End Implementation
+
+@Performance_Hints
+Identical to Let: one alloca + one store per Define.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks on ctx, hir_node_ptr.
+@End Security_Scope
+
+Process called "lower_hir_define_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let const_id be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let type_info be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Let alloca_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let alloca_inst be proc create_mir_alloca from MIRNodes with alloca_value, type_info, 0, 8
+    If alloca_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+    proc map_hir_to_mir_value from MIRBuilder with builder_ctx, const_id, alloca_value
+
+    proc lowering_set_pending_lvalue from LCtx with ctx, alloca_value
+    Return 1
+End Process
+
+Process called "lower_hir_define_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let alloca_value be proc lowering_take_pending_lvalue from LCtx with ctx
+    If alloca_value is equal to 0:
+        Return 1
+    End If
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    If depth is equal to 0:
+        Return 1
+    End If
+
+    Let init_value be proc lowering_pop_result from LCtx with ctx
+    Let type_info be proc memory_get_int64 from Layout with hir_node_ptr, 8
+
+    Let store_inst be proc create_mir_store from MIRNodes with alloca_value, init_value, 0, type_info, 0
+    If store_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_OTHERWISE_STATEMENT post handler (11004)
+Note: ============================================================
+
+@Reasoning
+HIR_OTHERWISE_STATEMENT post: per v3 design Q3, the else-clause
+node is consumed by the parent HIR_IF_STATEMENT's child traversal
+which reads the else-body directly. If the visitor ever routes a
+standalone HIR_OTHERWISE_STATEMENT through visit_hir_node, this
+handler is a no-op — its body (the wrapped statement) has already
+emitted its MIR through the recursive visit. Registered for
+completeness so dispatch coverage is 100%.
+@End Reasoning
+
+@Implementation
+Returns 1. No state mutation, no emission.
+@End Implementation
+
+@Performance_Hints
+Zero cost beyond the dispatch trampoline. In practice the handler
+is never invoked because HIR_IF_STATEMENT consumes the else body
+directly.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_otherwise_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_YIELD_STATEMENT post handler (11011)
+Note: ============================================================
+
+@Reasoning
+HIR_YIELD_STATEMENT post: lowers a generator yield. For v0.0.8.5
+generators are implemented as state-machine functions; the yield
+emits a runtime call to the generator's yield helper with the
+value being yielded. The generator state machine handles
+suspension and resumption.
+@End Reasoning
+
+@Implementation
+1. Pop the yielded value from the result stack.
+2. Read yield_type at HIR_YIELD_STATEMENT offset 16.
+3. Build a single-arg MIR_CALL to the runtime yield helper
+   (callee value 0 = intrinsic, LIR resolves the runtime symbol).
+@End Implementation
+
+@Performance_Hints
+One call emission per yield.
+@End Performance_Hints
+
+@Security_Scope
+Null value is treated as a void yield (legal in some generator
+forms); emit a call with no args in that case.
+@End Security_Scope
+
+Process called "lower_hir_yield_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let yield_type be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let depth be proc lowering_result_depth from LCtx with ctx
+    Let mir_args be proc create from List
+    Let arg_count be 0
+    If depth is greater than 0:
+        Let yielded_value be proc lowering_pop_result from LCtx with ctx
+        proc insert from List with mir_args, 0, yielded_value
+        Set arg_count to 1
+    End If
+
+    Let result_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let call_inst be proc create_mir_call from MIRNodes with result_value, 0, mir_args, arg_count, yield_type, 0, 0
+    If call_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, call_inst
+    End If
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_COMPOUND_ASSIGN_STATEMENT post handler (11020)
+Note: ============================================================
+
+@Reasoning
+HIR_COMPOUND_ASSIGN_STATEMENT post: lowers compound assignments
+(+=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=) to load + binary op +
+store. The visitor pushes the target address (child 0) and the
+right-hand-side value (child 1); we load the current target value,
+perform the binary op, and store the result back.
+@End Reasoning
+
+@Implementation
+1. Pop rhs_value (child_index 1) and target_addr (child_index 0).
+2. Read operator id at HIR_COMPOUND_ASSIGN_STATEMENT offset 24 and
+   result_type at offset 32.
+3. Map the operator to a MIR binary opcode via
+   map_binary_operator_to_mir_opcode from ExpressionLowering.
+4. Emit MIR_LOAD(current_value, target_addr).
+5. Emit MIR_BINARY_OP(result_value, current_value, rhs_value).
+6. Emit MIR_STORE(target_addr, result_value).
+@End Implementation
+
+@Performance_Hints
+Three instruction emissions per compound assign.
+@End Performance_Hints
+
+@Security_Scope
+Null target or rhs is a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_compound_assign_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let rhs_value be proc lowering_pop_result from LCtx with ctx
+    Let target_addr be proc lowering_pop_result from LCtx with ctx
+
+    If target_addr is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 40, hir_node_ptr
+        Return 0
+    End If
+    If rhs_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 41, hir_node_ptr
+        Return 0
+    End If
+
+    Let operator be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let result_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Let mir_opcode be proc map_binary_operator_to_mir_opcode from ExprLow with operator
+
+    Let current_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with current_value, target_addr, 0, result_type, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let new_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let bin_inst be proc create_mir_binary_op from MIRNodes with mir_opcode, new_value, current_value, rhs_value, result_type
+    If bin_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, bin_inst
+    End If
+
+    Let store_inst be proc create_mir_store from MIRNodes with target_addr, new_value, 0, result_type, 0
+    If store_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    End If
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_INCREASE_STATEMENT post handler (11021)
+Note: ============================================================
+
+@Reasoning
+HIR_INCREASE_STATEMENT post: "Increase X by N" — equivalent to
+X = X + N. The visitor pushes the target address (child 0) and
+the increase amount (child 1). Identical shape to compound assign
+with operator hard-coded to MIR_ADD (20002).
+@End Reasoning
+
+@Implementation
+1. Pop amount (child 1) and target (child 0).
+2. Emit load + add + store with MIR_ADD opcode.
+@End Implementation
+
+@Performance_Hints
+Three instruction emissions per Increase.
+@End Performance_Hints
+
+@Security_Scope
+Null target or amount is a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_increase_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let amount be proc lowering_pop_result from LCtx with ctx
+    Let target_addr be proc lowering_pop_result from LCtx with ctx
+
+    If target_addr is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 42, hir_node_ptr
+        Return 0
+    End If
+    If amount is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 43, hir_node_ptr
+        Return 0
+    End If
+
+    Let value_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let current_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with current_value, target_addr, 0, value_type, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let new_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let add_inst be proc create_mir_binary_op from MIRNodes with 20002, new_value, current_value, amount, value_type
+    If add_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, add_inst
+    End If
+
+    Let store_inst be proc create_mir_store from MIRNodes with target_addr, new_value, 0, value_type, 0
+    If store_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    End If
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_DECREASE_STATEMENT post handler (11022)
+Note: ============================================================
+
+@Reasoning
+HIR_DECREASE_STATEMENT post: "Decrease X by N" — equivalent to
+X = X - N. Same shape as Increase with MIR_SUB (20003) as the
+operator.
+@End Reasoning
+
+@Implementation
+load + sub + store with MIR_SUB opcode.
+@End Implementation
+
+@Performance_Hints
+Three instruction emissions per Decrease.
+@End Performance_Hints
+
+@Security_Scope
+Null target or amount is a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_decrease_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let amount be proc lowering_pop_result from LCtx with ctx
+    Let target_addr be proc lowering_pop_result from LCtx with ctx
+
+    If target_addr is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 44, hir_node_ptr
+        Return 0
+    End If
+    If amount is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 45, hir_node_ptr
+        Return 0
+    End If
+
+    Let value_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let current_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with current_value, target_addr, 0, value_type, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let new_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let sub_inst be proc create_mir_binary_op from MIRNodes with 20003, new_value, current_value, amount, value_type
+    If sub_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, sub_inst
+    End If
+
+    Let store_inst be proc create_mir_store from MIRNodes with target_addr, new_value, 0, value_type, 0
+    If store_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    End If
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_MULTIPLY_STATEMENT post handler (11023)
+Note: ============================================================
+
+@Reasoning
+HIR_MULTIPLY_STATEMENT post: "Multiply X by N" — X = X * N. Same
+shape with MIR_MUL (20004) as the operator.
+@End Reasoning
+
+@Implementation
+load + mul + store with MIR_MUL opcode.
+@End Implementation
+
+@Performance_Hints
+Three instruction emissions per Multiply.
+@End Performance_Hints
+
+@Security_Scope
+Null target or amount is a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_multiply_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let amount be proc lowering_pop_result from LCtx with ctx
+    Let target_addr be proc lowering_pop_result from LCtx with ctx
+
+    If target_addr is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 46, hir_node_ptr
+        Return 0
+    End If
+    If amount is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 47, hir_node_ptr
+        Return 0
+    End If
+
+    Let value_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let current_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with current_value, target_addr, 0, value_type, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let new_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let mul_inst be proc create_mir_binary_op from MIRNodes with 20004, new_value, current_value, amount, value_type
+    If mul_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, mul_inst
+    End If
+
+    Let store_inst be proc create_mir_store from MIRNodes with target_addr, new_value, 0, value_type, 0
+    If store_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    End If
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_DIVIDE_STATEMENT post handler (11024)
+Note: ============================================================
+
+@Reasoning
+HIR_DIVIDE_STATEMENT post: "Divide X by N" — X = X / N. Same shape
+with MIR_DIV (20005) as the operator.
+@End Reasoning
+
+@Implementation
+load + div + store with MIR_DIV opcode.
+@End Implementation
+
+@Performance_Hints
+Three instruction emissions per Divide. Division has runtime cost
+proportional to bit width on most ISAs; the compiler does not
+elide divide-by-constant here — that optimisation belongs in MIR
+strength-reduction.
+@End Performance_Hints
+
+@Security_Scope
+Null target or amount is a lowering error. Divide-by-zero is a
+runtime concern handled by the MIR_DIV instruction's runtime
+trap; the lowering layer does not inject a runtime check.
+@End Security_Scope
+
+Process called "lower_hir_divide_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let amount be proc lowering_pop_result from LCtx with ctx
+    Let target_addr be proc lowering_pop_result from LCtx with ctx
+
+    If target_addr is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 48, hir_node_ptr
+        Return 0
+    End If
+    If amount is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 49, hir_node_ptr
+        Return 0
+    End If
+
+    Let value_type be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let current_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_inst be proc create_mir_load from MIRNodes with current_value, target_addr, 0, value_type, 0
+    If load_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_inst
+    End If
+
+    Let new_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let div_inst be proc create_mir_binary_op from MIRNodes with 20005, new_value, current_value, amount, value_type
+    If div_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, div_inst
+    End If
+
+    Let store_inst be proc create_mir_store from MIRNodes with target_addr, new_value, 0, value_type, 0
+    If store_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+    End If
+    Return 1
+End Process
+
+Note: ============================================================
+Note: Statement Handler Registration
+Note: ============================================================
+
+@Reasoning
+Installs every statement-node handler in the lowering dispatch
+table.
+@End Reasoning
+
+@Implementation
+Sequence of lowering_register_handler calls. LET and SET register
+both pre + post; the rest register post only.
+@End Implementation
+
+@Performance_Hints
+Cold path.
+@End Performance_Hints
+
+@Security_Scope
+Validates table non-null.
+@End Security_Scope
+
+Process called "register_statement_handlers" that takes dispatch_table as Integer returns Integer:
+    If dispatch_table is equal to 0:
+        Return 0
+    End If
+
+    Note: HIR_LET_STATEMENT (11000): pre + post
+    proc lowering_register_handler from LCtx with dispatch_table, 11000, lower_hir_let_statement_pre, lower_hir_let_statement_post, 0, 0
+
+    Note: HIR_SET_STATEMENT (11001): pre + post
+    proc lowering_register_handler from LCtx with dispatch_table, 11001, lower_hir_set_statement_pre, lower_hir_set_statement_post, 0, 0
+
+    Note: HIR_RETURN_STATEMENT (11010): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11010, 0, lower_hir_return_statement_post, 0, 0
+
+    Note: HIR_BREAK_STATEMENT (11012): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11012, 0, lower_hir_break_statement_post, 0, 0
+
+    Note: HIR_CONTINUE_STATEMENT (11013): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11013, 0, lower_hir_continue_statement_post, 0, 0
+
+    Note: HIR_BLOCK_STATEMENT (11018): post only (no-op)
+    proc lowering_register_handler from LCtx with dispatch_table, 11018, 0, lower_hir_block_statement_post, 0, 0
+
+    Note: HIR_EXPRESSION_STATEMENT (11019): post only (pop-and-discard)
+    proc lowering_register_handler from LCtx with dispatch_table, 11019, 0, lower_hir_expression_statement_post, 0, 0
+
+    Note: HIR_DEFINE_STATEMENT (11002): pre + post
+    proc lowering_register_handler from LCtx with dispatch_table, 11002, lower_hir_define_statement_pre, lower_hir_define_statement_post, 0, 0
+
+    Note: HIR_OTHERWISE_STATEMENT (11004): post only (no-op per v3 Q3)
+    proc lowering_register_handler from LCtx with dispatch_table, 11004, 0, lower_hir_otherwise_statement_post, 0, 0
+
+    Note: HIR_YIELD_STATEMENT (11011): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11011, 0, lower_hir_yield_statement_post, 0, 0
+
+    Note: HIR_COMPOUND_ASSIGN_STATEMENT (11020): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11020, 0, lower_hir_compound_assign_statement_post, 0, 0
+
+    Note: HIR_INCREASE_STATEMENT (11021): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11021, 0, lower_hir_increase_statement_post, 0, 0
+
+    Note: HIR_DECREASE_STATEMENT (11022): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11022, 0, lower_hir_decrease_statement_post, 0, 0
+
+    Note: HIR_MULTIPLY_STATEMENT (11023): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11023, 0, lower_hir_multiply_statement_post, 0, 0
+
+    Note: HIR_DIVIDE_STATEMENT (11024): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11024, 0, lower_hir_divide_statement_post, 0, 0
+
+    Return 1
+End Process

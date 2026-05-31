@@ -384,6 +384,33 @@ Register size determines allocation constraints (8, 16, 32, 64 bits).
 Register class determines which physical registers can be allocated (GPR, FPR, VEC).
 @End Reasoning
 
+@Implementation
+1. NULL-guard the function pointer; emit a diagnostic and return 0 on failure.
+2. Load the next_vreg_id counter at offset 88 (starts at 1000 from lir_create_function).
+3. Increment next_vreg_id in place so subsequent calls allocate unique IDs.
+4. Maintain the virtual_reg_count statistic at offset 80 for downstream allocator sizing.
+5. Lazily materialize the per-function metadata Dictionary at offset 136 on first
+   virtual-register creation to avoid the allocation when no metadata is used.
+6. Within metadata, key 1 maps to the vreg_classes Dictionary; create it on demand.
+7. Record vreg_id -> reg_class so lir_get_virtual_register_class achieves O(1) lookup
+   without scanning every instruction for the defining write.
+@End Implementation
+
+@Performance_Hints
+Hot path during LIR builder execution. Pure integer arithmetic plus at most two
+lazy Dictionary creations (amortized to one creation pair across an entire
+function). The per-vreg insert is a single Dictionary.set, which Dictionary
+inlines as a hashed slot write. Avoid materializing metadata before the first
+vreg is created so leaf accessor functions stay allocation-free.
+@End Performance_Hints
+
+@Security_Scope
+NULL-guard on function pointer prevents memory faults on malformed builder use.
+vreg_id values cannot wrap into the physical register range (0-31) within the
+lifetime of any realistic compilation unit (start=1000, 64-bit counter), so the
+virtual/physical discriminator is preserved by construction.
+@End Security_Scope
+
 Process called "lir_create_virtual_register" that takes function as Integer, reg_class as Integer, reg_size as Integer returns Integer:
     If function is equal to 0:
         Display "lir_create_virtual_register: null function"
@@ -392,33 +419,33 @@ Process called "lir_create_virtual_register" that takes function as Integer, reg
 
     Note: Get next virtual register ID
     Let next_vreg_offset be 88
-    Let vreg_id be Layout.memory_get_int64(function, next_vreg_offset)
+    Let vreg_id be proc memory_get_int64 from Layout with function, next_vreg_offset
 
     Note: Increment virtual register counter
-    Layout.memory_set_int64(function, next_vreg_offset, vreg_id plus 1)
+    proc memory_set_int64 from Layout with function, next_vreg_offset, vreg_id plus 1
 
     Note: Increment virtual register count
     Let vreg_count_offset be 80
-    Let vreg_count be Layout.memory_get_int64(function, vreg_count_offset)
-    Layout.memory_set_int64(function, vreg_count_offset, vreg_count plus 1)
+    Let vreg_count be proc memory_get_int64 from Layout with function, vreg_count_offset
+    proc memory_set_int64 from Layout with function, vreg_count_offset, vreg_count plus 1
 
     Note: Store register class in metadata
-    Let metadata be Layout.memory_get_int64(function, 136)
+    Let metadata be proc memory_get_int64 from Layout with function, 136
     If metadata is equal to 0:
         Note: Create metadata dictionary if it doesn't exist
-        Set metadata to Dictionary.create()
-        Layout.memory_set_int64(function, 136, metadata)
+        Set metadata to proc create from Dictionary
+        proc memory_set_int64 from Layout with function, 136, metadata
     End If
 
     Note: Get or create vreg_classes dictionary in metadata
-    Let vreg_classes be Dictionary.get(metadata, 1)  Note: key=1 for vreg_classes
+    Let vreg_classes be proc get from Dictionary with metadata, 1  Note: key=1 for vreg_classes
     If vreg_classes is equal to 0:
-        Set vreg_classes to Dictionary.create()
-        Dictionary.set(metadata, 1, vreg_classes)
+        Set vreg_classes to proc create from Dictionary
+        proc set from Dictionary with metadata, 1, vreg_classes
     End If
 
     Note: Store register class for this virtual register
-    Dictionary.set(vreg_classes, vreg_id, reg_class)
+    proc set from Dictionary with vreg_classes, vreg_id, reg_class
 
     Return vreg_id
 End Process
@@ -461,6 +488,26 @@ Virtual registers (>= 1000): Retrieves class from metadata stored during
 creation by lir_create_virtual_register. This is O(1) lookup.
 @End Reasoning
 
+@Implementation
+Pure ID-range classification. The two-argument form has no access to the
+defining function and therefore cannot reach the vreg metadata table; it
+returns LIR_REGCLASS_GPR as the default for virtual IDs. Callers that need
+the true virtual class must invoke lir_get_virtual_register_class with the
+owning function pointer so the metadata table can be consulted.
+@End Implementation
+
+@Performance_Hints
+Branch-predicted constant comparisons only; no memory traffic. Suitable for
+use in hot register-allocator inner loops when classifying physical
+registers.
+@End Performance_Hints
+
+@Security_Scope
+Negative IDs are coerced to GPR rather than asserted, on the assumption that
+they originate from sentinel values inside the builder. Callers must treat
+the GPR default for virtual IDs as informational, not authoritative.
+@End Security_Scope
+
 Process called "lir_get_register_class" that takes reg_id as Integer returns Integer:
     If reg_id is less than 0:
         Return LIR_REGCLASS_GPR
@@ -497,6 +544,29 @@ Virtual registers have their class stored when created by lir_create_virtual_reg
 This avoids expensive instruction scanning and is the production-grade approach.
 @End Reasoning
 
+@Implementation
+1. If function is NULL, fall back to the GPR default since no metadata is reachable.
+2. For physical IDs (<1000) delegate to lir_get_register_class for range-based
+   classification rather than duplicating the bookkeeping.
+3. Otherwise load the metadata Dictionary at offset 136, key 1, and probe the
+   vreg_classes child Dictionary for the vreg_id entry inserted by
+   lir_create_virtual_register.
+4. Any miss (missing metadata, missing child table, or absent key) returns the
+   GPR default rather than failing the compilation.
+@End Implementation
+
+@Performance_Hints
+Two Dictionary.get calls in the worst case for virtual IDs; physical IDs
+skip both. The two-level table is intentional - the outer key (1) keeps
+room for future metadata categories on the same Dictionary without changing
+offset 136.
+@End Performance_Hints
+
+@Security_Scope
+Read-only. Defends against missing metadata by returning a safe default
+register class. Does not propagate raw Dictionary errors to the caller.
+@End Security_Scope
+
 Process called "lir_get_virtual_register_class" that takes function as Integer, vreg_id as Integer returns Integer:
     If function is equal to 0:
         Return LIR_REGCLASS_GPR  Note: Default if no function
@@ -508,19 +578,19 @@ Process called "lir_get_virtual_register_class" that takes function as Integer, 
     End If
 
     Note: Retrieve metadata
-    Let metadata be Layout.memory_get_int64(function, 136)
+    Let metadata be proc memory_get_int64 from Layout with function, 136
     If metadata is equal to 0:
         Return LIR_REGCLASS_GPR  Note: Default if no metadata
     End If
 
     Note: Get vreg_classes dictionary
-    Let vreg_classes be Dictionary.get(metadata, 1)  Note: key=1 for vreg_classes
+    Let vreg_classes be proc get from Dictionary with metadata, 1  Note: key=1 for vreg_classes
     If vreg_classes is equal to 0:
         Return LIR_REGCLASS_GPR  Note: Default if not found
     End If
 
     Note: Lookup register class for this virtual register
-    Let reg_class be Dictionary.get(vreg_classes, vreg_id)
+    Let reg_class be proc get from Dictionary with vreg_classes, vreg_id
     If reg_class is equal to 0:
         Return LIR_REGCLASS_GPR  Note: Default if not found
     End If
@@ -541,6 +611,25 @@ Win64 callee-saved registers:
 This function uses System V convention. Calling convention is specified
 in LIRFunction for platform-specific handling.
 @End Reasoning
+
+@Implementation
+Linear equality compare against the System V callee-saved register IDs
+(RBX, RBP, R12-R15). Returns 1 on the first match, 0 otherwise. The
+sequence of If chains is intentionally flat to keep the bootstrap parse
+fast and the call boundary trivial; the cost is dominated by the caller's
+loop, not by branch prediction here.
+@End Implementation
+
+@Performance_Hints
+Six compare-and-branch operations in the worst case; no memory accesses.
+For Win64 convention queries, use platform-specific dispatch through
+LIRFunction.calling_convention before reaching this accessor.
+@End Performance_Hints
+
+@Security_Scope
+Pure function. No side effects, no memory access, no calling-convention
+metadata required.
+@End Security_Scope
 
 Process called "lir_is_callee_saved_register" that takes reg_id as Integer returns Integer:
     Note: System V x86-64 callee-saved registers
@@ -576,6 +665,25 @@ Some registers are reserved for special purposes:
 All other physical registers are allocatable.
 @End Reasoning
 
+@Implementation
+RSP is hard-blocked because the ABI relies on its meaning for every call,
+return, and exception frame. Physical IDs 0-31 (GPR + XMM) are otherwise
+allocatable; the RBP-as-frame-pointer policy is enforced by the allocator
+against StackFrame.uses_frame_pointer rather than here. Virtual registers
+(>= 1000) are always candidates.
+@End Implementation
+
+@Performance_Hints
+Three short branches. Inlinable into the register allocator's candidate
+filter without a separate call boundary in practice.
+@End Performance_Hints
+
+@Security_Scope
+Read-only. Provides the allocator with a conservative allowlist; rejects
+unknown IDs (negative or in the vector-register reserved range 32-999) by
+falling through to 0.
+@End Security_Scope
+
 Process called "lir_is_allocatable_register" that takes reg_id as Integer returns Integer:
     Note: RSP is never allocatable (stack pointer)
     If reg_id is equal to LIR_REG_RSP:
@@ -601,117 +709,139 @@ Returns a human-readable name for a physical register ID.
 Used for debug printing and assembly generation.
 @End Reasoning
 
+@Implementation
+Linear If-chain mapping LIR_REG_* IDs to their AT&T-syntax mnemonics.
+GPRs and XMM registers each have a dedicated branch. Virtual registers
+(>= 1000) format as "v<id>" so debug dumps remain readable before
+register allocation lowers them to physical names. The fallback
+"unknown" entry guards against malformed IDs reaching the assembler
+printer.
+@End Implementation
+
+@Performance_Hints
+Up to 32 compare-branches per call - acceptable because this accessor
+runs on the slow assembly-printing path, not in the optimizer hot loop.
+Each successful branch performs a single StringCore.create_from_literal
+that hands the assembler-printer an owned-heap string copy.
+@End Performance_Hints
+
+@Security_Scope
+Pure read of constant integer IDs. The returned string is owned by the
+caller (StringCore.create_from_literal duplicates the literal data) so
+no aliasing risk exists with other register-name consumers.
+@End Security_Scope
+
 Process called "lir_get_register_name" that takes reg_id as Integer returns Integer:
     Note: General-Purpose Registers
     If reg_id is equal to LIR_REG_RAX:
-        Return StringCore.create_from_literal("rax")
+        Return proc create_from_literal from StringCore with "rax"
     End If
     If reg_id is equal to LIR_REG_RBX:
-        Return StringCore.create_from_literal("rbx")
+        Return proc create_from_literal from StringCore with "rbx"
     End If
     If reg_id is equal to LIR_REG_RCX:
-        Return StringCore.create_from_literal("rcx")
+        Return proc create_from_literal from StringCore with "rcx"
     End If
     If reg_id is equal to LIR_REG_RDX:
-        Return StringCore.create_from_literal("rdx")
+        Return proc create_from_literal from StringCore with "rdx"
     End If
     If reg_id is equal to LIR_REG_RSI:
-        Return StringCore.create_from_literal("rsi")
+        Return proc create_from_literal from StringCore with "rsi"
     End If
     If reg_id is equal to LIR_REG_RDI:
-        Return StringCore.create_from_literal("rdi")
+        Return proc create_from_literal from StringCore with "rdi"
     End If
     If reg_id is equal to LIR_REG_RBP:
-        Return StringCore.create_from_literal("rbp")
+        Return proc create_from_literal from StringCore with "rbp"
     End If
     If reg_id is equal to LIR_REG_RSP:
-        Return StringCore.create_from_literal("rsp")
+        Return proc create_from_literal from StringCore with "rsp"
     End If
     If reg_id is equal to LIR_REG_R8:
-        Return StringCore.create_from_literal("r8")
+        Return proc create_from_literal from StringCore with "r8"
     End If
     If reg_id is equal to LIR_REG_R9:
-        Return StringCore.create_from_literal("r9")
+        Return proc create_from_literal from StringCore with "r9"
     End If
     If reg_id is equal to LIR_REG_R10:
-        Return StringCore.create_from_literal("r10")
+        Return proc create_from_literal from StringCore with "r10"
     End If
     If reg_id is equal to LIR_REG_R11:
-        Return StringCore.create_from_literal("r11")
+        Return proc create_from_literal from StringCore with "r11"
     End If
     If reg_id is equal to LIR_REG_R12:
-        Return StringCore.create_from_literal("r12")
+        Return proc create_from_literal from StringCore with "r12"
     End If
     If reg_id is equal to LIR_REG_R13:
-        Return StringCore.create_from_literal("r13")
+        Return proc create_from_literal from StringCore with "r13"
     End If
     If reg_id is equal to LIR_REG_R14:
-        Return StringCore.create_from_literal("r14")
+        Return proc create_from_literal from StringCore with "r14"
     End If
     If reg_id is equal to LIR_REG_R15:
-        Return StringCore.create_from_literal("r15")
+        Return proc create_from_literal from StringCore with "r15"
     End If
 
     Note: Floating-Point Registers
     If reg_id is equal to LIR_REG_XMM0:
-        Return StringCore.create_from_literal("xmm0")
+        Return proc create_from_literal from StringCore with "xmm0"
     End If
     If reg_id is equal to LIR_REG_XMM1:
-        Return StringCore.create_from_literal("xmm1")
+        Return proc create_from_literal from StringCore with "xmm1"
     End If
     If reg_id is equal to LIR_REG_XMM2:
-        Return StringCore.create_from_literal("xmm2")
+        Return proc create_from_literal from StringCore with "xmm2"
     End If
     If reg_id is equal to LIR_REG_XMM3:
-        Return StringCore.create_from_literal("xmm3")
+        Return proc create_from_literal from StringCore with "xmm3"
     End If
     If reg_id is equal to LIR_REG_XMM4:
-        Return StringCore.create_from_literal("xmm4")
+        Return proc create_from_literal from StringCore with "xmm4"
     End If
     If reg_id is equal to LIR_REG_XMM5:
-        Return StringCore.create_from_literal("xmm5")
+        Return proc create_from_literal from StringCore with "xmm5"
     End If
     If reg_id is equal to LIR_REG_XMM6:
-        Return StringCore.create_from_literal("xmm6")
+        Return proc create_from_literal from StringCore with "xmm6"
     End If
     If reg_id is equal to LIR_REG_XMM7:
-        Return StringCore.create_from_literal("xmm7")
+        Return proc create_from_literal from StringCore with "xmm7"
     End If
     If reg_id is equal to LIR_REG_XMM8:
-        Return StringCore.create_from_literal("xmm8")
+        Return proc create_from_literal from StringCore with "xmm8"
     End If
     If reg_id is equal to LIR_REG_XMM9:
-        Return StringCore.create_from_literal("xmm9")
+        Return proc create_from_literal from StringCore with "xmm9"
     End If
     If reg_id is equal to LIR_REG_XMM10:
-        Return StringCore.create_from_literal("xmm10")
+        Return proc create_from_literal from StringCore with "xmm10"
     End If
     If reg_id is equal to LIR_REG_XMM11:
-        Return StringCore.create_from_literal("xmm11")
+        Return proc create_from_literal from StringCore with "xmm11"
     End If
     If reg_id is equal to LIR_REG_XMM12:
-        Return StringCore.create_from_literal("xmm12")
+        Return proc create_from_literal from StringCore with "xmm12"
     End If
     If reg_id is equal to LIR_REG_XMM13:
-        Return StringCore.create_from_literal("xmm13")
+        Return proc create_from_literal from StringCore with "xmm13"
     End If
     If reg_id is equal to LIR_REG_XMM14:
-        Return StringCore.create_from_literal("xmm14")
+        Return proc create_from_literal from StringCore with "xmm14"
     End If
     If reg_id is equal to LIR_REG_XMM15:
-        Return StringCore.create_from_literal("xmm15")
+        Return proc create_from_literal from StringCore with "xmm15"
     End If
 
     Note: Virtual registers display as v<id>
     If reg_id is greater than or equal to 1000:
-        Let name be StringCore.create_from_literal("v")
-        Let id_str be StringCore.integer_to_string(reg_id)
-        Let result be StringCore.concatenate(name, id_str)
+        Let name be proc create_from_literal from StringCore with "v"
+        Let id_str be proc integer_to_string from StringCore with reg_id
+        Let result be proc concatenate from StringCore with name, id_str
         Return result
     End If
 
     Note: Unknown register
-    Return StringCore.create_from_literal("unknown")
+    Return proc create_from_literal from StringCore with "unknown"
 End Process
 
 @Reasoning
@@ -726,6 +856,30 @@ Win64 float argument registers: XMM0-XMM3
 
 Arguments beyond register capacity are passed on the stack.
 @End Reasoning
+
+@Implementation
+The function is structured as a four-quadrant lookup keyed on
+(calling_convention, is_float):
+  (SYSTEMV, float)   -> XMM0..XMM7
+  (SYSTEMV, integer) -> RDI, RSI, RDX, RCX, R8, R9
+  (WIN64,   float)   -> XMM0..XMM3
+  (WIN64,   integer) -> RCX, RDX, R8, R9
+Each quadrant is an inline If-chain on arg_index for the corresponding
+register set. A return of -1 signals "out of register slots - spill to
+stack" and is consumed by the call-lowering layer to materialize the
+shadow space or argument area.
+@End Implementation
+
+@Performance_Hints
+Branch-only; no memory traffic. Called once per outgoing argument during
+call lowering, which is well off the hot path of typical compilations.
+@End Performance_Hints
+
+@Security_Scope
+Pure constant lookup. Unknown calling conventions fall through to the
+System V default and then return -1, forcing the caller to handle the
+spill case safely instead of misclassifying as a register argument.
+@End Security_Scope
 
 Process called "lir_get_argument_register" that takes calling_convention as Integer, arg_index as Integer, is_float as Integer returns Integer:
     If calling_convention is equal to LIR_CC_SYSTEMV:
@@ -845,55 +999,75 @@ System V x86-64 caller-saved: RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, XMM0-XM
 Win64 caller-saved: RAX, RCX, RDX, R8, R9, R10, R11, XMM0-XMM5
 @End Reasoning
 
+@Implementation
+Allocates a fresh List and appends every caller-saved register ID for the
+requested calling convention. System V exposes nine GPRs and all sixteen
+XMMs as caller-saved; Win64 exposes seven GPRs and XMM0-XMM5. RBX/RBP/
+R12-R15 are excluded from both as they are callee-saved. The list ordering
+matches the assembly-time spill ordering used by the prologue/epilogue
+generator.
+@End Implementation
+
+@Performance_Hints
+Called once per call site during liveness/spill insertion. Allocates a
+short List (<= 25 entries) on the OWNED HEAP. Callers may cache the
+result per calling convention to avoid rebuilding on every call.
+@End Performance_Hints
+
+@Security_Scope
+Returns a freshly-allocated List owned by the caller. Modifying the
+returned list does not affect future invocations.
+@End Security_Scope
+
 Process called "lir_get_caller_saved_registers" that takes calling_convention as Integer returns Integer:
-    Let caller_saved be List.create()
+    Let caller_saved be proc create from List
 
     If calling_convention is equal to LIR_CC_SYSTEMV:
         Note: System V caller-saved GPRs
-        List.append(caller_saved, LIR_REG_RAX)
-        List.append(caller_saved, LIR_REG_RCX)
-        List.append(caller_saved, LIR_REG_RDX)
-        List.append(caller_saved, LIR_REG_RSI)
-        List.append(caller_saved, LIR_REG_RDI)
-        List.append(caller_saved, LIR_REG_R8)
-        List.append(caller_saved, LIR_REG_R9)
-        List.append(caller_saved, LIR_REG_R10)
-        List.append(caller_saved, LIR_REG_R11)
+        proc append from List with caller_saved, LIR_REG_RAX
+        proc append from List with caller_saved, LIR_REG_RCX
+        proc append from List with caller_saved, LIR_REG_RDX
+        proc append from List with caller_saved, LIR_REG_RSI
+        proc append from List with caller_saved, LIR_REG_RDI
+        proc append from List with caller_saved, LIR_REG_R8
+        proc append from List with caller_saved, LIR_REG_R9
+        proc append from List with caller_saved, LIR_REG_R10
+        proc append from List with caller_saved, LIR_REG_R11
 
         Note: System V caller-saved XMM registers (all)
-        List.append(caller_saved, LIR_REG_XMM0)
-        List.append(caller_saved, LIR_REG_XMM1)
-        List.append(caller_saved, LIR_REG_XMM2)
-        List.append(caller_saved, LIR_REG_XMM3)
-        List.append(caller_saved, LIR_REG_XMM4)
-        List.append(caller_saved, LIR_REG_XMM5)
-        List.append(caller_saved, LIR_REG_XMM6)
-        List.append(caller_saved, LIR_REG_XMM7)
-        List.append(caller_saved, LIR_REG_XMM8)
-        List.append(caller_saved, LIR_REG_XMM9)
-        List.append(caller_saved, LIR_REG_XMM10)
-        List.append(caller_saved, LIR_REG_XMM11)
-        List.append(caller_saved, LIR_REG_XMM12)
-        List.append(caller_saved, LIR_REG_XMM13)
-        List.append(caller_saved, LIR_REG_XMM14)
-        List.append(caller_saved, LIR_REG_XMM15)
+        proc append from List with caller_saved, LIR_REG_XMM0
+        proc append from List with caller_saved, LIR_REG_XMM1
+        proc append from List with caller_saved, LIR_REG_XMM2
+        proc append from List with caller_saved, LIR_REG_XMM3
+        proc append from List with caller_saved, LIR_REG_XMM4
+        proc append from List with caller_saved, LIR_REG_XMM5
+        proc append from List with caller_saved, LIR_REG_XMM6
+        proc append from List with caller_saved, LIR_REG_XMM7
+        proc append from List with caller_saved, LIR_REG_XMM8
+        proc append from List with caller_saved, LIR_REG_XMM9
+        proc append from List with caller_saved, LIR_REG_XMM10
+        proc append from List with caller_saved, LIR_REG_XMM11
+        proc append from List with caller_saved, LIR_REG_XMM12
+        proc append from List with caller_saved, LIR_REG_XMM13
+        proc append from List with caller_saved, LIR_REG_XMM14
+        proc append from List with caller_saved, LIR_REG_XMM15
     Otherwise:
         Note: Win64 caller-saved GPRs
-        List.append(caller_saved, LIR_REG_RAX)
-        List.append(caller_saved, LIR_REG_RCX)
-        List.append(caller_saved, LIR_REG_RDX)
-        List.append(caller_saved, LIR_REG_R8)
-        List.append(caller_saved, LIR_REG_R9)
-        List.append(caller_saved, LIR_REG_R10)
-        List.append(caller_saved, LIR_REG_R11)
+        proc append from List with caller_saved, LIR_REG_RAX
+        proc append from List with caller_saved, LIR_REG_RCX
+        proc append from List with caller_saved, LIR_REG_RDX
+        proc append from List with caller_saved, LIR_REG_R8
+        proc append from List with caller_saved, LIR_REG_R9
+        proc append from List with caller_saved, LIR_REG_R10
+        proc append from List with caller_saved, LIR_REG_R11
 
         Note: Win64 caller-saved XMM registers (XMM0-XMM5)
-        List.append(caller_saved, LIR_REG_XMM0)
-        List.append(caller_saved, LIR_REG_XMM1)
-        List.append(caller_saved, LIR_REG_XMM2)
-        List.append(caller_saved, LIR_REG_XMM3)
-        List.append(caller_saved, LIR_REG_XMM4)
-        List.append(caller_saved, LIR_REG_XMM5)
+        proc append from List with caller_saved, LIR_REG_XMM0
+        proc append from List with caller_saved, LIR_REG_XMM1
+        proc append from List with caller_saved, LIR_REG_XMM2
+        proc append from List with caller_saved, LIR_REG_XMM3
+        proc append from List with caller_saved, LIR_REG_XMM4
+        proc append from List with caller_saved, LIR_REG_XMM5
     End If
 
     Return caller_saved
@@ -908,55 +1082,107 @@ Creates a new LIR function with the given name and calling convention.
 Initializes the function structure with empty block list and default settings.
 @End Reasoning
 
+@Implementation
+1. Allocate 168 bytes on the OWNED HEAP for the LIRFunction header (Tier 3).
+2. Duplicate the name string so the LIR module owns its own copy independent
+   of any HIR lifetime.
+3. Initialize every field offset explicitly: entry/exit blocks (0), block and
+   parameter Lists, return type, stack frame slot, virtual register accounting
+   (next_vreg_id starts at 1000 so virtual IDs never collide with physical
+   IDs 0-31), next_label_id (starts at 1 reserving 0 as the sentinel
+   "no label"), calling convention, default-leaf flag (1, demoted by the
+   builder when a call is appended), HIR back-pointer slot, and metadata.
+4. Initialize the P2-D FFI extension trio (library_name, alias_name,
+   convention_id) at offsets 144/152/160 to zero so non-external functions
+   present a clean default.
+@End Implementation
+
+@Performance_Hints
+One arena/heap allocation plus one string duplication per function. Field
+initialization is a sequence of explicit 8-byte writes - no zero-fill loop -
+to keep the per-function setup compact and inlinable in the LIR builder.
+@End Performance_Hints
+
+@Security_Scope
+Failure modes (allocation failure, string duplication failure) emit a
+diagnostic and return 0 so the caller can abort the compilation. No
+partial-initialization escape: the struct is either fully wired or zero.
+@End Security_Scope
+
 Process called "lir_create_function" that takes name as Integer, calling_convention as Integer, return_type as Integer returns Integer:
-    Let function be Layout.allocate(168)
+    Let function be proc allocate from Layout with 168
     If function is equal to 0:
         Display "lir_create_function: allocation failed"
         Return 0
     End If
 
     Note: Copy function name
-    Let name_copy be StringCore.duplicate(name)
+    Let name_copy be proc duplicate from StringCore with name
     If name_copy is equal to 0:
         Display "lir_create_function: name duplication failed"
         Return 0
     End If
 
     Note: Initialize function fields
-    Layout.memory_set_int64(function, 0, name_copy)               Note: name
-    Layout.memory_set_int64(function, 8, 0)                       Note: mangled_name (set later)
-    Layout.memory_set_int64(function, 16, 0)                      Note: entry_block (set later)
-    Layout.memory_set_int64(function, 24, 0)                      Note: exit_block (set later)
+    proc memory_set_int64 from Layout with function, 0, name_copy               Note: name
+    proc memory_set_int64 from Layout with function, 8, 0                       Note: mangled_name (set later)
+    proc memory_set_int64 from Layout with function, 16, 0                      Note: entry_block (set later)
+    proc memory_set_int64 from Layout with function, 24, 0                      Note: exit_block (set later)
 
     Note: Create blocks list
-    Let blocks be List.create()
-    Layout.memory_set_int64(function, 32, blocks)                 Note: blocks
-    Layout.memory_set_int64(function, 40, 0)                      Note: block_count
+    Let blocks be proc create from List
+    proc memory_set_int64 from Layout with function, 32, blocks                 Note: blocks
+    proc memory_set_int64 from Layout with function, 40, 0                      Note: block_count
 
     Note: Create parameters list
-    Let parameters be List.create()
-    Layout.memory_set_int64(function, 48, parameters)             Note: parameters
-    Layout.memory_set_int64(function, 56, 0)                      Note: parameter_count
+    Let parameters be proc create from List
+    proc memory_set_int64 from Layout with function, 48, parameters             Note: parameters
+    proc memory_set_int64 from Layout with function, 56, 0                      Note: parameter_count
 
-    Layout.memory_set_int64(function, 64, return_type)            Note: return_type
-    Layout.memory_set_int64(function, 72, 0)                      Note: stack_frame (created later)
-    Layout.memory_set_int64(function, 80, 0)                      Note: virtual_reg_count
-    Layout.memory_set_int64(function, 88, 1000)                   Note: next_vreg_id (start at 1000)
-    Layout.memory_set_int64(function, 96, 1)                      Note: next_label_id (start at 1)
-    Layout.memory_set_int64(function, 104, calling_convention)    Note: calling_convention
-    Layout.memory_set_int64(function, 112, 0)                     Note: is_external
-    Layout.memory_set_int64(function, 120, 1)                     Note: is_leaf (assume until proven otherwise)
-    Layout.memory_set_int64(function, 128, 0)                     Note: hir_node
-    Layout.memory_set_int64(function, 136, 0)                     Note: metadata
+    proc memory_set_int64 from Layout with function, 64, return_type            Note: return_type
+    proc memory_set_int64 from Layout with function, 72, 0                      Note: stack_frame (created later)
+    proc memory_set_int64 from Layout with function, 80, 0                      Note: virtual_reg_count
+    proc memory_set_int64 from Layout with function, 88, 1000                   Note: next_vreg_id (start at 1000)
+    proc memory_set_int64 from Layout with function, 96, 1                      Note: next_label_id (start at 1)
+    proc memory_set_int64 from Layout with function, 104, calling_convention    Note: calling_convention
+    proc memory_set_int64 from Layout with function, 112, 0                     Note: is_external
+    proc memory_set_int64 from Layout with function, 120, 1                     Note: is_leaf (assume until proven otherwise)
+    proc memory_set_int64 from Layout with function, 128, 0                     Note: hir_node
+    proc memory_set_int64 from Layout with function, 136, 0                     Note: metadata
 
     Note: P2-D FFI extension fields:
     Note:   library_name (offset 144), alias_name (offset 152), convention_id (offset 160)
-    Layout.memory_set_int64(function, 144, 0)                     Note: library_name
-    Layout.memory_set_int64(function, 152, 0)                     Note: alias_name
-    Layout.memory_set_int64(function, 160, 0)                     Note: convention_id
+    proc memory_set_int64 from Layout with function, 144, 0                     Note: library_name
+    proc memory_set_int64 from Layout with function, 152, 0                     Note: alias_name
+    proc memory_set_int64 from Layout with function, 160, 0                     Note: convention_id
 
     Return function
 End Process
+
+@Reasoning
+P2-D FFI hook: tag a LIRFunction as external and record the library name,
+optional C-side alias, and calling-convention ID for the linker and the
+backend's import-table writer.
+@End Reasoning
+
+@Implementation
+Sets is_external (offset 112) to 1 and writes library_name/alias_name/
+convention_id into the P2-D extension slots (offsets 144/152/160). The
+callee owns no copies - the caller is expected to pass already-owned
+strings or stable interned pointers; LIR does not duplicate them again
+because they typically originate from the import declaration itself.
+@End Implementation
+
+@Performance_Hints
+Four 8-byte writes; called once per external function during HIR-to-LIR
+lowering. Not on the per-instruction hot path.
+@End Performance_Hints
+
+@Security_Scope
+NULL-guard on function pointer. Convention IDs are caller-validated; the
+backend's import emitter is responsible for rejecting unknown values
+rather than this accessor.
+@End Security_Scope
 
 Process called "lir_function_set_external_ffi" that takes function as Integer, library_name as Integer, alias_name as Integer, convention_id as Integer returns Integer:
     Note: P2-D FFI: Mark a LIRFunction as external and record FFI metadata.
@@ -964,43 +1190,87 @@ Process called "lir_function_set_external_ffi" that takes function as Integer, l
         Return 0
     End If
 
-    Layout.memory_set_int64(function, 112, 1)                     Note: is_external = 1
-    Layout.memory_set_int64(function, 144, library_name)
-    Layout.memory_set_int64(function, 152, alias_name)
-    Layout.memory_set_int64(function, 160, convention_id)
+    proc memory_set_int64 from Layout with function, 112, 1                     Note: is_external = 1
+    proc memory_set_int64 from Layout with function, 144, library_name
+    proc memory_set_int64 from Layout with function, 152, alias_name
+    proc memory_set_int64 from Layout with function, 160, convention_id
 
     Return 1
 End Process
+
+@Reasoning
+Returns the FFI library_name string pointer stored on the LIRFunction, or 0
+for functions that are not external. Used by the backend import-table writer.
+@End Reasoning
 
 Process called "lir_function_get_library_name" that takes function as Integer returns Integer:
     If function is equal to 0:
         Return 0
     End If
-    Return Layout.memory_get_int64(function, 144)
+    Return proc memory_get_int64 from Layout with function, 144
 End Process
+
+@Reasoning
+Returns the FFI alias_name (the C-side symbol) for a LIRFunction. If no
+alias was recorded, falls back to the function's own name field so the
+linker still sees a usable symbol.
+@End Reasoning
 
 Process called "lir_function_get_alias_name" that takes function as Integer returns Integer:
     If function is equal to 0:
         Return 0
     End If
-    Let alias be Layout.memory_get_int64(function, 152)
+    Let alias be proc memory_get_int64 from Layout with function, 152
     If alias is equal to 0:
-        Return Layout.memory_get_int64(function, 0)
+        Return proc memory_get_int64 from Layout with function, 0
     End If
     Return alias
 End Process
+
+@Reasoning
+Returns the FFI convention_id (0=c, 1=stdcall, 2=fastcall, 3=cdecl,
+4=syscall, 5=objc) for a LIRFunction.
+@End Reasoning
 
 Process called "lir_function_get_convention_id" that takes function as Integer returns Integer:
     If function is equal to 0:
         Return 0
     End If
-    Return Layout.memory_get_int64(function, 160)
+    Return proc memory_get_int64 from Layout with function, 160
 End Process
 
 @Reasoning
 Adds a basic block to a function and returns the block ID.
 If is_entry is true, sets this as the entry block.
 @End Reasoning
+
+@Implementation
+1. Allocate 96 bytes (LIRBasicBlock) on the OWNED HEAP.
+2. Read the function's blocks list pointer (offset 32) and block_count
+   (offset 40); the next block_id is the current block_count so IDs match
+   the List index for O(1) retrieval.
+3. Materialize the assembly label by concatenating ".L" with the function's
+   next_label_id counter, then increment that counter at offset 96.
+4. Initialize all twelve block fields: block_id, label, instructions List,
+   instruction_count, predecessors List, predecessor_count, successors List,
+   successor_count, live_in/live_out (filled by liveness analysis), and
+   loop_depth/is_loop_header (filled by loop analysis).
+5. Append the block to the function's block list and bump block_count.
+6. If is_entry is 1, also wire the function's entry_block slot (offset 16).
+@End Implementation
+
+@Performance_Hints
+One block-sized allocation plus three List allocations (instructions,
+predecessors, successors). Label construction performs a single
+StringCore.concatenate, which produces an owned string ready for the
+assembler. Hot during LIR construction but linear in the block count.
+@End Performance_Hints
+
+@Security_Scope
+NULL-guards both the function pointer and the block allocation. On any
+allocation failure emits a diagnostic and returns 0; callers detect the
+failure and abort before referencing the (invalid) block_id.
+@End Security_Scope
 
 Process called "lir_add_block" that takes function as Integer, is_entry as Integer returns Integer:
     If function is equal to 0:
@@ -1009,7 +1279,7 @@ Process called "lir_add_block" that takes function as Integer, is_entry as Integ
     End If
 
     Note: Allocate basic block
-    Let block be Layout.allocate(96)
+    Let block be proc allocate from Layout with 96
     If block is equal to 0:
         Display "lir_add_block: block allocation failed"
         Return 0
@@ -1017,47 +1287,47 @@ Process called "lir_add_block" that takes function as Integer, is_entry as Integ
 
     Note: Get next block ID
     Let blocks_offset be 32
-    Let blocks be Layout.memory_get_int64(function, blocks_offset)
+    Let blocks be proc memory_get_int64 from Layout with function, blocks_offset
     Let block_count_offset be 40
-    Let block_count be Layout.memory_get_int64(function, block_count_offset)
+    Let block_count be proc memory_get_int64 from Layout with function, block_count_offset
     Let block_id be block_count
 
     Note: Generate label
     Let next_label_id_offset be 96
-    Let label_id be Layout.memory_get_int64(function, next_label_id_offset)
-    Let label_prefix be StringCore.create_from_literal(".L")
-    Let label_num be StringCore.integer_to_string(label_id)
-    Let label be StringCore.concatenate(label_prefix, label_num)
-    Layout.memory_set_int64(function, next_label_id_offset, label_id plus 1)
+    Let label_id be proc memory_get_int64 from Layout with function, next_label_id_offset
+    Let label_prefix be proc create_from_literal from StringCore with ".L"
+    Let label_num be proc integer_to_string from StringCore with label_id
+    Let label be proc concatenate from StringCore with label_prefix, label_num
+    proc memory_set_int64 from Layout with function, next_label_id_offset, label_id plus 1
 
     Note: Initialize block fields
-    Layout.memory_set_int64(block, 0, block_id)                   Note: block_id
-    Layout.memory_set_int64(block, 8, label)                      Note: label
+    proc memory_set_int64 from Layout with block, 0, block_id                   Note: block_id
+    proc memory_set_int64 from Layout with block, 8, label                      Note: label
 
-    Let instructions be List.create()
-    Layout.memory_set_int64(block, 16, instructions)              Note: instructions
-    Layout.memory_set_int64(block, 24, 0)                         Note: instruction_count
+    Let instructions be proc create from List
+    proc memory_set_int64 from Layout with block, 16, instructions              Note: instructions
+    proc memory_set_int64 from Layout with block, 24, 0                         Note: instruction_count
 
-    Let predecessors be List.create()
-    Layout.memory_set_int64(block, 32, predecessors)              Note: predecessors
-    Layout.memory_set_int64(block, 40, 0)                         Note: predecessor_count
+    Let predecessors be proc create from List
+    proc memory_set_int64 from Layout with block, 32, predecessors              Note: predecessors
+    proc memory_set_int64 from Layout with block, 40, 0                         Note: predecessor_count
 
-    Let successors be List.create()
-    Layout.memory_set_int64(block, 48, successors)                Note: successors
-    Layout.memory_set_int64(block, 56, 0)                         Note: successor_count
+    Let successors be proc create from List
+    proc memory_set_int64 from Layout with block, 48, successors                Note: successors
+    proc memory_set_int64 from Layout with block, 56, 0                         Note: successor_count
 
-    Layout.memory_set_int64(block, 64, 0)                         Note: live_in (computed during liveness)
-    Layout.memory_set_int64(block, 72, 0)                         Note: live_out (computed during liveness)
-    Layout.memory_set_int64(block, 80, 0)                         Note: loop_depth
-    Layout.memory_set_int64(block, 88, 0)                         Note: is_loop_header
+    proc memory_set_int64 from Layout with block, 64, 0                         Note: live_in (computed during liveness)
+    proc memory_set_int64 from Layout with block, 72, 0                         Note: live_out (computed during liveness)
+    proc memory_set_int64 from Layout with block, 80, 0                         Note: loop_depth
+    proc memory_set_int64 from Layout with block, 88, 0                         Note: is_loop_header
 
     Note: Add block to function
-    List.append(blocks, block)
-    Layout.memory_set_int64(function, block_count_offset, block_count plus 1)
+    proc append from List with blocks, block
+    proc memory_set_int64 from Layout with function, block_count_offset, block_count plus 1
 
     Note: Set as entry block if requested
     If is_entry is equal to 1:
-        Layout.memory_set_int64(function, 16, block)              Note: entry_block
+        proc memory_set_int64 from Layout with function, 16, block              Note: entry_block
     End If
 
     Return block_id
@@ -1067,6 +1337,26 @@ End Process
 Retrieves a basic block pointer by block ID from a function.
 @End Reasoning
 
+@Implementation
+Loads the function's blocks List pointer (offset 32) and block_count
+(offset 40), validates the block_id against the inclusive lower bound 0 and
+exclusive upper bound block_count, and delegates the indexed read to
+List.get. Returns 0 on any failure so iterators terminate cleanly.
+@End Implementation
+
+@Performance_Hints
+Two memory loads plus one List.get. O(1) given List's contiguous backing
+storage. Called from every block iterator, peephole pass, and CFG walk so
+the bounds check uses Integer comparisons rather than reaching into List's
+internal counters again.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checks both ends of the range. NULL function pointer surfaces a
+diagnostic. Out-of-range block_id surfaces a diagnostic and returns 0
+rather than a stale pointer.
+@End Security_Scope
+
 Process called "lir_get_block" that takes function as Integer, block_id as Integer returns Integer:
     If function is equal to 0:
         Display "lir_get_block: null function"
@@ -1074,17 +1364,17 @@ Process called "lir_get_block" that takes function as Integer, block_id as Integ
     End If
 
     Let blocks_offset be 32
-    Let blocks be Layout.memory_get_int64(function, blocks_offset)
+    Let blocks be proc memory_get_int64 from Layout with function, blocks_offset
 
     Let block_count_offset be 40
-    Let block_count be Layout.memory_get_int64(function, block_count_offset)
+    Let block_count be proc memory_get_int64 from Layout with function, block_count_offset
 
     If block_id is less than 0 or block_id is greater than or equal to block_count:
         Display "lir_get_block: invalid block_id"
         Return 0
     End If
 
-    Let block be List.get(blocks, block_id)
+    Let block be proc get from List with blocks, block_id
     Return block
 End Process
 
@@ -1119,7 +1409,7 @@ Process called "get_instruction_count" that takes block as Integer returns Integ
     If block is equal to 0:
         Return 0
     End If
-    Return Layout.memory_get_int64(block, 24)
+    Return proc memory_get_int64 from Layout with block, 24
 End Process
 
 @Reasoning
@@ -1139,7 +1429,7 @@ WASM stack scheduling and peephole passes.
 4. Delegate to List.get for the underlying indexed read.
 
 List.get itself NULL-guards and bounds-checks, so the validation here is
-belt-and-braces — it surfaces invalid-index errors with a meaningful
+belt-and-braces - it surfaces invalid-index errors with a meaningful
 display before the List layer's generic error.
 @End Implementation
 
@@ -1160,15 +1450,15 @@ Process called "get_instruction" that takes block as Integer, instr_idx as Integ
     If block is equal to 0:
         Return 0
     End If
-    Let instr_count be Layout.memory_get_int64(block, 24)
+    Let instr_count be proc memory_get_int64 from Layout with block, 24
     If instr_idx is less than 0:
         Return 0
     End If
     If instr_idx is greater than or equal to instr_count:
         Return 0
     End If
-    Let instructions be Layout.memory_get_int64(block, 16)
-    Return List.get(instructions, instr_idx)
+    Let instructions be proc memory_get_int64 from Layout with block, 16
+    Return proc get from List with instructions, instr_idx
 End Process
 
 @Reasoning
@@ -1176,26 +1466,47 @@ Adds an instruction to the end of a basic block.
 Updates the block's instruction count.
 @End Reasoning
 
+@Implementation
+1. NULL-guard both function and instruction.
+2. Resolve the block pointer from block_id via lir_get_block (which also
+   bounds-checks block_id).
+3. Append the instruction pointer to the block's instructions List
+   (offset 16) and increment instruction_count (offset 24) in lockstep so
+   any downstream reader sees a consistent count/list pair.
+@End Implementation
+
+@Performance_Hints
+One List.append plus two memory loads and one memory store. Hot during
+LIR construction; the lockstep increment avoids any second pass to
+recompute counts.
+@End Performance_Hints
+
+@Security_Scope
+Rejects NULL parameters and invalid block IDs before mutating the block
+contents. Failure surfaces a diagnostic and returns 0, leaving the
+function in its prior state.
+@End Security_Scope
+
 Process called "lir_append_instruction" that takes function as Integer, block_id as Integer, instruction as Integer returns Integer:
     If function is equal to 0 or instruction is equal to 0:
         Display "lir_append_instruction: null parameter"
         Return 0
     End If
 
-    Let block be lir_get_block(function, block_id)
+    Let block be proc lir_get_block with function, block_id
     If block is equal to 0:
         Display "lir_append_instruction: invalid block"
         Return 0
     End If
 
     Note: Get instructions list
-    Let instructions be Layout.memory_get_int64(block, 16)
-    List.append(instructions, instruction)
+    Let instructions be proc memory_get_int64 from Layout with block, 16
+    proc append from List with instructions, instruction
 
     Note: Increment instruction count
     Let count_offset be 24
-    Let count be Layout.memory_get_int64(block, count_offset)
-    Layout.memory_set_int64(block, count_offset, count plus 1)
+    Let count be proc memory_get_int64 from Layout with block, count_offset
+    proc memory_set_int64 from Layout with block, count_offset, count plus 1
 
     Return 1
 End Process
@@ -1205,14 +1516,38 @@ Adds a control flow edge from one block to another by updating successor
 and predecessor lists. Used for building the control flow graph.
 @End Reasoning
 
+@Implementation
+1. NULL-guard the function and resolve both endpoint blocks via
+   lir_get_block (which bounds-checks the IDs).
+2. Append to_block_id to from_block's successors List (offset 48) and bump
+   successor_count (offset 56).
+3. Symmetrically append from_block_id to to_block's predecessors List
+   (offset 32) and bump predecessor_count (offset 40).
+
+Storing IDs rather than block pointers in the edge lists keeps the CFG
+stable across block-list reallocations and matches the convention used by
+the dominator analysis pass.
+@End Implementation
+
+@Performance_Hints
+Two List.appends and four memory accesses. Called once per CFG edge,
+which is roughly linear in basic block count, so the cost is well below
+that of liveness or register allocation.
+@End Performance_Hints
+
+@Security_Scope
+Rejects NULL function and invalid block IDs (via lir_get_block's checks).
+Failure surfaces a diagnostic and leaves both endpoint blocks unchanged.
+@End Security_Scope
+
 Process called "lir_add_edge" that takes function as Integer, from_block_id as Integer, to_block_id as Integer returns Integer:
     If function is equal to 0:
         Display "lir_add_edge: null function"
         Return 0
     End If
 
-    Let from_block be lir_get_block(function, from_block_id)
-    Let to_block be lir_get_block(function, to_block_id)
+    Let from_block be proc lir_get_block with function, from_block_id
+    Let to_block be proc lir_get_block with function, to_block_id
 
     If from_block is equal to 0 or to_block is equal to 0:
         Display "lir_add_edge: invalid block"
@@ -1220,16 +1555,16 @@ Process called "lir_add_edge" that takes function as Integer, from_block_id as I
     End If
 
     Note: Add to successors of from_block
-    Let successors be Layout.memory_get_int64(from_block, 48)
-    List.append(successors, to_block_id)
-    Let succ_count be Layout.memory_get_int64(from_block, 56)
-    Layout.memory_set_int64(from_block, 56, succ_count plus 1)
+    Let successors be proc memory_get_int64 from Layout with from_block, 48
+    proc append from List with successors, to_block_id
+    Let succ_count be proc memory_get_int64 from Layout with from_block, 56
+    proc memory_set_int64 from Layout with from_block, 56, succ_count plus 1
 
     Note: Add to predecessors of to_block
-    Let predecessors be Layout.memory_get_int64(to_block, 32)
-    List.append(predecessors, from_block_id)
-    Let pred_count be Layout.memory_get_int64(to_block, 40)
-    Layout.memory_set_int64(to_block, 40, pred_count plus 1)
+    Let predecessors be proc memory_get_int64 from Layout with to_block, 32
+    proc append from List with predecessors, from_block_id
+    Let pred_count be proc memory_get_int64 from Layout with to_block, 40
+    proc memory_set_int64 from Layout with to_block, 40, pred_count plus 1
 
     Return 1
 End Process
@@ -1239,38 +1574,63 @@ Creates an empty stack frame for a function with default settings.
 The frame will be populated during register allocation and stack slot assignment.
 @End Reasoning
 
+@Implementation
+1. Allocate 80 bytes on the OWNED HEAP for the StackFrame header.
+2. Initialize all ten fields: frame_size, local_area_size, spill_area_size,
+   and arg_area_size start at zero (populated by stack-slot assignment),
+   alignment is hard-set to 16 for x86-64 ABI compliance, uses_frame_pointer
+   defaults to 1 (the prologue lowering may demote this later if the
+   function is a leaf with no spills).
+3. Create empty callee_saved_regs List, local_offsets Dictionary, and
+   spill_offsets Dictionary so allocator passes have stable containers to
+   write into.
+4. Wire the new frame into the LIRFunction's stack_frame slot (offset 72).
+@End Implementation
+
+@Performance_Hints
+One frame-sized allocation plus three container allocations (List +
+two Dictionaries). Called once per function and never on a per-instruction
+path.
+@End Performance_Hints
+
+@Security_Scope
+NULL-guards both the function pointer and the frame allocation. Failure
+surfaces a diagnostic and returns 0; the function's existing stack_frame
+slot is not overwritten in that case.
+@End Security_Scope
+
 Process called "lir_create_stack_frame" that takes function as Integer returns Integer:
     If function is equal to 0:
         Display "lir_create_stack_frame: null function"
         Return 0
     End If
 
-    Let frame be Layout.allocate(80)
+    Let frame be proc allocate from Layout with 80
     If frame is equal to 0:
         Display "lir_create_stack_frame: allocation failed"
         Return 0
     End If
 
     Note: Initialize frame fields
-    Layout.memory_set_int64(frame, 0, 0)                          Note: frame_size (computed later)
-    Layout.memory_set_int64(frame, 8, 0)                          Note: local_area_size
-    Layout.memory_set_int64(frame, 16, 0)                         Note: spill_area_size
-    Layout.memory_set_int64(frame, 24, 0)                         Note: arg_area_size
-    Layout.memory_set_int64(frame, 32, 16)                        Note: alignment (16 bytes for x86-64)
-    Layout.memory_set_int64(frame, 40, 1)                         Note: uses_frame_pointer (default true)
+    proc memory_set_int64 from Layout with frame, 0, 0                          Note: frame_size (computed later)
+    proc memory_set_int64 from Layout with frame, 8, 0                          Note: local_area_size
+    proc memory_set_int64 from Layout with frame, 16, 0                         Note: spill_area_size
+    proc memory_set_int64 from Layout with frame, 24, 0                         Note: arg_area_size
+    proc memory_set_int64 from Layout with frame, 32, 16                        Note: alignment (16 bytes for x86-64)
+    proc memory_set_int64 from Layout with frame, 40, 1                         Note: uses_frame_pointer (default true)
 
-    Let callee_saved_regs be List.create()
-    Layout.memory_set_int64(frame, 48, callee_saved_regs)         Note: callee_saved_regs
-    Layout.memory_set_int64(frame, 56, 0)                         Note: callee_saved_count
+    Let callee_saved_regs be proc create from List
+    proc memory_set_int64 from Layout with frame, 48, callee_saved_regs         Note: callee_saved_regs
+    proc memory_set_int64 from Layout with frame, 56, 0                         Note: callee_saved_count
 
-    Let local_offsets be Dictionary.create()
-    Layout.memory_set_int64(frame, 64, local_offsets)             Note: local_offsets
+    Let local_offsets be proc create from Dictionary
+    proc memory_set_int64 from Layout with frame, 64, local_offsets             Note: local_offsets
 
-    Let spill_offsets be Dictionary.create()
-    Layout.memory_set_int64(frame, 72, spill_offsets)             Note: spill_offsets
+    Let spill_offsets be proc create from Dictionary
+    proc memory_set_int64 from Layout with frame, 72, spill_offsets             Note: spill_offsets
 
     Note: Set frame in function
-    Layout.memory_set_int64(function, 72, frame)
+    proc memory_set_int64 from Layout with function, 72, frame
 
     Return frame
 End Process
@@ -1280,6 +1640,33 @@ Allocates a spill slot in the stack frame for a virtual register.
 Returns the stack offset (negative, relative to RBP).
 @End Reasoning
 
+@Implementation
+1. NULL-guard the function and reach the stack frame via offset 72;
+   surface a diagnostic when no frame has been created yet.
+2. Align the current spill_area_size up to the next multiple of size so
+   the slot satisfies the requested alignment (size is assumed a power of
+   2 by the allocator). The aligned offset before the slot is computed
+   explicitly; the slot itself occupies [aligned_offset, aligned_offset +
+   size).
+3. Bump spill_area_size in the frame to reserve the new slot.
+4. Compute the negative RBP-relative offset (slots grow downward) and
+   record vreg_id -> stack_offset in the spill_offsets Dictionary at
+   offset 72 of the frame so the assembly emitter can rematerialize the
+   spill location.
+@End Implementation
+
+@Performance_Hints
+A handful of integer arithmetic operations plus one Dictionary.set. Called
+once per spilled virtual register, which is bounded by the number of
+spills inserted by the register allocator.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe; surfaces diagnostics for missing frame. Negative RBP offsets
+are guaranteed by construction (the negation of a non-negative quantity)
+so the returned value is always interpretable by the prologue emitter.
+@End Security_Scope
+
 Process called "lir_allocate_spill_slot" that takes function as Integer, vreg_id as Integer, size as Integer returns Integer:
     If function is equal to 0:
         Display "lir_allocate_spill_slot: null function"
@@ -1287,7 +1674,7 @@ Process called "lir_allocate_spill_slot" that takes function as Integer, vreg_id
     End If
 
     Let frame_offset be 72
-    Let frame be Layout.memory_get_int64(function, frame_offset)
+    Let frame be proc memory_get_int64 from Layout with function, frame_offset
     If frame is equal to 0:
         Display "lir_allocate_spill_slot: no stack frame"
         Return 0
@@ -1295,7 +1682,7 @@ Process called "lir_allocate_spill_slot" that takes function as Integer, vreg_id
 
     Note: Get current spill area size
     Let spill_area_offset be 16
-    Let spill_size be Layout.memory_get_int64(frame, spill_area_offset)
+    Let spill_size be proc memory_get_int64 from Layout with frame, spill_area_offset
 
     Note: Align to size boundary (size should be power of 2)
     Let aligned_offset be spill_size
@@ -1306,14 +1693,14 @@ Process called "lir_allocate_spill_slot" that takes function as Integer, vreg_id
 
     Note: Allocate space
     Let new_spill_size be aligned_offset plus size
-    Layout.memory_set_int64(frame, spill_area_offset, new_spill_size)
+    proc memory_set_int64 from Layout with frame, spill_area_offset, new_spill_size
 
     Note: Stack offset is negative from RBP
     Let stack_offset be -(aligned_offset plus size)
 
     Note: Record mapping
-    Let spill_offsets be Layout.memory_get_int64(frame, 72)
-    Dictionary.set(spill_offsets, vreg_id, stack_offset)
+    Let spill_offsets be proc memory_get_int64 from Layout with frame, 72
+    proc set from Dictionary with spill_offsets, vreg_id, stack_offset
 
     Return stack_offset
 End Process
@@ -1323,6 +1710,30 @@ Finalizes the stack frame by computing total frame size with proper alignment.
 Called after all local variables and spill slots are allocated.
 @End Reasoning
 
+@Implementation
+1. NULL-guard the function and resolve its stack frame (offset 72).
+2. Sum local_area_size + spill_area_size + arg_area_size to get the
+   variable portion of the frame.
+3. Add 8 bytes per callee-saved register so the prologue's PUSH sequence
+   has reserved space inside the frame.
+4. Round the total up to the frame's alignment (typically 16 bytes for
+   x86-64) so the post-prologue RSP is properly aligned for any callee.
+5. Store the final size at offset 0 and return it for the prologue emitter.
+@End Implementation
+
+@Performance_Hints
+A constant amount of arithmetic. Called once per function during prologue
+lowering. The alignment round-up uses a modulo-and-add rather than a
+mask so the code remains readable when alignment is non-power-of-two on
+exotic targets.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe; surfaces a diagnostic when no frame is present. Returns 0 on
+failure so the prologue emitter can detect the error before generating
+malformed assembly.
+@End Security_Scope
+
 Process called "lir_finalize_stack_frame" that takes function as Integer returns Integer:
     If function is equal to 0:
         Display "lir_finalize_stack_frame: null function"
@@ -1330,23 +1741,23 @@ Process called "lir_finalize_stack_frame" that takes function as Integer returns
     End If
 
     Let frame_offset be 72
-    Let frame be Layout.memory_get_int64(function, frame_offset)
+    Let frame be proc memory_get_int64 from Layout with function, frame_offset
     If frame is equal to 0:
         Display "lir_finalize_stack_frame: no stack frame"
         Return 0
     End If
 
     Note: Get area sizes
-    Let local_size be Layout.memory_get_int64(frame, 8)
-    Let spill_size be Layout.memory_get_int64(frame, 16)
-    Let arg_size be Layout.memory_get_int64(frame, 24)
-    Let alignment be Layout.memory_get_int64(frame, 32)
+    Let local_size be proc memory_get_int64 from Layout with frame, 8
+    Let spill_size be proc memory_get_int64 from Layout with frame, 16
+    Let arg_size be proc memory_get_int64 from Layout with frame, 24
+    Let alignment be proc memory_get_int64 from Layout with frame, 32
 
     Note: Calculate total size
     Let total_size be local_size plus spill_size plus arg_size
 
     Note: Add space for callee-saved registers
-    Let callee_saved_count be Layout.memory_get_int64(frame, 56)
+    Let callee_saved_count be proc memory_get_int64 from Layout with frame, 56
     Let callee_saved_size be callee_saved_count multiplied by 8
     Set total_size to total_size plus callee_saved_size
 
@@ -1357,7 +1768,7 @@ Process called "lir_finalize_stack_frame" that takes function as Integer returns
     End If
 
     Note: Set final frame size
-    Layout.memory_set_int64(frame, 0, total_size)
+    proc memory_set_int64 from Layout with frame, 0, total_size
 
     Return total_size
 End Process
@@ -1370,34 +1781,55 @@ Note: ==========================================================================
 Creates a new LIR module to contain all functions in a compilation unit.
 @End Reasoning
 
+@Implementation
+1. Allocate 64 bytes on the OWNED HEAP for the LIRModule header.
+2. Duplicate the module name string so the module owns it independent of
+   any HIR program lifetime.
+3. Initialize the functions and external_functions Lists, zero out the
+   function_count and external_count tallies, and reset the
+   global_init_block, target_triple, and hir_program pointers for the
+   backend driver to populate as the compilation progresses.
+@End Implementation
+
+@Performance_Hints
+One module allocation, one string duplication, two List allocations.
+Called once per compilation unit.
+@End Performance_Hints
+
+@Security_Scope
+Failure modes (allocation failure, name duplication failure) surface a
+diagnostic and return 0. Callers must check the return value before
+populating function tables.
+@End Security_Scope
+
 Process called "lir_create_module" that takes name as Integer returns Integer:
-    Let module be Layout.allocate(64)
+    Let module be proc allocate from Layout with 64
     If module is equal to 0:
         Display "lir_create_module: allocation failed"
         Return 0
     End If
 
     Note: Copy module name
-    Let name_copy be StringCore.duplicate(name)
+    Let name_copy be proc duplicate from StringCore with name
     If name_copy is equal to 0:
         Display "lir_create_module: name duplication failed"
         Return 0
     End If
 
     Note: Initialize module fields
-    Layout.memory_set_int64(module, 0, name_copy)                 Note: name
+    proc memory_set_int64 from Layout with module, 0, name_copy                 Note: name
 
-    Let functions be List.create()
-    Layout.memory_set_int64(module, 8, functions)                 Note: functions
-    Layout.memory_set_int64(module, 16, 0)                        Note: function_count
+    Let functions be proc create from List
+    proc memory_set_int64 from Layout with module, 8, functions                 Note: functions
+    proc memory_set_int64 from Layout with module, 16, 0                        Note: function_count
 
-    Let external_functions be List.create()
-    Layout.memory_set_int64(module, 24, external_functions)       Note: external_functions
-    Layout.memory_set_int64(module, 32, 0)                        Note: external_count
+    Let external_functions be proc create from List
+    proc memory_set_int64 from Layout with module, 24, external_functions       Note: external_functions
+    proc memory_set_int64 from Layout with module, 32, 0                        Note: external_count
 
-    Layout.memory_set_int64(module, 40, 0)                        Note: global_init_block
-    Layout.memory_set_int64(module, 48, 0)                        Note: target_triple (set later)
-    Layout.memory_set_int64(module, 56, 0)                        Note: hir_program
+    proc memory_set_int64 from Layout with module, 40, 0                        Note: global_init_block
+    proc memory_set_int64 from Layout with module, 48, 0                        Note: target_triple (set later)
+    proc memory_set_int64 from Layout with module, 56, 0                        Note: hir_program
 
     Return module
 End Process
@@ -1406,6 +1838,22 @@ End Process
 Adds a function to the LIR module.
 @End Reasoning
 
+@Implementation
+Appends the LIRFunction pointer to the module's functions List (offset 8)
+and bumps function_count (offset 16). The pointer is stored verbatim - the
+function continues to be owned by the module's heap subarena.
+@End Implementation
+
+@Performance_Hints
+One List.append plus two memory accesses. Called once per function during
+module assembly.
+@End Performance_Hints
+
+@Security_Scope
+NULL-guards both parameters and surfaces a diagnostic on failure without
+mutating the module.
+@End Security_Scope
+
 Process called "lir_add_function" that takes module as Integer, function as Integer returns Integer:
     If module is equal to 0 or function is equal to 0:
         Display "lir_add_function: null parameter"
@@ -1413,12 +1861,12 @@ Process called "lir_add_function" that takes module as Integer, function as Inte
     End If
 
     Let functions_offset be 8
-    Let functions be Layout.memory_get_int64(module, functions_offset)
-    List.append(functions, function)
+    Let functions be proc memory_get_int64 from Layout with module, functions_offset
+    proc append from List with functions, function
 
     Let count_offset be 16
-    Let count be Layout.memory_get_int64(module, count_offset)
-    Layout.memory_set_int64(module, count_offset, count plus 1)
+    Let count be proc memory_get_int64 from Layout with module, count_offset
+    proc memory_set_int64 from Layout with module, count_offset, count plus 1
 
     Return 1
 End Process
@@ -1427,6 +1875,22 @@ End Process
 Retrieves a function from the module by index.
 @End Reasoning
 
+@Implementation
+Loads the module's functions List pointer (offset 8) and function_count
+(offset 16), validates the index against [0, function_count), and
+delegates the indexed read to List.get. Returns 0 with a diagnostic on
+any failure.
+@End Implementation
+
+@Performance_Hints
+Two memory loads plus one List.get. O(1).
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checks the index against function_count to guarantee no
+out-of-range read from the underlying List storage.
+@End Security_Scope
+
 Process called "lir_get_function" that takes module as Integer, index as Integer returns Integer:
     If module is equal to 0:
         Display "lir_get_function: null module"
@@ -1434,17 +1898,17 @@ Process called "lir_get_function" that takes module as Integer, index as Integer
     End If
 
     Let functions_offset be 8
-    Let functions be Layout.memory_get_int64(module, functions_offset)
+    Let functions be proc memory_get_int64 from Layout with module, functions_offset
 
     Let count_offset be 16
-    Let count be Layout.memory_get_int64(module, count_offset)
+    Let count be proc memory_get_int64 from Layout with module, count_offset
 
     If index is less than 0 or index is greater than or equal to count:
         Display "lir_get_function: invalid index"
         Return 0
     End If
 
-    Let function be List.get(functions, index)
+    Let function be proc get from List with functions, index
     Return function
 End Process
 
@@ -1457,12 +1921,31 @@ Checks if an instruction is a terminator (ends a basic block).
 Terminators include: JMP, conditional branches, RET, CALL (indirect only).
 @End Reasoning
 
+@Implementation
+Loads the opcode field at offset 0 of the LIRInstruction header and tests
+it against the unconditional jump opcode, the contiguous conditional
+branch range [LIR_JZ, LIR_JNP], and the return opcode. The range test
+relies on the contiguous numbering in the LIR opcode table (30501-30518
+for conditional branches).
+@End Implementation
+
+@Performance_Hints
+One memory load plus three branches. Called from every CFG-walking pass
+and the basic-block builder's "is this the last instruction" check.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe load. Unrecognized opcodes fall through to 0 (not a
+terminator) so the caller's iterator continues safely past unknown
+extension instructions.
+@End Security_Scope
+
 Process called "lir_is_terminator" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     Note: Unconditional jump
     If opcode is equal to LIR_JMP:
@@ -1486,12 +1969,28 @@ End Process
 Checks if an instruction is a branch (conditional or unconditional).
 @End Reasoning
 
+@Implementation
+Loads the opcode at offset 0 and tests for LIR_JMP plus the contiguous
+range [LIR_JZ, LIR_JNP]. Distinguished from lir_is_terminator by
+excluding LIR_RET so callers that specifically want intraprocedural
+branches do not have to filter returns.
+@End Implementation
+
+@Performance_Hints
+One memory load plus two branches. Used by every branch-folding and
+target-rewriting pass.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe load. Unknown opcodes return 0.
+@End Security_Scope
+
 Process called "lir_is_branch" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     Note: Unconditional jump
     If opcode is equal to LIR_JMP:
@@ -1510,12 +2009,29 @@ End Process
 Checks if an instruction is a call (direct or indirect).
 @End Reasoning
 
+@Implementation
+Loads the opcode at offset 0 and matches it against LIR_CALL or
+LIR_CALL_INDIRECT. Direct calls have known target symbols at lower; the
+indirect form uses a register operand resolved at runtime. Both clobber
+caller-saved registers and require call-site bookkeeping.
+@End Implementation
+
+@Performance_Hints
+One memory load plus one branch. Used by liveness, caller-saved spill
+insertion, and the leaf-function detector.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe. Returns 0 for instructions whose opcode does not match either
+call form.
+@End Security_Scope
+
 Process called "lir_is_call" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     If opcode is equal to LIR_CALL or opcode is equal to LIR_CALL_INDIRECT:
         Return 1
@@ -1528,12 +2044,27 @@ End Process
 Checks if an instruction is a load from memory.
 @End Reasoning
 
+@Implementation
+Tests the opcode against the contiguous load range
+[LIR_LOAD, LIR_LOAD64]. The single range covers the generic load and
+all four sized variants (LOAD8/16/32/64) so memory-aliasing passes can
+classify reads with one comparison pair.
+@End Implementation
+
+@Performance_Hints
+One memory load and one range test. Inlinable into alias-analysis loops.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe. Conservative: returns 0 for any opcode outside the load range.
+@End Security_Scope
+
 Process called "lir_is_load" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     If opcode is greater than or equal to LIR_LOAD and opcode is less than or equal to LIR_LOAD64:
         Return 1
@@ -1546,12 +2077,26 @@ End Process
 Checks if an instruction is a store to memory.
 @End Reasoning
 
+@Implementation
+Tests the opcode against the contiguous store range
+[LIR_STORE, LIR_STORE64]. Mirrors lir_is_load's structure so memory
+classifiers can use the two accessors symmetrically.
+@End Implementation
+
+@Performance_Hints
+One memory load and one range test. Hot in DCE/CSE alias filters.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe.
+@End Security_Scope
+
 Process called "lir_is_store" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     If opcode is greater than or equal to LIR_STORE and opcode is less than or equal to LIR_STORE64:
         Return 1
@@ -1564,12 +2109,27 @@ End Process
 Checks if an instruction is a move (register-to-register or immediate-to-register).
 @End Reasoning
 
+@Implementation
+Tests the opcode against LIR_MOV. Excludes LIR_MOVSX, LIR_MOVZX, and
+LIR_CMOVcc deliberately - those have different semantics (sign extend,
+zero extend, conditional) that downstream passes (move coalescing,
+copy propagation) must not treat as plain copies.
+@End Implementation
+
+@Performance_Hints
+One memory load and one branch.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe.
+@End Security_Scope
+
 Process called "lir_is_move" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     If opcode is equal to LIR_MOV:
         Return 1
@@ -1583,20 +2143,44 @@ Checks if an instruction has side effects (memory writes, calls, returns).
 Instructions with side effects cannot be eliminated during dead code elimination.
 @End Reasoning
 
+@Implementation
+Combines four checks in order of selectivity:
+1. lir_is_store - any memory write is observable.
+2. lir_is_call - calls clobber arbitrary state.
+3. LIR_RET - the function return is the function's main side effect.
+4. LIR_SYSCALL - kernel calls cross the trust boundary and must persist.
+Any positive match terminates with 1; everything else is treated as
+side-effect free (the DCE pass then decides eliminability via
+lir_is_eliminable).
+@End Implementation
+
+@Performance_Hints
+Up to four memory loads and four branches. Hot in DCE; ordering store
+first matches typical instruction-mix where memory writes dominate side
+effects.
+@End Performance_Hints
+
+@Security_Scope
+Conservative by construction - any unrecognized side-effect-bearing
+opcode that does not fit one of the four cases is treated as
+side-effect free, which means DCE will eliminate it. Extension opcodes
+that have side effects must be added here before they ship.
+@End Security_Scope
+
 Process called "lir_has_side_effects" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     Note: Stores have side effects
-    If lir_is_store(instruction) is equal to 1:
+    If proc lir_is_store with instruction is equal to 1:
         Return 1
     End If
 
     Note: Calls have side effects
-    If lir_is_call(instruction) is equal to 1:
+    If proc lir_is_call with instruction is equal to 1:
         Return 1
     End If
 
@@ -1618,18 +2202,39 @@ Checks if an instruction can be eliminated if its result is unused.
 Pure computational instructions (ADD, SUB, etc.) can be eliminated.
 @End Reasoning
 
+@Implementation
+1. NULL-safe early return.
+2. Reject anything with side effects (via lir_has_side_effects).
+3. Reject terminators (via lir_is_terminator) because removing them would
+   break the CFG.
+4. Everything else is a pure computation whose result can be elided when
+   no downstream user reads its definition.
+@End Implementation
+
+@Performance_Hints
+Two helper calls plus comparison logic. Hot in DCE; the early-out on
+side effects skips the terminator check on the common case of memory
+writes.
+@End Performance_Hints
+
+@Security_Scope
+Conservative: anything that is not provably pure and non-terminating is
+kept. False negatives waste optimization opportunities but never
+introduce miscompilation.
+@End Security_Scope
+
 Process called "lir_is_eliminable" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 0
     End If
 
     Note: Instructions with side effects cannot be eliminated
-    If lir_has_side_effects(instruction) is equal to 1:
+    If proc lir_has_side_effects with instruction is equal to 1:
         Return 0
     End If
 
     Note: Branches and terminators cannot be eliminated
-    If lir_is_terminator(instruction) is equal to 1:
+    If proc lir_is_terminator with instruction is equal to 1:
         Return 0
     End If
 
@@ -1646,129 +2251,147 @@ Returns a human-readable name for an LIR opcode.
 Used for debug printing and error messages.
 @End Reasoning
 
+@Implementation
+Long If-chain mapping each LIR_* opcode constant to its assembly
+mnemonic via StringCore.create_from_literal. Mnemonics follow Intel/AT&T
+conventions ("mov", "add", "jmp", ...). Unknown opcodes fall through
+to "unknown" so debug dumps remain readable when new opcodes appear
+without an entry here.
+@End Implementation
+
+@Performance_Hints
+Linear branch chain. Used only by debug printing and error formatting -
+not on any compile-time hot path. The owned-heap string returned to the
+caller is freshly allocated on each call.
+@End Performance_Hints
+
+@Security_Scope
+Pure constant lookup. The returned string is owned by the caller.
+@End Security_Scope
+
 Process called "lir_get_opcode_name" that takes opcode as Integer returns Integer:
     Note: Data Movement Operations
     If opcode is equal to LIR_NOP:
-        Return StringCore.create_from_literal("nop")
+        Return proc create_from_literal from StringCore with "nop"
     End If
     If opcode is equal to LIR_MOV:
-        Return StringCore.create_from_literal("mov")
+        Return proc create_from_literal from StringCore with "mov"
     End If
     If opcode is equal to LIR_LEA:
-        Return StringCore.create_from_literal("lea")
+        Return proc create_from_literal from StringCore with "lea"
     End If
     If opcode is equal to LIR_PUSH:
-        Return StringCore.create_from_literal("push")
+        Return proc create_from_literal from StringCore with "push"
     End If
     If opcode is equal to LIR_POP:
-        Return StringCore.create_from_literal("pop")
+        Return proc create_from_literal from StringCore with "pop"
     End If
 
     Note: Arithmetic Operations
     If opcode is equal to LIR_ADD:
-        Return StringCore.create_from_literal("add")
+        Return proc create_from_literal from StringCore with "add"
     End If
     If opcode is equal to LIR_SUB:
-        Return StringCore.create_from_literal("sub")
+        Return proc create_from_literal from StringCore with "sub"
     End If
     If opcode is equal to LIR_IMUL:
-        Return StringCore.create_from_literal("imul")
+        Return proc create_from_literal from StringCore with "imul"
     End If
     If opcode is equal to LIR_IDIV:
-        Return StringCore.create_from_literal("idiv")
+        Return proc create_from_literal from StringCore with "idiv"
     End If
     If opcode is equal to LIR_NEG:
-        Return StringCore.create_from_literal("neg")
+        Return proc create_from_literal from StringCore with "neg"
     End If
     If opcode is equal to LIR_INC:
-        Return StringCore.create_from_literal("inc")
+        Return proc create_from_literal from StringCore with "inc"
     End If
     If opcode is equal to LIR_DEC:
-        Return StringCore.create_from_literal("dec")
+        Return proc create_from_literal from StringCore with "dec"
     End If
 
     Note: Logical Operations
     If opcode is equal to LIR_AND:
-        Return StringCore.create_from_literal("and")
+        Return proc create_from_literal from StringCore with "and"
     End If
     If opcode is equal to LIR_OR:
-        Return StringCore.create_from_literal("or")
+        Return proc create_from_literal from StringCore with "or"
     End If
     If opcode is equal to LIR_XOR:
-        Return StringCore.create_from_literal("xor")
+        Return proc create_from_literal from StringCore with "xor"
     End If
     If opcode is equal to LIR_NOT:
-        Return StringCore.create_from_literal("not")
+        Return proc create_from_literal from StringCore with "not"
     End If
     If opcode is equal to LIR_TEST:
-        Return StringCore.create_from_literal("test")
+        Return proc create_from_literal from StringCore with "test"
     End If
 
     Note: Shift Operations
     If opcode is equal to LIR_SHL:
-        Return StringCore.create_from_literal("shl")
+        Return proc create_from_literal from StringCore with "shl"
     End If
     If opcode is equal to LIR_SHR:
-        Return StringCore.create_from_literal("shr")
+        Return proc create_from_literal from StringCore with "shr"
     End If
     If opcode is equal to LIR_SAR:
-        Return StringCore.create_from_literal("sar")
+        Return proc create_from_literal from StringCore with "sar"
     End If
 
     Note: Comparison
     If opcode is equal to LIR_CMP:
-        Return StringCore.create_from_literal("cmp")
+        Return proc create_from_literal from StringCore with "cmp"
     End If
 
     Note: Control Flow
     If opcode is equal to LIR_JMP:
-        Return StringCore.create_from_literal("jmp")
+        Return proc create_from_literal from StringCore with "jmp"
     End If
     If opcode is equal to LIR_JZ:
-        Return StringCore.create_from_literal("jz")
+        Return proc create_from_literal from StringCore with "jz"
     End If
     If opcode is equal to LIR_JNZ:
-        Return StringCore.create_from_literal("jnz")
+        Return proc create_from_literal from StringCore with "jnz"
     End If
     If opcode is equal to LIR_JE:
-        Return StringCore.create_from_literal("je")
+        Return proc create_from_literal from StringCore with "je"
     End If
     If opcode is equal to LIR_JNE:
-        Return StringCore.create_from_literal("jne")
+        Return proc create_from_literal from StringCore with "jne"
     End If
     If opcode is equal to LIR_JL:
-        Return StringCore.create_from_literal("jl")
+        Return proc create_from_literal from StringCore with "jl"
     End If
     If opcode is equal to LIR_JLE:
-        Return StringCore.create_from_literal("jle")
+        Return proc create_from_literal from StringCore with "jle"
     End If
     If opcode is equal to LIR_JG:
-        Return StringCore.create_from_literal("jg")
+        Return proc create_from_literal from StringCore with "jg"
     End If
     If opcode is equal to LIR_JGE:
-        Return StringCore.create_from_literal("jge")
+        Return proc create_from_literal from StringCore with "jge"
     End If
     If opcode is equal to LIR_CALL:
-        Return StringCore.create_from_literal("call")
+        Return proc create_from_literal from StringCore with "call"
     End If
     If opcode is equal to LIR_RET:
-        Return StringCore.create_from_literal("ret")
+        Return proc create_from_literal from StringCore with "ret"
     End If
 
     Note: Memory Operations
     If opcode is equal to LIR_LOAD:
-        Return StringCore.create_from_literal("load")
+        Return proc create_from_literal from StringCore with "load"
     End If
     If opcode is equal to LIR_STORE:
-        Return StringCore.create_from_literal("store")
+        Return proc create_from_literal from StringCore with "store"
     End If
 
     Note: Special
     If opcode is equal to LIR_LABEL:
-        Return StringCore.create_from_literal("label")
+        Return proc create_from_literal from StringCore with "label"
     End If
 
-    Return StringCore.create_from_literal("unknown")
+    Return proc create_from_literal from StringCore with "unknown"
 End Process
 
 @Reasoning
@@ -1776,12 +2399,34 @@ Returns the size of operand based on opcode and instruction properties.
 Used for proper machine code generation and memory operations.
 @End Reasoning
 
+@Implementation
+Maps each sized load/store opcode to its operand width:
+- LIR_LOAD8/LIR_STORE8   -> 1 byte
+- LIR_LOAD16/LIR_STORE16 -> 2 bytes
+- LIR_LOAD32/LIR_STORE32 -> 4 bytes
+- LIR_LOAD64/LIR_STORE64 -> 8 bytes
+All other opcodes default to 8 bytes (64-bit), the platform word size.
+A NULL instruction also defaults to 8 so callers can safely query
+absent slots during peephole rewriting.
+@End Implementation
+
+@Performance_Hints
+One memory load plus up to four branches. Used by the assembly emitter
+when selecting load/store mnemonics and operand sizes.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe. The 8-byte default is the conservative choice: it never
+under-reads or under-writes memory if the opcode classification is
+incomplete.
+@End Security_Scope
+
 Process called "lir_get_operand_size_from_instruction" that takes instruction as Integer returns Integer:
     If instruction is equal to 0:
         Return 8
     End If
 
-    Let opcode be Layout.memory_get_int64(instruction, 0)
+    Let opcode be proc memory_get_int64 from Layout with instruction, 0
 
     Note: Sized load/store operations have explicit size
     If opcode is equal to LIR_LOAD8 or opcode is equal to LIR_STORE8:
@@ -1805,44 +2450,83 @@ End Process
 Returns the condition code name for debugging and assembly generation.
 @End Reasoning
 
+@Implementation
+Maps each LIR_COND_* code (EQ, NE, LT, LE, GT, GE, ULT, ULE, UGT, UGE) to
+its textual mnemonic via StringCore.create_from_literal. The unsigned
+variants are named with the "u" prefix consistent with LLVM-style
+condition naming. Unknown codes fall through to "unknown" for safe debug
+printing.
+@End Implementation
+
+@Performance_Hints
+Linear If-chain over a fixed ten-code table. Used only by debug printing
+and assembly generation.
+@End Performance_Hints
+
+@Security_Scope
+Pure constant lookup. The returned string is owned by the caller.
+@End Security_Scope
+
 Process called "lir_get_condition_name" that takes condition as Integer returns Integer:
     If condition is equal to LIR_COND_EQ:
-        Return StringCore.create_from_literal("eq")
+        Return proc create_from_literal from StringCore with "eq"
     End If
     If condition is equal to LIR_COND_NE:
-        Return StringCore.create_from_literal("ne")
+        Return proc create_from_literal from StringCore with "ne"
     End If
     If condition is equal to LIR_COND_LT:
-        Return StringCore.create_from_literal("lt")
+        Return proc create_from_literal from StringCore with "lt"
     End If
     If condition is equal to LIR_COND_LE:
-        Return StringCore.create_from_literal("le")
+        Return proc create_from_literal from StringCore with "le"
     End If
     If condition is equal to LIR_COND_GT:
-        Return StringCore.create_from_literal("gt")
+        Return proc create_from_literal from StringCore with "gt"
     End If
     If condition is equal to LIR_COND_GE:
-        Return StringCore.create_from_literal("ge")
+        Return proc create_from_literal from StringCore with "ge"
     End If
     If condition is equal to LIR_COND_ULT:
-        Return StringCore.create_from_literal("ult")
+        Return proc create_from_literal from StringCore with "ult"
     End If
     If condition is equal to LIR_COND_ULE:
-        Return StringCore.create_from_literal("ule")
+        Return proc create_from_literal from StringCore with "ule"
     End If
     If condition is equal to LIR_COND_UGT:
-        Return StringCore.create_from_literal("ugt")
+        Return proc create_from_literal from StringCore with "ugt"
     End If
     If condition is equal to LIR_COND_UGE:
-        Return StringCore.create_from_literal("uge")
+        Return proc create_from_literal from StringCore with "uge"
     End If
 
-    Return StringCore.create_from_literal("unknown")
+    Return proc create_from_literal from StringCore with "unknown"
 End Process
 
 @Reasoning
 Prints the entire LIR module for debugging purposes.
 @End Reasoning
+
+@Implementation
+1. NULL-guard the module pointer.
+2. Print a fixed header banner so the dump is easy to locate in mixed
+   debug output.
+3. Read the module name string at offset 0 and display it followed by the
+   function_count at offset 16.
+4. Walk the functions List sequentially, displaying each function's name
+   string. Per-instruction printing is intentionally delegated to
+   lir_nodes.runa so the module printer stays compact and can be invoked
+   from any pass without pulling in the full instruction printer.
+@End Implementation
+
+@Performance_Hints
+Linear in the function count. Only used for debugging and
+post-compilation dumps - never on the compile-time hot path.
+@End Performance_Hints
+
+@Security_Scope
+NULL-safe; surfaces a diagnostic when the module pointer is null. Read-
+only across all module fields.
+@End Security_Scope
 
 Process called "lir_print_module" that takes module as Integer returns Integer:
     If module is equal to 0:
@@ -1852,25 +2536,25 @@ Process called "lir_print_module" that takes module as Integer returns Integer:
 
     Display "=== LIR Module ==="
 
-    Let name be Layout.memory_get_int64(module, 0)
+    Let name be proc memory_get_int64 from Layout with module, 0
     Display "Module: "
     Display name
     Display ""
 
-    Let function_count be Layout.memory_get_int64(module, 16)
+    Let function_count be proc memory_get_int64 from Layout with module, 16
     Display "Functions: "
     Display function_count
     Display ""
 
     Note: Print each function (detailed printing implemented in lir_nodes.runa)
-    Let functions be Layout.memory_get_int64(module, 8)
+    Let functions be proc memory_get_int64 from Layout with module, 8
     Let i be 0
     While i is less than function_count:
-        Let function be List.get(functions, i)
+        Let function be proc get from List with functions, i
         Display "Function "
         Display i
         Display ": "
-        Let func_name be Layout.memory_get_int64(function, 0)
+        Let func_name be proc memory_get_int64 from Layout with function, 0
         Display func_name
         Display ""
         Set i to i plus 1

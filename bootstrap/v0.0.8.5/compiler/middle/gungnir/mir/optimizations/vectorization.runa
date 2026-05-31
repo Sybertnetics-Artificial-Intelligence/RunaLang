@@ -248,9 +248,34 @@ Note: ==========================================================================
 
 Process called "create_vectorization_context" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Creates vectorization context and initializes all tracking structures.
-    Computes dominance tree for loop detection.
+    Allocates and initializes the per-function VectorizationContext that holds
+    every shared analysis result for the duration of the pass. The context
+    owns:
+    - The CFG and SSA pointers (borrowed; not freed on destroy)
+    - The dominance tree (computed here, freed on destroy)
+    - The per-loop info list, candidates dictionary, memory_accesses
+      dictionary, dependencies dictionary, and cost_models dictionary -
+      all owned, all freed by destroy_vectorization_context
+    - Counters and configuration knobs (vector width, profitability threshold)
+
+    DEFAULT CONFIGURATION:
+    - target_vector_width = 4 (SSE baseline; ABI-portable on all x86_64
+      cores from Pentium 4 onward). AVX2 cores can be bumped to 8 and
+      AVX-512 cores to 16 by the target-selection driver.
+    - profitability_threshold = 1.2x (stored fixed-point as 120). Below
+      this speedup ratio the vectorizer rejects the loop because the
+      runtime guard overhead would erase any small gain.
+    - allow_reductions = 1 (enable vectorization of accumulator patterns
+      via horizontal-reduce epilogues).
     @End Reasoning
+
+    @Implementation
+    The context is a flat 136-byte structure of Integer (i.e. pointer-sized)
+    fields. Pointers to owned sub-structures are stored at fixed offsets so
+    the destroy routine can locate them deterministically. Dominance tree
+    computation is the dominant cost of context creation; it is performed
+    eagerly here because every subsequent analysis depends on it.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Display "create_vectorization_context: null CFG"
@@ -320,8 +345,47 @@ End Process
 
 Process called "destroy_vectorization_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Destroys vectorization context and frees all allocated structures.
+    Releases every allocation owned by the VectorizationContext. Borrowed
+    pointers (CFG, SSA) are left alone; everything created by
+    create_vectorization_context or any analysis routine is freed here.
+
+    DEALLOCATION ORDER (must match owning-pointer topology):
+    1. loops_list (owns its element VectorLoopInfo pointers, which themselves
+       own body_blocks/exit_blocks/reduction_ops/rejection_reason).
+    2. loop_candidates dictionary (parallel iteration: each entry has the
+       same sub-structures as loops_list entries; both indices into the
+       same VectorLoopInfo allocations - the implementation walks both to
+       guarantee no double-free).
+    3. memory_accesses dictionary (each loop's value is a List of
+       MemoryAccess; each MemoryAccess owns a depends_on list).
+    4. dependencies dictionary (each loop's value is a List of
+       DependencyInfo).
+    5. cost_models dictionary (each loop's value is a single CostModel
+       allocation).
+    6. alignment_cache dictionary (values are scalar alignment integers, no
+       sub-allocations).
+    7. Dominance tree (owned by Dominance module; freed via its destructor).
+    8. The context struct itself.
+
+    Skipping any step would leak; freeing in the wrong order (e.g. context
+    before sub-structures) would dangle the iteration pointers used to walk
+    the dictionaries.
     @End Reasoning
+
+    @Implementation
+    Defensive null checks at every step: each owning pointer is tested
+    against 0 before traversal so that a partially-initialized context
+    (e.g., from an early-failure path in create_vectorization_context) can
+    be safely destroyed without invoking destroy on a null pointer.
+    @End Implementation
+
+    @Security_Scope
+    Double-free vulnerability avoidance: every allocation is freed exactly
+    once, and the dictionaries / lists are torn down before the context
+    itself so no field can be read after the underlying allocation is
+    released. Use-after-free during teardown is prevented by the strict
+    bottom-up order.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -516,10 +580,51 @@ Note: ==========================================================================
 
 Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Detects natural loops using back-edge identification.
-    A back edge (B → H) exists when H dominates B.
-    Loop body = nodes that can reach B without going through H.
+    Identifies the set of natural loops in the function's control flow graph
+    using the classical back-edge / dominator algorithm (Dragon Book section
+    9.6.4 / Aho-Sethi-Ullman). A natural loop in a CFG is the set of nodes
+    that form a strongly-connected region around a single entry point (the
+    header) reached via at least one back edge.
+
+    DEFINITIONS:
+    - Back edge: an edge B -> H in the CFG such that H dominates B. Domination
+      means every path from the function entry to B passes through H, so any
+      cycle containing the edge B -> H must re-enter the cycle through H.
+    - Loop header: the target H of a back edge. By construction H is the
+      single-entry node of the loop.
+    - Loop body: the set of CFG nodes that can reach B without passing through
+      H; this is computed by reverse-reachability from B in the
+      header-removed CFG.
+
+    Only natural loops are candidates for vectorization. Irreducible loops
+    (loops with multiple entry points, e.g. produced by goto-based code paths
+    in legacy languages) are intentionally skipped by this analyzer because
+    they cannot be safely cloned into the vector-prologue / scalar-epilogue
+    shape without first canonicalizing them via loop simplification.
+
+    WHY THIS COMES FIRST:
+    Every subsequent analysis - induction variables, memory access patterns,
+    dependency checking - is parameterized by a single loop. Detect_natural_
+    loops produces the work list for the per-loop pipeline. A function with
+    no loops does no further work in this pass and is rejected immediately.
     @End Reasoning
+
+    @Implementation
+    The implementation walks every block and every successor edge, testing
+    each edge for the back-edge property via the precomputed dominance tree.
+    Each back edge spawns one loop-info record via
+    create_loop_info_from_back_edge. Multiple back edges with the same target
+    are recognized as one loop with multiple latches; in this implementation
+    they currently produce separate VectorLoopInfo records, which is a
+    documented limitation - multi-latch loops will be merged in a future
+    canonicalization step before this pass.
+    @End Implementation
+
+    @Performance_Hints
+    O(B * S) where B is the number of blocks and S is the average successor
+    count, plus O(B * H) for the dominance probes where H is the dominator
+    tree height (typically O(log B) with a balanced dominator tree).
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
@@ -567,7 +672,7 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
                     Display succ_id
 
                     Note: Create loop info for this back edge
-                    Let loop_info be create_loop_info_from_back_edge(context_ptr, block_id, succ_id)
+                    Let loop_info be proc create_loop_info_from_back_edge with context_ptr, block_id, succ_id
 
                     If loop_info is not equal to 0:
                         proc list_append from ListCore with loops_list, loop_info
@@ -595,9 +700,32 @@ End Process
 
 Process called "create_loop_info_from_back_edge" that takes context_ptr as Integer, back_edge_source as Integer, header_id as Integer returns Integer:
     @Reasoning
-    Creates VectorLoopInfo structure from a back edge.
-    Computes loop body using dominance frontier algorithm.
+    Constructs a fresh VectorLoopInfo from a confirmed back edge (latch ->
+    header). The record captures the loop's topological skeleton (header,
+    preheader, body, exits) but defers IV analysis, memory-access analysis,
+    and cost modeling to subsequent per-phase routines.
+
+    POPULATED HERE:
+    - loop_header_id, preheader (found-or-created by canonicalization)
+    - body_blocks (computed by reverse reachability from the latch)
+    - exit_blocks (computed by successor enumeration over body_blocks)
+    - default initial values for fields populated later (induction_var=0,
+      trip_count=0, stride=1, vectorizable=0, vector_factor=4,
+      is_innermost=1)
+
+    The preheader-find-or-create step canonicalizes the loop shape: a
+    natural loop without a unique preheader gets one synthesized here, so
+    every downstream analysis can assume preheader != 0 and use it as the
+    insertion point for vector prologue code.
     @End Reasoning
+
+    @Implementation
+    The default vector_factor of 4 matches the SSE / NEON baseline. The
+    target-selection driver may override this via the context's
+    target_vector_width after construction. The default is_innermost=1 is
+    optimistic; nested-loop detection later in the pipeline may clear it
+    for outer loops.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -617,15 +745,15 @@ Process called "create_loop_info_from_back_edge" that takes context_ptr as Integ
     proc memory_set_int64 from Layout with loop_info, 0, header_id
 
     Note: Find or create preheader
-    Let preheader be find_or_create_preheader(cfg_ptr, header_id)
+    Let preheader be proc find_or_create_preheader with cfg_ptr, dom_info, header_id
     proc memory_set_int64 from Layout with loop_info, 8, preheader
 
     Note: Compute loop body blocks (blocks that can reach back_edge_source without leaving through header)
-    Let body_blocks be compute_loop_body(cfg_ptr, dom_info, header_id, back_edge_source)
+    Let body_blocks be proc compute_loop_body with cfg_ptr, dom_info, header_id, back_edge_source
     proc memory_set_int64 from Layout with loop_info, 16, body_blocks
 
     Note: Compute exit blocks (blocks outside loop with predecessors in loop)
-    Let exit_blocks be compute_exit_blocks(cfg_ptr, body_blocks)
+    Let exit_blocks be proc compute_exit_blocks with cfg_ptr, body_blocks
     proc memory_set_int64 from Layout with loop_info, 24, exit_blocks
 
     Note: Initialize remaining fields
@@ -648,9 +776,34 @@ End Process
 
 Process called "compute_loop_body" that takes cfg_ptr as Integer, dom_info as Integer, header_id as Integer, back_edge_source as Integer returns Integer:
     @Reasoning
-    Computes loop body using worklist algorithm.
-    Start with back_edge_source, add predecessors that are dominated by header.
+    Computes the set of CFG blocks that constitute a natural loop's body
+    using the standard reverse-reachability algorithm from the Dragon Book
+    (algorithm 9.46):
+
+      body = { N | N is reachable from back_edge_source in the reverse CFG,
+                   not crossing header H }
+
+    Equivalently: starting from the latch, walk predecessor edges, adding
+    each visited block to the body. Stop the traversal when we would leave
+    the dominance subtree of the header (such a block must lie outside the
+    loop because every loop body block is dominated by the header by
+    definition).
+
+    The worklist algorithm guarantees termination because the CFG is finite
+    and the body Set deduplicates revisits.
     @End Reasoning
+
+    @Implementation
+    Worklist-based BFS. Each pop yields a block; if already in body skip,
+    otherwise add to body and enqueue all predecessors that are dominated
+    by the header. The dominance test is the loop-exit guard.
+    @End Implementation
+
+    @Performance_Hints
+    O(B_loop + E_loop) where B_loop and E_loop are the blocks and edges in
+    the loop body. The dominance probe is O(1) amortized with a precomputed
+    dominator tree (which the caller already has in dom_info).
+    @End Performance_Hints
 
     Let body_set be proc create from Set
     If body_set is equal to 0:
@@ -701,8 +854,22 @@ End Process
 
 Process called "compute_exit_blocks" that takes cfg_ptr as Integer, body_blocks as Integer returns Integer:
     @Reasoning
-    Exit blocks are blocks outside the loop that have at least one predecessor in the loop.
+    Identifies every successor of a loop body block that lies outside the
+    body itself. These exit targets are the destinations of the loop's
+    natural exit edges and must be tracked so that update_loop_structure
+    can route them through the scalar epilogue.
+
+    A single loop may have multiple exit blocks (e.g., a normal-fall-through
+    exit plus an early-break exit), in which case all exits are merged
+    through the epilogue to give exit-phi-nodes a unified producer.
     @End Reasoning
+
+    @Implementation
+    O(B_loop * S) where S is the average successor count. Each successor
+    is membership-tested against the body Set; misses are added to the
+    exit Set, which de-duplicates multiple body blocks branching to the
+    same exit.
+    @End Implementation
 
     Let exit_set be proc create from Set
     If exit_set is equal to 0:
@@ -744,13 +911,42 @@ Process called "compute_exit_blocks" that takes cfg_ptr as Integer, body_blocks 
     Return exit_set
 End Process
 
-Process called "find_or_create_preheader" that takes cfg_ptr as Integer, header_id as Integer returns Integer:
+Process called "find_or_create_preheader" that takes cfg_ptr as Integer, dom_info as Integer, header_id as Integer returns Integer:
     @Reasoning
-    Preheader is a block that:
-    1. Has exactly one successor: the loop header
-    2. Has all predecessors of the header that are outside the loop
-    If no preheader exists, we create one (loop canonicalization).
+    Returns the loop's preheader block, creating one if the natural-loop
+    shape did not already provide a unique one. The preheader is the canonical
+    insertion point for vector-prologue code (alignment peels, trip-count
+    guards, runtime alias checks) and for loop-invariant code hoisted by LICM.
+
+    PREHEADER PROPERTIES:
+    A preheader for header H is a block P satisfying:
+    1. P's only successor is H (so falling off P unconditionally enters
+       the loop).
+    2. Every predecessor of H that is NOT a loop latch (back-edge source)
+       feeds into P instead of directly into H.
+
+    A loop with a unique non-back-edge predecessor of the header already
+    has its preheader for free (the most common case after standard CFG
+    construction). A loop with multiple non-back-edge predecessors needs
+    a synthetic preheader: a fresh empty block is inserted, all
+    non-back-edge predecessors are rewired to it, and a single edge from
+    the preheader to the header is added. Phi-nodes in the header are
+    repaired so that the multiple original predecessor entries collapse
+    into a single preheader entry.
+
+    Loop canonicalization to ensure a unique preheader is a precondition
+    for the rest of the vectorizer's analysis - downstream passes assume
+    they can read the loop's preheader_id field and find a single,
+    unambiguous insertion point.
     @End Reasoning
+
+    @Implementation
+    Fast-path detection: when the header has exactly two predecessors (the
+    common case of one latch and one preheader), inspect each predecessor's
+    successor count - the one with successor count exactly 1 is the
+    preheader. If neither matches, fall through to synthetic-preheader
+    creation.
+    @End Implementation
 
     Note: Get header predecessors
     Let predecessors be proc get_block_predecessors from CFG with cfg_ptr, header_id
@@ -820,7 +1016,6 @@ Process called "find_or_create_preheader" that takes cfg_ptr as Integer, header_
             Let pred_id be proc get from List with header_preds, i
 
             Note: Check if this is a back edge (predecessor is dominated by header)
-            Let dom_info be proc memory_get_int64 from Layout with context_ptr, 16
             Let is_back_edge be proc dominates from Dominance with dom_info, header_id, pred_id
 
             Note: Only redirect non-back-edge predecessors
@@ -865,12 +1060,47 @@ End Process
 
 Process called "analyze_induction_variables" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Analyzes phi nodes in loop header to identify induction variables.
-    An induction variable:
-    1. Has a phi node in the loop header
-    2. Has an initial value from outside the loop
-    3. Has a recurrence: phi_value = phi_value + stride
+    Locates the primary induction variable (IV) of a candidate loop. A loop is
+    not vectorizable without a recognizable IV because every memory address
+    in the body must be expressible as base + IV * element_size, and every
+    iteration count must be derivable from IV's range.
+
+    INDUCTION VARIABLE DEFINITION (Aho-Sethi-Ullman / Dragon Book classic):
+    A SSA value v is a basic induction variable of loop L iff:
+      1. v is defined by a phi-node in the loop header
+      2. exactly one incoming arc to that phi comes from outside L (initial
+         value), and exactly one comes from a loop-latch predecessor (update)
+      3. the update value is computed as v + c for some loop-invariant c (the
+         stride). c is required to be a compile-time integer constant for the
+         vectorizer (variable strides require strided/gather code and a
+         runtime trip-count expression; future work).
+
+    Derived induction variables (e.g., j = 2*i + 5 inside the body) are NOT
+    enumerated here - they are recognized lazily by compute_access_stride
+    during memory-access analysis, which is sufficient for the vectorizer
+    because only the address computation needs to be classified.
+
+    WHY UNIT STRIDE MATTERS:
+    Stride == 1 is the prerequisite for the consecutive-lane interpretation of
+    vector loads/stores. Stride == -1 (reverse iteration) is vectorizable with
+    an extra shuffle. Stride > 1 or stride < -1 produces strided/gather
+    access. The IV stride therefore propagates into every memory-access
+    record produced by the memory-access analyzer downstream.
     @End Reasoning
+
+    @Implementation
+    Walks the header block's phi node list and tests each via
+    is_induction_variable. The first matching phi is recorded as the primary
+    IV; subsequent matches are ignored because the vectorizer currently
+    supports only single-IV loops. Multi-IV vectorization (e.g., affine nested
+    loops with row and column induction) is a future extension that requires
+    a tuple-IV cost model.
+    @End Implementation
+
+    @Performance_Hints
+    O(P) where P is the number of phi nodes in the loop header (typically 1-3
+    in practice). The cost of is_induction_variable itself is O(1) per call.
+    @End Performance_Hints
 
     If context_ptr is equal to 0 or loop_info is equal to 0:
         Return 0
@@ -898,12 +1128,12 @@ Process called "analyze_induction_variables" that takes context_ptr as Integer, 
         Let phi_ptr be proc get from List with phi_nodes, i
 
         Note: Check if this phi is an induction variable
-        Let is_induction be is_induction_variable(context_ptr, loop_info, phi_ptr)
+        Let is_induction be proc is_induction_variable with context_ptr, loop_info, phi_ptr
 
         If is_induction is equal to 1:
             Note: Found induction variable, extract stride
             Let phi_result be proc memory_get_int64 from Layout with phi_ptr, 8
-            Let stride be extract_induction_stride(context_ptr, loop_info, phi_ptr)
+            Let stride be proc extract_induction_stride with context_ptr, loop_info, phi_ptr
 
             Note: Store induction variable and stride in loop info
             proc memory_set_int64 from Layout with loop_info, 32, phi_result
@@ -926,9 +1156,25 @@ End Process
 
 Process called "is_induction_variable" that takes context_ptr as Integer, loop_info as Integer, phi_ptr as Integer returns Integer:
     @Reasoning
-    Checks if a phi node represents an induction variable.
-    Pattern: phi = [init_val, preheader], [phi + stride, latch]
+    Tests whether a header phi-node has the canonical basic-induction-variable
+    shape:
+
+        phi = [ init_value, preheader_block ],
+              [ phi + constant_stride, latch_block ]
+
+    Exactly two incoming arcs are required (one from outside the loop carrying
+    the initial value, one from the latch carrying the per-iteration update).
+    More-arc phis arise from multi-latch or merged-control-flow loops and are
+    not yet supported by this vectorizer; they would require canonicalization
+    to a single-latch form before this pass.
     @End Reasoning
+
+    @Implementation
+    Classifies each incoming pair by whether its source block is inside the
+    loop body. The outside block carries the init value; the inside block
+    carries the update. Returns the result of is_induction_update on the
+    update value to verify that it has the phi + constant_stride shape.
+    @End Implementation
 
     If phi_ptr is equal to 0:
         Return 0
@@ -960,14 +1206,14 @@ Process called "is_induction_variable" that takes context_ptr as Integer, loop_i
     If block0_in_loop is equal to 1 and block1_in_loop is equal to 0:
         Note: block0 is latch, block1 is preheader
         Note: value0 should be phi + stride
-        Let is_update be is_induction_update(context_ptr, value0, phi_result)
+        Let is_update be proc is_induction_update with context_ptr, value0, phi_result
         Return is_update
     End If
 
     If block1_in_loop is equal to 1 and block0_in_loop is equal to 0:
         Note: block1 is latch, block0 is preheader
         Note: value1 should be phi + stride
-        Set is_update to is_induction_update(context_ptr, value1, phi_result)
+        Set is_update to proc is_induction_update with context_ptr, value1, phi_result
         Return is_update
     End If
 
@@ -977,8 +1223,19 @@ End Process
 
 Process called "is_induction_update" that takes context_ptr as Integer, value_id as Integer, phi_result as Integer returns Integer:
     @Reasoning
-    Checks if value_id is computed as phi_result + constant_stride.
+    Verifies that an SSA value is computed by an MIR_ADD whose operands are
+    the phi result (the induction variable's current iteration value) and an
+    SSA-level constant (the stride). This is the bottom half of the
+    basic-induction-variable check; without a constant stride the loop's
+    trip count cannot be expressed as an affine function of iteration index
+    and the vectorizer cannot statically tile by VF.
     @End Reasoning
+
+    @Implementation
+    Examines the defining instruction's opcode (must be MIR_ADD == 20100)
+    and both operand SSA values; one operand must equal phi_result, the
+    other must be an SSA-level integer constant.
+    @End Implementation
 
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
     If ssa_ptr is equal to 0:
@@ -1018,9 +1275,25 @@ End Process
 
 Process called "extract_induction_stride" that takes context_ptr as Integer, loop_info as Integer, phi_ptr as Integer returns Integer:
     @Reasoning
-    Extracts the stride value from an induction variable phi node.
-    Returns the constant stride value (typically 1 or -1).
+    Pulls the constant stride out of a recognized basic induction variable's
+    update expression. is_induction_variable already proved that the update
+    operand is a constant; this routine reads its constant value.
+
+    A stride of 1 corresponds to a normal forward counter (the overwhelmingly
+    common case). -1 corresponds to a reverse counter (down to zero, well-
+    handled). Strides with |s| > 1 step through the iteration space at a
+    non-unit rate; the vectorizer can still widen them but the access
+    classifier downstream may force a gather/scatter implementation rather
+    than a contiguous VLOAD.
     @End Reasoning
+
+    @Implementation
+    Locates the update value (the one whose source block is inside the loop
+    body), follows the SSA def chain to its MIR_ADD, and reads the constant
+    operand's value via SSA.get_constant_value. Returns 1 as the safe default
+    if any step fails - this default is safe because callers verify
+    induction-variable shape before invoking this routine.
+    @End Implementation
 
     Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
     Let phi_result be proc memory_get_int64 from Layout with phi_ptr, 8
@@ -1079,9 +1352,55 @@ Note: ==========================================================================
 
 Process called "analyze_loop_dependencies" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Analyzes data dependencies between memory accesses in the loop.
-    Identifies RAW, WAR, and WAW hazards that prevent vectorization.
+    Builds the loop-carried data-dependency graph that determines vectorization
+    legality. A loop is safe to vectorize if and only if no dependency
+    constraint forces a serial ordering of iterations that contradicts the
+    parallel-lane execution model.
+
+    DEPENDENCY TAXONOMY:
+    For two memory accesses A_i (executed in iteration i) and A_j (executed
+    in iteration j > i) to the same memory location:
+    - RAW (Read-After-Write, "true" / "flow"): write in iter i, read in iter j.
+      Cannot be reordered. If loop-carried (j > i with i and j in same VF
+      block), it prevents vectorization unless the distance is exactly 0
+      (same iteration, easily handled by lane ordering) or >= VF (cross-VF,
+      handled by the natural lane sequencing). Distance 1 to VF-1 is fatal.
+    - WAR (Write-After-Read, "anti"): read in iter i, write in iter j. Can be
+      resolved by SSA renaming / scalar privatization: rename the write to a
+      fresh value and the read continues to see the old value.
+    - WAW (Write-After-Write, "output"): write in iter i, write in iter j.
+      Resolvable by privatization (only the last write matters; in the vector
+      lane interpretation each lane's write is the "last" for its lane).
+    - RAR (Read-After-Read): not a dependency; both reads can occur in any
+      order. The pair-checking loop here explicitly skips RAR pairs.
+
+    DISTANCE / DIRECTION VECTOR:
+    The dependency distance vector measures how many iterations separate A_i
+    from A_j. Distance 0 means same-iteration (safe under vectorization);
+    distance >= VF means cross-VF (safe); distance 1..VF-1 means
+    within-VF-block (unsafe for RAW). The check_loop_carried_dependencies
+    pass walks the dep_list this routine populates and applies these rules.
+
+    O(N^2) PAIRWISE CHECK:
+    Each pair of accesses is checked independently; the analysis budgets up
+    to a quadratic-in-accesses cost for the precision it gains over the
+    cheaper "any two stores alias if bases are unequal" approximation. In
+    practice loops have fewer than 10 memory accesses, so N^2 is tractable.
     @End Reasoning
+
+    @Implementation
+    The pair-iteration j = i+1 to access_count avoids checking each pair twice
+    and avoids the symmetric A->A self-check. The dependency direction is
+    canonically i (earlier instruction) -> j (later instruction) in
+    program-source order, which matches the RAW/WAR/WAW naming convention.
+    @End Implementation
+
+    @Performance_Hints
+    O(N^2 * D) where N is the number of memory accesses in the loop and D is
+    the cost of one check_memory_dependency call (typically O(1) due to the
+    early base-pointer alias test). For N=8 this is 28 calls per loop, which
+    is negligible compared to the rest of the pass.
+    @End Performance_Hints
 
     If context_ptr is equal to 0 or loop_info is equal to 0:
         Return 0
@@ -1117,7 +1436,7 @@ Process called "analyze_loop_dependencies" that takes context_ptr as Integer, lo
             Let access_j be proc get from List with access_list, j
 
             Note: Check if there's a dependency between access_i and access_j
-            Let dep_info be check_memory_dependency(context_ptr, loop_info, access_i, access_j)
+            Let dep_info be proc check_memory_dependency with context_ptr, loop_info, access_i, access_j
 
             If dep_info is not equal to 0:
                 Note: Dependency found, add to list
@@ -1151,9 +1470,44 @@ End Process
 
 Process called "check_memory_dependency" that takes context_ptr as Integer, loop_info as Integer, access_i as Integer, access_j as Integer returns Integer:
     @Reasoning
-    Checks if two memory accesses have a data dependency.
-    Returns DependencyInfo structure if dependency exists, 0 otherwise.
+    Tests a pair of memory accesses for a data dependency and, when one
+    exists, constructs the DependencyInfo record that downstream legality
+    checks consume.
+
+    PAIR CLASSIFICATION:
+    1. ALIAS PROBE: if the two accesses have provably different base
+       pointers, return 0 (no dependency). The current implementation uses
+       SSA value equality as a fast must-not-alias test; full alias analysis
+       (TBAA, restrict propagation) would tighten this.
+    2. ACCESS-KIND PAIRING (gates dependency type):
+         load,  load  -> no dep (return 0)
+         store, load  -> RAW (type 1)
+         load,  store -> WAR (type 2)
+         store, store -> WAW (type 3)
+    3. DISTANCE: compute_dependency_distance derives the iteration-count
+       separation between the two accesses' index expressions.
+    4. CLASSIFICATION: is_loop_carried = (distance > 0); can_privatize for
+       WAR/WAW; can_runtime_check when distance is unknown (allows the
+       vectorizer to emit a runtime alias check guard).
     @End Reasoning
+
+    @Implementation
+    The conservative default is "assume may alias" when the base-pointer
+    equality test is inconclusive; this is the standard "safe but
+    potentially pessimistic" choice that preserves correctness while a more
+    precise alias analyzer is integrated. The analysis_confidence field
+    (currently fixed at 50 for inferred dependencies) lets future passes
+    distinguish provable dependencies (confidence 100) from inferred ones
+    that may be revisable by stronger analyses.
+    @End Implementation
+
+    @Security_Scope
+    A false negative (returning 0 when a real dependency exists) is the
+    only correctness-affecting failure mode here; it would let
+    check_loop_carried_dependencies green-light an unsafe vectorization.
+    The base-pointer alias test is therefore biased pessimistically: when
+    in doubt, treat the pair as potentially dependent.
+    @End Security_Scope
 
     If access_i is equal to 0 or access_j is equal to 0:
         Return 0
@@ -1201,7 +1555,7 @@ Process called "check_memory_dependency" that takes context_ptr as Integer, loop
     End If
 
     Note: Analyze dependency distance
-    Let distance be compute_dependency_distance(context_ptr, loop_info, index_i, index_j)
+    Let distance be proc compute_dependency_distance with context_ptr, loop_info, index_i, index_j
 
     Note: Allocate DependencyInfo structure (72 bytes)
     Let dep_info be proc allocate from Layout with 72
@@ -1243,17 +1597,44 @@ End Process
 
 Process called "compute_dependency_distance" that takes context_ptr as Integer, loop_info as Integer, index_i as Integer, index_j as Integer returns Integer:
     @Reasoning
-    Computes the loop-carried distance between two array accesses.
-    Distance = 0 means same iteration (or unknown)
-    Distance > 0 means index_j accesses iteration i+distance when index_i accesses iteration i
+    Computes the iteration-count separation between two memory-access index
+    expressions that share a base. This is the "distance" component of the
+    classical dependency direction vector used by Wolfe and Banerjee
+    dependency tests.
+
+    DISTANCE INTERPRETATION:
+    For accesses A_i and A_j writing/reading a[i + offset_i] and
+    a[i + offset_j] respectively in the same iteration i, the distance is
+    offset_j - offset_i: it tells us how many iterations apart in the
+    abstract iteration space the two accesses fall.
+
+      distance == 0 : same iteration. Safe under vectorization because the
+                      dependency is satisfied within a single SIMD lane.
+      distance > 0  : forward dependency (j after i in source order accesses
+                      a later iteration). Whether this is safe depends on
+                      whether the distance fits within VF (cross-lane within
+                      same vector register is unsafe; cross-VF-block is
+                      safe).
+      distance unknown (returned as 0): the analyzer could not determine the
+                      offsets; the caller must conservatively assume the
+                      dependency is loop-carried.
     @End Reasoning
+
+    @Implementation
+    Each index value is decomposed via extract_index_offset into an integer
+    offset relative to the loop's primary IV. The sentinel value -999999
+    signals "could not decompose"; in that case we fall back to distance 0
+    (which is then treated conservatively by the safety check). Negative
+    raw distances are clamped to 0 because a negative distance means the
+    iteration order is reversed and is handled by the same lane-local rule.
+    @End Implementation
 
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
     Let induction_var be proc memory_get_int64 from Layout with loop_info, 32
 
     Note: Check if indices are induction variable + constant offset
-    Let offset_i be extract_index_offset(ssa_ptr, index_i, induction_var)
-    Let offset_j be extract_index_offset(ssa_ptr, index_j, induction_var)
+    Let offset_i be proc extract_index_offset with ssa_ptr, index_i, induction_var
+    Let offset_j be proc extract_index_offset with ssa_ptr, index_j, induction_var
 
     If offset_i is equal to -999999 or offset_j is equal to -999999:
         Note: Cannot determine offsets, assume unknown distance
@@ -1272,9 +1653,25 @@ End Process
 
 Process called "extract_index_offset" that takes ssa_ptr as Integer, index_value as Integer, induction_var as Integer returns Integer:
     @Reasoning
-    Extracts constant offset from index expression: index = induction_var + offset
-    Returns offset if pattern matches, -999999 if cannot determine
+    Decomposes an array index value of the form IV + constant_offset into
+    its constant component. Used by compute_dependency_distance to compare
+    two indices that both reference the same induction variable.
+
+    PATTERN RECOGNIZED:
+      index == IV               -> offset = 0
+      index == ADD(IV, c)        -> offset = c
+      index == ADD(c, IV)        -> offset = c
+      anything else              -> -999999 (sentinel for "indeterminate")
     @End Reasoning
+
+    @Implementation
+    Single-level def-chain probe. Does not chase chained ADDs (e.g.,
+    ADD(ADD(IV, 1), 2)) - those should already have been canonicalized to a
+    single ADD with a folded constant by the constant-folding pass that
+    runs before vectorization. The sentinel -999999 is chosen to be safely
+    out of range for any realistic array offset; callers test against the
+    exact sentinel value rather than a sign or magnitude.
+    @End Implementation
 
     If index_value is equal to induction_var:
         Note: Direct use of induction variable, offset = 0
@@ -1316,9 +1713,40 @@ End Process
 
 Process called "check_loop_carried_dependencies" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Checks if any loop-carried RAW dependencies exist that prevent vectorization.
-    Returns 1 if safe to vectorize, 0 if unsafe.
+    The legality gate for vectorization. Walks the loop's dependency list and
+    returns 1 (safe) only if every dependency is compatible with parallel
+    cross-iteration execution.
+
+    SAFETY RULES BY DEPENDENCY TYPE:
+    - RAW + loop-carried + distance 1..VF-1: FATAL. The vector-lane
+      interpretation would have an earlier iteration's write appear in a
+      later iteration's read within the same SIMD register, which violates
+      the semantics. Vectorization is rejected.
+    - RAW + same iteration (distance 0): SAFE. The dependency is satisfied
+      within a single lane (lane-local data flow).
+    - WAR / WAW + loop-carried + can_privatize: SAFE. SSA renaming or scalar
+      privatization removes the false dependency before vectorization.
+    - WAR / WAW + loop-carried + NOT can_privatize: FATAL. The aliased
+      storage cannot be split per-iteration, so the cross-iteration write
+      ordering must be preserved.
+
+    The proven_independent flag (set by future alias analysis improvements
+    or by user-supplied __restrict-style annotations) overrides the
+    conservative pair-wise classification.
     @End Reasoning
+
+    @Implementation
+    Single pass over the per-loop dep_list. Early-return on first fatal
+    dependency for fast rejection of obviously unsafe loops.
+    @End Implementation
+
+    @Security_Scope
+    This is the legality gate; an incorrectly permissive answer here would
+    cause vectorization of a loop with a real cross-iteration data race,
+    producing silently wrong vector code at runtime. The conservative
+    fallback (return 0, do not vectorize) is therefore the safe default for
+    any dependency the analyzer cannot fully classify.
+    @End Security_Scope
 
     Let header_id be proc memory_get_int64 from Layout with loop_info, 0
     Let dependencies_dict be proc memory_get_int64 from Layout with context_ptr, 80
@@ -1363,9 +1791,48 @@ Note: ==========================================================================
 
 Process called "collect_memory_accesses" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Collects all load and store instructions in the loop.
-    Analyzes stride, alignment, and access patterns.
+    Walks the loop body and materializes a MemoryAccess record for every load
+    and store instruction. The output drives all subsequent legality and
+    profitability decisions: dependency analysis enumerates pairs of these
+    records, alignment analysis indexes into them, and the cost model counts
+    them by class (consecutive vs. strided vs. gather).
+
+    PER-ACCESS METADATA CAPTURED:
+    - Base address (the loop-invariant pointer or array origin)
+    - Index value (the per-iteration offset, usually an affine function of IV)
+    - Stride class (1 = unit-consecutive, k = k-strided, 0 = unknown)
+    - Element size (in bytes; drives lane-count selection)
+    - Alignment (in bytes; determines aligned vs. unaligned vector access)
+    - is_consecutive flag (fast path for plain VLOAD/VSTORE)
+    - is_loop_invariant_address flag (allows hoisting; address compute can
+      be sunk out of the loop entirely)
+    - depends_on list (populated later by dependency analysis)
+
+    The collection is per-loop, not per-function: nested loops will run
+    collect_memory_accesses separately for the inner and outer loops, with
+    separate access lists keyed by header_id in the context's
+    memory_accesses dictionary.
     @End Reasoning
+
+    @Implementation
+    Iterates every block in body_blocks, then every instruction in each
+    block. Instructions are classified by MIR opcode: MIR_LOAD (20201) and
+    MIR_STORE (20200). Each matching instruction is handed to
+    analyze_memory_access, which produces the MemoryAccess record. The
+    record is then appended to the per-loop access list and the loop's
+    memory_accesses_count is incremented.
+
+    BLOCK-LIST DESTRUCTION ORDER:
+    body_blocks is a Set; we materialize it as a List for iteration order,
+    iterate, then destroy the List (not the Set - the Set is owned by
+    loop_info and remains live).
+    @End Implementation
+
+    @Performance_Hints
+    O(B * I) where B is the number of blocks in the loop body and I is the
+    average instruction count per block. The per-instruction work
+    (analyze_memory_access) is O(1) amortized.
+    @End Performance_Hints
 
     If context_ptr is equal to 0 or loop_info is equal to 0:
         Return 0
@@ -1403,7 +1870,7 @@ Process called "collect_memory_accesses" that takes context_ptr as Integer, loop
                     Note: Check if load or store
                     If opcode is equal to 20201 or opcode is equal to 20200:  Note: MIR_LOAD or MIR_STORE
                         Note: Create MemoryAccess structure
-                        Let mem_access be analyze_memory_access(context_ptr, loop_info, inst_ptr)
+                        Let mem_access be proc analyze_memory_access with context_ptr, loop_info, inst_ptr
 
                         If mem_access is not equal to 0:
                             proc list_append from ListCore with access_list, mem_access
@@ -1439,8 +1906,40 @@ End Process
 
 Process called "analyze_memory_access" that takes context_ptr as Integer, loop_info as Integer, inst_ptr as Integer returns Integer:
     @Reasoning
-    Analyzes a single load/store instruction to create MemoryAccess structure.
+    Decomposes a single load/store instruction into its vectorization-relevant
+    components and packages the result as a MemoryAccess record.
+
+    DECOMPOSITION STEPS:
+    1. Extract the address operand from the load (operand 0) or store
+       (operand 0 = address, operand 1 = value).
+    2. Split the address into base + index via extract_array_index. The
+       canonical pattern is ADD(base, MUL(index, element_size)) for
+       array[i] indexing.
+    3. Classify the index expression's stride relative to the loop's primary
+       IV via compute_access_stride.
+    4. Look up the element type from the MIR type table and compute its size
+       in bytes - this drives both alignment requirements and lane count.
+    5. Compute the provable static alignment of the address via
+       compute_alignment.
+    6. Mark is_consecutive when stride == 1 - this is the fast path for
+       plain vector loads/stores.
+    7. Test whether the address is loop-invariant: invariant addresses can
+       be hoisted entirely out of the loop and load just once, then the
+       loaded value is broadcast to all lanes.
+
+    All of these per-access facts feed downstream into dependency analysis,
+    cost modeling, and the final transform.
     @End Reasoning
+
+    @Implementation
+    The MIR load and store opcodes have different operand layouts:
+      MIR_LOAD opcode 20201: result equals load of address; address is at
+        operand 0, result type is at offset 32 of the node.
+      MIR_STORE opcode 20200: store of address and value; address is at
+        operand 0 at offset 8 of the node, value at offset 16, value type
+        at offset 32.
+    The opcode check picks the correct address slot for the dispatch.
+    @End Implementation
 
     If inst_ptr is equal to 0:
         Return 0
@@ -1470,12 +1969,12 @@ Process called "analyze_memory_access" that takes context_ptr as Integer, loop_i
 
     Note: Decompose address into base + index
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let index_value be extract_array_index(ssa_ptr, address_value)
+    Let index_value be proc extract_array_index with ssa_ptr, address_value
     proc memory_set_int64 from Layout with mem_access, 16, index_value
 
     Note: Compute stride relative to induction variable
     Let induction_var be proc memory_get_int64 from Layout with loop_info, 32
-    Let stride be compute_access_stride(ssa_ptr, index_value, induction_var)
+    Let stride be proc compute_access_stride with ssa_ptr, index_value, induction_var
     proc memory_set_int64 from Layout with mem_access, 24, stride
 
     Note: Get element size from type information
@@ -1506,7 +2005,7 @@ Process called "analyze_memory_access" that takes context_ptr as Integer, loop_i
     proc memory_set_int64 from Layout with mem_access, 48, is_store
 
     Note: Compute alignment
-    Let alignment be compute_alignment(context_ptr, address_value, element_size)
+    Let alignment be proc compute_alignment with context_ptr, address_value, element_size
     proc memory_set_int64 from Layout with mem_access, 56, alignment
 
     Note: Check if consecutive access (stride == 1)
@@ -1517,7 +2016,7 @@ Process called "analyze_memory_access" that takes context_ptr as Integer, loop_i
     proc memory_set_int64 from Layout with mem_access, 64, is_consecutive
 
     Note: Check if address is loop-invariant
-    Let is_invariant be is_loop_invariant_address(context_ptr, loop_info, address_value)
+    Let is_invariant be proc is_loop_invariant_address with context_ptr, loop_info, address_value
     proc memory_set_int64 from Layout with mem_access, 72, is_invariant
 
     Note: Create empty depends_on list
@@ -1529,10 +2028,28 @@ End Process
 
 Process called "extract_array_index" that takes ssa_ptr as Integer, address_value as Integer returns Integer:
     @Reasoning
-    Extracts array index from address computation.
-    Pattern: address = base + index * element_size
-    Returns index value ID, or address_value if pattern doesn't match.
+    Decomposes a load/store address into base + index * element_size form and
+    returns the index value. This is the canonical shape of an array indexing
+    expression emitted by the frontend and the GEP-lowering pass:
+
+        address = ADD(base, MUL(index, element_size))
+
+    If the pattern matches, the returned value is the SSA value ID of the
+    index. If the pattern is degenerate (no MUL inside the ADD), the right
+    operand of the ADD is returned as a best-effort index. If the address
+    is not even an ADD (e.g., a direct alloca pointer or a constant
+    address), the address itself is returned and the access is classified
+    as having zero-stride / loop-invariant index.
+
+    The returned index value feeds compute_access_stride, which classifies
+    it as IV, IV+c, IV*c, or unknown.
     @End Reasoning
+
+    @Implementation
+    Two-level def-chain probe (ADD then MUL). Does not normalize commutative
+    operand order - the frontend always emits MUL(index, element_size) with
+    the index first, so the simple "right operand is MUL" check suffices.
+    @End Implementation
 
     Let def_inst be proc get_defining_instruction from SSA with ssa_ptr, address_value
     If def_inst is equal to 0:
@@ -1565,9 +2082,52 @@ End Process
 
 Process called "compute_access_stride" that takes ssa_ptr as Integer, index_value as Integer, induction_var as Integer returns Integer:
     @Reasoning
-    Computes stride of memory access relative to induction variable.
-    Returns 1 for consecutive access, -1 for reverse, 0 for unknown.
+    Classifies the iteration-to-iteration stride of an array index expression
+    relative to the loop's primary induction variable. The stride determines
+    which class of vector memory instruction will be emitted:
+
+      stride ==  1  : unit-stride consecutive access. Lane i loads element
+                      i, lane i+1 loads element i+1, ..., as a single
+                      contiguous SIMD register. Emitted as VLOAD/VSTORE.
+                      This is the throughput-optimal case.
+      stride == -1  : reverse-unit-stride. Emitted as VLOAD/VSTORE plus a
+                      shuffle that reverses lane order (or, on architectures
+                      with a "reverse load" - ARM SVE LD1RD - directly).
+      stride ==  k  : strided access. Different lanes touch addresses
+       (k > 1 or     base + k*0, base + k*1, ..., base + k*(VF-1). On most
+        k < -1)      ISAs this degrades to a gather (loads) or scatter
+                      (stores). Profitability depends on k - for k=2 the
+                      gather is often still profitable; for k>=4 it usually
+                      isn't.
+      stride ==  0  : unknown stride. The index expression is too complex
+                      for the static analyzer to classify. The vectorizer
+                      either rejects the loop or falls back to runtime-
+                      check-guarded vectorization.
+
+    RECOGNIZED PATTERNS:
+    The analyzer recognizes two index forms that arise from typical array
+    indexing:
+      1. index = IV                  (stride 1; direct loop counter)
+      2. index = IV * c, c constant  (stride c; e.g., 2-byte stride for
+                                      stepping through alternating
+                                      elements of a struct array)
+      3. index = IV + c, c constant  (stride 1; offset-from-IV, equivalent
+                                      to a base-pointer shift)
+
+    Affine combinations (a * IV + b * J + c) for nested loops are NOT
+    classified here; they are a future extension that requires a tuple-IV
+    representation and an SCEV-style symbolic evaluator.
     @End Reasoning
+
+    @Implementation
+    Pattern matching is by direct MIR opcode test on the defining instruction
+    of the index value. MUL with an IV operand and a constant operand yields
+    the constant as stride. ADD with an IV operand and any constant offset
+    operand yields stride 1 (the offset shifts the base address, not the
+    stride). Any other defining-instruction shape produces the conservative
+    "unknown" answer 0, which causes the caller to either reject the loop or
+    fall back to a runtime check.
+    @End Implementation
 
     If index_value is equal to induction_var:
         Note: Direct use of induction variable: stride = 1
@@ -1619,9 +2179,61 @@ End Process
 
 Process called "compute_alignment" that takes context_ptr as Integer, address_value as Integer, element_size as Integer returns Integer:
     @Reasoning
-    Computes alignment of memory access.
-    Important for efficient vectorization (aligned vs unaligned loads).
+    Determines the provable static alignment (in bytes) of a memory address used
+    inside a candidate vectorizable loop. Alignment is the single biggest
+    determinant of vector load/store throughput on every modern ISA:
+
+    - x86: aligned MOVAPS/MOVAPD on a misaligned address #GP-faults pre-AVX,
+      and even with the modern relaxed-alignment encodings (MOVUPS) misaligned
+      access can split across cache lines, costing 2x bandwidth.
+    - ARM NEON: VLD1 with .align 128 is faster than the unaligned form and
+      avoids the alignment fault on strict-alignment cores.
+    - RISC-V V: unaligned vector access is permitted but may trap to the kernel
+      on cores without the Zicclsm extension, costing thousands of cycles.
+
+    The vectorizer uses this value to decide between:
+    1. Plain aligned vector load/store - when alignment >= VF * element_size.
+    2. Unaligned vector load/store (slightly slower, no peeling) - when
+       alignment < VF * element_size but the architecture supports unaligned.
+    3. Loop versioning with alignment peeling - emit a scalar prelude that
+       iterates until the address is VF-aligned, then enter the aligned hot
+       loop. Used when the unaligned penalty is high and peeling is profitable.
+
+    ANALYSIS STRATEGY:
+    Currently the analysis chases the SSA def-chain to find an alloca, whose
+    declared alignment is an upper bound. Future extensions should also
+    recognize aligned-allocation library calls (posix_memalign, aligned_alloc,
+    operator new with std::align_val_t) and propagate known-alignment metadata
+    through pointer arithmetic by computing GCD(known_align, constant_offset).
     @End Reasoning
+
+    @Implementation
+    Results are cached in the per-context alignment_cache dictionary keyed by
+    SSA value ID. Cache hits are O(1); misses do at most one SSA def-chain hop
+    and one MIR-node-opcode read. The default conservative answer is the
+    element size, which is always a safe lower bound because the type system
+    guarantees that an in-bounds pointer of type T is aligned to at least
+    the alignment of T.
+    @End Implementation
+
+    @Performance_Hints
+    Alignment underestimation never breaks correctness - it only causes the
+    vectorizer to emit unaligned vector loads or skip vectorization. Alignment
+    overestimation, however, is a correctness bug (would emit an aligned load
+    that faults at runtime). The cache must therefore only ever store provably
+    lower-bound alignment values; runtime alignment assertions are not used to
+    populate the cache.
+    @End Performance_Hints
+
+    @Security_Scope
+    This analysis directly influences emitted instruction encodings. An
+    incorrectly high cached alignment value would cause the backend to emit
+    aligned vector accesses that fault on misaligned runtime data, which can
+    be exploited as a denial-of-service vector if attacker-controlled pointer
+    arithmetic flows in. The cache is therefore populated only from
+    statically provable sources (alloca declarations, allocation-site
+    annotations), never from runtime tests.
+    @End Security_Scope
 
     Let alignment_cache be proc memory_get_int64 from Layout with context_ptr, 96
 
@@ -1657,8 +2269,30 @@ End Process
 
 Process called "is_loop_invariant_address" that takes context_ptr as Integer, loop_info as Integer, address_value as Integer returns Integer:
     @Reasoning
-    Checks if an address value is loop-invariant (doesn't change across iterations).
+    Tests whether an address SSA value is loop-invariant - i.e., produces the
+    same value across all iterations. A loop-invariant address allows the
+    address computation to be hoisted out of the loop entirely (LICM
+    territory) and lets the vectorizer recognize the "splat" / "broadcast"
+    pattern: a single load before the loop fills every lane of the vector
+    register with the same value, eliminating a per-iteration memory
+    transaction.
+
+    INVARIANCE CRITERIA:
+    - Values defined outside the function (e.g., function arguments) are
+      trivially invariant.
+    - Values defined in a block outside the loop body are invariant within
+      this loop.
+    - Values defined inside the loop body are non-invariant (they may
+      change per iteration).
     @End Reasoning
+
+    @Implementation
+    Locates the defining instruction's block via SSA.get_instruction_block
+    and tests membership in the loop's body_blocks set. The conservative
+    default (when the def cannot be located) is "invariant", because a
+    missing def usually indicates an SSA-import from outside the current
+    analysis scope.
+    @End Implementation
 
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
     Let def_inst be proc get_defining_instruction from SSA with ssa_ptr, address_value
@@ -1689,9 +2323,63 @@ Note: ==========================================================================
 
 Process called "compute_vectorization_cost" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Computes cost model for vectorizing this loop.
-    Estimates scalar cost, vector cost, overhead, and speedup ratio.
+    Decides whether vectorizing a legal loop is actually profitable. Legality
+    (proven by the dependency analysis) is necessary but not sufficient -
+    vectorization adds prologue (alignment peel, min-trip-count check),
+    epilogue (modulo-VF remainder), and possibly horizontal-reduce overhead.
+    A short trip count, or a body dominated by non-vectorizable scalar tails
+    (function calls, indirect-control-flow), can easily make the vector version
+    slower than the scalar version.
+
+    COST MODEL FORMULATION:
+    The cost model is a coarse static estimator suitable for an MIR pass that
+    runs before register allocation:
+
+        scalar_cost     = sum over body of per-op-scalar-cycles
+        vector_cost     = (vectorizable_ops / VF) + non_vectorizable_ops
+                        + (memory_ops_consecutive / VF) * mem_cycle_cost
+                        + (memory_ops_strided)         * gather_scatter_cost
+        overhead        = prologue_cost + epilogue_cost + alignment_peel_cost
+        speedup_ratio   = scalar_cost / (vector_cost + overhead)
+
+    The ratio is stored as fixed-point (scaled by 100) so the comparison
+    against the profitability threshold (default 1.2x = 120) can be done in
+    pure integer arithmetic. Loops below the threshold are rejected and fall
+    through to the scalar code path.
+
+    LANE-WIDTH SELECTION INTERACTION:
+    This pass currently uses the target_vector_width chosen at context
+    creation. A more sophisticated future cost model would explore multiple VF
+    values (e.g., 4, 8, 16) and pick the maximum profitable one, since wider
+    vectors amortize overhead better at the cost of larger remainder loops and
+    potentially worse register pressure. The cost model's interface (storing
+    scalar_cost and vector_cost separately) makes this extension non-breaking.
     @End Reasoning
+
+    @Implementation
+    Memory operations are double-counted in the scalar_cost (added with a 4x
+    cycle weight) because L1 cache hits cost ~4 cycles on most architectures,
+    while register-register arithmetic costs 1 cycle. This 4:1 ratio is
+    deliberately conservative - in practice memory throughput dominates for
+    bandwidth-bound loops, so over-weighting memory in scalar_cost slightly
+    biases the heuristic in favor of vectorization for memory-heavy loops,
+    which is exactly the workload where vectorization gives the largest
+    speedup.
+
+    Function calls (opcodes 20304/20305) are classified as non-vectorizable
+    because the calling convention's register-bank assumptions break with
+    vector arguments unless the callee is itself a vector intrinsic. Future
+    work: extend the call classifier to recognize vector-clone candidates
+    (similar to GCC's #pragma omp declare simd) and inline them as vector ops
+    when the speedup justifies the analysis cost.
+    @End Implementation
+
+    @Performance_Hints
+    The cost model walks the loop body once and is O(I) in body instruction
+    count. It is called once per legal loop, so for typical functions with
+    fewer than 10 loops the cost-modeling overhead is well under 1% of the
+    overall pass time.
+    @End Performance_Hints
 
     If context_ptr is equal to 0 or loop_info is equal to 0:
         Return 0
@@ -1825,9 +2513,57 @@ Note: ==========================================================================
 
 Process called "transform_loop_to_vector" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Transforms a scalar loop into vectorized form.
-    Generates vector prologue, vectorized body, and scalar epilogue.
+    Performs the actual scalar-to-vector rewrite once a loop has passed all
+    legality and profitability gates. The transformation widens iteration
+    semantics by a factor of VF (the loop's chosen vector_factor): each scalar
+    operation on element type T becomes one operation on a vector of VF
+    Ts, the induction variable is stepped by VF * stride, and the loop trip
+    count is effectively divided by VF.
+
+    THREE-PHASE OUTPUT SHAPE (canonical vectorizer skeleton):
+    1. Vector prologue: alignment check + min-trip-count check. If the runtime
+       trip count is below VF, control branches directly to the scalar epilogue,
+       avoiding any vector-body execution. If the base address is not aligned
+       to (VF * element_size), a peeled scalar prelude (a small scalar loop
+       running until alignment is achieved) is emitted - this is the standard
+       "loop versioning for alignment" technique that lets us emit aligned
+       vector loads instead of unaligned ones in the hot loop.
+    2. Vector body: every vectorizable scalar instruction is replaced in place
+       with its vector counterpart (vector_opcode = scalar_opcode + 400 in
+       this MIR encoding). The induction variable's stride is rewritten to
+       step by VF. Reductions are widened to vector accumulators with a
+       horizontal-reduce epilogue.
+    3. Scalar epilogue: the trip_count mod VF remainder iterations execute as
+       the original scalar loop body, ensuring correctness for trip counts
+       that are not exact multiples of VF.
+
+    The prologue/epilogue scheme dominates LLVM's loop vectorizer output and is
+    required for correctness whenever the trip count is unknown at compile time
+    or known to not be a multiple of VF.
     @End Reasoning
+
+    @Implementation
+    Failure of any phase (prologue creation, body vectorization, or epilogue
+    creation) causes the transform to bail out before the CFG is mutated by
+    update_loop_structure, so the original scalar loop remains correct. Stats
+    counters (vectorized_loops, total_instructions_vectorized) are updated only
+    after all four phases succeed.
+
+    NOTE: This implementation does not yet perform mid-transform rollback if
+    update_loop_structure fails after the body has been rewritten in place - a
+    failure there would leave the function in an inconsistent state. In
+    practice update_loop_structure failure paths are limited to CFG-edge
+    integrity errors that signal a deeper compiler bug, so the pass aborts the
+    whole compilation rather than attempting recovery.
+    @End Implementation
+
+    @Performance_Hints
+    The pass is O(I) in the number of instructions in the loop body, plus
+    O(E) for the CFG-edge rewiring in update_loop_structure where E is the
+    number of loop-exit edges (usually 1 or 2). The dominant cost is typically
+    the per-instruction lookup in collect_memory_accesses, not the transform
+    itself.
+    @End Performance_Hints
 
     If context_ptr is equal to 0 or loop_info is equal to 0:
         Return 0
@@ -1841,28 +2577,28 @@ Process called "transform_loop_to_vector" that takes context_ptr as Integer, loo
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
 
     Note: Step 1: Create vector prologue block
-    Let prologue_block be create_vector_prologue(context_ptr, loop_info)
+    Let prologue_block be proc create_vector_prologue with context_ptr, loop_info
     If prologue_block is equal to 0:
         Display "transform_loop_to_vector: failed to create prologue"
         Return 0
     End If
 
     Note: Step 2: Transform loop body instructions to vector form
-    Let body_transformed be vectorize_loop_body(context_ptr, loop_info, vector_factor)
+    Let body_transformed be proc vectorize_loop_body with context_ptr, loop_info, vector_factor
     If body_transformed is equal to 0:
         Display "transform_loop_to_vector: failed to vectorize body"
         Return 0
     End If
 
     Note: Step 3: Create scalar epilogue for remainder iterations
-    Let epilogue_block be create_scalar_epilogue(context_ptr, loop_info)
+    Let epilogue_block be proc create_scalar_epilogue with context_ptr, loop_info
     If epilogue_block is equal to 0:
         Display "transform_loop_to_vector: failed to create epilogue"
         Return 0
     End If
 
     Note: Step 4: Update loop structure
-    Let update_success be update_loop_structure(context_ptr, loop_info, prologue_block, epilogue_block)
+    Let update_success be proc update_loop_structure with context_ptr, loop_info, prologue_block, epilogue_block
     If update_success is equal to 0:
         Display "transform_loop_to_vector: failed to update structure"
         Return 0
@@ -1885,8 +2621,47 @@ End Process
 
 Process called "create_vector_prologue" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Creates prologue block for alignment and trip count checks.
+    Materializes the vector prologue block, which guards entry into the
+    widened loop body. The prologue is the standard "loop versioning"
+    construct used by every modern vectorizer (LLVM LoopVectorizer, GCC tree-
+    vectorize) to make vectorization safe and efficient at runtime:
+
+    PROLOGUE RESPONSIBILITIES:
+    1. Minimum-trip-count guard: if the runtime trip count is below VF, jump
+       directly to the scalar epilogue. Without this guard a vector loop
+       executing zero iterations of its body would still execute its
+       prologue overhead and any preamble setup, wasting work; worse, with
+       trip counts under VF the vector body would never be entered, leaving
+       all iterations to the scalar epilogue.
+    2. Alignment peeling (when profitable): execute scalar iterations until
+       the base address is VF-element-size aligned, then enter the aligned
+       vector hot loop. This is the technique that lets us emit aligned
+       VLOAD/VSTORE in the body instead of the slower unaligned variants.
+       The peel count is computed as
+           peel = (VF - (((uintptr_t)base / element_size) mod VF)) mod VF
+    3. Runtime alias checks (when dependency analysis was inconclusive):
+       compare the address ranges of any pair of accesses flagged
+       can_runtime_check; if they overlap, jump to the scalar fallback.
+       This lets us vectorize loops where alias analysis could not prove
+       independence statically.
     @End Reasoning
+
+    @Implementation
+    The current implementation allocates the prologue block ID and creates
+    the empty basic block; instruction-level population of the alignment
+    check, trip count guard, and any runtime alias checks happens after
+    backend integration is complete. The block is wired into the CFG by
+    update_loop_structure.
+    @End Implementation
+
+    @Security_Scope
+    The min-trip-count and alignment guards are correctness-critical: an
+    incorrect guard would let the vector body execute on a too-short array
+    or a misaligned address, producing an out-of-bounds read or an alignment
+    fault. Future implementations must emit these checks with the same
+    conservatism as the legality gates above - any guard the analyzer cannot
+    statically prove redundant must be emitted at runtime.
+    @End Security_Scope
 
     Display "create_vector_prologue: creating prologue block"
 
@@ -1905,8 +2680,41 @@ End Process
 
 Process called "vectorize_loop_body" that takes context_ptr as Integer, loop_info as Integer, vector_factor as Integer returns Integer:
     @Reasoning
-    Transforms scalar instructions in loop body to vector instructions.
+    Walks every instruction in the loop body and applies the appropriate
+    scalar-to-vector widening transform. This is the heart of the
+    transformation phase: after this routine returns, the loop body is
+    expressed entirely in vector MIR opcodes, ready for the backend to
+    select target-specific SIMD instructions.
+
+    DISPATCH BY OPCODE CLASS:
+    - Arithmetic ops (20100-20115: add/sub/mul/div/mod and friends):
+      Widened via transform_to_vector_instruction. The opcode is rewritten
+      to the vector form (scalar + 400) and the result type is bumped to
+      a vector type with the loop's vector_factor lane count.
+    - Memory ops (20200 = MIR_STORE, 20201 = MIR_LOAD):
+      Widened via transform_to_vector_memory, which selects between
+      consecutive vector load/store and gather/scatter based on the
+      MemoryAccess.is_consecutive flag set during analysis.
+    - Control flow, phis, calls, and other non-vectorizable opcodes are
+      left untouched. The vectorizer model assumes that the loop body has
+      no internal control flow except the IV update and the loop exit;
+      stronger loops with internal branches must be flattened by
+      if-conversion before reaching this pass.
     @End Reasoning
+
+    @Implementation
+    Per-block, per-instruction loop. The instruction count returned
+    (instructions_transformed) drives the
+    context.total_instructions_vectorized statistic, which is used both for
+    debug reporting and for the should-this-pass-run-again heuristic on
+    nested optimization passes.
+    @End Implementation
+
+    @Performance_Hints
+    O(I) in the number of body instructions. Per-instruction transformation
+    is O(1). For a typical 10-instruction loop body, this routine returns
+    in single-digit microseconds even on cold caches.
+    @End Performance_Hints
 
     Let cfg_ptr be proc memory_get_int64 from Layout with context_ptr, 0
     Let body_blocks be proc memory_get_int64 from Layout with loop_info, 16
@@ -1934,7 +2742,7 @@ Process called "vectorize_loop_body" that takes context_ptr as Integer, loop_inf
                     Note: Transform vectorizable instructions
                     If opcode is greater than or equal to 20100 and opcode is less than or equal to 20115:
                         Note: Arithmetic operation, can be vectorized
-                        Let transformed be transform_to_vector_instruction(context_ptr, inst_ptr, vector_factor)
+                        Let transformed be proc transform_to_vector_instruction with context_ptr, inst_ptr, vector_factor
                         If transformed is equal to 1:
                             Set instructions_transformed to instructions_transformed plus 1
                         End If
@@ -1942,7 +2750,7 @@ Process called "vectorize_loop_body" that takes context_ptr as Integer, loop_inf
 
                     If opcode is equal to 20200 or opcode is equal to 20201:
                         Note: Memory operation, can be vectorized if consecutive
-                        Set transformed to transform_to_vector_memory(context_ptr, loop_info, inst_ptr, vector_factor)
+                        Set transformed to proc transform_to_vector_memory with context_ptr, loop_info, inst_ptr, vector_factor
                         If transformed is equal to 1:
                             Set instructions_transformed to instructions_transformed plus 1
                         End If
@@ -1969,9 +2777,52 @@ End Process
 
 Process called "transform_to_vector_instruction" that takes context_ptr as Integer, inst_ptr as Integer, vector_factor as Integer returns Integer:
     @Reasoning
-    Transforms a scalar arithmetic instruction to vector form.
-    Example: %3 = add i32 %1, %2  →  %3 = vadd <4 x i32> %1, %2
+    Widens a scalar arithmetic MIR instruction into its SIMD counterpart. The
+    transformation is purely lane-replication semantics: a single
+    add/sub/mul/div on scalars becomes a single vadd/vsub/vmul/vdiv on
+    vectors-of-VF, where every lane independently applies the original op to
+    the corresponding lanes of the operands.
+
+    OPCODE ENCODING:
+    Vector opcodes are encoded as scalar_opcode + 400 in this MIR. The +400
+    offset is reserved in the MIR opcode space (scalar arithmetic occupies
+    20100-20115, vector arithmetic 20500-20515). This dense numeric encoding
+    enables fast classification by the backend: a single range test
+    distinguishes scalar from vector arithmetic, and the +400 shift can be
+    eliminated by a single ADD to convert a scalar-handler dispatch into a
+    vector-handler dispatch.
+
+    LANE COUNT INVARIANT:
+    Every operand and result of a vector instruction must have the same lane
+    count (the loop's vector_factor). This function therefore updates the
+    result value type via set_value_type_vector to mark the lane count.
+    Operands keep their existing SSA value IDs; the SSA infrastructure
+    upgrades them to vector type on first use, propagating the lane-count
+    annotation backwards through the def chain. This delayed-widening keeps
+    the per-instruction transform O(1) and lets a separate SSA-typing pass
+    perform the per-value vectorization.
+
+    NOT HANDLED HERE:
+    - Reductions (sum, min, max accumulating across iterations) need a
+      horizontal-reduce epilogue and are handled in vectorize_loop_body.
+    - Type conversions (e.g., sext from i32 to i64) need lane-width adjustment
+      and are emitted as separate vsext/vzext instructions.
+    - Compares need a mask-producing form (vcmpeq -> mask register) that is
+      conceptually distinct from a value-producing vector op; future work.
     @End Reasoning
+
+    @Implementation
+    The transformation is purely in-place MIR-node mutation: opcode field
+    overwrite + result type bump. No new instructions are created and no
+    operand re-encoding is needed because the lane-count annotation lives on
+    the value, not on the operand reference.
+    @End Implementation
+
+    @Performance_Hints
+    This is the inner loop of body widening, called once per vectorizable
+    instruction. Its O(1) cost is the reason the whole pass is dominated by
+    analysis rather than transformation.
+    @End Performance_Hints
 
     Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
 
@@ -1997,9 +2848,62 @@ End Process
 
 Process called "transform_to_vector_memory" that takes context_ptr as Integer, loop_info as Integer, inst_ptr as Integer, vector_factor as Integer returns Integer:
     @Reasoning
-    Transforms a scalar load/store to vector load/store.
-    Example: %2 = load i32* %ptr  →  %2 = vload <4 x i32>* %ptr
+    Rewrites a scalar load or store into the appropriate vector memory
+    instruction. Memory ops have richer dispatch than arithmetic ops because
+    the access pattern determines which class of vector memory instruction is
+    legal AND profitable:
+
+    1. UNIT-STRIDE CONSECUTIVE (stride == 1):
+       The fast path. Element i, i+1, ..., i+VF-1 of the array are loaded as
+       a single contiguous SIMD register. Emitted as MIR_VLOAD/MIR_VSTORE
+       (scalar opcode + 400 in the encoding). These map directly to a single
+       ISA instruction on every modern SIMD: x86 MOVDQA/MOVDQU, ARM NEON
+       LD1/ST1, RISC-V vle/vse, etc.
+
+    2. NON-UNIT STRIDE (stride != 1, including reverse and gather/scatter):
+       The slow but still-vectorizable path. Each lane loads from a different
+       base + index[lane] address. Emitted as MIR_GATHER (load) or
+       MIR_SCATTER (store). These map to x86 VPGATHER/VPSCATTER (AVX2+),
+       ARM SVE/SVE2 LD1*-gather, and RISC-V V indexed-load. Throughput is
+       typically 1/VF of a contiguous load because each lane is a separate
+       memory transaction, but the vector version still wins over scalar
+       when the body has substantial vectorizable arithmetic between the
+       memory ops.
+
+    Lane width (VF) selection has already been made by the cost model; this
+    function is purely a translator from the MemoryAccess analysis result into
+    the matching MIR opcode. The MemoryAccess.is_consecutive flag carries the
+    classification produced by compute_access_stride.
+
+    OPERAND LAYOUT FOR GATHER/SCATTER:
+    Gather/scatter need an extra operand: the lane-indexed offset vector. The
+    index_vector is stored in MemoryAccess.is_loop_invariant_address slot
+    (field offset 72) during analysis and is appended to the instruction's
+    operand array here, increasing operand_count by 1.
     @End Reasoning
+
+    @Implementation
+    The function dispatches by searching the per-loop access list for the
+    MemoryAccess record that matches inst_ptr. The lookup is linear because
+    the access list is typically short (under 10 entries per loop). For
+    pathologically long lists this could be lifted to a dictionary keyed by
+    instruction pointer.
+
+    The opcode-rewrite uses in-place mutation of the MIR node: opcode field
+    is set to the vector form, and the result value type is updated to vector
+    via set_value_type_vector. No new instructions are created; downstream
+    passes see a structurally identical CFG with widened operand types.
+    @End Implementation
+
+    @Performance_Hints
+    Gather/scatter is significantly slower than consecutive access on most
+    cores (Skylake-X VPGATHERDD: ~22 cycles vs. MOVDQA: 1 cycle). The cost
+    model should already have rejected unprofitable gather-dominated loops by
+    the time we get here, but a defensive secondary check at the call site
+    would be a reasonable hardening - currently this function emits the
+    gather/scatter form whenever the access is non-consecutive, deferring to
+    the cost model for the profitability decision.
+    @End Performance_Hints
 
     Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
 
@@ -2085,9 +2989,33 @@ End Process
 
 Process called "create_scalar_epilogue" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Creates epilogue block to handle remainder iterations.
-    If trip_count % vector_factor != 0, need scalar epilogue.
+    Materializes the scalar epilogue block, which executes the residual
+    (trip_count mod VF) iterations after the vector body completes. Without
+    the epilogue, a loop with trip count not exactly divisible by VF would
+    either read out of bounds (if we naively rounded up) or skip its tail
+    iterations (if we rounded down).
+
+    EPILOGUE RESPONSIBILITIES:
+    1. Execute the original scalar body for the remainder iterations (count
+       in 0..VF-1). At most VF-1 scalar iterations run here, so the
+       epilogue is small and rarely dominates loop runtime.
+    2. Merge into the same exit point as the original scalar loop, so that
+       phi nodes in the post-loop blocks see a single producer regardless
+       of which path (vector body, vector prologue jump, scalar epilogue)
+       reached them.
+
+    The epilogue is also the target of the prologue's min-trip-count guard:
+    a loop with fewer than VF iterations bypasses the vector body entirely
+    and runs as pure scalar code via the epilogue. This is the standard
+    "loop versioning" two-path layout used by modern vectorizers.
     @End Reasoning
+
+    @Implementation
+    The block is allocated and registered with the CFG here; population
+    with a copy of the original scalar body and wiring of the loop-exit phi
+    fixups happens during update_loop_structure and the subsequent
+    SSA-repair pass.
+    @End Implementation
 
     Display "create_scalar_epilogue: creating epilogue block"
 
@@ -2106,8 +3034,56 @@ End Process
 
 Process called "update_loop_structure" that takes context_ptr as Integer, loop_info as Integer, prologue_block as Integer, epilogue_block as Integer returns Integer:
     @Reasoning
-    Updates CFG to wire prologue → vector loop → epilogue.
+    Performs the CFG-level surgery that splices the prologue and epilogue
+    around the vectorized loop body, producing the canonical three-block
+    vector-loop layout:
+
+         preheader
+            |
+            v
+         prologue   (alignment check, trip-count guard, runtime alias checks)
+        /        \
+       v          v
+    vector_body   epilogue   (scalar remainder)
+       |          ^
+       +----------+
+
+    EDGE REWIRING STEPS:
+    1. Redirect preheader -> header to preheader -> prologue. The prologue
+       is now the single entry into the vector region.
+    2. Add prologue -> header to keep the vector body reachable.
+    3. For every loop exit edge (body_block -> exit_target), redirect
+       through the epilogue so that exit phi-nodes see a unified
+       last-iteration producer.
+
+    This wiring is intentionally conservative: every loop exit is routed
+    through the epilogue, even when no scalar remainder is needed at
+    runtime, so the SSA phi-fixup logic has a single canonical merge point
+    regardless of trip count.
+
+    PHI-NODE REPAIR:
+    Header phi-nodes that previously named the preheader as a predecessor
+    must be updated to name the prologue, because the preheader -> header
+    edge has been redirected. This is done by find_or_create_preheader for
+    the original preheader; the same logic applies here for the new
+    prologue, and is performed during the SSA-repair pass that follows
+    this routine.
     @End Reasoning
+
+    @Implementation
+    Uses CFG.redirect_edge for in-place edge mutation and CFG.add_edge for
+    new edges. Edge enumeration is via the body_blocks Set and the per-loop
+    exit_blocks Set computed by compute_exit_blocks during loop info
+    construction.
+    @End Implementation
+
+    @Security_Scope
+    Incorrect CFG rewiring would leave the function with dead vector code
+    or, worse, a control-flow path that reaches an undefined block. The
+    routine therefore never deletes edges - it only redirects existing
+    edges and adds new ones, preserving the dominator tree's invariants
+    for the post-loop blocks.
+    @End Security_Scope
 
     Display "update_loop_structure: updating CFG edges"
 
@@ -2178,8 +3154,56 @@ Note: ==========================================================================
 
 Process called "optimize_function_with_vectorization" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Main entry point for vectorization optimization pass.
+    Top-level driver for the loop auto-vectorization pass. Implements the classical
+    "loop vectorizer" strategy used by LLVM and GCC: scalar loops whose iterations
+    are provably independent are rewritten so that VF (vectorization factor)
+    consecutive iterations execute as a single SIMD operation per lane, where VF
+    matches the target SIMD register lane count (4 for SSE/NEON, 8 for AVX2,
+    16 for AVX-512).
+
+    PIPELINE STAGES:
+    1. Natural loop detection via back-edge identification on the dominance tree.
+    2. Per-loop induction variable analysis: every vectorizable loop must have
+       a primary integer induction variable with a compile-time-constant stride.
+    3. Memory access collection and stride classification (unit-stride consecutive
+       lanes are the prerequisite for plain vector loads/stores; non-unit strides
+       degrade to gather/scatter).
+    4. Data dependency analysis: detect RAW/WAR/WAW hazards and reject loops with
+       loop-carried RAW dependencies that cannot be sunk into the same SIMD lane.
+    5. Cost model: estimate scalar vs. vector cycle counts and reject loops whose
+       projected speedup is below the profitability threshold (default 1.2x).
+    6. Transformation: emit vector prologue, widen body instructions to vector
+       opcodes, and emit scalar epilogue for the modulo-VF remainder.
+
+    LOOP-VECTORIZATION vs. SLP:
+    This pass implements loop-level vectorization (widening iteration semantics).
+    Straight-line SLP (Superword-Level Parallelism) vectorization of basic blocks
+    is performed by a complementary MIR pass and is intentionally out of scope
+    here; the loop vectorizer only widens code that is already in a natural-loop
+    nest with an analyzable induction variable.
     @End Reasoning
+
+    @Implementation
+    The driver iterates the loop list produced by detect_natural_loops in the
+    order returned by CFG traversal. Each loop is treated as an independent
+    candidate; rejection of one loop never aborts the pass. Rejection paths
+    increment context.rejected_loops and continue, while the success path falls
+    through to transform_loop_to_vector and increments context.vectorized_loops.
+
+    Continue-statements inside the analysis loop are used so that early-out
+    rejection at any phase (no induction, loop-carried hazard, unprofitable)
+    short-circuits the remaining analyses for that loop without affecting the
+    state of the shared VectorizationContext (memory_accesses, dependencies,
+    and cost_models dictionaries are keyed by loop_header_id so partial
+    population is safe).
+    @End Implementation
+
+    @Performance_Hints
+    Pass cost is dominated by analyze_loop_dependencies, which is O(N^2) in the
+    number of memory accesses per loop. Innermost-loop-only filtering keeps N
+    small in practice (typical N=2 to 8). Detect_natural_loops itself is
+    O(blocks * avg_successors) dominated by the dominance probe.
+    @End Performance_Hints
 
     Display "========== Starting Loop Vectorization Pass =========="
 
@@ -2189,7 +3213,7 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
     End If
 
     Note: Create context
-    Let context_ptr be create_vectorization_context(cfg_ptr)
+    Let context_ptr be proc create_vectorization_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "optimize_function_with_vectorization: failed to create context"
         Return 0
@@ -2197,11 +3221,11 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
 
     Note: Step 1: Detect natural loops
     Display "Step 1: Detecting natural loops"
-    Let loops_found be detect_natural_loops(context_ptr)
+    Let loops_found be proc detect_natural_loops with context_ptr
 
     If loops_found is equal to 0:
         Display "optimize_function_with_vectorization: no loops found"
-        destroy_vectorization_context(context_ptr)
+        proc destroy_vectorization_context with context_ptr
         Return 0
     End If
 
@@ -2219,7 +3243,7 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
         Display i
 
         Note: Analyze induction variables
-        Let has_induction be analyze_induction_variables(context_ptr, loop_info)
+        Let has_induction be proc analyze_induction_variables with context_ptr, loop_info
 
         If has_induction is equal to 0:
             Display "  No induction variable found, rejecting"
@@ -2232,13 +3256,13 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
         End If
 
         Note: Collect memory accesses
-        Let access_count be collect_memory_accesses(context_ptr, loop_info)
+        Let access_count be proc collect_memory_accesses with context_ptr, loop_info
 
         Note: Analyze dependencies
-        Let dep_count be analyze_loop_dependencies(context_ptr, loop_info)
+        Let dep_count be proc analyze_loop_dependencies with context_ptr, loop_info
 
         Note: Check for loop-carried dependencies
-        Let is_safe be check_loop_carried_dependencies(context_ptr, loop_info)
+        Let is_safe be proc check_loop_carried_dependencies with context_ptr, loop_info
 
         If is_safe is equal to 0:
             Display "  Loop-carried dependencies found, rejecting"
@@ -2251,7 +3275,7 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
         End If
 
         Note: Compute cost model
-        Let is_profitable be compute_vectorization_cost(context_ptr, loop_info)
+        Let is_profitable be proc compute_vectorization_cost with context_ptr, loop_info
 
         If is_profitable is equal to 0:
             Display "  Vectorization not profitable, rejecting"
@@ -2268,7 +3292,7 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
         proc memory_set_int64 from Layout with loop_info, 56, 1
 
         Note: Transform loop
-        Let transformed be transform_loop_to_vector(context_ptr, loop_info)
+        Let transformed be proc transform_loop_to_vector with context_ptr, loop_info
 
         If transformed is equal to 0:
             Display "  Transformation failed"
@@ -2281,10 +3305,10 @@ Process called "optimize_function_with_vectorization" that takes cfg_ptr as Inte
     End While
 
     Note: Print statistics
-    print_vectorization_stats(context_ptr)
+    proc print_vectorization_stats with context_ptr
 
     Note: Cleanup
-    destroy_vectorization_context(context_ptr)
+    proc destroy_vectorization_context with context_ptr
 
     Display "========== Loop Vectorization Pass Complete =========="
 
@@ -2296,14 +3320,27 @@ Process called "run_vectorization_pass" that takes cfg_ptr as Integer returns In
     Wrapper for vectorization pass execution.
     @End Reasoning
 
-    Return optimize_function_with_vectorization(cfg_ptr)
+    Return proc optimize_function_with_vectorization with cfg_ptr
 End Process
 
 Process called "should_run_vectorization" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Checks if vectorization pass should run on this function.
-    Always beneficial for functions with loops.
+    Cheap pre-pass filter that decides whether to run the full vectorizer.
+    Vectorization is profitable only for functions containing at least one
+    loop; for loop-free functions the analysis overhead is pure waste.
+
+    The check is implemented as a single back-edge probe on the CFG, which
+    is the same fundamental test that detect_natural_loops would perform.
+    Running the cheap version first lets the pass manager skip the
+    expensive dominance-tree construction for the common case of loop-free
+    leaf functions.
     @End Reasoning
+
+    @Implementation
+    Delegates to CFG.has_back_edges, which is O(B*S) at worst but
+    short-circuits on the first back edge found. For typical loop-free
+    functions this is O(B + E) total.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Return 0

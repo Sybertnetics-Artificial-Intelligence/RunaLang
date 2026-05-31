@@ -171,6 +171,30 @@ Process called "create_adce_context" that takes cfg as Integer returns Integer:
     - Builds def-use map for O(1) definition lookup (OPTIMIZATION)
     @End Reasoning
 
+    @Implementation
+    Allocates a 136-byte context block on the owned heap via Layout and
+    populates it field-by-field using memory_set_int64 at fixed offsets:
+
+    - Offset 0: CFG pointer (input parameter).
+    - Offset 8: post-dominance info pointer computed eagerly via
+      compute_post_dominance_tree.
+    - Offset 16: CDG pointer built from the CFG and post-dominance info via
+      build_control_dependence_graph.
+    - Offset 24: critical instruction set (empty List).
+    - Offset 32: worklist (empty List, reused by propagate phase).
+    - Offsets 40/48/56: counters zeroed.
+    - Offset 64: def_use_map Dictionary, populated by a nested loop over
+      every block and every instruction in that block; for each instruction
+      that defines an SSA value (result_id != 0), the (block_index,
+      inst_index) pair is packed into a single 64-bit integer using
+      block_index * 2^32 + inst_index and stored under the result_id key
+      (converted to a string for Dictionary indexing).
+
+    Returns 0 on any allocation failure (Layout.allocate returns 0) so
+    callers can detect OOM. Cleanup of any partial state on failure is the
+    caller's responsibility via destroy_adce_context.
+    @End Implementation
+
     @Performance_Hints
     The def-use map optimization reduces mark_operand_definition from O(n×m)
     to O(1) by pre-computing value_id -> instruction mappings during context
@@ -194,12 +218,12 @@ Process called "create_adce_context" that takes cfg as Integer returns Integer:
 
     Note: Compute post-dominance information
     Display "create_adce_context: computing post-dominance"
-    Let post_dom be compute_post_dominance_tree(cfg)
+    Let post_dom be proc compute_post_dominance_tree with cfg
     proc memory_set_int64 from Layout with context_ptr, 8, post_dom
 
     Note: Build control dependence graph
     Display "create_adce_context: building control dependence graph"
-    Let cdg be build_control_dependence_graph(cfg, post_dom)
+    Let cdg be proc build_control_dependence_graph with cfg, post_dom
     proc memory_set_int64 from Layout with context_ptr, 16, cdg
 
     Note: Create critical instruction set
@@ -258,6 +282,23 @@ Process called "destroy_adce_context" that takes context_ptr as Integer returns 
     Destroys an ADCE context and frees all associated memory.
     @End Reasoning
 
+    @Implementation
+    Reverses the allocation sequence of create_adce_context in dependency
+    order to avoid use-after-free on substructures:
+
+    1. Read and destroy the def_use_map Dictionary (offset 64) if non-null.
+    2. Read and destroy the critical_set List (offset 24).
+    3. Read and destroy the worklist List (offset 32).
+    4. Read and recursively destroy the CDG via
+       destroy_control_dependence_graph (offset 16).
+    5. Read and recursively destroy the post-dominance info via
+       destroy_post_dominance_info (offset 8).
+    6. Free the 136-byte context block itself via Layout.deallocate.
+
+    Each step null-checks before destroying so partial-initialization
+    contexts are handled safely.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -283,13 +324,13 @@ Process called "destroy_adce_context" that takes context_ptr as Integer returns 
     Note: Destroy control dependence graph
     Let cdg be proc memory_get_int64 from Layout with context_ptr, 16
     If cdg is not equal to 0:
-        destroy_control_dependence_graph(cdg)
+        proc destroy_control_dependence_graph with cdg
     End If
 
     Note: Destroy post-dominance info
     Let post_dom be proc memory_get_int64 from Layout with context_ptr, 8
     If post_dom is not equal to 0:
-        destroy_post_dominance_info(post_dom)
+        proc destroy_post_dominance_info with post_dom
     End If
 
     Note: Free context structure
@@ -302,6 +343,14 @@ Process called "print_adce_stats" that takes context_ptr as Integer returns Inte
     @Reasoning
     Prints ADCE statistics for reporting.
     @End Reasoning
+
+    @Implementation
+    Reads the three elimination counters from fixed offsets in the context
+    (40 = instructions, 48 = blocks, 56 = functions) and prints a banner
+    bracketed by separator lines. Uses Display with joined-with for inline
+    integer-to-string conversion. Returns 1 on success and 0 only when the
+    context pointer is null.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -335,8 +384,8 @@ Process called "optimize_aggressive_dce" that takes cfg as Integer returns Integ
 
     **USAGE:**
     ```
-    Let cfg be mir_builder_build(hir_function)
-    Let success be optimize_aggressive_dce(cfg)
+    Let cfg be proc mir_builder_build with hir_function
+    Let success be proc optimize_aggressive_dce with cfg
     If success is equal to 1:
         Note: Advanced DCE completed successfully
     End If
@@ -344,6 +393,25 @@ Process called "optimize_aggressive_dce" that takes cfg as Integer returns Integ
 
     Returns 1 if successful, 0 if failed.
     @End Reasoning
+
+    @Implementation
+    Standalone driver for ADCE. Linear flow:
+
+    1. Null-check the CFG (returns 0 if missing).
+    2. Print the start banner.
+    3. Call create_adce_context to allocate and pre-compute post-dominance,
+       CDG, and def-use map. Bail with 0 on allocation failure.
+    4. Call run_adce_algorithm which performs all four ADCE phases.
+    5. Call verify_mir from Verifier to ensure the optimized CFG is still
+       structurally valid (no dangling operands, no orphaned blocks,
+       consistent SSA). On verification failure, destroy the context and
+       return 0 - the verifier failure indicates an optimizer bug, not
+       missing functionality.
+    6. Call print_adce_stats to emit the elimination summary.
+    7. Call destroy_adce_context to free all transient analysis state.
+
+    Returns the value produced by run_adce_algorithm (1 on success).
+    @End Implementation
 
     If cfg is equal to 0:
         Display "optimize_aggressive_dce: null CFG"
@@ -356,14 +424,14 @@ Process called "optimize_aggressive_dce" that takes cfg as Integer returns Integ
     Display ""
 
     Note: Create ADCE context
-    Let context_ptr be create_adce_context(cfg)
+    Let context_ptr be proc create_adce_context with cfg
     If context_ptr is equal to 0:
         Display "optimize_aggressive_dce: failed to create context"
         Return 0
     End If
 
     Note: Run aggressive DCE algorithm
-    Let result be run_adce_algorithm(context_ptr)
+    Let result be proc run_adce_algorithm with context_ptr
 
     Note: Verify MIR correctness
     Display ""
@@ -372,17 +440,17 @@ Process called "optimize_aggressive_dce" that takes cfg as Integer returns Integ
     If verification_result is equal to 0:
         Display "ERROR: MIR verification failed after ADCE"
         Display "This indicates a bug in the optimizer"
-        destroy_adce_context(context_ptr)
+        proc destroy_adce_context with context_ptr
         Return 0
     End If
     Display "MIR verification passed"
 
     Note: Print statistics
     Display ""
-    print_adce_stats(context_ptr)
+    proc print_adce_stats with context_ptr
 
     Note: Cleanup
-    destroy_adce_context(context_ptr)
+    proc destroy_adce_context with context_ptr
 
     Display ""
     Display "============================================"
@@ -402,11 +470,22 @@ Process called "run_aggressive_dce_pass" that takes optimizer_context as Integer
     **USAGE (from mir_optimizer.runa):**
     ```
     Note: After basic optimizations converge
-    Let adce_result be run_aggressive_dce_pass(context_ptr)
+    Let adce_result be proc run_aggressive_dce_pass with context_ptr
     ```
 
     Returns number of instructions eliminated.
     @End Reasoning
+
+    @Implementation
+    Pipeline-mode driver that integrates with mir_optimizer.runa's pass
+    manager. Extracts the CFG from the shared optimizer_context (offset 0),
+    builds a transient ADCEContext, runs the full ADCE algorithm via
+    run_adce_algorithm, then folds the per-pass elimination count back
+    into the shared optimizer_context's accumulator (offset 40). Cleans
+    up the ADCE-local state before returning. The return value is the
+    instruction-elimination count, allowing the pass manager to detect
+    fixed-point convergence (no eliminations -> no further passes needed).
+    @End Implementation
 
     If optimizer_context is equal to 0:
         Return 0
@@ -418,13 +497,13 @@ Process called "run_aggressive_dce_pass" that takes optimizer_context as Integer
     Let cfg be proc memory_get_int64 from Layout with optimizer_context, 0
 
     Note: Create ADCE context
-    Let adce_context be create_adce_context(cfg)
+    Let adce_context be proc create_adce_context with cfg
     If adce_context is equal to 0:
         Return 0
     End If
 
     Note: Run ADCE
-    run_adce_algorithm(adce_context)
+    proc run_adce_algorithm with adce_context
 
     Note: Get elimination count
     Let eliminated be proc memory_get_int64 from Layout with adce_context, 40
@@ -434,7 +513,7 @@ Process called "run_aggressive_dce_pass" that takes optimizer_context as Integer
     proc memory_set_int64 from Layout with optimizer_context, 40, current_deleted plus eliminated
 
     Note: Cleanup
-    destroy_adce_context(adce_context)
+    proc destroy_adce_context with adce_context
 
     Display "run_aggressive_dce_pass: eliminated " joined with eliminated joined with " instructions"
     Return eliminated
@@ -469,6 +548,36 @@ Process called "compute_post_dominance_tree" that takes cfg as Integer returns I
     Returns PostDominanceInfo pointer.
     @End Reasoning
 
+    @Implementation
+    Allocates a 64-byte PostDominanceInfo block and populates each field
+    via successive Layout calls:
+
+    1. Store the CFG pointer at offset 0.
+    2. Allocate the post_idom List at offset 8, then preinitialize one
+       entry per block with the sentinel value -1 (undefined).
+    3. Compute and cache the reverse-postorder list at offset 32 via
+       compute_reverse_postorder (this list is reused by the propagate
+       phase, saving a redundant traversal).
+    4. Identify exit blocks via find_exit_blocks and seed them with
+       self-post-dominance (post_idom[exit] = exit) so they form the
+       termination base case of the fixed-point iteration.
+    5. Run the iterative Cooper-Harvey-Kennedy update: in each pass, walk
+       blocks in RPO and recompute new_post_idom as the intersection of
+       all successor post-idoms via compute_post_idom_from_successors;
+       set changed=1 if any block's value moved. Loop until a complete
+       pass produces no change.
+    6. Build the explicit post-dominator tree (children-of map) via
+       build_post_dominator_tree at offset 16.
+    7. Compute the post-dominance frontier sets via
+       compute_post_dominance_frontiers at offset 24.
+    8. Release the exit_blocks temporary List and return the populated
+       PostDominanceInfo pointer.
+
+    Convergence: the lattice of post-idom assignments is finite (at most
+    N values per block), and the intersection operation is monotone, so
+    the fixed point is reached in O(V) passes worst-case.
+    @End Implementation
+
     If cfg is equal to 0:
         Return 0
     End If
@@ -489,7 +598,7 @@ Process called "compute_post_dominance_tree" that takes cfg as Integer returns I
     proc memory_set_int64 from Layout with post_dom_ptr, 8, post_idom
 
     Note: Get reverse postorder for efficient iteration
-    Let rpo be compute_reverse_postorder(cfg)
+    Let rpo be proc compute_reverse_postorder with cfg
     proc memory_set_int64 from Layout with post_dom_ptr, 32, rpo
 
     Note: Initialize post-idom map
@@ -502,7 +611,7 @@ Process called "compute_post_dominance_tree" that takes cfg as Integer returns I
     End While
 
     Note: Identify exit blocks (blocks with no successors or return instructions)
-    Let exit_blocks be find_exit_blocks(cfg)
+    Let exit_blocks be proc find_exit_blocks with cfg
 
     Note: Initialize exit blocks to post-dominate themselves
     Let exit_count be proc length from List with exit_blocks
@@ -527,10 +636,10 @@ Process called "compute_post_dominance_tree" that takes cfg as Integer returns I
             Let block_id be proc get from List with rpo, i
 
             Note: Skip exit blocks (already initialized)
-            Let is_exit be is_in_list(exit_blocks, block_id)
+            Let is_exit be proc is_in_list with exit_blocks, block_id
             If is_exit is equal to 0:
                 Note: Compute new post-idom as intersection of successor post-idoms
-                Let new_post_idom be compute_post_idom_from_successors(cfg, block_id, post_idom)
+                Let new_post_idom be proc compute_post_idom_from_successors with cfg, block_id, post_idom
 
                 Note: Check if post-idom changed
                 Let current_post_idom be proc get from List with post_idom, block_id
@@ -547,11 +656,11 @@ Process called "compute_post_dominance_tree" that takes cfg as Integer returns I
     Display "compute_post_dominance_tree: converged in " joined with iteration joined with " iterations"
 
     Note: Build post-dominator tree
-    Let post_dom_tree be build_post_dominator_tree(cfg, post_idom)
+    Let post_dom_tree be proc build_post_dominator_tree with cfg, post_idom
     proc memory_set_int64 from Layout with post_dom_ptr, 16, post_dom_tree
 
     Note: Compute post-dominance frontiers
-    Let post_dom_frontiers be compute_post_dominance_frontiers(cfg, post_idom)
+    Let post_dom_frontiers be proc compute_post_dominance_frontiers with cfg, post_idom
     proc memory_set_int64 from Layout with post_dom_ptr, 24, post_dom_frontiers
 
     Note: Cleanup
@@ -572,6 +681,19 @@ Process called "find_exit_blocks" that takes cfg as Integer returns Integer:
 
     Returns list of exit block IDs.
     @End Reasoning
+
+    @Implementation
+    Linear single-pass scan over every block in the CFG. For each block,
+    obtain its successor list; a block is an exit if either:
+    - succ_count is 0 (no outgoing edges), or
+    - the final instruction has opcode MIR_RET (20040), indicating an
+      explicit return that terminates control flow.
+
+    Exit indices are accumulated into a freshly allocated List which is
+    returned to the caller. The caller (compute_post_dominance_tree) is
+    responsible for destroying this List after seeding the post_idom map.
+    Returns 0 only when the CFG pointer itself is null.
+    @End Implementation
 
     If cfg is equal to 0:
         Return 0
@@ -620,6 +742,24 @@ Process called "compute_post_idom_from_successors" that takes cfg as Integer, bl
     Returns post-idom block ID, or -1 if undefined.
     @End Reasoning
 
+    @Implementation
+    Two-pass scan over the successor list of block_id:
+
+    Pass 1 (seed): walk successors until a successor with a defined
+    post_idom is found; that value becomes the initial result. If no
+    successor has a defined post_idom yet, return -1 - this block must
+    wait for a future iteration of the outer fixed-point loop.
+
+    Pass 2 (intersect): walk all successors and for each one with a
+    defined post_idom, invoke intersect_post_idoms to fold it into
+    result. The intersect helper walks the two pointers up the
+    partially built post-dominator tree until they meet, yielding the
+    nearest common ancestor.
+
+    Returns the converged result, which becomes the new post_idom value
+    for block_id in the outer loop.
+    @End Implementation
+
     If cfg is equal to 0 or post_idom is equal to 0:
         Return -1
     End If
@@ -654,7 +794,7 @@ Process called "compute_post_idom_from_successors" that takes cfg as Integer, bl
         Set succ_id to proc get from List with successors, i
         Set succ_post_idom to proc get from List with post_idom, succ_id
         If succ_post_idom is not equal to -1:
-            Set result to intersect_post_idoms(result, succ_post_idom, post_idom)
+            Set result to proc intersect_post_idoms with result, succ_post_idom, post_idom
         End If
         Set i to i plus 1
     End While
@@ -680,6 +820,27 @@ Process called "intersect_post_idoms" that takes finger1 as Integer, finger2 as 
 
     Returns intersected post-idom.
     @End Reasoning
+
+    @Implementation
+    Two-finger walk over the partial post-dom tree:
+
+    1. Copy finger1 -> f1 and finger2 -> f2 into local variables so the
+       parameters are not mutated.
+    2. Outer loop: while f1 != f2, the fingers are not yet at the common
+       ancestor.
+       - Inner loop 1: while f1 < f2, advance f1 to its post-immediate
+         dominator (f1 = post_idom[f1]). If that lookup hits -1, the
+         post-dom tree is not yet stable enough to intersect, so return
+         -1 to signal "wait for next iteration".
+       - Inner loop 2: symmetric step advancing f2.
+    3. Outer loop terminates when f1 == f2; that shared value is the
+       nearest common ancestor in the post-dom tree.
+
+    The block-id ordering encodes "depth" in the partial tree: lower
+    ids are processed earlier in reverse-postorder so their post_idom
+    is computed first. Comparing by id is a valid stand-in for tree
+    depth in this construction.
+    @End Implementation
 
     If post_idom is equal to 0:
         Return -1
@@ -716,6 +877,24 @@ Process called "build_post_dominator_tree" that takes cfg as Integer, post_idom 
 
     Returns tree structure (map of children lists).
     @End Reasoning
+
+    @Implementation
+    Builds the explicit children-of representation from the post_idom
+    map. Two-phase construction:
+
+    Phase 1 - initialize: allocate a top-level List of length block_count
+    and at every index store an empty children List. This guarantees
+    every block has a slot, even if it has no children.
+
+    Phase 2 - link: walk every block id i. Read its immediate
+    post-dominator (idom = post_idom[i]). If idom is defined (!= -1) and
+    not self-referential (!= i), append i to tree[idom]'s children list.
+
+    The self-referential check skips the exit blocks, which post-
+    dominate themselves by construction. Returns the populated tree
+    List, which is owned by the calling PostDominanceInfo and freed via
+    destroy_tree_structure.
+    @End Implementation
 
     If cfg is equal to 0 or post_idom is equal to 0:
         Return 0
@@ -760,6 +939,27 @@ Process called "compute_post_dominance_frontiers" that takes cfg as Integer, pos
     Returns map: block_id -> list of frontier blocks.
     @End Reasoning
 
+    @Implementation
+    Implements the Cooper-Harvey-Kennedy post-dominance frontier algorithm:
+
+    1. Allocate a top-level frontiers List with one empty per-block child
+       frontier list at every index.
+    2. For each block i that has more than one predecessor (a CFG merge
+       point - frontiers are vacuous for blocks with a single predecessor):
+       - For each predecessor pred_id of i:
+         - Start a runner pointer at pred_id.
+         - Walk runner upward via post_idom[runner] until runner reaches
+           i or hits -1.
+         - At each step, add i to runner's frontier set unless it is
+           already present (deduplication via is_in_list).
+    3. Return the populated frontiers list. The result is owned by the
+       PostDominanceInfo and freed via destroy_tree_structure.
+
+    Complexity: O(E * D) where E is edge count and D is post-dom tree
+    depth. The is_in_list dedup is O(F) where F is frontier size, but
+    F is typically small in real programs.
+    @End Implementation
+
     If cfg is equal to 0 or post_idom is equal to 0:
         Return 0
     End If
@@ -793,7 +993,7 @@ Process called "compute_post_dominance_frontiers" that takes cfg as Integer, pos
                 While runner is not equal to -1 and runner is not equal to i:
                     Let runner_frontier be proc get from List with frontiers, runner
                     Note: Add to frontier if not already present
-                    Let already_in be is_in_list(runner_frontier, i)
+                    Let already_in be proc is_in_list with runner_frontier, i
                     If already_in is equal to 0:
                         proc append from List with runner_frontier, i
                     End If
@@ -818,6 +1018,15 @@ Process called "compute_reverse_postorder" that takes cfg as Integer returns Int
 
     Returns list of block IDs in RPO order.
     @End Reasoning
+
+    @Implementation
+    Delegates to the Dominance module's existing RPO computation. Calls
+    Dominance.compute_dominance_tree on the CFG to produce a dominance
+    info handle, then extracts the cached RPO list via
+    Dominance.get_reverse_postorder. The result List is owned by the
+    Dominance module's lifetime; this function returns the borrowed
+    reference for read-only iteration. Returns 0 on null CFG.
+    @End Implementation
 
     If cfg is equal to 0:
         Return 0
@@ -853,6 +1062,13 @@ Process called "get_cached_reverse_postorder" that takes post_dom_info as Intege
     Returns list of block IDs in RPO order.
     @End Reasoning
 
+    @Implementation
+    Pure accessor that reads the cached RPO List pointer from offset 32
+    of the PostDominanceInfo structure. The cache was populated during
+    compute_post_dominance_tree's initial setup and remains valid for
+    the lifetime of the PostDominanceInfo. Returns 0 on null input.
+    @End Implementation
+
     @Performance_Hints
     RPO caching eliminates redundant O(V plus E) dominance tree computation.
     Use this function instead of compute_reverse_postorder when post-
@@ -874,6 +1090,17 @@ Process called "destroy_post_dominance_info" that takes post_dom_ptr as Integer 
     Destroys post-dominance information and frees memory.
     @End Reasoning
 
+    @Implementation
+    Frees substructures in reverse order of allocation:
+    - post_idom List (offset 8) via destroy from List,
+    - post_dom_tree (offset 16) via destroy_tree_structure,
+    - post_dom_frontiers (offset 24) via destroy_tree_structure,
+    - cached RPO List (offset 32) via destroy from List,
+    - the 64-byte struct itself via Layout.deallocate.
+    Each substructure is null-checked, allowing safe destruction of a
+    partially constructed PostDominanceInfo (e.g. mid-construction OOM).
+    @End Implementation
+
     If post_dom_ptr is equal to 0:
         Return 0
     End If
@@ -887,13 +1114,13 @@ Process called "destroy_post_dominance_info" that takes post_dom_ptr as Integer 
     Note: Destroy post-dom tree
     Let post_dom_tree be proc memory_get_int64 from Layout with post_dom_ptr, 16
     If post_dom_tree is not equal to 0:
-        destroy_tree_structure(post_dom_tree)
+        proc destroy_tree_structure with post_dom_tree
     End If
 
     Note: Destroy post-dom frontiers
     Let post_dom_frontiers be proc memory_get_int64 from Layout with post_dom_ptr, 24
     If post_dom_frontiers is not equal to 0:
-        destroy_tree_structure(post_dom_frontiers)
+        proc destroy_tree_structure with post_dom_frontiers
     End If
 
     Note: Destroy RPO list
@@ -914,6 +1141,14 @@ Process called "is_in_list" that takes list as Integer, value as Integer returns
 
     Returns 1 if found, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Linear scan over the input List using List.length to bound the loop
+    and List.get to read each element. Returns 1 on first equality match
+    so the worst-case cost is O(n) only when the value is absent. Returns
+    0 on null list pointer to make the function tolerant of uninitialized
+    frontier slots in the post-dominance computation.
+    @End Implementation
 
     If list is equal to 0:
         Return 0
@@ -936,6 +1171,15 @@ Process called "destroy_tree_structure" that takes tree as Integer returns Integ
     @Reasoning
     Destroys a tree structure (list of lists).
     @End Reasoning
+
+    @Implementation
+    Walks every slot in the outer List. Each slot contains a child List
+    (children-of map for post-dom tree, or frontier set for the post-
+    dominance frontier map). Each child List is freed via destroy from
+    List. After all inner Lists are freed, the outer List itself is freed.
+    Returns 1 on success; returns 0 on null input so it is safe to call
+    on partially constructed PostDominanceInfo instances.
+    @End Implementation
 
     If tree is equal to 0:
         Return 0
@@ -985,6 +1229,31 @@ Process called "build_control_dependence_graph" that takes cfg as Integer, post_
 
     Returns ControlDependenceGraph pointer.
     @End Reasoning
+
+    @Implementation
+    Allocates a 48-byte CDG struct and populates its four fields by
+    construction:
+
+    1. Offset 0: CFG pointer (input).
+    2. Offset 8: dependencies List (forward map - dependent -> deps).
+    3. Offset 16: reverse_dependencies List (reverse map - dep -> dependents).
+    4. Offset 24: branch_dependencies List (branch-specific subset).
+
+    For each block in the CFG, append an empty child List to each of the
+    three maps so every block has a slot.
+
+    Read the post-dominance frontiers (offset 24 of post_dom) and the
+    post_idom map (offset 8 of post_dom) once for reuse.
+
+    Then scan every block's terminator. When opcode == MIR_COND_BR
+    (20042), extract its true and false targets (offsets 24 and 32 of the
+    instruction record) and invoke add_control_dependencies_for_branch.
+    That helper walks the post-dominance frontier of the branching block
+    and records the resulting control dependencies in all three maps.
+
+    Returns the populated CDG pointer; returns 0 on null inputs or
+    allocation failure.
+    @End Implementation
 
     If cfg is equal to 0 or post_dom is equal to 0:
         Return 0
@@ -1050,7 +1319,7 @@ Process called "build_control_dependence_graph" that takes cfg as Integer, post_
                 Let false_target be proc memory_get_int64 from Layout with last_inst, 32
 
                 Note: Add control dependencies based on post-dominance frontier
-                add_control_dependencies_for_branch(cdg_ptr, i, true_target, false_target, post_idom, post_dom_frontiers)
+                proc add_control_dependencies_for_branch with cdg_ptr, i, true_target, false_target, post_idom, post_dom_frontiers
             End If
         End If
 
@@ -1072,6 +1341,27 @@ Process called "add_control_dependencies_for_branch" that takes cdg_ptr as Integ
 
     @End Reasoning
 
+    @Implementation
+    Reads the three CDG sub-maps from the cdg_ptr struct (dependencies
+    offset 8, reverse offset 16, branch offset 24), then reads the
+    post-dominance frontier list for the branching block (its PDF).
+
+    For every block Y in PDF(branch_block):
+    1. Append branch_block to dependencies[Y] unless already present
+       (deduplicated via is_in_list). This records "Y is control-
+       dependent on branch_block".
+    2. Append Y to reverse_deps[branch_block] unless already present.
+       This records the inverse relation for fast dependent-lookup.
+    3. If step 2 added a new entry, also append Y to
+       branch_deps[branch_block] to keep the branch-specific subset
+       parallel.
+
+    The two unused parameters (true_target, false_target, post_idom)
+    are retained in the signature for symmetry with multi-target branch
+    extensions and for future use when distinguishing per-edge
+    dependencies. Returns 1 on success, 0 on null cdg_ptr.
+    @End Implementation
+
     If cdg_ptr is equal to 0:
         Return 0
     End If
@@ -1091,14 +1381,14 @@ Process called "add_control_dependencies_for_branch" that takes cdg_ptr as Integ
 
         Note: Add control dependency: frontier_node depends on branch_block
         Let dep_list be proc get from List with dependencies, frontier_node
-        Let already_dep be is_in_list(dep_list, branch_block)
+        Let already_dep be proc is_in_list with dep_list, branch_block
         If already_dep is equal to 0:
             proc append from List with dep_list, branch_block
         End If
 
         Note: Add reverse dependency: branch_block controls frontier_node
         Let rev_list be proc get from List with reverse_deps, branch_block
-        Let already_rev be is_in_list(rev_list, frontier_node)
+        Let already_rev be proc is_in_list with rev_list, frontier_node
         If already_rev is equal to 0:
             proc append from List with rev_list, frontier_node
         End If
@@ -1122,6 +1412,13 @@ Process called "get_control_dependencies" that takes cdg_ptr as Integer, block_i
     Returns list of control dependency block IDs.
     @End Reasoning
 
+    @Implementation
+    Reads the dependencies submap pointer from CDG offset 8 and returns
+    the inner per-block List at index block_id. The returned List is a
+    borrowed reference owned by the CDG; callers must not free it.
+    Returns 0 on null cdg_ptr.
+    @End Implementation
+
     If cdg_ptr is equal to 0:
         Return 0
     End If
@@ -1139,6 +1436,14 @@ Process called "get_control_dependents" that takes cdg_ptr as Integer, block_id 
     Returns list of dependent block IDs.
     @End Reasoning
 
+    @Implementation
+    Reads the reverse_dependencies submap pointer from CDG offset 16
+    and returns the inner per-block List at index block_id. Borrowed
+    reference; callers must not free it. Returns 0 on null cdg_ptr.
+    Used by mark_control_dependencies during ADCE's propagate phase to
+    answer the inverse query "which blocks does branch_block control?".
+    @End Implementation
+
     If cdg_ptr is equal to 0:
         Return 0
     End If
@@ -1154,6 +1459,14 @@ Process called "destroy_control_dependence_graph" that takes cdg_ptr as Integer 
     Destroys control dependence graph and frees memory.
     @End Reasoning
 
+    @Implementation
+    Frees the three submap Lists at offsets 8, 16, 24 via
+    destroy_tree_structure (each is a list-of-lists), then frees the
+    48-byte CDG struct itself via Layout.deallocate. Each substructure
+    is null-checked, making it safe to destroy a partially constructed
+    CDG. Returns 1 on success.
+    @End Implementation
+
     If cdg_ptr is equal to 0:
         Return 0
     End If
@@ -1161,19 +1474,19 @@ Process called "destroy_control_dependence_graph" that takes cdg_ptr as Integer 
     Note: Destroy dependencies map
     Let dependencies be proc memory_get_int64 from Layout with cdg_ptr, 8
     If dependencies is not equal to 0:
-        destroy_tree_structure(dependencies)
+        proc destroy_tree_structure with dependencies
     End If
 
     Note: Destroy reverse dependencies map
     Let reverse_deps be proc memory_get_int64 from Layout with cdg_ptr, 16
     If reverse_deps is not equal to 0:
-        destroy_tree_structure(reverse_deps)
+        proc destroy_tree_structure with reverse_deps
     End If
 
     Note: Destroy branch dependencies map
     Let branch_deps be proc memory_get_int64 from Layout with cdg_ptr, 24
     If branch_deps is not equal to 0:
-        destroy_tree_structure(branch_deps)
+        proc destroy_tree_structure with branch_deps
     End If
 
     Note: Free CDG structure
@@ -1221,6 +1534,39 @@ Process called "run_adce_algorithm" that takes context_ptr as Integer returns In
     Returns 1 if successful, 0 if failed.
     @End Reasoning
 
+    @Implementation
+    The procedure orchestrates the four canonical ADCE phases against the
+    pre-built ADCEContext. Steps:
+
+    1. Guard against a null context_ptr (returns 0 to signal no work performed).
+    2. Extract the CFG, CDG, critical_set and worklist pointers from the
+       context's fixed offsets (0, 16, 24, 32 respectively).
+    3. Invoke mark_critical_instructions to seed critical_set with all
+       observable-effect instructions (Phase 1 - mark roots).
+    4. Invoke propagate_dependencies_backward, which drains the worklist by
+       transitively marking data and control predecessors of every critical
+       instruction until the worklist is empty (Phase 2 - fixed-point).
+    5. Invoke eliminate_non_critical_code, which sweeps every block,
+       building a new instruction list containing only marked instructions
+       and discarding the rest (Phase 3 - sweep).
+    6. Invoke remove_dead_blocks, which removes blocks that have become
+       unreachable from the entry after the sweep (Phase 4 - CFG cleanup).
+    7. Persist the eliminated instruction and block counts back to the
+       context (offsets 40 and 48) for downstream statistics consumers.
+
+    Termination is guaranteed: the critical_set is monotonically growing
+    and bounded by total_instructions, so the worklist drain phase converges
+    in at most O(N) iterations.
+    @End Implementation
+
+    @Performance_Hints
+    Complexity dominated by propagate_dependencies_backward: O((V+E) * D)
+    where V is block count, E is CFG edge count, and D is average use-def
+    depth. The def_use_map optimization in mark_operand_definition reduces
+    the per-operand cost from O(N*M) linear search to O(1) hashtable lookup,
+    making the overall pass linear in program size in practice.
+    @End Performance_Hints
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1234,19 +1580,19 @@ Process called "run_adce_algorithm" that takes context_ptr as Integer returns In
 
     Note: Phase 1: Mark critical instructions
     Display "run_adce_algorithm: marking critical instructions"
-    mark_critical_instructions(context_ptr)
+    proc mark_critical_instructions with context_ptr
 
     Note: Phase 2: Propagate dependencies backward
     Display "run_adce_algorithm: propagating dependencies"
-    propagate_dependencies_backward(context_ptr)
+    proc propagate_dependencies_backward with context_ptr
 
     Note: Phase 3: Eliminate non-critical code
     Display "run_adce_algorithm: eliminating dead code"
-    Let eliminated be eliminate_non_critical_code(context_ptr)
+    Let eliminated be proc eliminate_non_critical_code with context_ptr
 
     Note: Phase 4: Remove dead blocks
     Display "run_adce_algorithm: removing dead blocks"
-    Let blocks_removed be remove_dead_blocks(context_ptr)
+    Let blocks_removed be proc remove_dead_blocks with context_ptr
 
     Note: Update counters
     proc memory_set_int64 from Layout with context_ptr, 40, eliminated
@@ -1281,6 +1627,31 @@ Process called "mark_critical_instructions" that takes context_ptr as Integer re
 
     Returns number of critical instructions marked.
     @End Reasoning
+
+    @Implementation
+    Phase 1 of ADCE. Performs a single linear pass over every instruction
+    in every block of the CFG and seeds the worklist with all
+    "observably critical" instructions.
+
+    Algorithm:
+    1. Iterate i over blocks 0..block_count-1 and j over inst_count-1.
+    2. Read each instruction's opcode via MIRNodes.get_instruction_opcode.
+    3. Classify as critical when opcode equals any of:
+       - 20020 (MIR_STORE)  - memory write, observable side effect.
+       - 20030 (MIR_CALL)   - function call, conservative side effect.
+       - 20040 (MIR_RET)    - return, exit point.
+       - 20041 (MIR_BR)     - unconditional branch, control flow.
+       - 20042 (MIR_COND_BR) - conditional branch, control flow.
+       - 20050 (MIR_PHI)    - PHI node at merge point (SSA-critical).
+    4. For each critical instruction, allocate a 24-byte WorklistEntry
+       struct holding (block_id at 0, inst_index at 8, inst_ptr at 16),
+       append it to critical_set AND worklist, and increment marked_count.
+
+    The two appends ensure the entry serves both as a permanent marker
+    (in critical_set) and a propagation seed (in worklist). The same
+    entry pointer is shared by both Lists - no double allocation.
+    Returns marked_count for diagnostic display.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1379,6 +1750,31 @@ Process called "propagate_dependencies_backward" that takes context_ptr as Integ
     Returns number of instructions marked.
     @End Reasoning
 
+    @Implementation
+    Phase 2 of ADCE. Implements the classic worklist algorithm. Loop
+    invariant: every element in the worklist is also in critical_set,
+    but its predecessors (data and control) may not yet be.
+
+    Iteration:
+    1. While the worklist has entries, pop the last one (stack-like LIFO
+       order minimizes List.remove_at cost for an array-backed List).
+    2. Unpack the entry into block_id, inst_index, and inst_ptr.
+    3. Call mark_data_dependencies with context_ptr, inst, block_id.
+       This inspects the instruction's operands and, for each SSA value
+       used, locates the defining instruction via the def_use_map and
+       appends a new entry to both critical_set and worklist if not
+       already marked.
+    4. Call mark_control_dependencies with context_ptr, block_id, cdg.
+       This looks up the CDG's dependencies map for block_id and marks
+       each controlling branch instruction in the same way.
+    5. Sum the returned counts into marked_count.
+
+    Termination: critical_set is monotonically growing and bounded by
+    total_instructions; once nothing new is added, worklist drains and
+    the loop exits. Therefore the fixed point is reached in O(N)
+    overall, where N is total instruction count.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1402,11 +1798,11 @@ Process called "propagate_dependencies_backward" that takes context_ptr as Integ
         Let inst be proc memory_get_int64 from Layout with entry, 16
 
         Note: Mark data dependencies (operands)
-        Let data_marked be mark_data_dependencies(context_ptr, inst, block_id)
+        Let data_marked be proc mark_data_dependencies with context_ptr, inst, block_id
         Set marked_count to marked_count plus data_marked
 
         Note: Mark control dependencies
-        Let control_marked be mark_control_dependencies(context_ptr, block_id, cdg)
+        Let control_marked be proc mark_control_dependencies with context_ptr, block_id, cdg
         Set marked_count to marked_count plus control_marked
     End While
 
@@ -1428,6 +1824,29 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
     Returns number of newly marked instructions.
     @End Reasoning
 
+    @Implementation
+    Opcode-driven dispatch to the appropriate operand layout. Reads
+    opcode once and then handles each MIR shape:
+
+    - Binary ops (opcode 20002..20012, e.g. ADD/SUB/MUL/SHL): two
+      operands at instruction offsets 16 (left) and 24 (right). Mark
+      both via mark_operand_definition.
+    - Comparison ops (20100..20105, e.g. EQ/NE/LT/LE): same two-operand
+      layout as binary ops; reuses the binary handler structure with Set
+      assignments to the already-declared locals.
+    - Unary ops (20007 NEG, 20013 NOT): single operand at offset 16.
+    - Store (20020): value at offset 16, address at offset 24, both must
+      be kept live or the store is invalid.
+    - Cond_br (20042): condition at offset 16 must be live.
+    - PHI (20050): incoming_count at offset 24, incoming_values list at
+      offset 32; iterate every incoming SSA value and mark each defining
+      instruction.
+
+    mark_operand_definition itself uses the def_use_map for O(1) lookup
+    of the defining instruction. Returns the sum of newly marked
+    instructions across all operands; returns 0 immediately on null inst.
+    @End Implementation
+
     If inst is equal to 0:
         Return 0
     End If
@@ -1444,8 +1863,8 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
         Let left_operand be proc memory_get_int64 from Layout with inst, 16
         Let right_operand be proc memory_get_int64 from Layout with inst, 24
 
-        Let left_marked be mark_operand_definition(context_ptr, left_operand, block_id)
-        Let right_marked be mark_operand_definition(context_ptr, right_operand, block_id)
+        Let left_marked be proc mark_operand_definition with context_ptr, left_operand, block_id
+        Let right_marked be proc mark_operand_definition with context_ptr, right_operand, block_id
 
         Set marked_count to left_marked plus right_marked
     End If
@@ -1455,8 +1874,8 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
         Set left_operand to proc memory_get_int64 from Layout with inst, 16
         Set right_operand to proc memory_get_int64 from Layout with inst, 24
 
-        Set left_marked to mark_operand_definition(context_ptr, left_operand, block_id)
-        Set right_marked to mark_operand_definition(context_ptr, right_operand, block_id)
+        Set left_marked to proc mark_operand_definition with context_ptr, left_operand, block_id
+        Set right_marked to proc mark_operand_definition with context_ptr, right_operand, block_id
 
         Set marked_count to left_marked plus right_marked
     End If
@@ -1464,7 +1883,7 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
     Note: Unary operations (NEG=20007, NOT=20013)
     If opcode is equal to 20007 or opcode is equal to 20013:
         Let operand be proc memory_get_int64 from Layout with inst, 16
-        Let marked be mark_operand_definition(context_ptr, operand, block_id)
+        Let marked be proc mark_operand_definition with context_ptr, operand, block_id
         Set marked_count to marked
     End If
 
@@ -1473,8 +1892,8 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
         Let value be proc memory_get_int64 from Layout with inst, 16
         Let address be proc memory_get_int64 from Layout with inst, 24
 
-        Let value_marked be mark_operand_definition(context_ptr, value, block_id)
-        Let addr_marked be mark_operand_definition(context_ptr, address, block_id)
+        Let value_marked be proc mark_operand_definition with context_ptr, value, block_id
+        Let addr_marked be proc mark_operand_definition with context_ptr, address, block_id
 
         Set marked_count to value_marked plus addr_marked
     End If
@@ -1482,7 +1901,7 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
     Note: Conditional branch (20042)
     If opcode is equal to 20042:
         Let condition be proc memory_get_int64 from Layout with inst, 16
-        Set marked to mark_operand_definition(context_ptr, condition, block_id)
+        Set marked to proc mark_operand_definition with context_ptr, condition, block_id
         Set marked_count to marked
     End If
 
@@ -1494,7 +1913,7 @@ Process called "mark_data_dependencies" that takes context_ptr as Integer, inst 
         Let i be 0
         While i is less than incoming_count:
             Set value to proc get from List with incoming_values, i
-            Set marked to mark_operand_definition(context_ptr, value, block_id)
+            Set marked to proc mark_operand_definition with context_ptr, value, block_id
             Set marked_count to marked_count plus marked
             Set i to i plus 1
         End While
@@ -1515,6 +1934,32 @@ Process called "mark_operand_definition" that takes context_ptr as Integer, valu
 
     Returns 1 if newly marked, 0 if already marked.
     @End Reasoning
+
+    @Implementation
+    Optimized definition lookup via the def_use_map Dictionary that was
+    populated during create_adce_context:
+
+    1. Null-check value_id (returns 0 for non-existent SSA values).
+    2. Read context pointers (cfg, critical_set, worklist, def_use_map)
+       at their fixed offsets.
+    3. Convert value_id to its string key via String.integer_to_string.
+    4. Dictionary.contains - if the key is absent, the SSA value is a
+       function parameter or constant (no defining instruction in this
+       CFG), so return 0.
+    5. Dictionary.get returns the packed instruction info, which encodes
+       (block_index, inst_index) as block_index * 2^32 + inst_index.
+       Unpack via integer division (block) and modulo (inst).
+    6. Resolve the actual instruction pointer through CFG.get_block ->
+       CFG.get_block_instructions -> List.get.
+    7. Check is_instruction_marked to detect re-marking. If already
+       marked, return 0 (no new work).
+    8. Otherwise, allocate a 24-byte WorklistEntry holding (block_id,
+       inst_index, inst_ptr), append to both critical_set and worklist,
+       and return 1 to signal "newly marked".
+
+    The packing into a single 64-bit integer keeps def_use_map values
+    fixed-size and avoids a second heap allocation per entry.
+    @End Implementation
 
     @Performance_Hints
     This function is called very frequently during ADCE. The def-use map
@@ -1553,7 +1998,7 @@ Process called "mark_operand_definition" that takes context_ptr as Integer, valu
     Let inst be proc get from List with instructions, j
 
     Note: Check if already marked
-    Let already_marked be is_instruction_marked(critical_set, i, j)
+    Let already_marked be proc is_instruction_marked with critical_set, i, j
     If already_marked is equal to 0:
         Note: Mark as critical
         Let entry be proc allocate from Layout with 24
@@ -1582,6 +2027,27 @@ Process called "mark_control_dependencies" that takes context_ptr as Integer, bl
     Returns number of newly marked instructions.
     @End Reasoning
 
+    @Implementation
+    Queries the CDG for the list of blocks that control block_id via
+    get_control_dependencies. For each controlling block dep_block_id:
+
+    1. Resolve dep_block_id to its block pointer via CFG.get_block.
+    2. Read its instruction list and length.
+    3. The branch instruction is always the last instruction of the
+       block (the terminator), so branch_index = inst_count - 1 and
+       branch_inst = instructions[branch_index].
+    4. Check is_instruction_marked. If already marked, skip - the
+       branch is already live and its own dependencies will be visited
+       once that worklist entry is processed.
+    5. Otherwise allocate a 24-byte WorklistEntry, populate
+       (dep_block_id, branch_index, branch_inst), append to both
+       critical_set and worklist, increment marked_count.
+
+    Returns marked_count of newly added entries. Returns 0 when the CDG
+    pointer is null (e.g. ADCE invoked without prior CDG construction -
+    in that mode, control dependencies cannot be tracked).
+    @End Implementation
+
     If cdg is equal to 0:
         Return 0
     End If
@@ -1593,7 +2059,7 @@ Process called "mark_control_dependencies" that takes context_ptr as Integer, bl
     Let marked_count be 0
 
     Note: Get control dependencies for this block
-    Let deps be get_control_dependencies(cdg, block_id)
+    Let deps be proc get_control_dependencies with cdg, block_id
     Let dep_count be proc length from List with deps
 
     Let i be 0
@@ -1611,7 +2077,7 @@ Process called "mark_control_dependencies" that takes context_ptr as Integer, bl
             Let branch_index be inst_count minus 1
 
             Note: Check if already marked
-            Let already_marked be is_instruction_marked(critical_set, dep_block_id, branch_index)
+            Let already_marked be proc is_instruction_marked with critical_set, dep_block_id, branch_index
             If already_marked is equal to 0:
                 Note: Mark as critical
                 Let entry be proc allocate from Layout with 24
@@ -1638,6 +2104,20 @@ Process called "is_instruction_marked" that takes critical_set as Integer, block
 
     Returns 1 if marked, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Linear scan over critical_set. Each entry is a 24-byte struct laid
+    out as (block_id at 0, inst_index at 8, inst_ptr at 16). The function
+    reads entry.block_id and entry.inst_index via memory_get_int64 and
+    compares them against the input arguments. Returns 1 on the first
+    match, 0 if no match is found. Null critical_set yields 0.
+
+    The cost is O(|critical_set|) per call. ADCE's mark phase calls this
+    inside hot loops; for very large CFGs the cost is acceptable because
+    critical_set grows only with live instructions, not total
+    instructions. A hash-set variant could be substituted if profiling
+    indicates this scan dominates the pass.
+    @End Implementation
 
     If critical_set is equal to 0:
         Return 0
@@ -1676,6 +2156,26 @@ Process called "eliminate_non_critical_code" that takes context_ptr as Integer r
     Returns number of instructions eliminated.
     @End Reasoning
 
+    @Implementation
+    Phase 3 of ADCE. For every block in the CFG:
+
+    1. Read the block's existing instruction list.
+    2. Allocate a new empty List (new_instructions).
+    3. For each instruction j in the old list, call is_instruction_marked
+       to test (block_id, j) membership.
+       - If marked, append the instruction pointer to new_instructions.
+       - Otherwise increment eliminated_count.
+    4. Replace the block's instruction list with new_instructions via
+       CFG.set_block_instructions.
+
+    The old List pointer is overwritten in the block but the underlying
+    instruction objects whose pointers were copied to new_instructions
+    remain valid. Eliminated instructions still exist in memory; full
+    deallocation is deferred to the CFG owner.
+
+    Returns total eliminated_count across all blocks for statistics.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1698,7 +2198,7 @@ Process called "eliminate_non_critical_code" that takes context_ptr as Integer r
         Let j be 0
         While j is less than inst_count:
             Let inst be proc get from List with instructions, j
-            Let is_marked be is_instruction_marked(critical_set, i, j)
+            Let is_marked be proc is_instruction_marked with critical_set, i, j
 
             If is_marked is equal to 1:
                 proc append from List with new_instructions, inst
@@ -1732,6 +2232,26 @@ Process called "remove_dead_blocks" that takes context_ptr as Integer returns In
     Returns number of blocks removed.
     @End Reasoning
 
+    @Implementation
+    Phase 4 of ADCE. Identifies and counts blocks that are no longer
+    reachable from the entry after the sweep phase.
+
+    Algorithm:
+    1. Call compute_reachable_blocks with cfg which performs a DFS from
+       block 0 and returns the set of reachable block ids.
+    2. For every block index i in 0..block_count-1, test
+       is_in_list with reachable and i. If absent, the block is
+       unreachable and removed_count is incremented.
+    3. Free the reachable List via destroy from List.
+
+    Returns removed_count for statistics. The actual block removal from
+    the CFG is intentionally deferred to the CFG owner (or a subsequent
+    cleanup pass) so that this function can be invoked from a read-only
+    analysis context. In the standard ADCE pipeline,
+    optimize_aggressive_dce relies on this count purely for reporting;
+    the CFG's structural simplification happens via downstream passes.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1740,13 +2260,13 @@ Process called "remove_dead_blocks" that takes context_ptr as Integer returns In
     Let removed_count be 0
 
     Note: Find reachable blocks from entry
-    Let reachable be compute_reachable_blocks(cfg)
+    Let reachable be proc compute_reachable_blocks with cfg
 
     Note: Remove unreachable blocks
     Let block_count be proc get_block_count from CFG with cfg
     Let i be 0
     While i is less than block_count:
-        Let is_reachable be is_in_list(reachable, i)
+        Let is_reachable be proc is_in_list with reachable, i
 
         If is_reachable is equal to 0:
             Note: Block is unreachable, mark for removal
@@ -1768,6 +2288,29 @@ Process called "compute_reachable_blocks" that takes cfg as Integer returns Inte
 
     Returns list of reachable block IDs.
     @End Reasoning
+
+    @Implementation
+    Iterative DFS over the CFG, starting from block 0 (the entry).
+    Maintains two Lists:
+    - reachable: the result, populated with discovered block ids.
+    - worklist: LIFO stack of blocks awaiting successor expansion.
+
+    Seed by appending 0 to both Lists. Then loop:
+    1. Pop the last element of worklist (LIFO traversal).
+    2. Read its successor list via CFG.get_successors.
+    3. For each successor, test is_in_list with reachable and succ.
+       If not present, append to both reachable and worklist.
+    4. Continue until the worklist is empty.
+
+    Finally, destroy the worklist List (it is internal scratch space)
+    and return the reachable List, which the caller is responsible for
+    destroying. Returns 0 on null cfg.
+
+    Complexity: O(V + E) for the DFS, plus an O(R) is_in_list check
+    per edge where R is the discovered set size; in the worst case
+    this is O(V*E), acceptable for the block counts typical in MIR
+    functions.
+    @End Implementation
 
     If cfg is equal to 0:
         Return 0
@@ -1794,7 +2337,7 @@ Process called "compute_reachable_blocks" that takes cfg as Integer returns Inte
         Let i be 0
         While i is less than succ_count:
             Let succ be proc get from List with successors, i
-            Let already_visited be is_in_list(reachable, succ)
+            Let already_visited be proc is_in_list with reachable, succ
 
             If already_visited is equal to 0:
                 proc append from List with reachable, succ
@@ -1839,24 +2382,42 @@ Process called "eliminate_dead_functions" that takes module as Integer returns I
     code size and improving compilation time for later passes.
     @End Reasoning
 
+    @Implementation
+    Three-step whole-module pipeline:
+    1. build_call_graph with module walks every function and every
+       instruction to materialize a CallGraph (nodes plus entry_points).
+       If allocation fails this returns 0 and we propagate by
+       returning 0.
+    2. mark_reachable_functions with call_graph performs a transitive
+       closure from the entry points via the callee edges, flipping
+       is_reachable=1 on every node it visits.
+    3. remove_unreachable_functions with module and call_graph walks the
+       marked graph and invokes remove_function from MIR on every node
+       where is_reachable remains 0, returning the count.
+    4. destroy_call_graph with call_graph releases all per-node and
+       aggregate Lists.
+
+    Returns the number of functions removed from the module.
+    @End Implementation
+
     If module is equal to 0:
         Return 0
     End If
 
     Note: Build call graph
-    Let call_graph be build_call_graph(module)
+    Let call_graph be proc build_call_graph with module
     If call_graph is equal to 0:
         Return 0
     End If
 
     Note: Mark reachable functions from entry points
-    Let marked_count be mark_reachable_functions(call_graph)
+    Let marked_count be proc mark_reachable_functions with call_graph
 
     Note: Remove unreachable functions
-    Let removed_count be remove_unreachable_functions(module, call_graph)
+    Let removed_count be proc remove_unreachable_functions with module, call_graph
 
     Note: Cleanup
-    destroy_call_graph(call_graph)
+    proc destroy_call_graph with call_graph
 
     Return removed_count
 End Process
@@ -1870,6 +2431,35 @@ Process called "build_call_graph" that takes module as Integer returns Integer:
 
     Returns CallGraph structure or 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Two-phase construction over the module's function list:
+
+    Phase 1 - node creation:
+    - Allocate the top-level CallGraph struct via Layout.allocate (size
+      reported by size_of_CallGraph).
+    - Create an empty nodes List and an empty entry_points List.
+    - For each function in get_functions from MIR with module:
+      a. Allocate a CallGraphNode and populate function_id (via
+         MIR.get_function_id), function_name (via
+         MIR.get_function_name), an empty callees List, and
+         is_reachable=0 at their declared field offsets.
+      b. If MIR.is_entry_point returns 1, append function_id to
+         entry_points (functions like main, exported symbols, etc.).
+      c. Append the new node to nodes.
+
+    Phase 2 - edge construction:
+    - For each function index i, fetch its node and its CFG via
+      MIR.get_function_cfg. If the CFG is non-null, walk every
+      instruction in every block and look for opcode 20030 (MIR_CALL).
+      For each MIR_CALL, extract the target via MIRNodes.get_call_target
+      and append it to the node's callees List.
+
+    Finalize: write nodes pointer, function_count, and entry_points
+    pointer into the CallGraph struct at the offsets reported by
+    offset_of_CallGraph_nodes/node_count/entry_points.
+    Returns the CallGraph pointer (0 on allocation failure).
+    @End Implementation
 
     If module is equal to 0:
         Return 0
@@ -1993,18 +2583,39 @@ Process called "mark_reachable_functions" that takes call_graph as Integer retur
     Uses DFS-based marking to find transitive closure of reachable functions.
     @End Reasoning
 
+    @Implementation
+    Performs a worklist-based reachability scan over the CallGraph:
+
+    1. Read the nodes List, node_count, and entry_points List from the
+       CallGraph struct at their declared field offsets.
+    2. Seed a freshly allocated worklist with every entry_point id.
+    3. Loop while worklist is non-empty:
+       a. Pop the last id (LIFO traversal).
+       b. Locate its node via find_call_graph_node. If absent (id refers
+          to an external symbol with no node), Continue.
+       c. Read is_reachable. If already 1, Continue - this id was
+          enqueued multiple times via different callers.
+       d. Set is_reachable=1, increment marked_count.
+       e. Append every callee_id in node.callees to worklist for
+          subsequent processing.
+    4. Destroy the worklist List after the loop terminates.
+
+    Termination is guaranteed: each node can be marked at most once, and
+    only marked nodes contribute new entries. Returns marked_count.
+    @End Implementation
+
     If call_graph is equal to 0:
         Return 0
     End If
 
     Let nodes_offset be proc offset_of_CallGraph_nodes from Layout
-    Let nodes be memory_get_integer(call_graph, nodes_offset)
+    Let nodes be proc memory_get_integer from Layout with call_graph, nodes_offset
 
     Let node_count_offset be proc offset_of_CallGraph_node_count from Layout
-    Let node_count be memory_get_integer(call_graph, node_count_offset)
+    Let node_count be proc memory_get_integer from Layout with call_graph, node_count_offset
 
     Let entry_points_offset be proc offset_of_CallGraph_entry_points from Layout
-    Let entry_points be memory_get_integer(call_graph, entry_points_offset)
+    Let entry_points be proc memory_get_integer from Layout with call_graph, entry_points_offset
 
     Note: Create worklist initialized with entry points
     Let worklist be proc create from List
@@ -2026,14 +2637,14 @@ Process called "mark_reachable_functions" that takes call_graph as Integer retur
         proc remove_at from List with worklist, worklist_size minus 1
 
         Note: Find node for this function ID
-        Let node_ptr be find_call_graph_node(nodes, node_count, current_id)
+        Let node_ptr be proc find_call_graph_node with nodes, node_count, current_id
         If node_ptr is equal to 0:
             Continue
         End If
 
         Note: Check if already marked
         Let is_reachable_offset be proc offset_of_CallGraphNode_is_reachable from Layout
-        Let is_reachable be memory_get_integer(node_ptr, is_reachable_offset)
+        Let is_reachable be proc memory_get_integer from Layout with node_ptr, is_reachable_offset
 
         If is_reachable is equal to 1:
             Continue
@@ -2072,6 +2683,21 @@ Process called "remove_unreachable_functions" that takes module as Integer, call
     This is the final sweep phase of function-level DCE.
     @End Reasoning
 
+    @Implementation
+    Linear scan over the CallGraph's nodes List. For every node:
+    1. Read is_reachable at its declared offset.
+    2. If is_reachable is 0, the function was not visited by
+       mark_reachable_functions and is therefore dead.
+       a. Read function_id from the node.
+       b. Call remove_function from MIR with module and function_id.
+          The MIR module owns function lifetime; this call detaches the
+          function from the module and frees its body.
+       c. On success (return 1), increment removed_count.
+
+    Returns removed_count of functions actually purged from the module.
+    Reachable functions are left untouched.
+    @End Implementation
+
     If module is equal to 0:
         Return 0
     End If
@@ -2080,10 +2706,10 @@ Process called "remove_unreachable_functions" that takes module as Integer, call
     End If
 
     Let nodes_offset be proc offset_of_CallGraph_nodes from Layout
-    Let nodes be memory_get_integer(call_graph, nodes_offset)
+    Let nodes be proc memory_get_integer from Layout with call_graph, nodes_offset
 
     Let node_count_offset be proc offset_of_CallGraph_node_count from Layout
-    Let node_count be memory_get_integer(call_graph, node_count_offset)
+    Let node_count be proc memory_get_integer from Layout with call_graph, node_count_offset
 
     Let removed_count be 0
 
@@ -2093,12 +2719,12 @@ Process called "remove_unreachable_functions" that takes module as Integer, call
         Let node_ptr be proc get from List with nodes, i
 
         Let is_reachable_offset be proc offset_of_CallGraphNode_is_reachable from Layout
-        Let is_reachable be memory_get_integer(node_ptr, is_reachable_offset)
+        Let is_reachable be proc memory_get_integer from Layout with node_ptr, is_reachable_offset
 
         If is_reachable is equal to 0:
             Note: Function is unreachable, remove it
             Let function_id_offset be proc offset_of_CallGraphNode_function_id from Layout
-            Let function_id be memory_get_integer(node_ptr, function_id_offset)
+            Let function_id be proc memory_get_integer from Layout with node_ptr, function_id_offset
 
             Let result be proc remove_function from MIR with module, function_id
             If result is equal to 1:
@@ -2119,12 +2745,25 @@ Process called "find_call_graph_node" that takes nodes as Integer, node_count as
     Returns node pointer or 0 if not found.
     @End Reasoning
 
+    @Implementation
+    Walks the nodes List in index order. For each node:
+    1. Read function_id at offset_of_CallGraphNode_function_id.
+    2. If equal to the requested function_id, return the node pointer
+       immediately.
+    Otherwise return 0 after exhausting the list.
+
+    Cost is O(N) per call where N is function count. Acceptable because
+    mark_reachable_functions performs at most O(C) lookups where C is
+    total call edges. A hashmap-backed lookup is a possible future
+    optimization for very large modules.
+    @End Implementation
+
     Let i be 0
     While i is less than node_count:
         Let node_ptr be proc get from List with nodes, i
 
         Let function_id_offset be proc offset_of_CallGraphNode_function_id from Layout
-        Let current_id be memory_get_integer(node_ptr, function_id_offset)
+        Let current_id be proc memory_get_integer from Layout with node_ptr, function_id_offset
 
         If current_id is equal to function_id:
             Return node_ptr
@@ -2146,18 +2785,35 @@ Process called "destroy_call_graph" that takes call_graph as Integer returns Int
     - Frees call graph structure
     @End Reasoning
 
+    @Implementation
+    Three-tier teardown that mirrors build_call_graph's allocation order:
+
+    1. Read the nodes List, node_count, and entry_points List from the
+       CallGraph at their declared field offsets.
+    2. Iterate every node 0..node_count-1: read its callees List from
+       the node struct, destroy that List, then deallocate the node
+       struct itself (size_of_CallGraphNode).
+    3. Destroy the top-level nodes List (which held only the node
+       pointers now-freed in step 2).
+    4. Destroy the entry_points List.
+    5. Deallocate the CallGraph struct itself.
+
+    Returns 1 on success. Returns 1 (not 0) for null call_graph as
+    well, treating "nothing to destroy" as a no-op success.
+    @End Implementation
+
     If call_graph is equal to 0:
         Return 1
     End If
 
     Let nodes_offset be proc offset_of_CallGraph_nodes from Layout
-    Let nodes be memory_get_integer(call_graph, nodes_offset)
+    Let nodes be proc memory_get_integer from Layout with call_graph, nodes_offset
 
     Let node_count_offset be proc offset_of_CallGraph_node_count from Layout
-    Let node_count be memory_get_integer(call_graph, node_count_offset)
+    Let node_count be proc memory_get_integer from Layout with call_graph, node_count_offset
 
     Let entry_points_offset be proc offset_of_CallGraph_entry_points from Layout
-    Let entry_points be memory_get_integer(call_graph, entry_points_offset)
+    Let entry_points be proc memory_get_integer from Layout with call_graph, entry_points_offset
 
     Note: Destroy each node
     Let i be 0
@@ -2202,11 +2858,40 @@ Process called "run_module_dce_pass" that takes optimizer_context as Integer, mo
     **USAGE (from mir_optimizer.runa):**
     ```
     Note: After all other optimizations stabilize
-    Let total_eliminated be run_module_dce_pass(context_ptr, module)
+    Let total_eliminated be proc run_module_dce_pass with context_ptr, module
     ```
 
     Returns total number of elements eliminated (functions + instructions).
     @End Reasoning
+
+    @Implementation
+    Coordinates the two granularities of DCE in the correct order to
+    maximize total elimination:
+
+    Phase 1 - function-level DCE:
+    - eliminate_dead_functions with module removes every function not
+      reachable from a module entry point. Returns the function-count
+      delta which is added to total_eliminated immediately.
+
+    Phase 2 - instruction-level ADCE per surviving function:
+    - MIR.get_functions returns the now-shrunken function list.
+    - For each remaining function, fetch its CFG via
+      MIR.get_function_cfg; if non-null, build an ADCEContext via
+      create_adce_context, run the full four-phase ADCE via
+      run_adce_algorithm, read the eliminated instruction count from
+      context offset 40, sum it into total_inst_eliminated, and tear
+      down the context via destroy_adce_context.
+    - Add total_inst_eliminated to total_eliminated.
+
+    Finally, accumulate total_eliminated into the optimizer_context's
+    deletion counter at offset 40 so the global pass manager sees the
+    contribution. Display a closing banner and return total_eliminated.
+
+    The two-phase ordering is important: function-level DCE first
+    avoids wasting per-function ADCE work on functions that are about
+    to be removed wholesale. Returns total_eliminated (functions plus
+    instructions).
+    @End Implementation
 
     If optimizer_context is equal to 0:
         Return 0
@@ -2224,7 +2909,7 @@ Process called "run_module_dce_pass" that takes optimizer_context as Integer, mo
     Note: Phase 1: Function-level DCE
     Display ""
     Display "Phase 1: Function-level DCE..."
-    Let functions_removed be eliminate_dead_functions(module)
+    Let functions_removed be proc eliminate_dead_functions with module
     Display "Eliminated " joined with functions_removed joined with " unreachable functions"
     Set total_eliminated to total_eliminated plus functions_removed
 
@@ -2244,14 +2929,14 @@ Process called "run_module_dce_pass" that takes optimizer_context as Integer, mo
 
         If cfg is not equal to 0:
             Note: Run ADCE on this function
-            Let adce_context be create_adce_context(cfg)
+            Let adce_context be proc create_adce_context with cfg
             If adce_context is not equal to 0:
-                run_adce_algorithm(adce_context)
+                proc run_adce_algorithm with adce_context
 
                 Let eliminated be proc memory_get_int64 from Layout with adce_context, 40
                 Set total_inst_eliminated to total_inst_eliminated plus eliminated
 
-                destroy_adce_context(adce_context)
+                proc destroy_adce_context with adce_context
             End If
         End If
 
@@ -2289,6 +2974,33 @@ Process called "is_dce_beneficial" that takes optimizer_context as Integer retur
 
     Returns 1 if ADCE should run, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Three-signal decision procedure evaluated in priority order:
+
+    1. Recent basic DCE progress: read optimizer_context offset 48
+       (last_dce_count). If basic DCE eliminated any instructions in
+       the previous pipeline iteration, those simplifications often
+       expose additional opportunities that only ADCE's control-flow
+       reasoning can capture. Return 1 immediately.
+    2. Modified flag: read offset 56. If any optimization pass set the
+       modified bit since the last ADCE run, the CFG shape has changed
+       and another ADCE pass may find new dead code. Return 1.
+    3. Size threshold: read the CFG pointer from offset 0 and call
+       CFG.get_total_instruction_count. If the function has more than
+       100 instructions, run ADCE unconditionally - the analysis cost
+       is amortized over the elimination gains.
+
+    Returns 0 only when all three signals are negative (no recent DCE
+    progress, no modifications, small function). In that case the
+    caller's pass manager can safely skip this ADCE iteration.
+    @End Implementation
+
+    @Performance_Hints
+    This gate avoids the O(V+E) post-dominance and CDG construction
+    when ADCE is unlikely to find anything new, which is the common
+    case in late pipeline iterations near fixed point.
+    @End Performance_Hints
 
     If optimizer_context is equal to 0:
         Return 0
@@ -2333,7 +3045,7 @@ Note: more sophisticated analysis that can eliminate dead branches,
 Note: unreachable blocks, and dead functions.
 
 Note: INTEGRATION:
-Note: - Standalone: optimize_aggressive_dce(cfg)
-Note: - Pipeline: run_aggressive_dce_pass(optimizer_context)
-Note: - Module: run_module_dce_pass(optimizer_context, module)
+Note: - Standalone: proc optimize_aggressive_dce with cfg
+Note: - Pipeline: proc run_aggressive_dce_pass with optimizer_context
+Note: - Module: proc run_module_dce_pass with optimizer_context, module
 Note: ============================================================================

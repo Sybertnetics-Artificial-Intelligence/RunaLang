@@ -501,6 +501,21 @@ Note: Specialized MIR Node Creation Functions
 Note: ============================================================================
 
 
+@Reasoning
+SSA construction needs a value-merge primitive at every control-flow join.
+The phi node is that primitive: it ties a single SSA result to one incoming
+value per predecessor block. Creating the phi up front (with no incoming
+pairs yet) decouples node allocation from the predecessor walk performed
+by the dominance-frontier algorithm, which lets the SSA renamer add pairs
+in any order without reallocating the node.
+
+The 48-byte layout is fixed: offset 0 base MIRNode pointer, offset 8 result
+value id, offset 16 incoming-pairs List, offset 24 incoming count, offset 32
+result type, offset 40 parent block id. Storing the count separately from
+the List length is intentional: it lets the verifier cross-check List
+integrity in O(1).
+@End Reasoning
+
 @Implementation
 Creates a phi node for SSA form. Phi nodes are placed at the beginning of
 basic blocks with multiple predecessors. Incoming values are added after
@@ -536,6 +551,18 @@ Process called "create_mir_phi_node" that takes result_value_id as Integer, resu
 End Process
 
 
+@Reasoning
+The SSA renamer discovers (predecessor, value) pairs incrementally as it
+walks the dominance frontier. This proc is the append point that records
+each pair. Encoding the pair as two consecutive List elements (block then
+value) avoids a separate pair-struct allocation while keeping both ordering
+guarantees (block-N at even index, value-N at odd index) trivially testable.
+
+The redundant count stored at offset 24 lets later phases (verifier, dead-phi
+elimination, copy propagation) read pair count without dividing list length
+by two — useful because list length is itself an int64 load through Layout.
+@End Reasoning
+
 @Implementation
 Adds an incoming value to a phi node from a specific predecessor block.
 This builds the phi node's merge table mapping predecessors to values.
@@ -557,6 +584,18 @@ Process called "add_phi_incoming" that takes phi as Integer, block_id as Integer
     Return 1
 End Process
 
+
+@Reasoning
+Binary operations dominate the instruction stream in any realistic program,
+so the specialized node trades a few bytes of indirection (base MIRNode at
+offset 0) for direct field access to left/right operands and result type
+without dispatching through the generic operand-N getters in mir.runa.
+This shape is what every binary-op rewriter (constant folding, GVN, algebraic
+identities) expects: two operands and a result, all reachable in two loads.
+
+The opcode is mirrored into the base node so generic walkers can treat the
+binop as a plain MIRNode when they only care about opcode and successors.
+@End Reasoning
 
 @Implementation
 Creates a binary operation instruction (add, sub, mul, div, comparisons, etc.).
@@ -590,6 +629,19 @@ Process called "create_mir_binary_op" that takes opcode as Integer, result_value
 End Process
 
 
+@Reasoning
+Unary operations need only one operand slot, so the specialized layout is
+intentionally smaller than binop (32 bytes vs 40). This matters for cache
+density during peephole and combine passes that iterate every instruction:
+keeping unary nodes compact lets them share cache lines with neighboring
+nodes in the basic-block instruction list.
+
+Casts and conversions are also represented as unary ops with their target
+type held in result_type — the conversion semantics live in the opcode,
+not the type field, so the type field can be reused for value-numbering
+hashes without conflicting with cast direction.
+@End Reasoning
+
 @Implementation
 Creates a unary operation instruction (negation, bitwise NOT, casts, etc.).
 The opcode specifies which unary operation to perform.
@@ -618,6 +670,18 @@ Process called "create_mir_unary_op" that takes opcode as Integer, result_value_
 
     Return unop
 End Process
+
+@Reasoning
+Memory loads need explicit offset support so struct-field access can lower
+to a single load instead of (add base offset) + (load). The optimizer relies
+on this to recognize identical loads via the (address, offset, type) key
+used by load-CSE and PRE — without the offset baked into the node, two
+field accesses on the same base would look distinct.
+
+The is_volatile flag is preserved at MIR level (rather than only checked
+by the frontend) because optimization passes have to honor it: a volatile
+load is opaque to PRE, reordering, and dead-load elimination.
+@End Reasoning
 
 @Implementation
 Creates a load instruction that reads from memory. The address must be a
@@ -649,6 +713,19 @@ Process called "create_mir_load" that takes result_value_id as Integer, address_
     Return load
 End Process
 
+@Reasoning
+Stores are side-effecting and do not produce SSA values, so result_value_id
+is intentionally absent from the parameter list. Mem2reg and store-sinking
+need to recognize this — a store is identified by its (address, offset)
+pair and the value flowing into it, not by any result.
+
+Like loads, stores carry their own volatility bit and explicit byte offset
+to keep struct-field stores collapsed into a single instruction. The
+ordering invariant (stores execute in program order within a block unless
+proven independent by alias analysis) is the responsibility of the
+optimizer, not this constructor.
+@End Reasoning
+
 @Implementation
 Creates a store instruction that writes to memory. The address must be a
 pointer-typed value. Store instructions have side effects but produce no value.
@@ -678,6 +755,20 @@ Process called "create_mir_store" that takes address_value_id as Integer, value_
 
     Return store
 End Process
+
+@Reasoning
+Calls are the single most complex MIR node: they sit at the boundary of
+the optimizer's reasoning (a call can clobber memory, define new SSA
+values, transfer control). Encoding direct vs indirect via a flag (rather
+than two distinct opcodes) lets the inliner test eligibility with a single
+load and treat callee as either a string-table lookup or an SSA value.
+
+is_tail_call is recorded at construction time because it is decided by the
+frontend or by tail-call analysis early in the pipeline; lower passes only
+ever clear the flag (when a tail call gets out-of-lined). Storing it here
+preserves the decision across all transformations until the LIR layer
+finally consumes it for jmp-vs-call selection.
+@End Reasoning
 
 @Implementation
 Creates a function call instruction. For direct calls, callee is a function
@@ -719,6 +810,20 @@ Process called "create_mir_call" that takes result_value_id as Integer, callee a
     Return call
 End Process
 
+@Reasoning
+P2-D introduced FFI dispatch through MIR, requiring the LIR lowering pass
+to know two facts that are not derivable from the MIR_CALL opcode alone:
+whether the target is an external (non-Runa) symbol, and which calling
+convention it expects. Storing those two facts directly on the call node
+keeps the LIR lowering pass purely local (one node, one decision) and
+avoids a side-table lookup keyed by callee.
+
+The is_external bit is distinct from is_indirect because external calls
+may still be direct (named C functions) and Runa-internal calls may still
+be indirect (function-pointer dispatch). Separating the two preserves all
+four combinations cleanly.
+@End Reasoning
+
 Process called "mir_call_set_ffi_metadata" that takes call_node as Integer, is_external as Integer, convention_id as Integer returns Integer:
     Note: Sets the P2-D FFI metadata on a MIR_CALL node so LIR lowering can
     Note: dispatch through the callee's calling convention (vs. the caller's).
@@ -730,6 +835,14 @@ Process called "mir_call_set_ffi_metadata" that takes call_node as Integer, is_e
     Return 1
 End Process
 
+@Reasoning
+LIR lowering needs cheap access to the FFI external bit when emitting the
+call site. This getter is the read counterpart to mir_call_set_ffi_metadata
+and is used by the calling-convention selector in machine_code lowering.
+Returns 0 (the default) for null inputs, matching the construction default
+so callers can treat "missing metadata" and "explicitly internal" identically.
+@End Reasoning
+
 Process called "mir_call_get_callee_is_external" that takes call_node as Integer returns Integer:
     If call_node is equal to 0:
         Return 0
@@ -737,12 +850,30 @@ Process called "mir_call_get_callee_is_external" that takes call_node as Integer
     Return proc memory_get_int64 from Layout with call_node, 64
 End Process
 
+@Reasoning
+Returns the calling-convention ID for the call's target. Convention IDs are
+small integers (0 = C, others follow the FFI convention registry). LIR
+lowering uses this ID to pick the prologue/epilogue and argument-marshaling
+sequence for the call site. A 0 return on null input maps to the C
+convention, which is the safe default for direct Runa-to-Runa calls.
+@End Reasoning
+
 Process called "mir_call_get_callee_convention_id" that takes call_node as Integer returns Integer:
     If call_node is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with call_node, 72
 End Process
+
+@Reasoning
+The conditional branch is the workhorse terminator for control flow. Both
+target block IDs live in the same instruction so that CFG construction can
+extract both successors with a single node visit (rather than scanning a
+separate successor list). Branch weights live here, not in a side table,
+because profile-guided optimization, jump-threading, and basic-block
+ordering all consult them during transformations that may delete or rewire
+the branch — keeping the weights co-located prevents stale weight references.
+@End Reasoning
 
 @Implementation
 Creates a conditional branch instruction (terminator). Transfers control to
@@ -773,6 +904,15 @@ Process called "create_mir_branch" that takes condition_value_id as Integer, tru
     Return branch
 End Process
 
+@Reasoning
+The unconditional jump is the simplest terminator and is deliberately kept
+distinct from a degenerate branch (with one target). This separation lets
+CFG simplification recognize "single-successor block" by opcode without
+having to compare branch targets, and it lets the LIR backend select the
+shortest jump encoding for the target distance without rejecting cases
+where both branch targets happen to be equal.
+@End Reasoning
+
 @Implementation
 Creates an unconditional jump instruction (terminator). Transfers control
 directly to target_block_id with no condition check.
@@ -792,6 +932,18 @@ Process called "create_mir_jump" that takes target_block_id as Integer returns I
 
     Return jump
 End Process
+
+@Reasoning
+Returns are terminators that exit the current function. Storing return_type
+on the node (rather than re-deriving it from the function signature each
+time) lets the verifier confirm return-type compatibility locally and lets
+the LIR backend pick the correct return convention (e.g., float vs int
+return register) without re-walking up to the enclosing function.
+
+A zero value_id means "no value" (void return) — distinct from "value
+zero", which would carry a non-zero result_value_id pointing at a
+const-zero MIR node.
+@End Reasoning
 
 @Implementation
 Creates a return instruction (terminator). Ends function execution and
@@ -818,6 +970,16 @@ Process called "create_mir_return" that takes return_value_id as Integer, return
 
     Return ret
 End Process
+
+@Reasoning
+Alloca is the only MIR node that materializes stack memory; lowering it
+becomes "subtract from rsp" or "claim frame slot" at LIR. Encoding both
+the element type and the count value on the node lets register allocation
+and frame-layout passes compute exact stack-slot size without re-deriving
+the element width from the type system. Storing alignment separately
+(rather than inferring it from element_type) supports over-aligned
+allocations needed by SIMD types and explicit alignment requests.
+@End Reasoning
 
 @Implementation
 Creates a stack allocation instruction. Allocates count elements of element_type
@@ -849,6 +1011,19 @@ Process called "create_mir_alloca" that takes result_value_id as Integer, elemen
     Return alloca
 End Process
 
+@Reasoning
+Constants are SSA values like any other, but they carry their literal
+payload directly on the node instead of through a defining instruction.
+Splitting numeric vs string payloads via is_string lets numeric constants
+be packed into the constant_value field (avoiding a string-table lookup
+in the hot path of constant folding) while strings still resolve to a
+pointer into the deduplicated string table.
+
+Constant folding and value numbering hash the (value_type, constant_value)
+pair for numeric constants and (value_type, string_ptr) for strings — the
+flag selects which key to use without polymorphic dispatch.
+@End Reasoning
+
 @Implementation
 Creates a constant value instruction. For numeric constants, set is_string=0
 and store value in constant_value. For string constants, set is_string=1
@@ -878,6 +1053,18 @@ Process called "create_mir_const" that takes result_value_id as Integer, constan
 
     Return const
 End Process
+
+@Reasoning
+Switch is a multi-target terminator with dense or sparse case tables. The
+node stores cases in a List rather than a fixed-size array because case
+counts vary enormously across functions and over-provisioning would waste
+memory on the common small-switch case. Default block is mandatory — the
+parser inserts an implicit default of "unreachable" if the source did not
+provide one, so MIR always has a fully defined dispatch.
+
+Switch lowering can later pick jump-table, binary-search, or chained-
+compare based on case density; the MIR shape stays the same regardless.
+@End Reasoning
 
 @Implementation
 Creates a switch instruction for multi-way branching. Cases are added after
@@ -910,6 +1097,16 @@ Process called "create_mir_switch" that takes value_id as Integer, default_block
     Return switch
 End Process
 
+@Reasoning
+Mirrors add_phi_incoming but for switch dispatch: each case is two list
+elements (value, block) appended together. The redundant case_count at
+offset 24 is incremented in lockstep so that switch lowering can size its
+jump-table or binary-search structure without dividing list length by 2.
+This proc preserves insertion order, which matters for source-faithful
+debugging and for some lowering heuristics that prefer the first matching
+case to be the densest cluster.
+@End Reasoning
+
 @Implementation
 Adds a case to a switch instruction. Case value is a compile-time constant
 that maps to the target block. Switch will transfer control to the target
@@ -931,6 +1128,18 @@ Process called "add_switch_case" that takes switch as Integer, case_value as Int
 
     Return 1
 End Process
+
+@Reasoning
+Atomic operations need a dedicated node because they are opaque to most
+optimizations: they cannot be reordered, hoisted out of loops without
+proof, or duplicated across paths. Recording memory_order on the node
+lets each atomic carry its own ordering constraint instead of forcing
+the whole basic block into the strongest order.
+
+The expected_value_id slot is unused for plain atomic add/xor and only
+populated for compare-and-swap; storing 0 there for non-CAS ops keeps the
+layout uniform so generic walkers can treat all atomics with one shape.
+@End Reasoning
 
 @Implementation
 Creates an atomic operation instruction with specified memory ordering.
@@ -965,6 +1174,15 @@ Process called "create_mir_atomic_op" that takes opcode as Integer, result_value
     Return atomic
 End Process
 
+@Reasoning
+Fences are pure ordering barriers — no memory traffic, no SSA result.
+They share the atomic-op node layout (56 bytes) so that the same accessor
+machinery and verifier code can inspect either. The unused slots are
+zero-initialized rather than left untouched so that hash-based passes
+(GVN, value numbering) get deterministic content when they ever happen
+to canonicalize a fence node.
+@End Reasoning
+
 @Implementation
 Creates a memory fence instruction. Fences ensure memory ordering without
 performing loads or stores. Memory ordering determines synchronization
@@ -990,6 +1208,19 @@ Process called "create_mir_fence" that takes memory_order as Integer returns Int
 
     Return fence
 End Process
+
+@Reasoning
+Vector ops are scalarizable but expensive to scalarize, so MIR carries
+them in native vector form down to LIR where the machine_code backend
+picks SIMD instructions matching the architecture. Storing vector_width
+and element_type separately (rather than a composite "VectorType") lets
+the backend match against either dimension cheaply — e.g., "any 4-wide"
+or "any f32" without unpacking.
+
+The mask_data field is non-zero only for shuffle/blend opcodes; it stores
+a packed byte mask describing the lane permutation. Other opcodes leave
+it at 0 so the node layout remains uniform.
+@End Reasoning
 
 @Implementation
 Creates a vector operation instruction. Vector width specifies number of
@@ -1025,6 +1256,16 @@ Process called "create_mir_vector_op" that takes opcode as Integer, result_value
     Return vector
 End Process
 
+@Reasoning
+Invoke is the exception-aware version of MIR_CALL: it terminates the
+basic block and has two successor edges (normal return vs unwind). CFG
+construction must see both edges to keep the dominance tree correct in
+the presence of exceptional control flow, so they are stored directly
+on the invoke node rather than derived from a side table of try/catch
+scopes. Treating invoke as a terminator (rather than a call followed by
+a branch) ensures exception edges cannot be lost by mid-block optimizations.
+@End Reasoning
+
 @Implementation
 Creates an invoke instruction that calls a function with exception handling.
 Normal block is taken on successful return, exception block is taken if
@@ -1057,6 +1298,18 @@ Process called "create_mir_invoke" that takes result_value_id as Integer, callee
 
     Return invoke
 End Process
+
+@Reasoning
+Landing pads are the catch-block prologues for exception dispatch. They
+must be SSA values because subsequent code in the handler reads the
+exception object through the landing pad's result_value_id. The catch
+clauses list grows by add_catch_clause and matches what the unwinder
+will inspect at runtime to pick a handler.
+
+is_cleanup distinguishes cleanup-only pads (run finally/destructors then
+re-raise) from match-arm pads (test the thrown type, dispatch on match).
+The runtime needs the bit to decide whether to continue unwinding.
+@End Reasoning
 
 @Implementation
 Creates a landing pad instruction for exception handling. Landing pads are
@@ -1091,6 +1344,14 @@ Process called "create_mir_landingpad" that takes result_value_id as Integer, ex
     Return landingpad
 End Process
 
+@Reasoning
+Catch clauses share the (type, block) two-element encoding used by phi
+incoming pairs and switch cases — keeping the same shape lets all three
+benefit from the same List utilities and verifier checks. Append order
+matters: the runtime tests clauses in insertion order, so the parser
+preserves source order when emitting them.
+@End Reasoning
+
 @Implementation
 Adds a catch clause to a landing pad. Type ID specifies which exception
 type this clause catches. Block ID is the target handler block.
@@ -1111,6 +1372,15 @@ Process called "add_catch_clause" that takes landingpad as Integer, type_id as I
 
     Return 1
 End Process
+
+@Reasoning
+Throw is a terminator with no static successor — control leaves the
+current function (and possibly stack frames above it) by stack unwinding.
+The verifier treats it specially: a block ending in MIR_THROW has zero
+CFG-visible successors but is not unreachable. The exception_type field
+gives the unwinder enough information to start matching against catch
+clauses in enclosing landing pads.
+@End Reasoning
 
 @Implementation
 Creates a throw instruction that raises an exception. The exception value
@@ -1138,6 +1408,16 @@ Process called "create_mir_throw" that takes exception_value_id as Integer, exce
 
     Return throw
 End Process
+
+@Reasoning
+Debug values bridge SSA back to source semantics so debuggers and crash
+dumps can show "this value is variable foo declared at file:line:col".
+They are pseudo-instructions: they don't compute anything, they only
+annotate. Keeping them in the instruction stream (rather than a parallel
+side table) means they ride along through every optimization without
+needing separate update logic — if an optimization moves the underlying
+value, the debug node moves with it because it sits in the same block.
+@End Reasoning
 
 @Implementation
 Creates a debug value annotation that associates an SSA value with a source
@@ -1168,6 +1448,15 @@ Process called "create_mir_debug_value" that takes value_id as Integer, variable
     Return debug
 End Process
 
+@Reasoning
+Debug locations carry the source position attached to one MIR instruction.
+They are the input to stack-trace generation and to source-line stepping
+in a debugger. The inlined_at field is critical for correct backtraces in
+inlined code: it stores the call site that triggered the inlining, so
+the debugger can show both the inlined source location and the call site
+from which it was inlined (giving a proper "inlined from foo:42" frame).
+@End Reasoning
+
 @Implementation
 Creates a debug location marker that annotates an instruction with its
 source location. Enables accurate stack traces and source-level debugging.
@@ -1196,12 +1485,78 @@ Note: ==========================================================================
 Note: Specialized Node Access Functions
 Note: ============================================================================
 
+@Reasoning
+Returns the MIR opcode of an instruction. Called from MIR optimization passes
+(inlining cost analysis, dead code elimination, common subexpression elimination)
+that need to dispatch on opcode without depending on the specialized node accessors
+in mir.runa. Centralizing opcode access here lets MIRNodes serve as the canonical
+access boundary for all MIR instruction introspection used by middle-end passes.
+
+The opcode is stored at byte offset 0 of every MIRNode (verified by the MIRNode
+type definition in mir.runa: opcode is the first field, occupying bytes 0-7).
+Specialized nodes (MIRPhiNode, MIRBinaryOp, etc.) wrap a base MIRNode pointer
+at offset 0 — but callers that hold a specialized-node pointer should use
+MIR.get_mir_node_opcode on the base pointer they extracted, not this proc.
+This proc expects a MIRNode pointer (the kind stored in basic-block instruction
+lists by mir.add_instruction_to_block).
+@End Reasoning
+
+@Implementation
+Performs a single 8-byte load at offset 0 of the instruction pointer. Defends
+against null inputs by returning 0 (matching the sentinel used by every other
+accessor in this file and by MIR.get_mir_node_opcode in mir.runa). No allocation,
+no dispatch, no auxiliary lookups — purely a typed memory read through the
+Layout primitive so allocator-aware semantics (Tier 3 OWNED HEAP) are honored.
+@End Implementation
+
+@Performance_Hints
+Hot path: called once per instruction in inlining cost analysis (inlining.runa
+line 405) and once per instruction during inlining transform iteration (line 637).
+For a function with N instructions visited by the inliner, this runs O(N) times.
+Single int64 load is a candidate for inlining by the backend; the null check
+adds one compare-and-branch but is predicted not-taken in production input.
+No heap traffic, no syscalls, no string formatting — strictly arithmetic.
+@End Performance_Hints
+
+@Security_Scope
+Read-only operation on caller-provided pointer. Validates non-null before
+dereferencing. Does not modify the instruction, does not expose internal
+state beyond the opcode value, does not propagate caller pointers. The
+opcode value returned is a numeric constant in the documented MIR opcode
+range (20000-20999) — leaking it carries no security implication beyond
+revealing the structural shape of the MIR, which is intentional public API.
+No untrusted-input path: callers in the optimization pipeline operate on
+MIR produced by the compiler itself, not on user-controlled byte streams.
+@End Security_Scope
+
+Process called "get_opcode" that takes inst_ptr as Integer returns Integer:
+    If inst_ptr is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with inst_ptr, 0
+End Process
+
+@Reasoning
+The phi pair-count field (offset 24) is the cheap source of truth for
+how many predecessor edges this phi merges. CFG dominance verification
+and copy-propagation read this constantly while scanning a function's
+phi nodes, so making it a single int64 load (rather than computing
+list-length / 2) keeps it O(1) and branch-free.
+@End Reasoning
+
 Process called "get_phi_incoming_count" that takes phi as Integer returns Integer:
     If phi is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with phi, 24
 End Process
+
+@Reasoning
+Decodes the value half of the Nth phi incoming pair. Pairs are stored as
+two consecutive list elements (block at 2N, value at 2N+1) so the index
+math compresses one multiply and one add. The SSA renamer and copy
+propagation both need value lookup keyed by pair index.
+@End Reasoning
 
 Process called "get_phi_incoming_value" that takes phi as Integer, index as Integer returns Integer:
     If phi is equal to 0:
@@ -1213,6 +1568,13 @@ Process called "get_phi_incoming_value" that takes phi as Integer, index as Inte
     Return proc get from List with incoming_pairs, pair_index
 End Process
 
+@Reasoning
+Block side of the phi pair (offset 2N in the list). CFG-aware passes
+(loop simplification, edge splitting) iterate pairs by predecessor, so
+having direct block lookup avoids constructing a temporary tuple just
+to read one half.
+@End Reasoning
+
 Process called "get_phi_incoming_block" that takes phi as Integer, index as Integer returns Integer:
     If phi is equal to 0:
         Return 0
@@ -1223,12 +1585,26 @@ Process called "get_phi_incoming_block" that takes phi as Integer, index as Inte
     Return proc get from List with incoming_pairs, pair_index
 End Process
 
+@Reasoning
+Left operand of a binary op (offset 16 in MIRBinaryOp). Constant folding,
+algebraic identity rules, and reassociation all read both sides, so
+giving each side a separate direct accessor avoids exposing the binop's
+internal layout to optimization passes.
+@End Reasoning
+
 Process called "get_binary_op_left" that takes binop as Integer returns Integer:
     If binop is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with binop, 16
 End Process
+
+@Reasoning
+Right operand (offset 24). For non-commutative ops (sub, div, shift)
+left-vs-right ordering is semantic and must be preserved verbatim by
+every transform — distinct accessors make that ordering explicit at the
+call site instead of relying on positional convention.
+@End Reasoning
 
 Process called "get_binary_op_right" that takes binop as Integer returns Integer:
     If binop is equal to 0:
@@ -1237,12 +1613,27 @@ Process called "get_binary_op_right" that takes binop as Integer returns Integer
     Return proc memory_get_int64 from Layout with binop, 24
 End Process
 
+@Reasoning
+Sole operand of a unary op (offset 16). The accessor exists so that
+unary-specific passes (cast-folding, neg-of-neg removal) can address the
+operand without knowing the underlying layout. Returning 0 on a null
+input matches the rest of the accessor family.
+@End Reasoning
+
 Process called "get_unary_op_operand" that takes unop as Integer returns Integer:
     If unop is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with unop, 16
 End Process
+
+@Reasoning
+Address operand of a load (offset 16 in MIRLoad). Alias analysis and
+load-CSE both partition loads by address; pulling the address through a
+named accessor isolates this layout decision from those passes so future
+layout changes (e.g., switching to inline immediate addresses) require
+edits only here.
+@End Reasoning
 
 Process called "get_load_address" that takes load as Integer returns Integer:
     If load is equal to 0:
@@ -1251,12 +1642,26 @@ Process called "get_load_address" that takes load as Integer returns Integer:
     Return proc memory_get_int64 from Layout with load, 16
 End Process
 
+@Reasoning
+Byte offset added to the address (offset 24). Two loads with the same
+base address but different offsets are distinct memory operations and
+load-CSE must not merge them — exposing this field independently from
+the address lets passes treat (address, offset) as a single key.
+@End Reasoning
+
 Process called "get_load_offset" that takes load as Integer returns Integer:
     If load is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with load, 24
 End Process
+
+@Reasoning
+Result type of the load (offset 32). Required for type-aware optimization
+(e.g., load-store forwarding only fires when the store's value type
+matches the load's result type) and for LIR lowering, which needs the
+type to choose the right load opcode (movb/movw/movl/movq on x86).
+@End Reasoning
 
 Process called "get_load_type" that takes load as Integer returns Integer:
     If load is equal to 0:
@@ -1265,12 +1670,27 @@ Process called "get_load_type" that takes load as Integer returns Integer:
     Return proc memory_get_int64 from Layout with load, 32
 End Process
 
+@Reasoning
+Address operand of a store (offset 8). Stores share the alias-analysis
+and load-store-forwarding machinery with loads, so they expose their
+target address through the same accessor pattern. Offset 8 (not 16 like
+loads) reflects the fact that stores carry no result value, freeing the
+value-id slot for the address itself.
+@End Reasoning
+
 Process called "get_store_address" that takes store as Integer returns Integer:
     If store is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with store, 8
 End Process
+
+@Reasoning
+Value being stored (offset 16). Store-to-load forwarding rewrites
+subsequent loads of the same address to use this value directly,
+so reading it through a named accessor lets that pass remain
+oblivious to the store's underlying byte layout.
+@End Reasoning
 
 Process called "get_store_value" that takes store as Integer returns Integer:
     If store is equal to 0:
@@ -1279,12 +1699,27 @@ Process called "get_store_value" that takes store as Integer returns Integer:
     Return proc memory_get_int64 from Layout with store, 16
 End Process
 
+@Reasoning
+Byte offset (offset 24) added to the store address. Two stores to the
+same address with different offsets are distinct (e.g., field stores
+inside one struct); exposing offset independently lets passes treat
+(address, offset) as the alias-disambiguation key.
+@End Reasoning
+
 Process called "get_store_offset" that takes store as Integer returns Integer:
     If store is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with store, 24
 End Process
+
+@Reasoning
+Callee field (offset 16). Interpretation depends on is_call_indirect:
+for direct calls, this is a string-table pointer to the function name;
+for indirect calls, it is an SSA value id. Inliner and devirtualization
+passes both call this to decide whether they can statically resolve
+the target.
+@End Reasoning
 
 Process called "get_call_callee" that takes call as Integer returns Integer:
     If call is equal to 0:
@@ -1293,12 +1728,26 @@ Process called "get_call_callee" that takes call as Integer returns Integer:
     Return proc memory_get_int64 from Layout with call, 16
 End Process
 
+@Reasoning
+Arguments list (offset 24) holding SSA value IDs in calling order. The
+list itself is allocated separately from the call node so it can grow
+without resizing the node; passes that mutate calls (e.g., argument
+promotion, dead-arg elimination) modify the list in place.
+@End Reasoning
+
 Process called "get_call_arguments" that takes call as Integer returns Integer:
     If call is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with call, 24
 End Process
+
+@Reasoning
+Cached argument count (offset 32) — mirrors the arguments list length
+but is stored separately so verifier checks and quick-iteration passes
+do not pay the cost of a List-length call. Maintained in lockstep by
+the constructor and any pass that mutates the argument list.
+@End Reasoning
 
 Process called "get_call_argument_count" that takes call as Integer returns Integer:
     If call is equal to 0:
@@ -1307,12 +1756,27 @@ Process called "get_call_argument_count" that takes call as Integer returns Inte
     Return proc memory_get_int64 from Layout with call, 32
 End Process
 
+@Reasoning
+Return type (offset 40). LIR lowering uses this to pick the correct
+return-register handling (gpr vs xmm) at the call site. Recording the
+type on the call node, rather than re-resolving from the callee
+signature, lets passes mutate the call without touching a global
+symbol table.
+@End Reasoning
+
 Process called "get_call_return_type" that takes call as Integer returns Integer:
     If call is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with call, 40
 End Process
+
+@Reasoning
+Indirect-call flag (offset 48). A non-zero result indicates the callee
+field is an SSA value id rather than a function name. The flag is set
+once at construction and only cleared by devirtualization when it has
+proven a single target.
+@End Reasoning
 
 Process called "is_call_indirect" that takes call as Integer returns Integer:
     If call is equal to 0:
@@ -1321,12 +1785,27 @@ Process called "is_call_indirect" that takes call as Integer returns Integer:
     Return proc memory_get_int64 from Layout with call, 48
 End Process
 
+@Reasoning
+Tail-call flag (offset 56). Tells the LIR backend to use a tail-call
+sequence (jmp instead of call) when this flag is set, freeing the
+caller's stack frame before transferring control. Tail-call analysis
+sets this; out-of-lining passes that destroy the tail position clear
+it again.
+@End Reasoning
+
 Process called "is_tail_call" that takes call as Integer returns Integer:
     If call is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with call, 56
 End Process
+
+@Reasoning
+Condition value (offset 8) consumed by a branch terminator. Trivial-
+branch elimination tests this against the known-constant predicate
+table; jump-threading propagates known-zero/known-one conditions
+backwards through the CFG to remove the branch entirely.
+@End Reasoning
 
 Process called "get_branch_condition" that takes branch as Integer returns Integer:
     If branch is equal to 0:
@@ -1335,12 +1814,24 @@ Process called "get_branch_condition" that takes branch as Integer returns Integ
     Return proc memory_get_int64 from Layout with branch, 8
 End Process
 
+@Reasoning
+True-branch successor (offset 16). CFG construction extracts both
+successors with two separate getters rather than a tuple to avoid
+allocating a transient pair object on every block visit.
+@End Reasoning
+
 Process called "get_branch_true_target" that takes branch as Integer returns Integer:
     If branch is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with branch, 16
 End Process
+
+@Reasoning
+False-branch successor (offset 24). Distinct from the true-branch
+slot so that branch-folding passes can rewrite either edge in place
+without disturbing the other.
+@End Reasoning
 
 Process called "get_branch_false_target" that takes branch as Integer returns Integer:
     If branch is equal to 0:
@@ -1349,12 +1840,25 @@ Process called "get_branch_false_target" that takes branch as Integer returns In
     Return proc memory_get_int64 from Layout with branch, 24
 End Process
 
+@Reasoning
+Sole successor of an unconditional jump (offset 8). CFG simplification
+uses this to identify trivial successor chains, which it then merges
+into a single block when no other predecessor depends on the
+intermediate block.
+@End Reasoning
+
 Process called "get_jump_target" that takes jump as Integer returns Integer:
     If jump is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with jump, 8
 End Process
+
+@Reasoning
+Return value (offset 8). Zero means "void return" (no value); a non-
+zero value is the SSA id flowing into the function's return slot.
+Return-value-numbering canonicalizes returns by extracting this id.
+@End Reasoning
 
 Process called "get_return_value" that takes ret as Integer returns Integer:
     If ret is equal to 0:
@@ -1363,12 +1867,26 @@ Process called "get_return_value" that takes ret as Integer returns Integer:
     Return proc memory_get_int64 from Layout with ret, 8
 End Process
 
+@Reasoning
+Type of the returned value (offset 16). LIR uses this to choose the
+return register layout. Keeping the type on the return node (rather
+than re-deriving from the function signature) makes the return node
+self-describing for cross-function optimizations like inlining.
+@End Reasoning
+
 Process called "get_return_type" that takes ret as Integer returns Integer:
     If ret is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with ret, 16
 End Process
+
+@Reasoning
+Element type stored in an alloca (offset 16). Frame-layout passes use
+this together with alignment and count to compute exact slot size.
+Distinct from the alloca's result type (which is "pointer to element")
+because the underlying element size is what drives stack layout.
+@End Reasoning
 
 Process called "get_alloca_element_type" that takes alloca as Integer returns Integer:
     If alloca is equal to 0:
@@ -1377,12 +1895,26 @@ Process called "get_alloca_element_type" that takes alloca as Integer returns In
     Return proc memory_get_int64 from Layout with alloca, 16
 End Process
 
+@Reasoning
+Element count for variable-sized allocas (offset 24). For fixed-size
+allocas this is a constant SSA id pointing at a const node; for VLAs
+it is a dynamic SSA value computed at runtime. Either way, the LIR
+lowering pass treats it uniformly as an operand.
+@End Reasoning
+
 Process called "get_alloca_count" that takes alloca as Integer returns Integer:
     If alloca is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with alloca, 24
 End Process
+
+@Reasoning
+Explicit alignment (offset 32). Stored separately from element_type
+because callers may request alignment stricter than the element's
+natural alignment (e.g., 64-byte alignment for cache-line isolation).
+Frame layout honors the maximum of requested and natural.
+@End Reasoning
 
 Process called "get_alloca_alignment" that takes alloca as Integer returns Integer:
     If alloca is equal to 0:
@@ -1391,12 +1923,26 @@ Process called "get_alloca_alignment" that takes alloca as Integer returns Integ
     Return proc memory_get_int64 from Layout with alloca, 32
 End Process
 
+@Reasoning
+Numeric payload of a constant (offset 16). For string constants this
+field is unused (zero); use is_const_string + get_const_string instead.
+Constant folding hashes (value_type, constant_value) for numeric
+constants to identify equal-but-separate const nodes for CSE.
+@End Reasoning
+
 Process called "get_const_value" that takes const as Integer returns Integer:
     If const is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with const, 16
 End Process
+
+@Reasoning
+Type of the constant (offset 24). Determines how the LIR lowering
+materializes the value: integer immediates may inline into the
+instruction; floats may need a constant-pool slot; strings need a
+.rodata reference.
+@End Reasoning
 
 Process called "get_const_type" that takes const as Integer returns Integer:
     If const is equal to 0:
@@ -1405,12 +1951,27 @@ Process called "get_const_type" that takes const as Integer returns Integer:
     Return proc memory_get_int64 from Layout with const, 24
 End Process
 
+@Reasoning
+String-vs-numeric discriminator (offset 32). Non-zero means the constant
+is a string and string_ptr (offset 40) holds the actual pointer; zero
+means the numeric payload at offset 16 is the value. Choosing a flag
+over two distinct opcodes keeps the constant node uniform across
+optimization passes that don't care about the distinction.
+@End Reasoning
+
 Process called "is_const_string" that takes const as Integer returns Integer:
     If const is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with const, 32
 End Process
+
+@Reasoning
+String-pointer payload (offset 40), valid only when is_const_string is
+non-zero. Points into the deduplicated string table so that two const
+nodes for the same literal share a single backing string and the
+constant-CSE pass can merge them.
+@End Reasoning
 
 Process called "get_const_string" that takes const as Integer returns Integer:
     If const is equal to 0:
@@ -1421,12 +1982,25 @@ End Process
 
 Note: Switch Accessors
 
+@Reasoning
+Switched value (offset 8) — the SSA value being matched against cases.
+Switch lowering reads this to emit the comparison sequence (chain of
+cmps, jump table base register, or binary-search pivot).
+@End Reasoning
+
 Process called "get_switch_value" that takes switch as Integer returns Integer:
     If switch is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with switch, 8
 End Process
+
+@Reasoning
+Case list pointer (offset 16). Returns the raw List of (case_value,
+block_id) pairs so callers that need to iterate all cases at once (e.g.,
+jump-table builder) can walk the list directly without N round trips
+through the per-case accessors.
+@End Reasoning
 
 Process called "get_switch_cases" that takes switch as Integer returns Integer:
     If switch is equal to 0:
@@ -1435,6 +2009,12 @@ Process called "get_switch_cases" that takes switch as Integer returns Integer:
     Return proc memory_get_int64 from Layout with switch, 16
 End Process
 
+@Reasoning
+Cached case count (offset 24). Mirrors the case-list length but is
+maintained as a separate int64 so the verifier and density-analysis
+passes can read it in O(1) without paying a List-length call.
+@End Reasoning
+
 Process called "get_switch_case_count" that takes switch as Integer returns Integer:
     If switch is equal to 0:
         Return 0
@@ -1442,12 +2022,25 @@ Process called "get_switch_case_count" that takes switch as Integer returns Inte
     Return proc memory_get_int64 from Layout with switch, 24
 End Process
 
+@Reasoning
+Default target (offset 32) — the block taken when no case matches.
+Switch always has a default (the parser materializes "unreachable" if
+the source did not provide one) so this is never 0 except for null
+inputs.
+@End Reasoning
+
 Process called "get_switch_default_block" that takes switch as Integer returns Integer:
     If switch is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with switch, 32
 End Process
+
+@Reasoning
+Decodes the case value at the given index (even slot in the pair list).
+Density analysis sorts cases by value to pick jump-table-vs-chain
+lowering, so per-index value access is on the hot path of that decision.
+@End Reasoning
 
 Process called "get_switch_case_value" that takes switch as Integer, index as Integer returns Integer:
     If switch is equal to 0:
@@ -1457,6 +2050,13 @@ Process called "get_switch_case_value" that takes switch as Integer, index as In
     Let pair_index be index multiplied by 2
     Return proc get from List with cases, pair_index
 End Process
+
+@Reasoning
+Decodes the target block at the given case index (odd slot in the pair
+list). CFG construction walks all (value, block) pairs to build the
+switch's successor edges; per-index block access keeps that walk
+allocation-free.
+@End Reasoning
 
 Process called "get_switch_case_block" that takes switch as Integer, index as Integer returns Integer:
     If switch is equal to 0:
@@ -1469,12 +2069,25 @@ End Process
 
 Note: Atomic Operation Accessors
 
+@Reasoning
+Atomic address (offset 16) — the memory location being mutated. Alias
+analysis treats atomic addresses as opaque (cannot be reordered with
+other atomics on the same location) so this accessor is the key into
+that analysis.
+@End Reasoning
+
 Process called "get_atomic_address" that takes atomic as Integer returns Integer:
     If atomic is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with atomic, 16
 End Process
+
+@Reasoning
+Primary operand (offset 24) — the value being added/xchg'd/etc. For
+plain loads it is unused; for store-style atomics it is the value
+being written; for arithmetic atomics it is the delta.
+@End Reasoning
 
 Process called "get_atomic_operand" that takes atomic as Integer returns Integer:
     If atomic is equal to 0:
@@ -1483,12 +2096,25 @@ Process called "get_atomic_operand" that takes atomic as Integer returns Integer
     Return proc memory_get_int64 from Layout with atomic, 24
 End Process
 
+@Reasoning
+Expected-value field (offset 32) — populated only for compare-and-swap
+opcodes. The CAS lowering reads both expected and operand; other atomic
+opcodes leave this slot at 0 to keep the node layout uniform.
+@End Reasoning
+
 Process called "get_atomic_expected" that takes atomic as Integer returns Integer:
     If atomic is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with atomic, 32
 End Process
+
+@Reasoning
+Memory-ordering tag (offset 40): 0=relaxed, 1=acquire, 2=release,
+3=acq_rel, 4=seq_cst. LIR lowering uses this to emit the proper fence
+instruction or to pick the architectural opcode (e.g., x86 lock-xadd
+vs plain xadd).
+@End Reasoning
 
 Process called "get_atomic_memory_order" that takes atomic as Integer returns Integer:
     If atomic is equal to 0:
@@ -1499,12 +2125,25 @@ End Process
 
 Note: Vector Operation Accessors
 
+@Reasoning
+First vector operand (offset 16). Vector ops can be ternary (e.g.,
+fused-multiply-add, blends with mask), so operands are exposed as three
+separate accessors. Operand1 is the primary input for unary, binary,
+and ternary vector ops alike.
+@End Reasoning
+
 Process called "get_vector_operand1" that takes vector as Integer returns Integer:
     If vector is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with vector, 16
 End Process
+
+@Reasoning
+Second vector operand (offset 24). Unused (zero) for strictly unary
+vector ops; populated for binary and ternary forms. Vectorization
+passes read operand2 to build the dependence DAG between SIMD lanes.
+@End Reasoning
 
 Process called "get_vector_operand2" that takes vector as Integer returns Integer:
     If vector is equal to 0:
@@ -1513,12 +2152,26 @@ Process called "get_vector_operand2" that takes vector as Integer returns Intege
     Return proc memory_get_int64 from Layout with vector, 24
 End Process
 
+@Reasoning
+Third vector operand (offset 32). Populated only for ternary vector
+opcodes (FMA, select). The slot is part of the standard layout so
+shape-uniform walkers can read it unconditionally — they get 0 for
+non-ternary ops, which is the documented sentinel.
+@End Reasoning
+
 Process called "get_vector_operand3" that takes vector as Integer returns Integer:
     If vector is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with vector, 32
 End Process
+
+@Reasoning
+Vector width (offset 40) — number of SIMD lanes (2, 4, 8, 16, 32, 64).
+The LIR backend matches width against architecture capabilities (SSE 128
+= 4-wide f32, AVX-256 = 8-wide f32, AVX-512 = 16-wide f32) to pick the
+right instruction and register class.
+@End Reasoning
 
 Process called "get_vector_width" that takes vector as Integer returns Integer:
     If vector is equal to 0:
@@ -1527,12 +2180,27 @@ Process called "get_vector_width" that takes vector as Integer returns Integer:
     Return proc memory_get_int64 from Layout with vector, 40
 End Process
 
+@Reasoning
+Element type (offset 48) — the type of one lane of the vector. Combined
+with width, this fully describes the vector layout. The backend picks
+the lane size from the type's bit width when computing the total
+vector size.
+@End Reasoning
+
 Process called "get_vector_element_type" that takes vector as Integer returns Integer:
     If vector is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with vector, 48
 End Process
+
+@Reasoning
+Mask/shuffle data (offset 56). Non-zero only for shuffle, blend, and
+gather/scatter opcodes that select per-lane behavior. Encoded as a
+packed byte sequence (one byte per lane index or per lane predicate)
+so it fits in a single int64 for narrow vectors and as a pointer to
+external storage for wider ones.
+@End Reasoning
 
 Process called "get_vector_mask_data" that takes vector as Integer returns Integer:
     If vector is equal to 0:
@@ -1543,12 +2211,24 @@ End Process
 
 Note: Exception Handling Accessors
 
+@Reasoning
+Invoke callee (offset 16) — same encoding as call.callee. Inlining is
+allowed to remove the exception edges if it proves the inlinee cannot
+throw, in which case it would replace this node with a plain call.
+@End Reasoning
+
 Process called "get_invoke_callee" that takes invoke as Integer returns Integer:
     If invoke is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with invoke, 16
 End Process
+
+@Reasoning
+Invoke arguments list (offset 24). Mirrors call.arguments but lives on
+the invoke node so the two opcodes share layout up through offset 40.
+Argument-promotion runs over both equally.
+@End Reasoning
 
 Process called "get_invoke_arguments" that takes invoke as Integer returns Integer:
     If invoke is equal to 0:
@@ -1557,12 +2237,24 @@ Process called "get_invoke_arguments" that takes invoke as Integer returns Integ
     Return proc memory_get_int64 from Layout with invoke, 24
 End Process
 
+@Reasoning
+Invoke argument count (offset 32). Cached length, kept consistent with
+the list by the constructor and any argument-modifying pass.
+@End Reasoning
+
 Process called "get_invoke_argument_count" that takes invoke as Integer returns Integer:
     If invoke is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with invoke, 32
 End Process
+
+@Reasoning
+Normal-return successor (offset 48) — taken when the invoked callee
+returns without throwing. The CFG must see this edge to keep dominance
+correct, and most optimization passes treat it as the "fall-through"
+side of the invoke.
+@End Reasoning
 
 Process called "get_invoke_normal_block" that takes invoke as Integer returns Integer:
     If invoke is equal to 0:
@@ -1571,12 +2263,25 @@ Process called "get_invoke_normal_block" that takes invoke as Integer returns In
     Return proc memory_get_int64 from Layout with invoke, 48
 End Process
 
+@Reasoning
+Exception successor (offset 56) — taken when the invoked callee
+unwinds. Marks the entry to a landing-pad block. Cleanup-elimination
+may rewire this edge, but it cannot remove it as long as the callee
+may throw.
+@End Reasoning
+
 Process called "get_invoke_exception_block" that takes invoke as Integer returns Integer:
     If invoke is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with invoke, 56
 End Process
+
+@Reasoning
+Exception-type field on a landing pad (offset 16) — the runtime type
+descriptor used to match incoming throws against this pad. The runtime
+uses RTTI on the thrown value to find a matching catch.
+@End Reasoning
 
 Process called "get_landingpad_exception_type" that takes landingpad as Integer returns Integer:
     If landingpad is equal to 0:
@@ -1585,12 +2290,26 @@ Process called "get_landingpad_exception_type" that takes landingpad as Integer 
     Return proc memory_get_int64 from Layout with landingpad, 16
 End Process
 
+@Reasoning
+Catch clauses list (offset 24). Each clause is a (type_id, block_id)
+pair stored as two consecutive list elements, in source order. The
+runtime tests them in order, so optimizations that reorder clauses
+must preserve the "first match wins" semantics.
+@End Reasoning
+
 Process called "get_landingpad_catch_clauses" that takes landingpad as Integer returns Integer:
     If landingpad is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with landingpad, 24
 End Process
+
+@Reasoning
+Cached catch-clause count (offset 32). Lockstep with the clauses list.
+Cleanup-elimination and clause-merging both consult this count when
+deciding whether the landing pad has been reduced to a single trivial
+clause that can be folded out.
+@End Reasoning
 
 Process called "get_landingpad_clause_count" that takes landingpad as Integer returns Integer:
     If landingpad is equal to 0:
@@ -1599,6 +2318,13 @@ Process called "get_landingpad_clause_count" that takes landingpad as Integer re
     Return proc memory_get_int64 from Layout with landingpad, 32
 End Process
 
+@Reasoning
+Cleanup successor (offset 40) — taken when no catch clause matches but
+the pad still has cleanup actions (RAII-like destructors, finally
+blocks). The runtime jumps here after executing cleanup, then re-raises
+the exception to continue unwinding.
+@End Reasoning
+
 Process called "get_landingpad_cleanup_block" that takes landingpad as Integer returns Integer:
     If landingpad is equal to 0:
         Return 0
@@ -1606,12 +2332,26 @@ Process called "get_landingpad_cleanup_block" that takes landingpad as Integer r
     Return proc memory_get_int64 from Layout with landingpad, 40
 End Process
 
+@Reasoning
+Thrown SSA value (offset 8). The exception object that will be raised.
+Unwinding inspects this value's runtime type to find a matching landing
+pad. Exception-flow analysis can fold a throw whose value flows directly
+from a catch with no transformation.
+@End Reasoning
+
 Process called "get_throw_exception_value" that takes throw as Integer returns Integer:
     If throw is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with throw, 8
 End Process
+
+@Reasoning
+Static type tag on a throw (offset 16). Lets static analysis match
+throws to catches without inspecting runtime RTTI — useful for proving
+that a throw cannot escape a given function (so the callee's invoke
+edges can be trimmed).
+@End Reasoning
 
 Process called "get_throw_exception_type" that takes throw as Integer returns Integer:
     If throw is equal to 0:
@@ -1622,12 +2362,22 @@ End Process
 
 Note: Debug Info Accessors
 
+@Reasoning
+SSA value id (offset 8) that a debug-value annotation is shadowing. Reads
+the SSA value the debug node is tracking on behalf of a source variable.
+@End Reasoning
+
 Process called "get_debug_value_id" that takes debug as Integer returns Integer:
     If debug is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with debug, 8
 End Process
+
+@Reasoning
+Original source variable name (offset 16). String-table pointer kept on
+the debug node so dumps and debuggers can map the SSA name back to source.
+@End Reasoning
 
 Process called "get_debug_variable_name" that takes debug as Integer returns Integer:
     If debug is equal to 0:
@@ -1636,12 +2386,22 @@ Process called "get_debug_variable_name" that takes debug as Integer returns Int
     Return proc memory_get_int64 from Layout with debug, 16
 End Process
 
+@Reasoning
+Source file (offset 24) — string pointer to the file path the variable
+declaration came from. Used by debuggers to navigate to the declaration.
+@End Reasoning
+
 Process called "get_debug_source_file" that takes debug as Integer returns Integer:
     If debug is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with debug, 24
 End Process
+
+@Reasoning
+Source line (offset 32) — 1-based line number where the variable was
+declared. Combined with file gives the precise source position.
+@End Reasoning
 
 Process called "get_debug_source_line" that takes debug as Integer returns Integer:
     If debug is equal to 0:
@@ -1650,12 +2410,23 @@ Process called "get_debug_source_line" that takes debug as Integer returns Integ
     Return proc memory_get_int64 from Layout with debug, 32
 End Process
 
+@Reasoning
+Source column (offset 40) — 1-based column. DWARF emitters use line+col
+to generate the .debug_line table that maps PC ranges to source positions.
+@End Reasoning
+
 Process called "get_debug_source_column" that takes debug as Integer returns Integer:
     If debug is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with debug, 40
 End Process
+
+@Reasoning
+Debug scope id (offset 48) — identifies the lexical block, function, or
+namespace the variable belongs to. Scope information enables correct
+variable-shadowing behavior in debuggers.
+@End Reasoning
 
 Process called "get_debug_scope_id" that takes debug as Integer returns Integer:
     If debug is equal to 0:
@@ -1664,12 +2435,23 @@ Process called "get_debug_scope_id" that takes debug as Integer returns Integer:
     Return proc memory_get_int64 from Layout with debug, 48
 End Process
 
+@Reasoning
+Location source file (offset 8 in MIRDebugLocation). Distinct from
+MIRDebugValue: location nodes attach to instructions, not values, and
+drive stack-trace line numbers rather than variable inspection.
+@End Reasoning
+
 Process called "get_location_source_file" that takes loc as Integer returns Integer:
     If loc is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with loc, 8
 End Process
+
+@Reasoning
+Location source line (offset 16). Drives the .debug_line PC→line mapping
+that the runtime consults for backtrace formatting.
+@End Reasoning
 
 Process called "get_location_source_line" that takes loc as Integer returns Integer:
     If loc is equal to 0:
@@ -1678,6 +2460,12 @@ Process called "get_location_source_line" that takes loc as Integer returns Inte
     Return proc memory_get_int64 from Layout with loc, 16
 End Process
 
+@Reasoning
+Location source column (offset 24). Column-aware backtraces let crash
+dumps point at the exact expression that raised an error, not just the
+containing line.
+@End Reasoning
+
 Process called "get_location_source_column" that takes loc as Integer returns Integer:
     If loc is equal to 0:
         Return 0
@@ -1685,12 +2473,25 @@ Process called "get_location_source_column" that takes loc as Integer returns In
     Return proc memory_get_int64 from Layout with loc, 24
 End Process
 
+@Reasoning
+Location scope id (offset 32). Different from the debug-value scope because
+locations track lexical block identity for instruction-level granularity
+(useful when single-stepping through inlined code).
+@End Reasoning
+
 Process called "get_location_scope_id" that takes loc as Integer returns Integer:
     If loc is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with loc, 32
 End Process
+
+@Reasoning
+Inlined-at marker (offset 40). When non-zero, indicates this instruction
+came from an inlined function; the value is the call-site location id of
+the original call. Debuggers use this to reconstruct virtual frames so
+inlined code appears as a proper inline stack frame in backtraces.
+@End Reasoning
 
 Process called "get_location_inlined_at" that takes loc as Integer returns Integer:
     If loc is equal to 0:
@@ -1709,6 +2510,15 @@ Formats a phi node as: %result = phi type [%val1, block1], [%val2, block2], ...
 Example: %3 = phi i32 [%1, block_0], [%2, block_1]
 @End Implementation
 
+@Reasoning
+Phi node debug-print produces "%N = phi [%val, block_K], ..." in LLVM-ish
+style so MIR dumps are familiar to compiler engineers and so the verifier's
+error messages can quote the exact offending node. The constructed string
+is heap-owned so callers must deallocate it; per-pair concatenation is
+deliberate to keep the printer's allocator footprint linear in pair count
+rather than super-linear.
+@End Reasoning
+
 Process called "phi_node_to_string" that takes phi as Integer returns Integer:
     If phi is equal to 0:
         Return proc string_duplicate from StringCore with "<null phi>"
@@ -1725,8 +2535,8 @@ Process called "phi_node_to_string" that takes phi as Integer returns Integer:
 
     Let i be 0
     While i is less than incoming_count:
-        Let block_id be get_phi_incoming_block(phi, i)
-        Let value_id be get_phi_incoming_value(phi, i)
+        Let block_id be proc get_phi_incoming_block with phi, i
+        Let value_id be proc get_phi_incoming_value with phi, i
 
         Let block_str be proc integer_to_string from StringCore with block_id
         Let value_str be proc integer_to_string from StringCore with value_id
@@ -1749,6 +2559,14 @@ Process called "phi_node_to_string" that takes phi as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning
+Binop debug-print mirrors LLVM IR conventions so dumps can be diffed
+across compilers when porting tests. Pulling the opcode through the base
+MIRNode (rather than caching it on the binop) keeps a single source of
+truth for opcode and avoids two locations to update if MIR opcode numbering
+ever shifts.
+@End Reasoning
 
 @Implementation
 Formats a binary operation as: %result = opcode type %left, %right
@@ -1788,6 +2606,13 @@ Process called "binary_op_to_string" that takes binop as Integer returns Integer
     Return result
 End Process
 
+@Reasoning
+Load debug-print uses LLVM "load ptr %addr" shorthand. The offset is
+intentionally elided from the default dump when it would be 0 — explicit
+zero offsets clutter the dump for the common direct-load case. Verifier
+errors that need the offset use a dedicated, more verbose dump path.
+@End Reasoning
+
 @Implementation
 Formats a load instruction as: %result = load type, ptr %address
 Example: %10 = load i32, ptr %9
@@ -1815,6 +2640,14 @@ Process called "load_to_string" that takes load as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning
+Store debug-print follows "store value, ptr addr" so the value-then-ptr
+order reads naturally in dumps and matches the LLVM convention. There is
+no result_value_id to print because stores produce no SSA value, which
+makes the dump shorter than for loads — a visual cue to the reader that
+this is a side-effecting node, not a value-producing one.
+@End Reasoning
+
 @Implementation
 Formats a store instruction as: store type %value, ptr %address
 Example: store i32 %5, ptr %6
@@ -1841,6 +2674,15 @@ Process called "store_to_string" that takes store as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning
+Call debug-print elides the "%N =" prefix when result_value_id is 0 (void
+call) so void calls do not waste characters on a phantom result. Arguments
+are pulled from the List and printed comma-separated; the constructed
+string keeps the per-argument allocation discipline of the rest of the
+printer (each integer-to-string allocation is deallocated immediately
+after being concatenated).
+@End Reasoning
 
 @Implementation
 Formats a call instruction as: %result = call return_type @function(%arg1, %arg2, ...)
@@ -1896,6 +2738,13 @@ Formats a branch instruction as: br i1 %cond, label %true, label %false
 Example: br i1 %2, label %block_1, label %block_2
 @End Implementation
 
+@Reasoning
+Branch debug-print uses "br i1 %cond, label %true, label %false" to mirror
+LLVM IR. The verbose form (with both targets) is preferred over a compact
+"branch %cond -> %true | %false" because dumps are read most often during
+backend debugging, where matching LLVM convention reduces cognitive load.
+@End Reasoning
+
 Process called "branch_to_string" that takes branch as Integer returns Integer:
     If branch is equal to 0:
         Return proc string_duplicate from StringCore with "<null branch>"
@@ -1923,6 +2772,13 @@ Process called "branch_to_string" that takes branch as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning
+Jump debug-print uses "jmp label %target" — short by design because the
+unconditional jump is the simplest terminator and visual brevity reinforces
+that. Note the deliberate use of "jmp" rather than "br" to make
+unconditional vs conditional control flow visually distinct in dumps.
+@End Reasoning
+
 @Implementation
 Formats a jump instruction as: jmp label %target
 Example: jmp label %block_3
@@ -1943,6 +2799,14 @@ Process called "jump_to_string" that takes jump as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning
+Return debug-print switches between "ret void" (no value) and "ret %N"
+based on whether return_value_id is zero. The two forms share no
+character with each other beyond "ret", so we build them as separate
+literals rather than concatenating an optional value suffix — this keeps
+the void branch allocation-free and matches the LLVM dump convention.
+@End Reasoning
 
 @Implementation
 Formats a return instruction as: ret type %value or ret void
@@ -1967,6 +2831,14 @@ Process called "return_to_string" that takes ret as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning
+Alloca debug-print shows result-id and alignment. The element type is
+intentionally elided from the default dump form (the alloca's result
+type "%N = alloca, align K" already conveys what is being allocated
+through downstream uses); when fuller info is needed, the verifier
+uses a dedicated dump path that includes element type and count.
+@End Reasoning
 
 @Implementation
 Formats an alloca instruction as: %result = alloca type, align N
@@ -1994,6 +2866,13 @@ Process called "alloca_to_string" that takes alloca as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning
+Const debug-print branches on is_string: numeric constants print their
+literal value, string constants print the quoted source text. The split
+keeps the dump readable for both cases without forcing a single uniform
+encoding ("const ptr %0x..." for strings would lose the literal text).
+@End Reasoning
 
 @Implementation
 Formats a constant instruction as: %result = const value
@@ -2033,6 +2912,14 @@ Process called "const_to_string" that takes const as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning
+Switch debug-print iterates every case in order, then appends the default
+clause. The "value => block" arrow notation is chosen instead of the LLVM
+bracket form because it reads more naturally for the long case lists that
+appear in match/dispatch-heavy Runa code. Per-case allocations are freed
+immediately after concatenation to keep peak memory bounded.
+@End Reasoning
+
 @Implementation
 Formats a switch instruction as: switch %value [ case1 => block1, case2 => block2, default => block_default ]
 Example: switch %5 [ 0 => block_1, 1 => block_2, default => block_3 ]
@@ -2055,8 +2942,8 @@ Process called "switch_to_string" that takes switch as Integer returns Integer:
 
     Let i be 0
     While i is less than case_count:
-        Let case_value be get_switch_case_value(switch, i)
-        Let block_id be get_switch_case_block(switch, i)
+        Let case_value be proc get_switch_case_value with switch, i
+        Let block_id be proc get_switch_case_block with switch, i
 
         Let case_str be proc integer_to_string from StringCore with case_value
         Let block_str be proc integer_to_string from StringCore with block_id
@@ -2084,6 +2971,14 @@ Process called "switch_to_string" that takes switch as Integer returns Integer:
 
     Return result
 End Process
+
+@Reasoning
+Atomic-op debug-print spells out the memory-ordering tag (relaxed,
+acquire, release, acq_rel, seq_cst) for readability — the numeric tag
+would force the reader to remember the encoding. The operand is optional
+(zero for atomic loads) so the printer guards each component with a
+non-zero check, keeping dumps free of spurious "%0" placeholders.
+@End Reasoning
 
 @Implementation
 Formats an atomic operation as: %result = atomic_op memory_order ptr %addr, %operand
@@ -2150,6 +3045,14 @@ Process called "atomic_op_to_string" that takes atomic as Integer returns Intege
     Return result
 End Process
 
+@Reasoning
+Vector-op debug-print uses LLVM "<width x type>" shorthand because that
+form makes lane count visible at a glance — critical when diffing
+vectorization passes that may change width across versions. Operand3 is
+elided from the default dump (only FMA and select use it); a verifier-
+mode dump path includes operand3 when present.
+@End Reasoning
+
 @Implementation
 Formats a vector operation as: %result = vector_op <width x type> %op1, %op2
 Example: %7 = vector_add <4 x float> %5, %6
@@ -2205,6 +3108,13 @@ Process called "vector_op_to_string" that takes vector as Integer returns Intege
 
     Return result
 End Process
+
+@Reasoning
+Invoke debug-print extends the call-dump form with two label suffixes
+("normal:" and "exception:") so both successor edges are visible in
+one line. This makes invokes immediately distinguishable from calls in
+dumps — important because optimization decisions hinge on the distinction.
+@End Reasoning
 
 @Implementation
 Formats an invoke instruction as: %result = invoke @function(%args) normal: block1, exception: block2
@@ -2266,6 +3176,13 @@ Process called "invoke_to_string" that takes invoke as Integer returns Integer:
 End Process
 
 
+@Reasoning
+Throw debug-print is intentionally minimal — "throw %N" — because the
+thrown value's type and runtime metadata are inspected at the catch
+site, not at the throw. The verbose form including exception_type is
+reserved for verifier output where exception-type tracking matters.
+@End Reasoning
+
 @Implementation
 Formats a throw instruction as: throw type %exception
 Example: throw Exception %10
@@ -2287,6 +3204,14 @@ Process called "throw_to_string" that takes throw as Integer returns Integer:
     Return result
 End Process
 
+
+@Reasoning
+Debug-value debug-print includes the source variable name in quotes plus
+the source location triple. This matches how DWARF reads in dumpers, so
+debugger-format diffs against MIR dumps remain meaningful. Unknown
+file paths are replaced with "<unknown>" to keep the format positionally
+stable for downstream regex-based tooling.
+@End Reasoning
 
 @Implementation
 Formats a debug value annotation as: debug_value %value "variable_name" at file:line:column
@@ -2343,6 +3268,13 @@ Note: These functions return block IDs from terminator instructions
 Note: Used by cfg.runa for control flow graph construction
 Note: ============================================================
 
+@Reasoning
+CFG construction needs branch successor block IDs as fully-resolved Integer
+labels, not as raw MIRBranch fields. This accessor returns the true target
+with -1 sentinel on null input so the CFG builder can distinguish a missing
+target from block ID 0 (block 0 is the function entry block, a valid value).
+@End Reasoning
+
 Process called "get_mir_branch_true_block" that takes branch as Integer returns Integer:
     @Implementation
     Returns the true target block ID from a MIRBranch instruction.
@@ -2354,6 +3286,13 @@ Process called "get_mir_branch_true_block" that takes branch as Integer returns 
     End If
     Return proc memory_get_int64 from Layout with branch, 16
 End Process
+
+@Reasoning
+Mirror of get_mir_branch_true_block for the false successor. Two distinct
+accessors (rather than an indexed accessor) make CFG-construction code
+self-documenting: "true_succ = ..., false_succ = ..." reads cleaner than
+"succ_0 = ..., succ_1 = ...". Same -1 sentinel discipline for null inputs.
+@End Reasoning
 
 Process called "get_mir_branch_false_block" that takes branch as Integer returns Integer:
     @Implementation
@@ -2367,6 +3306,13 @@ Process called "get_mir_branch_false_block" that takes branch as Integer returns
     Return proc memory_get_int64 from Layout with branch, 24
 End Process
 
+@Reasoning
+Returns the single successor of an unconditional jump for CFG construction.
+The -1 sentinel preserves the convention used by the branch accessors
+above so the CFG builder can treat all terminator successors uniformly
+(any -1 means "skip this edge").
+@End Reasoning
+
 Process called "get_mir_jump_target_block" that takes jump as Integer returns Integer:
     @Implementation
     Returns the target block ID from a MIRJump instruction.
@@ -2379,6 +3325,15 @@ Process called "get_mir_jump_target_block" that takes jump as Integer returns In
     Return proc memory_get_int64 from Layout with jump, 8
 End Process
 
+@Reasoning
+CFG construction needs to iterate every case in a switch to discover all
+successor edges. Returning the cached count (offset 24) lets the builder
+size its iteration without paying the cost of inspecting the case-list
+List for its length. Returns 0 on null input rather than -1 because the
+"no cases" interpretation is valid for both null switches and switches
+with all cases removed.
+@End Reasoning
+
 Process called "get_mir_switch_case_count" that takes switch_ptr as Integer returns Integer:
     @Implementation
     Returns the number of case clauses in a MIRSwitch instruction.
@@ -2390,6 +3345,14 @@ Process called "get_mir_switch_case_count" that takes switch_ptr as Integer retu
     End If
     Return proc memory_get_int64 from Layout with switch_ptr, 24
 End Process
+
+@Reasoning
+Default-case target accessor used during CFG leader identification: every
+basic-block leader must include the default destination, otherwise the
+CFG misses an edge and dominance becomes wrong. Returns 0 on null input
+because the leader-identification pass treats 0 as "skip" rather than
+attempting to read it as a valid target.
+@End Reasoning
 
 Process called "get_mir_switch_default_target" that takes switch_ptr as Integer returns Integer:
     @Implementation
@@ -2404,6 +3367,14 @@ Process called "get_mir_switch_default_target" that takes switch_ptr as Integer 
     Note: Default block ID is at offset 32
     Return proc memory_get_int64 from Layout with switch_ptr, 32
 End Process
+
+@Reasoning
+Per-case target accessor used during CFG leader identification. Reads
+the case-list entry at case_idx (an index pair structure stored at offset
+8) and returns the block_id. Bounds-checks both negative and out-of-range
+indices because CFG construction iterates by index and would otherwise
+read past the case list.
+@End Reasoning
 
 Process called "get_mir_switch_case_target" that takes switch_ptr as Integer, case_idx as Integer returns Integer:
     @Implementation
@@ -2436,7 +3407,7 @@ Process called "get_mir_switch_case_target" that takes switch_ptr as Integer, ca
     Note: Each case is a pair (case_value, block_id)
     Note: We need the block_id which is the second element of the pair
     Note: Assuming list_get returns pointer to pair, and block_id is at offset 8 in the pair
-    Let case_pair be list_get(cases_list, case_idx)
+    Let case_pair be proc list_get from List with cases_list, case_idx
 
     If case_pair is equal to 0:
         Return 0
@@ -2445,6 +3416,13 @@ Process called "get_mir_switch_case_target" that takes switch_ptr as Integer, ca
     Note: Return the block_id from the pair (second field, offset 8)
     Return proc memory_get_int64 from Layout with case_pair, 8
 End Process
+
+@Reasoning
+Block-ID accessor (vs the "default_target" variant above) — uses the -1
+sentinel because CFG-edge construction needs to distinguish between "no
+default" and "default is block 0". Block 0 (function entry) is a legal
+default target in some lowering schemes.
+@End Reasoning
 
 Process called "get_mir_switch_default_block" that takes switch_ptr as Integer returns Integer:
     @Implementation
@@ -2457,6 +3435,13 @@ Process called "get_mir_switch_default_block" that takes switch_ptr as Integer r
     End If
     Return proc memory_get_int64 from Layout with switch_ptr, 32
 End Process
+
+@Reasoning
+Block-ID variant of get_mir_switch_case_target, with the same bounds-check
+discipline but the -1 sentinel for CFG-edge consumers. Two accessors
+(target vs block) exist because CFG construction works at two layers:
+leader identification (uses raw target) and edge enumeration (uses block ID).
+@End Reasoning
 
 Process called "get_mir_switch_case_block" that takes switch_ptr as Integer, case_idx as Integer returns Integer:
     @Implementation
@@ -2486,7 +3471,7 @@ Process called "get_mir_switch_case_block" that takes switch_ptr as Integer, cas
     End If
 
     Note: Each case is a pair (case_value, block_id)
-    Let case_pair be list_get(cases_list, case_idx)
+    Let case_pair be proc list_get from List with cases_list, case_idx
 
     If case_pair is equal to 0:
         Return negative 1
@@ -2495,6 +3480,13 @@ Process called "get_mir_switch_case_block" that takes switch_ptr as Integer, cas
     Note: Return the block_id from the pair (second field, offset 8)
     Return proc memory_get_int64 from Layout with case_pair, 8
 End Process
+
+@Reasoning
+Normal-successor accessor for invoke nodes, raw-target form. CFG leader
+identification visits this to mark the normal-return block as a leader.
+Returns 0 on null so the leader-identification driver can treat 0 as
+"skip" and continue walking the function uniformly.
+@End Reasoning
 
 Process called "get_mir_invoke_normal_dest" that takes invoke_ptr as Integer returns Integer:
     @Implementation
@@ -2510,6 +3502,12 @@ Process called "get_mir_invoke_normal_dest" that takes invoke_ptr as Integer ret
     Return proc memory_get_int64 from Layout with invoke_ptr, 48
 End Process
 
+@Reasoning
+Exception-edge accessor for invoke, raw-target form. The exception
+successor block must also be a leader so exception-handling code lives
+in its own block. Same 0-sentinel discipline as the normal-dest accessor.
+@End Reasoning
+
 Process called "get_mir_invoke_unwind_dest" that takes invoke_ptr as Integer returns Integer:
     @Implementation
     Returns the exception/unwind destination target (as instruction/value, not block ID) from MIRInvoke.
@@ -2524,6 +3522,13 @@ Process called "get_mir_invoke_unwind_dest" that takes invoke_ptr as Integer ret
     Return proc memory_get_int64 from Layout with invoke_ptr, 56
 End Process
 
+@Reasoning
+Block-ID variant of get_mir_invoke_normal_dest. CFG edge construction
+consumes block IDs (not raw targets), so this accessor exists alongside
+its raw-target sibling. -1 sentinel matches the other block-ID accessors
+in this section so the CFG builder's null handling stays uniform.
+@End Reasoning
+
 Process called "get_mir_invoke_normal_block" that takes invoke_ptr as Integer returns Integer:
     @Implementation
     Returns the normal destination block ID from a MIRInvoke instruction.
@@ -2535,6 +3540,12 @@ Process called "get_mir_invoke_normal_block" that takes invoke_ptr as Integer re
     End If
     Return proc memory_get_int64 from Layout with invoke_ptr, 48
 End Process
+
+@Reasoning
+Block-ID variant of get_mir_invoke_unwind_dest. Pairs with the normal-
+block accessor to give the CFG builder both successor edges of an invoke
+in the same -1-sentinel format used by the rest of this section.
+@End Reasoning
 
 Process called "get_mir_invoke_unwind_block" that takes invoke_ptr as Integer returns Integer:
     @Implementation
@@ -2597,7 +3608,7 @@ Process called "get_phi_variable_name" that takes phi_ptr as Integer returns Int
     End If
 
     Note: Check if actually a phi node
-    Let is_phi be is_phi_node(phi_ptr)
+    Let is_phi be proc is_phi_node with phi_ptr
     If is_phi is equal to 0:
         Return 0
     End If
@@ -2611,7 +3622,7 @@ Process called "get_phi_variable_name" that takes phi_ptr as Integer returns Int
 
         If metadata_ptr is not equal to 0:
             Note: Get variable name from metadata
-            Let variable_name be get_metadata_variable_name(metadata_ptr)
+            Let variable_name be proc get_metadata_variable_name with metadata_ptr
 
             If variable_name is not equal to 0:
                 Note: Found variable name in metadata - return it
@@ -2686,7 +3697,7 @@ Process called "get_phi_result_type" that takes phi_ptr as Integer returns Integ
     End If
 
     Note: Check if actually a phi node
-    Let is_phi be is_phi_node(phi_ptr)
+    Let is_phi be proc is_phi_node with phi_ptr
     If is_phi is equal to 0:
         Return 0
     End If
@@ -2717,7 +3728,7 @@ Process called "set_phi_result_value_id" that takes phi_ptr as Integer, new_valu
     End If
 
     Note: Check if actually a phi node
-    Let is_phi be is_phi_node(phi_ptr)
+    Let is_phi be proc is_phi_node with phi_ptr
     If is_phi is equal to 0:
         Return 0
     End If
@@ -2734,133 +3745,135 @@ Process called "set_phi_result_value_id" that takes phi_ptr as Integer, new_valu
     Return 1
 End Process
 
-Process called "add_phi_incoming" that takes phi_ptr as Integer, value_id as Integer, block_id as Integer returns Integer:
-    @Reasoning
-    Adds an incoming value to a phi node.
+Note: ============================================================
+Note: PROGRAM-LEVEL AND FUNCTION-LEVEL TRAVERSAL HELPERS
+Note: ============================================================
 
-    During SSA renaming, we fill in the incoming values for phi nodes.
-    Each incoming value is a (value_id, block_id) pair representing
-    the value coming from a specific predecessor block.
+@Reasoning
+Whole-program optimization passes (inlining, devirtualization, tail-call,
+verifier) need to iterate every function in a MIRProgram. Rather than each
+pass re-implementing the offset-0 list load, this canonical accessor returns
+the program's function List directly. Returning the live List (rather than a
+copy) lets callers append to it cheaply when a pass needs to register new
+functions, while the program retains canonical ownership of the list itself.
+A null program returns 0 so the caller's standard "if functions is equal to 0"
+guard handles the missing-program path uniformly with the empty-program path.
+@End Reasoning
 
-    MIRPhi structure:
-    - Offset 16: incoming_pairs (List of (value_id, block_id) pairs)
-    - Offset 24: incoming_count
+@Implementation
+Reads the int64 at MIRProgram offset 0, which is the canonical functions-list
+slot established by create_mir_program. The MIRProgram layout (set by
+create_mir_program in mir.runa) places:
+  offset  0: functions List
+  offset  8: function_count
+  offset 16: global_values List
+  offset 24: global_values_count
+  offset 32: string_constants List
+  offset 40: string_count
+  offset 48: type_table
+  offset 56: reserved
+The returned List is owned by the program; callers must not destroy it.
+@End Implementation
 
-    Returns: 1 on success, 0 on failure
-    @End Reasoning
+@Performance_Hints
+Single int64 load. Inlines to one mov on x86_64. Called once per
+whole-program pass, so not on any inner loop.
+@End Performance_Hints
 
-    Note: Null check
-    If phi_ptr is equal to 0:
+@Security_Scope
+Pure read with explicit null guard. No allocation, no mutation.
+@End Security_Scope
+
+Process called "get_program_functions" that takes program_ptr as Integer returns Integer:
+    If program_ptr is equal to 0:
         Return 0
     End If
-
-    Note: Get incoming_pairs list (offset 16)
-    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
-    If incoming_pairs is equal to 0:
-        Note: Create new list if needed
-        Set incoming_pairs to proc create from List
-        proc memory_set_int64 from Layout with phi_ptr, 16, incoming_pairs
-    End If
-
-    Note: Create (value_id, block_id) pair
-    Note: Allocate 16 bytes for pair
-    Let pair be proc allocate from Layout with 16
-    proc memory_set_int64 from Layout with pair, 0, value_id
-    proc memory_set_int64 from Layout with pair, 8, block_id
-
-    Note: Add pair to list
-    proc append from List with incoming_pairs, pair
-
-    Note: Update incoming_count (offset 24)
-    Let count be proc memory_get_int64 from Layout with phi_ptr, 24
-    proc memory_set_int64 from Layout with phi_ptr, 24, count plus 1
-
-    Return 1
+    Return proc memory_get_int64 from Layout with program_ptr, 0
 End Process
 
-Process called "get_phi_incoming_count" that takes phi_ptr as Integer returns Integer:
-    @Reasoning
-    Returns the number of incoming values in a phi node.
+@Reasoning
+Profitability gating in optimization passes (inlining, devirtualization,
+tail-call) is dramatically cheaper when the pass can skip functions that
+contain no instructions of the relevant kind. Rather than each pass
+re-implementing the walk-blocks-walk-instructions double loop with its own
+opcode comparison, this canonical helper centralises the pattern and exposes
+the single tuning knob (the opcode to match) as a parameter. The function
+is read-only over its inputs, so it is safe to call from any phase including
+post-pass profitability checks.
+@End Reasoning
 
-    Returns: Number of incoming values, or 0 if phi_ptr is invalid
-    @End Reasoning
+@Implementation
+Walks the function's CFG and counts every instruction whose opcode equals
+the requested target_opcode. The traversal pattern:
+  1. From function pointer, read CFG pointer (MIRFunction offset 8).
+  2. From CFG pointer, read blocks List (MIRCFG offset 16).
+  3. For each block in the List, read its instructions List (MIRBasicBlock
+     offset 16) and instruction_count (offset 24).
+  4. For each instruction in that block, read its opcode (MIRNode offset 0)
+     and increment the running tally on a match.
+Returns 0 for a null function pointer or any structurally absent
+sub-component (no CFG, no blocks list, no instructions list); 0 is the
+correct count for "this function has no instructions of that kind",
+matching what callers expect from a vacuous case.
+@End Implementation
 
-    Note: Null check
-    If phi_ptr is equal to 0:
+@Performance_Hints
+O(N) in the total instruction count of the function. Called once per
+function per profitability check, not in any inner optimization loop.
+The cached instruction_count at MIRBasicBlock offset 24 avoids re-walking
+the per-block list to compute its length.
+@End Performance_Hints
+
+@Security_Scope
+Pure read with explicit null guards at every dereference level. No
+allocation, no mutation, no side effects.
+@End Security_Scope
+
+Process called "count_instructions_of_type" that takes function_ptr as Integer, target_opcode as Integer returns Integer:
+    If function_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get incoming_count from MIRPhi (offset 24)
-    Let count be proc memory_get_int64 from Layout with phi_ptr, 24
-    Return count
-End Process
-
-Process called "get_phi_incoming_value" that takes phi_ptr as Integer, index as Integer returns Integer:
-    @Reasoning
-    Gets the value ID of the Nth incoming value in a phi node.
-
-    Returns: Value ID, or 0 if index out of bounds
-    @End Reasoning
-
-    Note: Null check
-    If phi_ptr is equal to 0:
+    Note: Read CFG pointer from MIRFunction offset 8
+    Let cfg_ptr be proc memory_get_int64 from Layout with function_ptr, 8
+    If cfg_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Check bounds
-    Let count be get_phi_incoming_count(phi_ptr)
-    If index is less than 0 or index is greater than or equal to count:
+    Note: Read blocks List from MIRCFG offset 16
+    Let blocks be proc memory_get_int64 from Layout with cfg_ptr, 16
+    If blocks is equal to 0:
         Return 0
     End If
 
-    Note: Get incoming_pairs list (offset 16)
-    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
-    If incoming_pairs is equal to 0:
-        Return 0
-    End If
+    Let block_count be proc list_length from List with blocks
+    Let total_count be 0
+    Let block_idx be 0
 
-    Note: Get pair at index
-    Let pair be proc get from List with incoming_pairs, index
-    If pair is equal to 0:
-        Return 0
-    End If
+    While block_idx is less than block_count:
+        Let block_ptr be proc list_get from List with blocks, block_idx
+        If block_ptr is not equal to 0:
+            Note: Read instructions List from MIRBasicBlock offset 16
+            Let instructions be proc memory_get_int64 from Layout with block_ptr, 16
+            If instructions is not equal to 0:
+                Note: Read cached instruction_count from MIRBasicBlock offset 24
+                Let inst_count be proc memory_get_int64 from Layout with block_ptr, 24
+                Let inst_idx be 0
+                While inst_idx is less than inst_count:
+                    Let inst_ptr be proc list_get from List with instructions, inst_idx
+                    If inst_ptr is not equal to 0:
+                        Note: Read opcode from MIRNode offset 0
+                        Let opcode be proc memory_get_int64 from Layout with inst_ptr, 0
+                        If opcode is equal to target_opcode:
+                            Set total_count to total_count plus 1
+                        End If
+                    End If
+                    Set inst_idx to inst_idx plus 1
+                End While
+            End If
+        End If
+        Set block_idx to block_idx plus 1
+    End While
 
-    Note: Get value_id from pair (offset 0)
-    Let value_id be proc memory_get_int64 from Layout with pair, 0
-    Return value_id
-End Process
-
-Process called "get_phi_incoming_block" that takes phi_ptr as Integer, index as Integer returns Integer:
-    @Reasoning
-    Gets the block ID of the Nth incoming value in a phi node.
-
-    Returns: Block ID, or -1 if index out of bounds
-    @End Reasoning
-
-    Note: Null check
-    If phi_ptr is equal to 0:
-        Return negative 1
-    End If
-
-    Note: Check bounds
-    Let count be get_phi_incoming_count(phi_ptr)
-    If index is less than 0 or index is greater than or equal to count:
-        Return negative 1
-    End If
-
-    Note: Get incoming_pairs list (offset 16)
-    Let incoming_pairs be proc memory_get_int64 from Layout with phi_ptr, 16
-    If incoming_pairs is equal to 0:
-        Return negative 1
-    End If
-
-    Note: Get pair at index
-    Let pair be proc get from List with incoming_pairs, index
-    If pair is equal to 0:
-        Return negative 1
-    End If
-
-    Note: Get block_id from pair (offset 8)
-    Let block_id be proc memory_get_int64 from Layout with pair, 8
-    Return block_id
+    Return total_count
 End Process

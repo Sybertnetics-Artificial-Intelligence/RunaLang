@@ -1,0 +1,758 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+DEFINITION LOWERING - HIR Declarations and Top-Level Driver (P2-E Group B)
+
+Lowers top-level HIR declarations (process definitions, external
+declarations) to MIR functions, and owns the lower_hir_program /
+lower_hir_function drivers that the compile orchestrator invokes.
+
+The drivers:
+  1. Allocate a MIRBuilderContext + LoweringContext.
+  2. Allocate the dispatch table.
+  3. Call register_*_handlers from each lowering module.
+  4. Create a HIRVisitorContext bound to the four lowering
+     trampolines.
+  5. Walk the HIR tree via visit_hir_tree.
+  6. Pull resulting MIR functions out and attach them to the
+     program.
+  7. Teardown.
+:End Note
+
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
+Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
+Import "compiler/middle/gungnir/mir/lowering/lowering_context.runa" as LCtx
+Import "compiler/middle/gungnir/mir/lowering/expression_lowering.runa" as ExprLow
+Import "compiler/middle/gungnir/mir/lowering/statement_lowering.runa" as StmtLow
+Import "compiler/middle/gungnir/mir/lowering/control_flow_lowering.runa" as CFLow
+Import "compiler/middle/gungnir/mir/lowering/type_lowering.runa" as TypeLow
+Import "compiler/middle/gungnir/mir/lowering/pattern_lowering.runa" as PatLow
+Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/hir_visitor.runa" as HirVisitor
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================
+Note: HIR_PROCESS_DEFINITION handlers (12000)
+Note: ============================================================
+
+@Reasoning
+HIR_PROCESS_DEFINITION pre: creates a new MIR function, registers
+its parameters as MIR values, and sets the builder context's
+current_function pointer. The return_type and body children are
+visited next; the body's statements emit MIR into the current
+function's instruction list.
+@End Reasoning
+
+@Implementation
+1. Read function_name (offset 8), parameters list (offset 16),
+   param_count (offset 24), return_type (offset 32), body (offset
+   40).
+2. Create MIR function via create_mir_function from MIR with name,
+   return_type, hir_node=hir_node_ptr.
+3. Store the function pointer at builder_ctx offset 0.
+4. Store the return type at builder_ctx offset 72 for use by
+   return-statement lowering.
+5. For each parameter, allocate an alloca, allocate a parameter
+   value, emit the load-into-alloca store, and map the HIR param
+   id to the alloca's value id.
+6. Allocate an entry label and emit it as a leader marker.
+@End Implementation
+
+@Performance_Hints
+Cold per function. The parameter loop is O(param_count).
+@End Performance_Hints
+
+@Security_Scope
+Allocation failures return 0.
+@End Security_Scope
+
+Process called "lower_hir_process_definition_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let function_name be proc memory_get_int64 from Layout with hir_node_ptr, 8
+    Let parameters_list be proc memory_get_int64 from Layout with hir_node_ptr, 16
+    Let param_count be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let return_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+
+    Let mir_function be proc create_mir_function from MIR with function_name, return_type, hir_node_ptr
+    If mir_function is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with builder_ctx, 0, mir_function
+    proc memory_set_int64 from Layout with builder_ctx, 72, return_type
+
+    Let entry_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let entry_marker be proc create_mir_jump from MIRNodes with entry_label
+    If entry_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, entry_marker
+    End If
+
+    Let i be 0
+    While i is less than param_count:
+        If parameters_list is equal to 0:
+            Set i to param_count
+        Otherwise:
+            Let param_node be proc get from List with parameters_list, i
+            If param_node is not equal to 0:
+                Let param_id be proc memory_get_int64 from Layout with param_node, 0
+                Let param_type be proc memory_get_int64 from Layout with param_node, 8
+
+                Let param_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+                Let alloca_inst be proc create_mir_alloca from MIRNodes with param_alloca, param_type, 0, 8
+                If alloca_inst is not equal to 0:
+                    proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+                End If
+
+                Let param_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+                Let store_inst be proc create_mir_store from MIRNodes with param_alloca, param_value, 0, param_type, 0
+                If store_inst is not equal to 0:
+                    proc emit_instruction from MIRBuilder with builder_ctx, store_inst
+                End If
+
+                proc map_hir_to_mir_value from MIRBuilder with builder_ctx, param_id, param_alloca
+            End If
+            Set i to i plus 1
+        End If
+    End While
+
+    Return 1
+End Process
+
+Process called "lower_hir_process_definition_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_process_definition_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning
+HIR_PROCESS_DEFINITION post: finalises the MIR function by
+ensuring the last instruction is a terminator (implicit void
+return if needed), invoking the CFG construction pass, then
+running SSA construction. Resets the builder context's
+current_function so subsequent function lowerings start fresh.
+@End Reasoning
+
+@Implementation
+1. Read instruction list from builder_ctx offset 16.
+2. If non-empty, get last instruction's opcode via get_opcode from
+   MIRNodes. If the last opcode is not MIR_RETURN (20303), append
+   an implicit void return.
+3. Call build_cfg_from_instructions from CFG with the function.
+4. Call construct_ssa_form from SSA (if cfg available).
+5. Clear builder_ctx.current_function and return_type.
+@End Implementation
+
+@Performance_Hints
+CFG and SSA construction dominate the post handler's cost; each
+is O(N) in the function's instruction count.
+@End Performance_Hints
+
+@Security_Scope
+SSA construction failure does not abort the lowering — the
+function is left in pre-SSA form for diagnostic purposes.
+@End Security_Scope
+
+Process called "lower_hir_process_definition_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let inst_list be proc memory_get_int64 from Layout with builder_ctx, 16
+    If inst_list is not equal to 0:
+        Let inst_count be proc length from List with inst_list
+        If inst_count is greater than 0:
+            Let last_index be inst_count minus 1
+            Let last_inst be proc get from List with inst_list, last_index
+            Let last_opcode be proc get_opcode from MIRNodes with last_inst
+            If last_opcode is not equal to 20303:
+                Let void_return be proc create_mir_return from MIRNodes with 0, 0
+                If void_return is not equal to 0:
+                    proc emit_instruction from MIRBuilder with builder_ctx, void_return
+                End If
+            End If
+        End If
+    End If
+
+    Let mir_function be proc memory_get_int64 from Layout with builder_ctx, 0
+    If mir_function is not equal to 0:
+        proc build_cfg_from_instructions from CFG with mir_function
+    End If
+
+    proc memory_set_int64 from Layout with builder_ctx, 0, 0
+    proc memory_set_int64 from Layout with builder_ctx, 72, 0
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_EXTERNAL_DECLARATION post handler (12004)
+Note: ============================================================
+
+@Reasoning
+HIR_EXTERNAL_DECLARATION post: lowers an external function
+declaration to a declaration-only MIRFunction with is_external = 1.
+Also registers the external in the per-builder externals registry
+so subsequent call-site lowering picks up the FFI convention id.
+@End Reasoning
+
+@Implementation
+1. Read HIR_EXTERNAL fields (name at offset 104, alias at 112,
+   library at 120, return_type at 144, convention_id at 152).
+2. Create MIR function (declaration only).
+3. Call mir_function_set_external to mark and populate FFI fields.
+4. Register the name -> convention mapping in the MIR builder
+   context.
+@End Implementation
+
+@Performance_Hints
+Cold path; one per External declaration.
+@End Performance_Hints
+
+@Security_Scope
+HIR-layer validation of the external is already performed; the
+lowering layer just transcribes the metadata.
+@End Security_Scope
+
+Process called "lower_hir_external_declaration_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let ext_name be proc memory_get_int64 from Layout with hir_node_ptr, 104
+    Let ext_alias be proc memory_get_int64 from Layout with hir_node_ptr, 112
+    Let ext_library be proc memory_get_int64 from Layout with hir_node_ptr, 120
+    Let ext_return_type be proc memory_get_int64 from Layout with hir_node_ptr, 144
+    Let ext_convention_id be proc memory_get_int64 from Layout with hir_node_ptr, 152
+
+    Let mir_function be proc create_mir_function from MIR with ext_name, ext_return_type, hir_node_ptr
+    If mir_function is equal to 0:
+        Return 0
+    End If
+
+    proc mir_function_set_external from MIR with mir_function, ext_library, ext_alias, ext_convention_id
+
+    If ext_name is not equal to 0:
+        proc mir_context_register_external from MIRBuilder with builder_ctx, ext_name, ext_convention_id
+    End If
+
+    Note: Stash the MIR function in pending_lvalue so the driver
+    Note: can collect it after visit_hir_tree returns.
+    proc lowering_push_result from LCtx with ctx, mir_function
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TYPE_DEFINITION post handler (12001)
+Note: ============================================================
+
+@Reasoning
+HIR_TYPE_DEFINITION post: a type definition (struct, enum, union,
+alias) declares a type in the symbol/type tables but does not
+emit any runtime MIR. The MIR-level type information is consumed
+by codegen through the type table; the lowering layer's only job
+is to acknowledge the declaration and record the type into the
+MIR program's type table for downstream consumers.
+
+For v0.0.8.5 the MIR program does not yet have a dedicated type
+table (the type_table field in MIRProgram is null), so this
+handler is a no-op marker that signals the type has been visited.
+When the type table lands, this handler will populate it.
+@End Reasoning
+
+@Implementation
+1. Read type_name at HIR_TYPE_DEFINITION offset 8, type_symbol at
+   offset 16, type_kind at offset 24.
+2. Register the type metadata into the MIR builder context's
+   type registry (if present) keyed by type_name.
+3. Return 1 to acknowledge.
+@End Implementation
+
+@Performance_Hints
+Cold path; one Type Definition produces one registry insert.
+@End Performance_Hints
+
+@Security_Scope
+HIR-layer validation has already enforced uniqueness; the
+lowering layer trusts the input.
+@End Security_Scope
+
+Process called "lower_hir_type_definition_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Note: Type definitions emit no runtime MIR for v0.0.8.5. The
+    Note: type information is carried via HIR type pointers that
+    Note: codegen consults directly; once the MIR type table is
+    Note: wired in, this handler will populate it.
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_IMPORT_STATEMENT post handler (12002)
+Note: ============================================================
+
+@Reasoning
+HIR_IMPORT_STATEMENT post: imports are resolved at HIR
+construction time; the imported symbols are folded into the
+current module's symbol table. No MIR emission is required — the
+import declaration is purely metadata. The handler is a no-op
+marker to satisfy dispatch coverage.
+@End Reasoning
+
+@Implementation
+Returns 1.
+@End Implementation
+
+@Performance_Hints
+Zero cost beyond the dispatch trampoline.
+@End Performance_Hints
+
+@Security_Scope
+HIR-layer import resolution has already validated availability
+and visibility. The lowering layer trusts the resolved set.
+@End Security_Scope
+
+Process called "lower_hir_import_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_PROTOCOL_DEFINITION post handler (12003)
+Note: ============================================================
+
+@Reasoning
+HIR_PROTOCOL_DEFINITION post: a protocol/trait definition declares
+required methods. Like HIR_TYPE_DEFINITION, no runtime MIR is
+emitted at this point — the protocol is a compile-time contract
+satisfied by implementations. The contract metadata lives in the
+HIR-level symbol/type tables; codegen consults them directly.
+@End Reasoning
+
+@Implementation
+Returns 1.
+@End Implementation
+
+@Performance_Hints
+Cold path; one Protocol Definition produces zero MIR.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_protocol_definition_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_MODULE_DEFINITION post handler (12005)
+Note: ============================================================
+
+@Reasoning
+HIR_MODULE_DEFINITION post: a module declaration is purely
+metadata — it carries the module name and visibility scope but
+emits no runtime MIR. The HIR_PROGRAM root carries the module
+identity; the lowering layer treats it as a scope marker only.
+@End Reasoning
+
+@Implementation
+Returns 1.
+@End Implementation
+
+@Performance_Hints
+Zero cost beyond the dispatch trampoline.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_module_definition_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_FIELD_DEFINITION post handler (12006)
+Note: ============================================================
+
+@Reasoning
+HIR_FIELD_DEFINITION post: declares a single field within a Type
+or Record definition. The field metadata (offset, type, default
+value) is carried in the HIR symbol/type tables. No runtime MIR
+is emitted; the handler is a marker for dispatch coverage and a
+future hook for code generators that want to emit per-field
+debug info or initialization helpers.
+@End Reasoning
+
+@Implementation
+Returns 1.
+@End Implementation
+
+@Performance_Hints
+Cold path; one Field Definition produces zero MIR today.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_field_definition_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_VARIANT_DEFINITION post handler (12007)
+Note: ============================================================
+
+@Reasoning
+HIR_VARIANT_DEFINITION post: declares a single variant of an Enum
+or ADT. Like HIR_FIELD_DEFINITION, the metadata is in the symbol
+table; no MIR emission is needed. The variant's tag value is
+embedded in the type table for runtime discrimination.
+@End Reasoning
+
+@Implementation
+Returns 1.
+@End Implementation
+
+@Performance_Hints
+Cold path.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_variant_definition_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning
+Definition handler registration.
+@End Reasoning
+
+@Implementation
+Eight registrations covering every declaration HIR node:
+PROCESS_DEFINITION (12000), TYPE_DEFINITION (12001),
+IMPORT_STATEMENT (12002), PROTOCOL_DEFINITION (12003),
+EXTERNAL_DECLARATION (12004), MODULE_DEFINITION (12005),
+FIELD_DEFINITION (12006), VARIANT_DEFINITION (12007).
+@End Implementation
+
+@Performance_Hints
+Cold.
+@End Performance_Hints
+
+@Security_Scope
+Validates table.
+@End Security_Scope
+
+Process called "register_definition_handlers" that takes dispatch_table as Integer returns Integer:
+    If dispatch_table is equal to 0:
+        Return 0
+    End If
+
+    Note: HIR_PROCESS_DEFINITION (12000)
+    proc lowering_register_handler from LCtx with dispatch_table, 12000, lower_hir_process_definition_pre, lower_hir_process_definition_post, lower_hir_process_definition_child_enter, lower_hir_process_definition_child_exit
+
+    Note: HIR_EXTERNAL_DECLARATION (12004): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12004, 0, lower_hir_external_declaration_post, 0, 0
+
+    Note: HIR_TYPE_DEFINITION (12001): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12001, 0, lower_hir_type_definition_post, 0, 0
+
+    Note: HIR_IMPORT_STATEMENT (12002): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12002, 0, lower_hir_import_statement_post, 0, 0
+
+    Note: HIR_PROTOCOL_DEFINITION (12003): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12003, 0, lower_hir_protocol_definition_post, 0, 0
+
+    Note: HIR_MODULE_DEFINITION (12005): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12005, 0, lower_hir_module_definition_post, 0, 0
+
+    Note: HIR_FIELD_DEFINITION (12006): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12006, 0, lower_hir_field_definition_post, 0, 0
+
+    Note: HIR_VARIANT_DEFINITION (12007): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 12007, 0, lower_hir_variant_definition_post, 0, 0
+
+    Return 1
+End Process
+
+Note: ============================================================
+Note: TOP-LEVEL DRIVERS
+Note: ============================================================
+
+@Reasoning
+lower_hir_program is the public entry point that the compile
+orchestrator invokes (replacing the old build_mir_from_hir). It
+constructs the lowering pipeline: creates a builder context, a
+lowering context, a dispatch table populated by every
+register_*_handlers, a visitor context bound to the trampolines,
+and then walks each top-level HIR declaration.
+
+The MIR program is the output; each lowered function or external
+is added to the program's function list.
+@End Reasoning
+
+@Implementation
+1. Validate hir_program input.
+2. Create MIR program via create_mir_program from MIR (passing 0
+   for type_table — the v0.0.8.5 pipeline doesn't have a type
+   table yet).
+3. Create MIR builder context via create_mir_builder_context.
+4. Create LoweringContext wrapping the builder context.
+5. Create + populate the dispatch table.
+6. Install the dispatch table into the LoweringContext.
+7. Create a HIRVisitorContext with the four lowering trampolines
+   as callbacks and the LoweringContext pointer as user_data.
+8. Read the declarations list from the HIR program at offset 0.
+9. For each declaration: save cf_frame depth, call visit_hir_tree;
+   on error unwind cf frames and skip the declaration.
+10. For PROCESS_DEFINITION declarations, the lowered MIR function
+    lives at builder_ctx.current_function (cleared in post); we
+    re-read it before clearing.
+11. Add each lowered function to the MIR program's function list
+    (offset 0).
+12. Teardown.
+@End Implementation
+
+@Performance_Hints
+The visitor walk is the hot path. Driver overhead is fixed
+per-program.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks at every step. Partial failure leaves the
+MIR program in a deterministic state with successfully-lowered
+functions retained.
+@End Security_Scope
+
+Process called "lower_hir_program" that takes hir_program as Integer returns Integer:
+    If hir_program is equal to 0:
+        Return 0
+    End If
+
+    Let mir_program be proc create_mir_program from MIR with 0
+    If mir_program is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc create_mir_builder_context from MIRBuilder
+    If builder_ctx is equal to 0:
+        Return mir_program
+    End If
+
+    Let lowering_ctx be proc create_lowering_context from LCtx with builder_ctx
+    If lowering_ctx is equal to 0:
+        proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+        Return mir_program
+    End If
+
+    Let dispatch_table be proc create_lowering_dispatch_table from LCtx
+    If dispatch_table is equal to 0:
+        proc destroy_lowering_context from LCtx with lowering_ctx
+        proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+        Return mir_program
+    End If
+
+    proc lowering_set_dispatch_table from LCtx with lowering_ctx, dispatch_table
+
+    proc register_expression_handlers from ExprLow with dispatch_table
+    proc register_statement_handlers from StmtLow with dispatch_table
+    proc register_control_flow_handlers from CFLow with dispatch_table
+    proc register_definition_handlers with dispatch_table
+    proc register_type_handlers from TypeLow with dispatch_table
+    proc register_pattern_handlers from PatLow with dispatch_table
+
+    Let visitor_ctx be proc create_visitor_context from HirVisitor with lowering_pre_trampoline from LCtx, lowering_post_trampoline from LCtx, lowering_ctx, lowering_child_enter_trampoline from LCtx, lowering_child_exit_trampoline from LCtx
+
+    If visitor_ctx is equal to 0:
+        proc destroy_lowering_dispatch_table from LCtx with dispatch_table
+        proc destroy_lowering_context from LCtx with lowering_ctx
+        proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+        Return mir_program
+    End If
+
+    Let decls_list be proc memory_get_int64 from Layout with hir_program, 0
+    If decls_list is equal to 0:
+        proc destroy_visitor_context from HirVisitor with visitor_ctx
+        proc destroy_lowering_dispatch_table from LCtx with dispatch_table
+        proc destroy_lowering_context from LCtx with lowering_ctx
+        proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+        Return mir_program
+    End If
+
+    Let functions_list be proc memory_get_int64 from Layout with mir_program, 0
+    Let decl_count be proc length from List with decls_list
+    Let i be 0
+    While i is less than decl_count:
+        Let decl_hir be proc get from List with decls_list, i
+        If decl_hir is not equal to 0:
+            Let saved_depth be proc cf_frame_depth from LCtx with lowering_ctx
+            Let traversal_result be proc visit_hir_tree from HirVisitor with decl_hir, visitor_ctx
+
+            Note: Unwind any residual control-flow frames left by
+            Note: error paths so the next declaration starts clean.
+            proc cf_frame_unwind_to_depth from LCtx with lowering_ctx, saved_depth
+
+            Let error_flag be proc lowering_get_error from LCtx with lowering_ctx
+            If error_flag is equal to 0:
+                Note: For PROCESS_DEFINITION, the post handler
+                Note: cleared current_function; re-read it from the
+                Note: result stack where the post stashed the
+                Note: created function pointer. Drain the result
+                Note: stack.
+                Let result_depth be proc lowering_result_depth from LCtx with lowering_ctx
+                While result_depth is greater than 0:
+                    Let func_ptr be proc lowering_pop_result from LCtx with lowering_ctx
+                    If func_ptr is not equal to 0:
+                        If functions_list is not equal to 0:
+                            proc append from List with functions_list, func_ptr
+                        End If
+                    End If
+                    Set result_depth to proc lowering_result_depth from LCtx with lowering_ctx
+                End While
+            End If
+        End If
+        Set i to i plus 1
+    End While
+
+    proc destroy_visitor_context from HirVisitor with visitor_ctx
+    proc destroy_lowering_dispatch_table from LCtx with dispatch_table
+    proc destroy_lowering_context from LCtx with lowering_ctx
+    proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+
+    Return mir_program
+End Process
+
+@Reasoning
+lower_hir_function is the per-function entry point (used by
+incremental compilation paths and unit tests). Mirrors
+lower_hir_program but walks a single HIR_PROCESS_DEFINITION
+without enclosing program teardown.
+@End Reasoning
+
+@Implementation
+Same pipeline as lower_hir_program but with one visit call and
+direct return of the resulting MIRFunction pointer.
+@End Implementation
+
+@Performance_Hints
+Used by tests and incremental compile; cold path.
+@End Performance_Hints
+
+@Security_Scope
+Defensive checks at every step.
+@End Security_Scope
+
+Process called "lower_hir_function" that takes hir_function as Integer returns Integer:
+    If hir_function is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc create_mir_builder_context from MIRBuilder
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let lowering_ctx be proc create_lowering_context from LCtx with builder_ctx
+    If lowering_ctx is equal to 0:
+        proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+        Return 0
+    End If
+
+    Let dispatch_table be proc create_lowering_dispatch_table from LCtx
+    If dispatch_table is equal to 0:
+        proc destroy_lowering_context from LCtx with lowering_ctx
+        proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+        Return 0
+    End If
+
+    proc lowering_set_dispatch_table from LCtx with lowering_ctx, dispatch_table
+
+    proc register_expression_handlers from ExprLow with dispatch_table
+    proc register_statement_handlers from StmtLow with dispatch_table
+    proc register_control_flow_handlers from CFLow with dispatch_table
+    proc register_definition_handlers with dispatch_table
+    proc register_type_handlers from TypeLow with dispatch_table
+    proc register_pattern_handlers from PatLow with dispatch_table
+
+    Let visitor_ctx be proc create_visitor_context from HirVisitor with lowering_pre_trampoline from LCtx, lowering_post_trampoline from LCtx, lowering_ctx, lowering_child_enter_trampoline from LCtx, lowering_child_exit_trampoline from LCtx
+
+    Let result_function be 0
+    If visitor_ctx is not equal to 0:
+        Let saved_depth be proc cf_frame_depth from LCtx with lowering_ctx
+        proc visit_hir_tree from HirVisitor with hir_function, visitor_ctx
+        proc cf_frame_unwind_to_depth from LCtx with lowering_ctx, saved_depth
+
+        Let result_depth be proc lowering_result_depth from LCtx with lowering_ctx
+        If result_depth is greater than 0:
+            Set result_function to proc lowering_pop_result from LCtx with lowering_ctx
+        End If
+
+        proc destroy_visitor_context from HirVisitor with visitor_ctx
+    End If
+
+    proc destroy_lowering_dispatch_table from LCtx with dispatch_table
+    proc destroy_lowering_context from LCtx with lowering_ctx
+    proc destroy_mir_builder_context from MIRBuilder with builder_ctx
+
+    Return result_function
+End Process

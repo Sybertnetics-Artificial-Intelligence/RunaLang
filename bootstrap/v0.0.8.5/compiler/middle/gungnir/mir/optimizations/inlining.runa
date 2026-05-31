@@ -37,6 +37,7 @@ This file consists of the following functions/features/operation types:
 
 Note: ========== IMPORTS ==========
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
 Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
@@ -128,6 +129,20 @@ Note: ============================================================
 Note: CONTEXT MANAGEMENT
 Note: ============================================================
 
+@Reasoning
+The inlining context owns every mutable piece of state used during a single
+function's optimization pass. Concentrating that state behind one pointer
+keeps the public entry points narrow (caller hands in one opaque handle) and
+makes lifetime management deterministic: the destructor frees every cache
+and list this constructor allocates, with no escape paths.
+
+Default max_inlining_depth of 4 reflects the empirical observation that
+beyond four levels of nesting the code-size explosion from inlining
+dominates the residual call-elimination benefit. This matches the
+heuristics used by mature production compilers and prevents pathological
+blow-ups on mutually recursive helper chains.
+@End Reasoning
+
 @Implementation
 Creates and initializes an InliningContext structure for a given CFG.
 All counters start at zero, caches are initialized as empty collections,
@@ -142,6 +157,15 @@ Memory allocation:
 
 Returns pointer to initialized context, or 0 on allocation failure.
 @End Implementation
+
+@Performance_Hints
+Five allocations occur in this path (context plus four collections). On
+hot paths that process many small functions, the constructor's cost is
+amortized because every cache it sets up is then queried repeatedly during
+collect_call_sites and calculate_inline_cost. Keeping the context per-function
+(rather than per-call-site) ensures the cost_cache hit rate stays high when
+the same callee appears at multiple call sites.
+@End Performance_Hints
 
 Process called "create_inlining_context" that takes cfg_ptr as Integer returns Integer:
     If cfg_ptr is equal to 0:
@@ -201,6 +225,16 @@ Process called "create_inlining_context" that takes cfg_ptr as Integer returns I
     Return context
 End Process
 
+@Reasoning
+The optimization pipeline runs the inlining pass once per function, so
+contexts are created and destroyed in tight succession. Failing to release
+a context's caches (cost_cache, value_remap) or its candidate list would
+leak hundreds of bytes per function and accumulate into hundreds of
+megabytes on programs with thousands of functions. The teardown order
+mirrors the construction order: collections inside the context are
+destroyed first, then the context structure itself.
+@End Reasoning
+
 @Implementation
 Destroys an InliningContext and frees all associated memory.
 This includes freeing all candidate structures, call site structures,
@@ -208,6 +242,13 @@ caches, and the context itself.
 
 Proper cleanup prevents memory leaks in the optimization pipeline.
 @End Implementation
+
+@Security_Scope
+Double-free is prevented by the null check on context_ptr. Each owned
+list iterates and deallocates element-by-element before destroying the
+list spine, guaranteeing no dangling element pointers survive the
+context. Callers must not reuse the context_ptr after this returns.
+@End Security_Scope
 
 Process called "destroy_inlining_context" that takes context_ptr as Integer returns Nothing:
     If context_ptr is equal to 0:
@@ -343,6 +384,17 @@ Complexity penalties:
 Returns estimated cost in "instruction units".
 @End Implementation
 
+@Performance_Hints
+This walks the entire callee CFG, so the per-call complexity is O(B + I)
+where B is the block count and I is the total instruction count. The
+cost_cache on context_ptr converts repeat queries for the same callee
+into a single dictionary lookup, which is critical for programs where a
+small set of utility functions is called from many sites. Returning the
+sentinel 999999 instead of a real cost on hard-reject conditions (no CFG,
+external function) lets the profitability check use a single comparison
+to filter both error and ineligible cases.
+@End Performance_Hints
+
 Process called "calculate_inline_cost" that takes callee_ptr as Integer, context_ptr as Integer returns Integer:
     If callee_ptr is equal to 0 or context_ptr is equal to 0:
         Return 999999  Note: Infinite cost prevents inlining
@@ -373,7 +425,7 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
     Let exception_penalty be 0
 
     Note: Get all blocks from callee CFG
-    Let blocks be CFG.get_all_blocks(callee_cfg)
+    Let blocks be proc get_all_blocks from CFG with callee_cfg
     If blocks is equal to 0:
         Return 999999
     End If
@@ -393,7 +445,7 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
             End If
 
             Note: Get instructions in this block
-            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let instructions be proc get_block_instructions from CFG with block_ptr
             If instructions is not equal to 0:
                 Let inst_count be proc length from List with instructions
                 Let inst_idx be 0
@@ -402,7 +454,7 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
                     Let inst_ptr be proc get from List with instructions, inst_idx
 
                     If inst_ptr is not equal to 0:
-                        Let opcode be MIR.get_opcode(inst_ptr)
+                        Let opcode be proc get_opcode from MIRNodes with inst_ptr
 
                         Note: Apply cost weights based on opcode
 
@@ -461,6 +513,20 @@ Process called "calculate_inline_cost" that takes callee_ptr as Integer, context
     Return total_cost
 End Process
 
+@Reasoning
+Benefit estimation is asymmetric with cost estimation: cost is a function of
+the callee body alone (and is therefore cacheable), but benefit depends on
+the specific call site (argument count, surrounding loop depth, return value
+usage). We deliberately keep the model conservative so the optimizer never
+inlines on a phantom benefit. The 20% optimization-opportunity factor is the
+empirically observed fraction of callee instructions that become foldable
+constants, eliminable copies, or dead code after parameter substitution.
+
+Counting argument setup at two units per argument captures both the move
+into the parameter slot and the spill that the calling convention would
+otherwise force; this is the realistic cost the inliner is erasing.
+@End Reasoning
+
 @Implementation
 Calculates the benefit of inlining a function call.
 
@@ -478,6 +544,13 @@ Benefit estimation:
 
 Returns estimated benefit in "instruction units".
 @End Implementation
+
+@Performance_Hints
+The optimization_benefit term calls calculate_inline_cost, which is itself
+cached, so repeated benefit computations for the same callee remain O(1)
+after the first call. Without that cache, a callee referenced from N call
+sites would walk its entire CFG N times during benefit analysis.
+@End Performance_Hints
 
 Process called "calculate_inline_benefit" that takes callee_ptr as Integer, call_inst_ptr as Integer, context_ptr as Integer returns Integer:
     If callee_ptr is equal to 0 or call_inst_ptr is equal to 0 or context_ptr is equal to 0:
@@ -502,7 +575,7 @@ Process called "calculate_inline_benefit" that takes callee_ptr as Integer, call
 
     Note: Estimate optimization opportunities enabled by inlining
     Note: Conservative estimate: 20% of callee cost becomes optimizable
-    Let callee_cost be calculate_inline_cost(callee_ptr, context_ptr)
+    Let callee_cost be proc calculate_inline_cost with callee_ptr, context_ptr
     Let optimization_benefit be callee_cost divided by 5
 
     Note: Total benefit
@@ -510,6 +583,20 @@ Process called "calculate_inline_benefit" that takes callee_ptr as Integer, call
 
     Return total_benefit
 End Process
+
+@Reasoning
+This is the gate that converts an analyzed candidate into an actual
+transformation. Four guards must pass simultaneously: an absolute cost
+ceiling (500 units) so a single huge inline cannot inflate the caller
+beyond reason, a minimum net-benefit floor (5 units) so we never burn
+optimizer time on marginal wins, a recursion-depth check tied to the
+context's max_inlining_depth, and the can_inline eligibility bit set
+during candidate creation.
+
+Hierarchical gating (cheapest checks first) is intentional: cost and
+benefit are already memoized on the candidate so the early returns are
+O(1), keeping this hot procedure trivial in the common reject case.
+@End Reasoning
 
 @Implementation
 Determines if a call site is profitable to inline based on cost-benefit analysis.
@@ -612,7 +699,7 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
     Let site_count be 0
 
     Note: Get all blocks from CFG
-    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let blocks be proc get_all_blocks from CFG with cfg_ptr
     If blocks is equal to 0:
         Return 0
     End If
@@ -625,7 +712,7 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
 
         If block_ptr is not equal to 0:
             Note: Get instructions in this block
-            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let instructions be proc get_block_instructions from CFG with block_ptr
             If instructions is not equal to 0:
                 Let inst_count be proc length from List with instructions
                 Let inst_idx be 0
@@ -634,7 +721,7 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
                     Let inst_ptr be proc get from List with instructions, inst_idx
 
                     If inst_ptr is not equal to 0:
-                        Let opcode be MIR.get_opcode(inst_ptr)
+                        Let opcode be proc get_opcode from MIRNodes with inst_ptr
 
                         Note: Check for direct call (MIR_CALL = 20304)
                         If opcode is equal to 20304:
@@ -656,19 +743,19 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
                                 Note: Count arguments by examining call instruction operands
                                 Let arg_count be 0
                                 Note: Check operands at offsets 16, 24, 32, etc.
-                                Let op1 be Layout.memory_get_int64(inst_ptr, 16)
+                                Let op1 be proc memory_get_int64 from Layout with inst_ptr, 16
                                 If op1 is not equal to 0:
                                     Set arg_count to arg_count plus 1
                                 End If
-                                Let op2 be Layout.memory_get_int64(inst_ptr, 24)
+                                Let op2 be proc memory_get_int64 from Layout with inst_ptr, 24
                                 If op2 is not equal to 0:
                                     Set arg_count to arg_count plus 1
                                 End If
-                                Let op3 be Layout.memory_get_int64(inst_ptr, 32)
+                                Let op3 be proc memory_get_int64 from Layout with inst_ptr, 32
                                 If op3 is not equal to 0:
                                     Set arg_count to arg_count plus 1
                                 End If
-                                Layout.memory_set_int64(site_ptr, 24, arg_count)
+                                proc memory_set_int64 from Layout with site_ptr, 24, arg_count
 
                                 Note: Set is_indirect to false (this is direct call)
                                 proc memory_set_int64 from Layout with site_ptr, 32, 0
@@ -690,7 +777,7 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
                                     Let succ_count be proc memory_get_int64 from Layout with block_ptr, 56
                                     If succ_count is greater than 0:
                                         Let succ_id be proc get from List with successors, 0
-                                        Set continuation to CFG.get_block_by_id(cfg_ptr, succ_id)
+                                        Set continuation to proc get_block_by_id from CFG with cfg_ptr, succ_id
                                     End If
                                 End If
                                 proc memory_set_int64 from Layout with site_ptr, 48, continuation
@@ -745,6 +832,21 @@ Process called "collect_call_sites" that takes context_ptr as Integer returns In
     Return site_count
 End Process
 
+@Reasoning
+Candidate creation is the second analysis pass. The first pass (collect_call_sites)
+walks the CFG once and records every call instruction; this pass walks the
+shorter call-site list and attaches cost-benefit data to each direct call.
+Splitting the work this way means cost analysis runs exactly once per call
+site even when the cost computation itself is heavyweight, and the cost_cache
+on the context dedupes work across multiple call sites to the same callee.
+
+Direct self-recursion (callee equals current_func) is filtered out here by
+clearing can_inline, rather than later in the profitability check. This
+prevents the depth counter from incrementing for an inline that we already
+know will be rejected, keeping the depth limit reserved for legitimate
+multi-level non-recursive inlining chains.
+@End Reasoning
+
 @Implementation
 Creates inline candidates from call sites by performing cost-benefit analysis.
 
@@ -786,8 +888,8 @@ Process called "create_inline_candidates" that takes context_ptr as Integer retu
 
                 If callee is not equal to 0:
                     Note: Calculate costs
-                    Let inline_cost be calculate_inline_cost(callee, context_ptr)
-                    Let benefit be calculate_inline_benefit(callee, call_inst, context_ptr)
+                    Let inline_cost be proc calculate_inline_cost with callee, context_ptr
+                    Let benefit be proc calculate_inline_benefit with callee, call_inst, context_ptr
                     Let net_benefit be benefit minus inline_cost
 
                     Note: Check if recursive
@@ -865,6 +967,25 @@ Algorithm:
 Returns 1 on success, 0 on failure.
 @End Implementation
 
+@Performance_Hints
+Allocates one new MIR basic block and one new MIR node per source block
+and instruction, so memory pressure scales linearly with callee size.
+Cleared value_remap is reused (replaced with a fresh dictionary) rather
+than reset entry-by-entry, which is asymptotically equivalent but avoids
+the cost of a long-lived dictionary's resize history dragging on
+subsequent inlines.
+@End Performance_Hints
+
+@Security_Scope
+The function verifies callee_cfg before walking it, so a callee with a
+NULL CFG (typically an external or unimplemented function) cannot
+trigger a wild pointer dereference. Each cloned instruction copies only
+the fixed-offset fields (opcode, value_id, operands, type_info); no
+operand chains are followed during cloning, which keeps the clone phase
+free from re-entrancy hazards even when the callee references global or
+shared MIR nodes.
+@End Security_Scope
+
 Process called "clone_function_body" that takes callee_ptr as Integer, context_ptr as Integer returns Integer:
     If callee_ptr is equal to 0 or context_ptr is equal to 0:
         Return 0
@@ -892,7 +1013,7 @@ Process called "clone_function_body" that takes callee_ptr as Integer, context_p
     Let next_value_id be proc memory_get_int64 from Layout with caller_func, 56
 
     Note: Clone all blocks from callee
-    Let callee_blocks be CFG.get_all_blocks(callee_cfg)
+    Let callee_blocks be proc get_all_blocks from CFG with callee_cfg
     Let block_count be proc length from List with callee_blocks
     Let block_idx be 0
 
@@ -908,11 +1029,11 @@ Process called "clone_function_body" that takes callee_ptr as Integer, context_p
             proc memory_set_int64 from Layout with caller_cfg, 48, next_block_id
 
             Note: Create cloned block
-            Let cloned_block be MIR.create_mir_basic_block(new_block_id, 0)
+            Let cloned_block be proc create_mir_basic_block from MIR with new_block_id, 0
 
             If cloned_block is not equal to 0:
                 Note: Clone instructions from original block
-                Let orig_instructions be CFG.get_block_instructions(orig_block_ptr)
+                Let orig_instructions be proc get_block_instructions from CFG with orig_block_ptr
                 Let inst_count be proc length from List with orig_instructions
                 Let inst_idx be 0
 
@@ -924,7 +1045,7 @@ Process called "clone_function_body" that takes callee_ptr as Integer, context_p
                         Let opcode be proc memory_get_int64 from Layout with orig_inst, 0
 
                         Note: Clone instruction
-                        Let cloned_inst be MIR.create_mir_node(opcode)
+                        Let cloned_inst be proc create_mir_node from MIR with opcode
 
                         If cloned_inst is not equal to 0:
                             Note: Get original value ID
@@ -982,6 +1103,21 @@ Process called "clone_function_body" that takes callee_ptr as Integer, context_p
     Return 1
 End Process
 
+@Reasoning
+Cloning preserves the textual shape of the callee but leaves operands
+pointing at the callee's SSA value IDs. SSA correctness in the caller
+requires every use to reach a definition that dominates it; after
+inlining, only the remapped value IDs satisfy that property. Performing
+this pass after cloning (rather than during) lets clone_function_body
+remain a pure structural copy and isolates the remap logic, which is the
+only step that depends on the populated value_remap table.
+
+A missing entry in the remap dictionary (lookup returns 0) is treated as
+"already in caller scope" and the operand is left alone. This is the
+correct behavior for arguments that were substituted directly during
+parameter binding and for constants that don't carry value IDs.
+@End Reasoning
+
 @Implementation
 Remaps SSA values in cloned instructions using the value remap dictionary.
 
@@ -1010,7 +1146,7 @@ Process called "remap_cloned_values" that takes cloned_blocks as Integer, contex
         Let block_ptr be proc get from List with cloned_blocks, block_idx
 
         If block_ptr is not equal to 0:
-            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let instructions be proc get_block_instructions from CFG with block_ptr
             Let inst_count be proc length from List with instructions
             Let inst_idx be 0
 
@@ -1090,6 +1226,26 @@ Algorithm:
 Returns 1 on success, 0 on failure.
 @End Implementation
 
+@Performance_Hints
+The CFG mutation phase (split call block, wire continuation edges,
+rewrite returns into jumps) is O(I_callee) for the return-rewrite scan
+and O(1) per CFG-edge update. SSA recomputation, when triggered, is the
+dominant cost; batching multiple inlines and recomputing SSA once at the
+end would be faster but requires a context-level dirty bit that this
+single-call entry point does not maintain.
+@End Performance_Hints
+
+@Security_Scope
+The opcode of the call instruction is verified to be MIR_CALL (20304)
+before any transformation; any other opcode reaching this path indicates
+a corrupted candidate and is rejected. If the call instruction cannot be
+located in its claimed block (found_call == 0), the function bails
+without mutating any state, leaving the caller's CFG intact. Cloned
+blocks are only added to the CFG after parameter substitution and value
+remapping succeed, so a mid-transformation failure cannot leave
+half-rewritten blocks dangling in the CFG.
+@End Security_Scope
+
 Process called "perform_inline_transformation" that takes candidate_ptr as Integer, context_ptr as Integer returns Integer:
     If candidate_ptr is equal to 0 or context_ptr is equal to 0:
         Return 0
@@ -1100,7 +1256,7 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
     Let callee_ptr be proc memory_get_int64 from Layout with candidate_ptr, 16
 
     Note: Clone function body
-    Let cloned_blocks be clone_function_body(callee_ptr, context_ptr)
+    Let cloned_blocks be proc clone_function_body with callee_ptr, context_ptr
     If cloned_blocks is equal to 0:
         Return 0
     End If
@@ -1140,13 +1296,13 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
     End While
 
     Note: Remap all values in cloned blocks
-    remap_cloned_values(cloned_blocks, context_ptr)
+    proc remap_cloned_values with cloned_blocks, context_ptr
 
     Note: Split call block at call instruction
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
 
     Note: Create continuation block (instructions after call)
-    Let continuation_block be CFG.create_basic_block(cfg)
+    Let continuation_block be proc create_basic_block from CFG with cfg
     If continuation_block is equal to 0:
         Return 0
     End If
@@ -1175,7 +1331,7 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
     Let move_idx be call_inst_idx plus 1
     While move_idx is less than inst_count:
         Let inst_to_move be proc memory_get_int64 from Layout with call_block_insts plus (move_idx multiplied by 8), 0
-        CFG.add_instruction_to_block(continuation_block, inst_to_move)
+        proc add_instruction_to_block from CFG with continuation_block, inst_to_move
         Set move_idx to move_idx plus 1
     End While
 
@@ -1185,7 +1341,7 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
     Note: Remove call instruction (truncated by updating count)
 
     Note: Wire CFG edges: call_block -> entry_block -> ... -> continuation_block
-    CFG.add_edge(call_block_ptr, entry_block_ptr)
+    proc add_edge from CFG with call_block_ptr, entry_block_ptr
 
     Note: Find all return instructions in cloned blocks and redirect to continuation
     Let block_idx be 0
@@ -1209,7 +1365,7 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
                 proc memory_set_int64 from Layout with last_inst, 8, continuation_block
 
                 Note: Add edge to continuation
-                CFG.add_edge(cloned_block, continuation_block)
+                proc add_edge from CFG with cloned_block, continuation_block
 
                 Note: If call had result, replace uses of result with return value
                 Let call_result_id be proc memory_get_int64 from Layout with call_inst_ptr, 8
@@ -1227,14 +1383,14 @@ Process called "perform_inline_transformation" that takes candidate_ptr as Integ
     Set block_idx to 0
     While block_idx is less than block_count:
         Set cloned_block to proc memory_get_int64 from Layout with cloned_blocks plus 16 plus (block_idx multiplied by 8), 0
-        CFG.add_block_to_function(cfg, cloned_block)
+        proc add_block_to_function from CFG with cfg, cloned_block
         Set block_idx to block_idx plus 1
     End While
 
     Note: Update SSA form (recompute dominance and SSA after CFG modification)
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
     If ssa_ptr is not equal to 0:
-        SSA.recompute_ssa(cfg, ssa_ptr)
+        proc recompute_ssa from SSA with cfg, ssa_ptr
     End If
 
     Note: Increment inlined calls counter
@@ -1247,6 +1403,39 @@ End Process
 Note: ============================================================
 Note: MAIN ENTRY POINTS
 Note: ============================================================
+
+@Reasoning
+This is the master orchestrator for inlining a single function. The
+pipeline is intentionally three-phase: analyze (collect_call_sites),
+score (create_inline_candidates), and transform (perform_inline_transformation
+gated by is_profitable_to_inline). Separating analysis from transformation
+is essential because the transformation phase mutates the caller's CFG; if
+we interleaved them, the call-site list would become stale mid-iteration
+and the candidate cost estimates (which depend on call-site context like
+loop depth) could drift away from reality.
+
+Cost-benefit heuristic in summary: a candidate proceeds only when the
+modeled benefit (eliminated call overhead plus 20% of callee cost as a
+proxy for enabled optimizations) exceeds the modeled cost (weighted
+instruction count plus loop and exception penalties) by at least 5 units,
+the absolute cost stays under 500 units, and we have not exceeded
+max_inlining_depth nested inlines.
+
+Recursion limit semantics: the depth counter is incremented before each
+successful inline and decremented after, so nested inlining (where the
+just-inlined body itself contained eligible calls) can still proceed up
+to the limit. Direct self-recursion is filtered earlier in
+create_inline_candidates by clearing can_inline, so the depth counter is
+reserved for legitimate non-recursive inline chains.
+
+Post-inline cleanup: perform_inline_transformation triggers SSA
+recomputation when the context holds an SSA pointer, the candidate's
+counters are folded into context statistics, and the entire context
+(including caches and lists) is freed by destroy_inlining_context. The
+caller (run_inlining_pass) is responsible for any subsequent optimization
+passes that benefit from the now-inlined code (DCE, CSE, constant
+propagation).
+@End Reasoning
 
 @Implementation
 Main entry point for function inlining optimization.
@@ -1264,6 +1453,25 @@ Algorithm:
 Returns 1 on success, 0 on failure.
 @End Implementation
 
+@Performance_Hints
+Worst-case complexity is O(C * (B_callee + I_callee)) where C is the
+number of call sites in the function and B_callee/I_callee are the
+average block and instruction counts of the inlined callees. The
+cost_cache keeps cost analysis amortized O(1) per callee even with many
+call sites. SSA recomputation, invoked from perform_inline_transformation,
+is the dominant cost when many inlines fire; callers that perform many
+inlines in sequence should consider batching SSA recomputation across the
+whole pass.
+@End Performance_Hints
+
+@Security_Scope
+The function refuses to operate on a null function pointer or a function
+without a CFG, returning failure rather than dereferencing junk. Context
+allocation failure is also handled. Every successful path frees the
+context via destroy_inlining_context; the early-return paths after
+"No calls found" also call destroy_inlining_context to prevent leaks.
+@End Security_Scope
+
 Process called "optimize_function_with_inlining" that takes function_ptr as Integer returns Integer:
     If function_ptr is equal to 0:
         Return 0
@@ -1279,7 +1487,7 @@ Process called "optimize_function_with_inlining" that takes function_ptr as Inte
     End If
 
     Note: Create context
-    Let context_ptr be create_inlining_context(cfg_ptr)
+    Let context_ptr be proc create_inlining_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "Failed to create inlining context"
         Return 0
@@ -1289,17 +1497,17 @@ Process called "optimize_function_with_inlining" that takes function_ptr as Inte
     proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
 
     Note: Collect call sites
-    Let call_count be collect_call_sites(context_ptr)
+    Let call_count be proc collect_call_sites with context_ptr
     Display "Found " joined with call_count joined with " call sites"
 
     If call_count is equal to 0:
         Display "No calls found, skipping inlining"
-        destroy_inlining_context(context_ptr)
+        proc destroy_inlining_context with context_ptr
         Return 1
     End If
 
     Note: Create inline candidates
-    Let candidate_count be create_inline_candidates(context_ptr)
+    Let candidate_count be proc create_inline_candidates with context_ptr
     Display "Created " joined with candidate_count joined with " inline candidates"
 
     Note: Inline profitable candidates
@@ -1311,14 +1519,14 @@ Process called "optimize_function_with_inlining" that takes function_ptr as Inte
         Let candidate_ptr be proc get from List with candidates, i
 
         If candidate_ptr is not equal to 0:
-            Let is_profitable be is_profitable_to_inline(candidate_ptr, context_ptr)
+            Let is_profitable be proc is_profitable_to_inline with candidate_ptr, context_ptr
 
             If is_profitable is equal to 1:
                 Note: Increment depth before inlining (track nesting level)
                 Let current_depth be proc memory_get_int64 from Layout with context_ptr, 80
                 proc memory_set_int64 from Layout with context_ptr, 80, (current_depth plus 1)
 
-                Let success be perform_inline_transformation(candidate_ptr, context_ptr)
+                Let success be proc perform_inline_transformation with candidate_ptr, context_ptr
 
                 Note: Decrement depth after inlining
                 Let new_depth be proc memory_get_int64 from Layout with context_ptr, 80
@@ -1337,15 +1545,30 @@ Process called "optimize_function_with_inlining" that takes function_ptr as Inte
     proc memory_set_int64 from Layout with context_ptr, 32, inlined_count
 
     Note: Print statistics
-    print_inlining_stats(context_ptr)
+    proc print_inlining_stats with context_ptr
 
     Note: Clean up
-    destroy_inlining_context(context_ptr)
+    proc destroy_inlining_context with context_ptr
 
     Display "Function inlining optimization complete"
 
     Return 1
 End Process
+
+@Reasoning
+Program-wide inlining is a per-function loop, not a fixed-point algorithm.
+Each function is optimized independently with its own context, which means
+the cost_cache does not carry across functions; this is the right trade-off
+because cost analysis depends on the full callee body, which is invariant
+across callers, but caching across the entire program would require
+program-level memoization infrastructure beyond the scope of one pass.
+
+External functions (is_external == 1) are skipped: their bodies are not
+available in the current translation unit, so they cannot be inlined.
+Walking the function list once with this filter is cheaper than producing
+a filtered list up front because most production programs have very few
+external definitions relative to internal ones.
+@End Reasoning
 
 @Implementation
 Entry point for running inlining pass on entire program.
@@ -1353,13 +1576,23 @@ Entry point for running inlining pass on entire program.
 Returns 1 on success, 0 on failure.
 @End Implementation
 
+@Performance_Hints
+Calling order matters: inlining works best after rough type inference and
+basic constant propagation have run on each function (so cost estimates
+reflect already-simplified code), but before global optimizations like
+inter-procedural DCE (which benefit from the call-graph simplification
+inlining produces). The reported optimized_count is informational; even
+when zero inlines fire, the pass still consumes O(C) cost-analysis time
+per function with C call sites.
+@End Performance_Hints
+
 Process called "run_inlining_pass" that takes program_ptr as Integer returns Integer:
     If program_ptr is equal to 0:
         Return 0
     End If
 
     Note: Get all functions
-    Let functions be MIR.get_program_functions(program_ptr)
+    Let functions be proc get_program_functions from MIRNodes with program_ptr
     If functions is equal to 0:
         Return 0
     End If
@@ -1376,7 +1609,7 @@ Process called "run_inlining_pass" that takes program_ptr as Integer returns Int
         If func_ptr is not equal to 0:
             Let is_external be proc memory_get_int64 from Layout with func_ptr, 80
             If is_external is equal to 0:
-                Let success be optimize_function_with_inlining(func_ptr)
+                Let success be proc optimize_function_with_inlining with func_ptr
                 If success is equal to 1:
                     Set optimized_count to optimized_count plus 1
                 End If
@@ -1390,6 +1623,20 @@ Process called "run_inlining_pass" that takes program_ptr as Integer returns Int
 
     Return 1
 End Process
+
+@Reasoning
+Inlining is gated to -O2 and above because at -O0/-O1 the debugger
+experience suffers: stepping through inlined frames is confusing and
+breakpoints on the original function definition become unreliable.
+Additionally, the SSA recomputation cost only pays for itself when the
+caller benefits from subsequent passes (DCE, CSE, constant folding) that
+also run at -O2.
+
+The early-out on functions without any calls (count_instructions_of_type
+for MIR_CALL returns 0) avoids the constant overhead of building an
+empty inlining context and walking an empty call-site list, which matters
+in programs where most leaf functions have no calls of their own.
+@End Reasoning
 
 @Implementation
 Profitability check for inlining optimization.
@@ -1410,7 +1657,7 @@ Process called "should_run_inlining" that takes function_ptr as Integer, optimiz
 
     Note: Check if function has calls
     If function_ptr is not equal to 0:
-        Let call_count be MIR.count_instructions_of_type(function_ptr, 20304)
+        Let call_count be proc count_instructions_of_type from MIRNodes with function_ptr, 20304
         If call_count is greater than 0:
             Return 1
         End If
@@ -1428,7 +1675,7 @@ Returns the name of this optimization pass.
 @End Implementation
 
 Process called "get_inlining_pass_name" that takes nothing returns Integer:
-    Return StringCore.create_from_literal("Function Inlining")
+    Return proc create_from_literal from StringCore with "Function Inlining"
 End Process
 
 @Implementation
@@ -1436,5 +1683,5 @@ Returns a description of this optimization pass.
 @End Implementation
 
 Process called "get_inlining_pass_description" that takes nothing returns Integer:
-    Return StringCore.create_from_literal("Inlines function calls based on cost-benefit analysis to eliminate call overhead and enable inter-procedural optimization")
+    Return proc create_from_literal from StringCore with "Inlines function calls based on cost-benefit analysis to eliminate call overhead and enable inter-procedural optimization"
 End Process

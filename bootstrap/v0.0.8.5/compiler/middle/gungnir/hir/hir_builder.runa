@@ -85,6 +85,19 @@ Process called "create_builder_context" returns Integer:
     unsafe-call rejection.
     @End Implementation
 
+    @Performance_Hints
+    Cold path. Called once per compilation unit. Cost is dominated by
+    the four sub-allocations (root scope, scope_stack, error_list, and
+    unsafe_externals dictionary).
+    @End Performance_Hints
+
+    @Security_Scope
+    Trusted constructor — bootstraps every state field with safe defaults
+    so the partial-failure paths can still return cleanly. If any of the
+    four sub-allocations fails, the context is deallocated before
+    returning 0 to prevent a leak from a half-constructed context.
+    @End Security_Scope
+
     Let context_size be 80
     Let context be proc allocate from Layout with context_size
 
@@ -355,6 +368,19 @@ Process called "destroy_builder_context" takes context as Integer returns Intege
     - offset 56: cached_boolean_type
     @End Implementation
 
+    @Performance_Hints
+    Cold path. Called once per compilation unit at teardown. Cost is
+    proportional to the number of scopes + errors + cached types
+    accumulated during lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Trusted destructor — releases every owned resource in a deterministic
+    order so partial-init failures from create_builder_context unwind
+    cleanly. Each per-field null check guards against double-free if a
+    field was never populated.
+    @End Security_Scope
+
     If context is equal to 0:
         Return 0
     End If
@@ -438,6 +464,26 @@ Process called "push_scope" takes context as Integer, scope as Integer returns I
     onto scope stack to maintain proper symbol resolution.
     @End Reasoning
 
+    @Implementation
+    Append the supplied scope pointer to the scope_stack list at offset 8
+    of HIRBuilderContext, then overwrite current_scope (offset 0) to the
+    new top-of-stack. Returns 0 if either pointer is null or the underlying
+    List append fails (which preserves the previous current_scope so the
+    caller can recover without corrupting the stack invariant).
+    @End Implementation
+
+    @Performance_Hints
+    Amortised O(1). One List append (which may reallocate the backing
+    buffer) plus one 8-byte store. Called once per function definition,
+    block statement, match arm, and loop body during AST→HIR lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Builder-internal scope-management surface; never reachable from user
+    code. The validation `scope is equal to 0` rejects malformed callers
+    that would otherwise pollute the scope stack with a null entry.
+    @End Security_Scope
+
     If context is equal to 0:
         Return 0
     End If
@@ -473,6 +519,26 @@ Process called "pop_scope" takes context as Integer returns Integer:
     Exiting lexical scope requires popping from stack and restoring
     parent scope as current.
     @End Reasoning
+
+    @Implementation
+    Read scope_stack from offset 8, refuse to pop if size is less than or
+    equal to 1 (the root scope must never be removed), call List.remove_last,
+    then write the new top-of-stack into current_scope at offset 0. The
+    early refusal on stack_size ≤ 1 is the invariant that keeps the root
+    scope alive for the lifetime of the builder.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One List.remove_last, one List.get for the new top, one 8-byte
+    store. Called once per block exit during AST→HIR lowering; paired
+    one-for-one with push_scope.
+    @End Performance_Hints
+
+    @Security_Scope
+    Builder-internal. The root-scope guard prevents stack underflow even
+    when the AST contains a malformed block-exit sequence; root scope
+    lives until destroy_builder_context releases it.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -512,6 +578,31 @@ End Process
 Process called "get_current_scope" takes context as Integer returns Integer:
     Note: Get current scope from context
 
+    @Reasoning
+    Returns the active lexical scope pointer for symbol-resolution callers.
+    Lowering of identifiers, Let/Set statements, and block entry/exit all
+    branch on the current scope; centralising the read keeps the scope-stack
+    layout (offset 0 of HIRBuilderContext) private to this module.
+    @End Reasoning
+
+    @Implementation
+    Single 8-byte load from offset 0 of the HIRBuilderContext. Returns 0
+    when the context pointer is null; callers treat that as "no active
+    scope" and skip symbol attachment rather than aborting the lowering.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load. Invoked on every identifier and Let/Set lowering
+    pass; hot path for AST→HIR, but the cost is a single load and never
+    allocates.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor on builder-internal state. The current_scope field
+    is mutated only by push_scope/pop_scope; this Process is safe to call
+    from any lowering path regardless of unsafe-depth.
+    @End Security_Scope
+
     If context is equal to 0:
         Return 0
     End If
@@ -530,6 +621,28 @@ Process called "lower_ast_to_hir" takes ast_root as Integer returns Integer:
     Main entry point for AST→HIR conversion. Creates builder context,
     traverses AST, and returns HIR root node.
     @End Reasoning
+
+    @Implementation
+    Allocate a fresh HIRBuilderContext via create_builder_context, dispatch
+    to lower_ast_node on the AST root, then inspect the error_list at
+    offset 32. If errors accumulated during lowering, surface that as a
+    null HIR root so semantic analysis bails out cleanly. The context
+    itself is intentionally not destroyed here — the caller owns it so
+    the HIR can be inspected together with its symbol/type tables before
+    the eventual destroy_builder_context call.
+    @End Implementation
+
+    @Performance_Hints
+    Dominant cost is the recursive lower_ast_node walk (O(AST nodes)).
+    The context allocation amortises across the entire HIR build; the
+    error-list size check at the end is O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Trust boundary between AST and HIR. The null-AST guard rejects empty
+    inputs before any allocation; downstream lowering routines may rely
+    on a non-null ast_root.
+    @End Security_Scope
 
     If ast_root is equal to 0:
         Return 0
@@ -571,6 +684,31 @@ Process called "lower_ast_node" takes context as Integer, ast_node as Integer re
     Central dispatcher examines AST node type and calls specialized
     lowering function for that construct.
     @End Reasoning
+
+    @Implementation
+    Reads the AST node tag at offset 0 plus line/column at offsets 8 and
+    16, then linearly tests against the AST_* constants in tag-range
+    order: expressions (1000-1999), statements (2000-2999), declarations.
+    Returns 0 for any unrecognised tag, which propagates as a null HIR
+    node to the parent dispatch frame. Line/column are read once here and
+    threaded through every specialised lowering call so source-location
+    metadata survives the lowering pass.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path: called for every AST node in the program (one invocation
+    per node, recursive on children inside each specialised lowering).
+    The cost is dominated by the cascade of If comparisons; ordering tests
+    by expected frequency (expressions, then statements, then declarations)
+    keeps the common case short.
+    @End Performance_Hints
+
+    @Security_Scope
+    Both pointer arguments are validated at entry. Unknown node tags
+    return 0 rather than fall through to undefined behaviour, ensuring
+    that a malformed or future-extended AST cannot inject control flow
+    into the HIR builder.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -706,6 +844,27 @@ Process called "lower_literal" takes context as Integer, ast_node as Integer, li
     on literal value type.
     @End Reasoning
 
+    @Implementation
+    Read the literal payload at offsets 40 (value) and 48 (value_type tag)
+    of the AST node, construct an HIR_LITERAL node carrying the same
+    payload, then call infer_literal_type to attach a resolved HIRTypeInfo.
+    The set_hir_node_value/type_info helpers fill the HIR node's value
+    fields; line/column propagate from the AST dispatch frame for source
+    mapping during diagnostics.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path under expression-dense workloads. O(1) excluding the type
+    inference call, which itself is O(1) for built-in literal kinds.
+    No symbol lookup is required because literals do not bind names.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure construction; no side effects on the symbol table or scope stack.
+    Failure to allocate the HIR node returns 0 cleanly so the dispatcher
+    can propagate the error.
+    @End Security_Scope
+
     Note: Get literal value (offset 40) and type (offset 48)
     Let value be proc ast_node_get_value from AST with ast_node
     Let value_type be proc ast_node_get_value_type from AST with ast_node
@@ -737,6 +896,28 @@ Process called "lower_identifier" takes context as Integer, ast_node as Integer,
     Identifiers require symbol table lookup to resolve to variable/function.
     We create HIR identifier node and attach resolved symbol information.
     @End Reasoning
+
+    @Implementation
+    Read the identifier name pointer at offset 40 of the AST node, build
+    an HIR_IDENTIFIER carrying the same string with value_type tag 1
+    (string), then call resolve_symbol against the current scope. When
+    resolution succeeds, attach both the symbol id and the symbol's type
+    info so later passes (semantic, codegen) avoid a second lookup.
+    Unresolved identifiers fall through with the bare HIR node, leaving
+    the resolution diagnostic to the semantic analyser.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path. The dominant cost is resolve_symbol which walks the scope
+    chain; the rest is O(1). Unresolved identifiers still allocate the
+    HIR node so error recovery can continue lowering the parent.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read against the symbol table; never mutates scope. The current
+    scope is fetched via get_current_scope so name capture honours the
+    same lexical boundary the parser observed.
+    @End Security_Scope
 
     Note: Get identifier name (offset 40)
     Let name be proc ast_node_get_value from AST with ast_node
@@ -775,6 +956,28 @@ Process called "lower_binary_expression" takes context as Integer, ast_node as I
     Binary expressions require lowering both operands, type checking,
     and result type inference based on operator and operand types.
     @End Reasoning
+
+    @Implementation
+    Read operator/left/right from the BinaryExpressionNode at offsets
+    80/88/96, recursively lower both operands, then construct an
+    HIR_BINARY_EXPRESSION base node and a specialised HIRBinaryExpression
+    structure (create_hir_binary_expression). Result type is computed via
+    infer_binary_result_type using the lowered operands' attached
+    HIRTypeInfo, then stamped onto the base node for downstream queries.
+    @End Implementation
+
+    @Performance_Hints
+    Recursive: cost dominated by lowering of nested children. Local work
+    is O(1) memory loads plus three allocations (base node, specialised
+    node, optional type). Hot path for any program with arithmetic or
+    boolean expressions.
+    @End Performance_Hints
+
+    @Security_Scope
+    Both operand lowerings are validated before continuing; either
+    failing aborts construction with 0 rather than building a half-formed
+    HIR node. No mutation of the symbol table or scope stack.
+    @End Security_Scope
 
     Note: Get operator and operands from BinaryExpressionNode specialized structure
     Note: operator at offset 80, left at offset 88, right at offset 96
@@ -831,6 +1034,27 @@ Process called "lower_unary_expression" takes context as Integer, ast_node as In
     on operator (!, -, ~, etc.).
     @End Reasoning
 
+    @Implementation
+    Read the operator token from the AST value field and the operand from
+    child slot 0, recursively lower the operand, then create the base
+    HIR_UNARY_EXPRESSION node and call create_hir_unary_expression for the
+    specialised payload. infer_unary_result_type maps (operator, operand
+    type) to the HIR result type; the base node receives the result type
+    when present so peephole optimisations can see the operator semantics.
+    @End Implementation
+
+    @Performance_Hints
+    Recursive: dominated by operand lowering. Local work is O(1). On the
+    specialised-node allocation failure path we still return the base
+    HIR node so the upstream lowering can proceed in degraded mode.
+    @End Performance_Hints
+
+    @Security_Scope
+    Operand lowering is validated before allocation continues. The
+    fallback (return base_hir on specialised allocator failure) keeps the
+    HIR tree well-formed even under low-memory conditions.
+    @End Security_Scope
+
     Note: Get operator from value field and operand from first child
     Note: For unary expressions, operator is stored in value field
     Let operator be proc ast_node_get_value from AST with ast_node
@@ -880,6 +1104,32 @@ Process called "lower_call_expression" takes context as Integer, ast_node as Int
     Call expressions require callee resolution, argument lowering,
     type checking of arguments against parameters, and return type determination.
     @End Reasoning
+
+    @Implementation
+    Read callee/arguments/arg_count from offsets 80/88/96 of the
+    CallExpressionNode. Before lowering, the unsafe-external gate
+    inspects the callee: if it is an AST_IDENTIFIER registered as an
+    unsafe External via hir_context_register_unsafe_external and the
+    current unsafe_depth is 0, lowering is rejected with a diagnostic
+    pushed onto the error_list. Otherwise lower callee, allocate a List
+    of HIR arg nodes, lower each argument, build the HIR_CALL_EXPRESSION
+    base, infer return type via get_function_return_type, and construct
+    the specialised HIRCallExpression with the resolved symbol id.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path: call sites dominate most real programs. Cost is O(args) for
+    argument lowering plus one resolve_function_symbol call when the
+    callee is a bare identifier. The unsafe-external check is a single
+    Dictionary lookup keyed by the interned name pointer.
+    @End Performance_Hints
+
+    @Security_Scope
+    Critical security boundary: this is where the unsafe-External
+    compile-time gate is enforced (P2-D Q4). The depth-0 rejection path
+    is the only place outside-of-Unsafe-Block calls to unsafe externals
+    can be blocked before reaching codegen.
+    @End Security_Scope
 
     Note: Get callee and arguments from CallExpressionNode specialized structure
     Note: callee at offset 80, arguments at offset 88, argument_count at offset 96
@@ -987,6 +1237,28 @@ Process called "lower_function_pointer_expression" takes context as Integer, ast
     The result is a first-class function value.
     @End Reasoning
 
+    @Implementation
+    Read function_name from offset 80 of the FunctionPointerNode, allocate
+    an HIR_FUNCTION_POINTER base node, then call resolve_function_symbol
+    to obtain the function's symbol id. If resolution fails the lowering
+    is aborted (the resolver already emitted the diagnostic). The function
+    type is read from the resolved symbol and threaded into the specialised
+    HIRFunctionPointer node so later passes treat the value as a
+    first-class function reference rather than a generic pointer.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) excluding resolve_function_symbol, which is a single symbol-table
+    lookup. Function-pointer expressions are uncommon in typical Runa code,
+    so this is a cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read against the symbol table. Unresolved function names abort
+    construction rather than fabricate a phantom symbol, which prevents
+    arbitrary integer values from being treated as function pointers.
+    @End Security_Scope
+
     Note: Get function name from FunctionPointerNode specialized structure
     Note: function_name at offset 80
     Let function_name be proc memory_get_int64 from Layout with ast_node, 80
@@ -1038,6 +1310,30 @@ Process called "lower_indirect_call_expression" takes context as Integer, ast_no
     We must lower the function value expression, verify it has function type,
     lower arguments, and determine return type from the function type signature.
     @End Reasoning
+
+    @Implementation
+    Read function_value/arguments/arg_count from offsets 80/88/96 of the
+    IndirectCallNode. Lower the function-value expression first (must
+    yield non-null HIR), then build a List of lowered argument HIR nodes,
+    construct the HIR_INDIRECT_CALL base, derive the return type from the
+    function-value's HIRTypeInfo via get_function_return_type, and assemble
+    the specialised HIRIndirectCall payload. The result type is stamped
+    onto the base so downstream typing queries succeed without a second
+    walk of the function-value type.
+    @End Implementation
+
+    @Performance_Hints
+    O(args) for argument lowering plus the function-value lowering. No
+    symbol resolution is required because the callee is a value, not a
+    name. Less common than direct calls but still a warm path in HOF code.
+    @End Performance_Hints
+
+    @Security_Scope
+    Indirect calls bypass the unsafe-external name registry, so any
+    unsafe-FFI gating must be performed earlier (at function-pointer
+    creation). This Process trusts that the value being called has been
+    typed as a function pointer; the verifier flags non-function values.
+    @End Security_Scope
 
     Note: Get function value and arguments from IndirectCallNode specialized structure
     Note: function_value at offset 80, arguments at offset 88, argument_count at offset 96
@@ -1119,6 +1415,30 @@ Process called "lower_member_expression" takes context as Integer, ast_node as I
     and result type determination from member type.
     @End Reasoning
 
+    @Implementation
+    Read object/property from offsets 80/88 of the MemberExpressionNode,
+    lower the object expression, then look up the property name on the
+    object's HIRTypeInfo via resolve_member_index and resolve_member_type.
+    A negative index indicates an unknown field, which triggers an
+    add_error diagnostic and falls back to index 0 so the HIR stays
+    well-formed for the rest of the pass. The specialised HIRMemberExpression
+    node carries the resolved field index for codegen offset arithmetic.
+    @End Implementation
+
+    @Performance_Hints
+    Two type-table lookups (resolve_member_index + resolve_member_type) per
+    member access. Records dominate by frequency; the lookup walks the
+    record's field list, so cost is O(fields). Worth caching by (type,
+    name) if member access becomes a hotspot.
+    @End Performance_Hints
+
+    @Security_Scope
+    Type-checking surface: unknown members are reported via add_error so
+    the diagnostic stream surfaces them. The fallback index 0 prevents a
+    -1 from being silently propagated to codegen where it would translate
+    into an out-of-bounds memory offset.
+    @End Security_Scope
+
     Note: Get object and property from MemberExpressionNode specialized structure
     Note: object at offset 80, property at offset 88
     Let object_ast be proc memory_get_int64 from Layout with ast_node, 80
@@ -1176,6 +1496,28 @@ Process called "lower_index_expression" takes context as Integer, ast_node as In
     index type validation (must be Integer), and element type extraction.
     @End Reasoning
 
+    @Implementation
+    Read object/index from offsets 80/88 of the IndexExpressionNode, lower
+    both subexpressions, build the HIR_INDEX_EXPRESSION base, then derive
+    the element type from the object's HIRTypeInfo via
+    get_array_element_type. The specialised HIRIndexExpression node is
+    stored back into the base's metadata slot (offset 56) so HIR-walk
+    consumers can recover the structure from any HIR_INDEX_EXPRESSION node.
+    @End Implementation
+
+    @Performance_Hints
+    Two recursive lowerings (object + index) plus one type-lookup. Cost is
+    O(1) at this level; the actual depth is bounded by the subexpression
+    depth. Index expressions are common in array-processing code so this
+    is a warm path.
+    @End Performance_Hints
+
+    @Security_Scope
+    The lowering itself does not verify in-bounds access — that is left
+    to the bounds-check pass — but it guarantees both subexpressions are
+    successfully lowered before constructing the index node.
+    @End Security_Scope
+
     Note: Get object and index from IndexExpressionNode specialized structure
     Note: object at offset 80, index at offset 88
     Let object_ast be proc memory_get_int64 from Layout with ast_node, 80
@@ -1230,6 +1572,30 @@ Process called "lower_let_statement" takes context as Integer, ast_node as Integ
     Let statements introduce new variables into scope. We create symbol,
     add to symbol table, and lower initializer expression with type checking.
     @End Reasoning
+
+    @Implementation
+    Children of the Let AST node are: [name, optional type, optional
+    initializer]. The implementation distinguishes a type child from an
+    expression child by tag-range test (4000-4999 is type, 1000-1999 is
+    expression). Mutability is read from the modifiers field at offset
+    56 (MODIFIER_MUTABLE=1). After lowering, a fresh HIR symbol is
+    interned into the current scope with the resolved type (from the
+    annotation or inferred from the initializer), and an HIR_LET_STATEMENT
+    node carries the (symbol, initializer, is_mutable) triple.
+    @End Implementation
+
+    @Performance_Hints
+    Hot path: every variable declaration goes through here. Cost is one
+    recursive lower of the initializer plus one symbol-table insert. The
+    type-vs-expression heuristic at children is two integer comparisons.
+    @End Performance_Hints
+
+    @Security_Scope
+    Symbol creation surface: adds bindings to the current scope. The
+    immutability default (is_mutable defaults to 0) prevents accidental
+    rebinding unless the AST explicitly carries MODIFIER_MUTABLE. Shadowing
+    is allowed within nested scopes by the standard scope-stack rules.
+    @End Security_Scope
 
     Note: Get variable name, type annotation, and initializer from children
     Note: Let statement structure: child 0 = identifier/name, child 1 = type (optional), child 2 = initializer (optional)
@@ -1333,6 +1699,29 @@ Process called "lower_set_statement" takes context as Integer, ast_node as Integ
     and type compatibility checking between target and value.
     @End Reasoning
 
+    @Implementation
+    Children of the Set AST node are [target, value]. Lower both, then
+    call types_compatible(value_type, target_type) to verify assignment
+    is type-safe; mismatches emit an add_error diagnostic but lowering
+    continues so the AST can be observed by later passes. The target's
+    HIR symbol id is captured so the codegen knows which storage location
+    receives the value, and the specialised HIRSetStatement is stored in
+    the base node's metadata slot (offset 56).
+    @End Implementation
+
+    @Performance_Hints
+    Two recursive lowerings plus one types_compatible call. The
+    compatibility check is the dominant cost when target/value types are
+    composite (records/unions); plain primitive assignments are O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Type compatibility is enforced here; failure surfaces as a diagnostic
+    rather than aborting the build so the compiler can collect multiple
+    errors per pass. Mutability of the target is left to the semantic
+    pass that examines the symbol's MODIFIER_MUTABLE flag.
+    @End Security_Scope
+
     Note: Get target and value from children
     Note: Set statement structure: child 0 = target, child 1 = value
     Let target_ast be proc ast_node_get_child from AST with ast_node, 0
@@ -1390,6 +1779,28 @@ Process called "lower_if_statement" takes context as Integer, ast_node as Intege
     If statements require condition type checking (must be Boolean),
     and lowering of then and optional else branches.
     @End Reasoning
+
+    @Implementation
+    Children are [condition, then_block, optional else_block]. Lower the
+    condition first, verify is_type_boolean — non-boolean conditions emit
+    a localized diagnostic but lowering proceeds so the user sees the
+    surrounding HIR errors too. Then lower the then-block, conditionally
+    lower the else-block based on child_count at offset 32, and assemble
+    HIR_IF_STATEMENT with the specialised HIRIfStatement payload stored
+    in metadata offset 56.
+    @End Implementation
+
+    @Performance_Hints
+    Three recursive lowerings (condition, then, optional else). Local
+    work is O(1). If statements are extremely common, so this is one of
+    the hottest control-flow lowerings.
+    @End Performance_Hints
+
+    @Security_Scope
+    The boolean-condition check is the static guard against unintended
+    coercions (e.g. integer-as-condition); it is enforced as a diagnostic
+    so the parser's intentional-recovery layer can still produce HIR.
+    @End Security_Scope
 
     Note: Get condition, then block, and else block from children
     Note: If statement structure: child 0 = condition, child 1 = then block, child 2 = else block (optional)
@@ -1461,6 +1872,29 @@ Process called "lower_while_statement" takes context as Integer, ast_node as Int
     with increased loop depth for break/continue validation.
     @End Reasoning
 
+    @Implementation
+    Children are [condition, body]. Lower the condition first and verify
+    is_type_boolean; the condition is rebuilt before each iteration so the
+    HIR must preserve the order. Push a fresh SCOPE_LOOP onto the scope
+    stack, increment loop_depth at offset 48 (used by break/continue
+    resolution), lower the body, then unwind the scope and decrement
+    loop_depth. Assemble HIR_WHILE_LOOP with the specialised HIRWhileStatement
+    payload stored at metadata offset 56.
+    @End Implementation
+
+    @Performance_Hints
+    Two recursive lowerings, two scope mutations, two depth-counter
+    updates. Cost is bounded by the depth of the body. Loops are
+    frequent in algorithmic code so this stays on the warm path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Loop-depth tracking is a precondition for valid break/continue
+    lowering inside the body; the increment/decrement pair must remain
+    balanced even on early returns. The boolean-condition check is the
+    static guard against accidental integer conditions.
+    @End Security_Scope
+
     Note: Get condition and body from children
     Note: While statement structure: child 0 = condition, child 1 = body
     Let condition_ast be proc ast_node_get_child from AST with ast_node, 0
@@ -1523,6 +1957,28 @@ Process called "lower_for_statement" takes context as Integer, ast_node as Integ
     For loops introduce iterator variable into scope, require iterable
     type checking, and loop body lowering with new scope.
     @End Reasoning
+
+    @Implementation
+    Children are [iterator name, iterable expression, body]. Lower the
+    iterable first, derive the element type via get_iterable_element_type,
+    push a SCOPE_LOOP, create a symbol for the iterator bound to the
+    element type, lower the body, then unwind scope and loop_depth. The
+    iterator symbol is added to the loop scope so identifier resolution
+    inside the body finds it; the symbol id is also stamped onto the base
+    HIR_FOR_LOOP node so codegen can synthesise the iterator slot.
+    @End Implementation
+
+    @Performance_Hints
+    Two recursive lowerings (iterable + body), one element-type lookup,
+    and one symbol-table insert. Hot path for collection-heavy code.
+    @End Performance_Hints
+
+    @Security_Scope
+    Iterator scope mirrors the lexical structure: the iterator name is
+    only visible inside the loop body, never outside. Loop-depth
+    accounting matches lower_while_statement so break/continue handling
+    is consistent across loop kinds.
+    @End Security_Scope
 
     Note: Get iterator variable, iterable, and body from children
     Note: For statement structure: child 0 = iterator identifier, child 1 = iterable expression, child 2 = body
@@ -1598,6 +2054,30 @@ Process called "lower_return_statement" takes context as Integer, ast_node as In
     against current function return type.
     @End Reasoning
 
+    @Implementation
+    The Return AST node has zero or one child (the value expression).
+    When a value is present, lower it and consult current_function at
+    offset 40 of HIRBuilderContext to obtain the expected return type
+    (stored at offset 48 of HIRProcessDefinition). The actual return type
+    is read from offset 48 of the HIR value node and checked against the
+    expected via types_compatible. A missing value when the function
+    expects non-VOID is itself a diagnostic. The HIR return node carries
+    the value pointer at offset 40.
+    @End Implementation
+
+    @Performance_Hints
+    Cost dominated by the value expression lowering and one
+    types_compatible call (skipped when either type is null). Return
+    statements are O(1) at this level.
+    @End Performance_Hints
+
+    @Security_Scope
+    The return-type compatibility check is the static guard ensuring the
+    caller receives the type the callee's signature promises. Mismatches
+    are reported via add_error but do not abort lowering, allowing the
+    pass to surface multiple issues at once.
+    @End Security_Scope
+
     Note: Get return value from children (may be null for void returns)
     Note: Return statement structure: child 0 = return value (optional)
     Let child_count be proc memory_get_int64 from Layout with ast_node, 32
@@ -1668,6 +2148,29 @@ Process called "lower_match_statement" takes context as Integer, ast_node as Int
     exhaustiveness checking, and type checking of arm bodies for consistency.
     @End Reasoning
 
+    @Implementation
+    Read expression/arms/arm_count from offsets 80/88/96 of the
+    MatchStatementNode. Lower the matched expression once, then iterate
+    every when clause via lower_when_clause, passing the expression's
+    type for pattern type-checking. After all arms are lowered, invoke
+    check_match_exhaustiveness which inspects the matched type
+    (ADT/record/primitive) and the collected patterns to verify total
+    coverage. The HIR_MATCH_STATEMENT base carries the list of lowered
+    arms and the matched value pointer.
+    @End Implementation
+
+    @Performance_Hints
+    Cost is O(arm_count * pattern_complexity). The exhaustiveness check
+    is O(arm_count) for primitives and O(variants * arm_count) for ADTs.
+    Match is common in functional style code so this is a warm path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Exhaustiveness checking is the static guard preventing UB from
+    unmatched values. Missing-arm cases surface as diagnostics so the
+    user must add a wildcard or cover the missing variant before codegen.
+    @End Security_Scope
+
     Note: Get matched expression and when clauses from MatchStatementNode specialized structure
     Note: expression at offset 80, arms (when clauses) at offset 88, arm_count at offset 96
     Let expression_ast be proc memory_get_int64 from Layout with ast_node, 80
@@ -1734,6 +2237,28 @@ Process called "lower_when_clause" takes context as Integer, ast_node as Integer
     new scope for pattern bindings and lower all components.
     @End Reasoning
 
+    @Implementation
+    Pattern/guard/body live at offsets 80/88/96 of the WhenClauseNode. A
+    fresh SCOPE_BLOCK is pushed so pattern bindings are visible only
+    within the arm body and guard; this matches the language semantics
+    where a binding in one arm cannot leak into the next. Pattern is
+    lowered first (binds names), guard is lowered against the now-extended
+    scope, then the body. The HIRWhenClause carries pattern/guard/body
+    references for downstream codegen of decision trees.
+    @End Implementation
+
+    @Performance_Hints
+    Three recursive lowerings (pattern, optional guard, body). Pattern
+    lowering itself is recursive on nested patterns; cost scales with the
+    pattern shape. Scope push/pop is amortised O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Per-arm scope isolation is the security boundary: pattern bindings
+    cannot escape the arm. This also prevents accidental name capture
+    by the surrounding match expression.
+    @End Security_Scope
+
     Note: Get pattern, guard, and body from WhenClauseNode specialized structure
     Note: pattern at offset 80, guard at offset 88, body at offset 96
     Let pattern_ast be proc memory_get_int64 from Layout with ast_node, 80
@@ -1784,6 +2309,31 @@ Process called "lower_pattern" takes context as Integer, ast_node as Integer, ma
     Patterns require type checking against matched expression type,
     binding symbol creation, and nested pattern lowering for complex patterns.
     @End Reasoning
+
+    @Implementation
+    Read the AST pattern tag at offset 0 and dispatch by kind:
+    identifier-pattern creates a SYMBOL_VARIABLE binding in the current
+    scope and emits PATTERN_BINDING; literal-pattern emits PATTERN_LITERAL;
+    wildcard emits HIR_WILDCARD_PATTERN; tuple-pattern recurses on each
+    subpattern with the element types from get_tuple_element_type;
+    record-pattern recurses on each field pattern with field types from
+    get_record_field_type. Each path attaches matched_type to the HIR
+    pattern node so the decision-tree compiler downstream can type-test.
+    @End Implementation
+
+    @Performance_Hints
+    Recursive: cost is O(pattern nodes). Each subpattern incurs one
+    type-element extraction and one create_hir_pattern allocation.
+    Identifier patterns also do a symbol-table insert.
+    @End Performance_Hints
+
+    @Security_Scope
+    Binding patterns are the only path by which match arms introduce new
+    symbols; the per-arm scope set up by lower_when_clause confines them.
+    Type-element extraction relies on matched_type being well-formed; a
+    null type is tolerated and pattern lowering proceeds with no type
+    info attached.
+    @End Security_Scope
 
     If ast_node is equal to 0:
         Return 0
@@ -1926,6 +2476,29 @@ Process called "lower_block_statement" takes context as Integer, ast_node as Int
     Blocks create new lexical scope and lower all contained statements.
     @End Reasoning
 
+    @Implementation
+    Statements list and count live at offsets 24 and 32 of the AST block.
+    Push a fresh SCOPE_BLOCK, allocate the HIR_BLOCK base, then iterate
+    statements: each is lowered via lower_ast_node and appended to the
+    base's children list at offset 24 (the list is lazily created on
+    first append). Child count at offset 32 is incremented per successful
+    append. Scope is unconditionally popped on exit so the block scope
+    never leaks into the parent.
+    @End Implementation
+
+    @Performance_Hints
+    O(N) where N is the statement count, plus the sum of nested lowering
+    costs. The lazy children-list creation avoids an allocation for
+    empty blocks.
+    @End Performance_Hints
+
+    @Security_Scope
+    Per-block scope isolation is the language-level guarantee that
+    variables declared inside a block do not leak to enclosing scope.
+    The unconditional pop_scope on exit preserves this even if a child
+    lowering failed.
+    @End Security_Scope
+
     Note: Get statements from children list
     Let statements_ast be proc memory_get_int64 from Layout with ast_node, 24  Note: children list
     Let statement_count be proc memory_get_int64 from Layout with ast_node, 32  Note: child_count
@@ -2060,6 +2633,31 @@ Process called "lower_process_definition" takes context as Integer, ast_node as 
     body lowering in new scope, and function symbol creation.
     @End Reasoning
 
+    @Implementation
+    Read process_name/parameters/param_count/return_type/body from offsets
+    80/88/96/104/112 of the ProcessDefinitionNode. Lower the return type
+    annotation, create a SYMBOL_FUNCTION binding in the outer scope, push
+    a SCOPE_FUNCTION, set current_function (offset 40) for return-type
+    checks, then iterate parameters: each parameter creates a
+    SYMBOL_PARAMETER bound to its lowered type and is added to the
+    function scope. The body is lowered, the function symbol receives a
+    composite function HIRTypeInfo (return + param types), and the scope
+    is popped before returning the HIR_PROCESS_DEFINITION node.
+    @End Implementation
+
+    @Performance_Hints
+    Cost is O(params) for parameter lowering plus the recursive body
+    lowering, which dominates. One symbol-table insert per parameter,
+    one for the function itself.
+    @End Performance_Hints
+
+    @Security_Scope
+    Function declarations are the entry point for the entire scope
+    chain inside the body. current_function in the context is the link
+    that lets lower_return_statement type-check returns against the
+    correct signature; it is restored on exit.
+    @End Security_Scope
+
     Note: Get process information from ProcessDefinitionNode specialized structure
     Note: name at offset 80, parameters at offset 88, parameter_count at offset 96
     Note: return_type at offset 104, body at offset 112
@@ -2167,6 +2765,29 @@ Process called "lower_type_definition" takes context as Integer, ast_node as Int
     and structure validation.
     @End Reasoning
 
+    @Implementation
+    Read name/body from offsets 80/104 of the TypeDefinitionNode (the
+    body holds field or variant declarations as its children). Create a
+    SYMBOL_TYPE binding in the current scope so subsequent references
+    resolve, then construct an HIR_TYPE_DEFINITION node. Each field
+    becomes a SYMBOL_FIELD with its lowered HIRTypeInfo; fields are
+    appended to the HIR type definition via add_type_field for codegen
+    layout calculation later.
+    @End Implementation
+
+    @Performance_Hints
+    O(fields) for the field lowering loop. One symbol-table insert per
+    field plus one for the type itself. Cold path: types are defined
+    once per file rather than per expression.
+    @End Performance_Hints
+
+    @Security_Scope
+    Type symbols are registered in the current scope, which is
+    typically the module scope. Field names share the type's namespace
+    via the SYMBOL_FIELD kind so they cannot collide with regular
+    variables of the same name elsewhere.
+    @End Security_Scope
+
     Note: Get type information from TypeDefinitionNode specialized structure
     Note: name at offset 80, generic_parameters at offset 88, generic_count at offset 96
     Note: body at offset 104 (contains fields/variants)
@@ -2259,6 +2880,30 @@ Process called "lower_type_annotation" takes context as Integer, type_ast as Int
     Type annotations require resolution to HIRTypeInfo structures,
     handling generics, unions, and complex type expressions.
     @End Reasoning
+
+    @Implementation
+    Inspect the AST type tag at offset 0 and branch by kind: basic types
+    delegate to resolve_basic_type by name; generic types extract the
+    base name and recurse on each type argument; union types collect
+    each alternative recursively; function types lower parameter and
+    return components; array/optional types recurse on the element type.
+    Each branch produces an HIRTypeInfo configured to the matching tag
+    so semantic and codegen passes can switch on type kind without
+    re-parsing.
+    @End Implementation
+
+    @Performance_Hints
+    Recursive: cost proportional to the type expression depth. Plain
+    basic types are O(1) lookups. Generic instantiations and unions are
+    O(N) over their type arguments.
+    @End Performance_Hints
+
+    @Security_Scope
+    Type resolution is a pure read of the symbol table; no scope
+    mutation. Unknown type names propagate as null HIRTypeInfo, which
+    downstream passes report as resolution failures with source
+    location.
+    @End Security_Scope
 
     If type_ast is equal to 0:
         Return 0
@@ -2484,6 +3129,27 @@ Process called "resolve_basic_type" takes context as Integer, type_name as Integ
     built-in type info structures.
     @End Reasoning
 
+    @Implementation
+    Compare type_name against the four built-in names ("Integer",
+    "Float", "String", "Boolean") via string_equals on freshly created
+    strings. On a hit, allocate an HIRTypeInfo with the matching tag and
+    set size/alignment to 8/8 (the common 64-bit ABI representation).
+    Returns 0 on miss so the caller falls through to user-defined type
+    lookup.
+    @End Implementation
+
+    @Performance_Hints
+    Four sequential string comparisons per call; not on a hot loop since
+    it is called once per type annotation. The transient name strings
+    are created each call — a future optimisation could intern them.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure type-table read. Only built-in types are exposed here, so user
+    code cannot subvert the basic-type resolution path by redefining a
+    name.
+    @End Security_Scope
+
     Note: Map type name string to HIRTypeInfo by checking against known basic types
 
     Note: Check if type is Integer
@@ -2536,6 +3202,24 @@ Process called "infer_literal_type" takes context as Integer, value_type as Inte
     Literals have their types directly inferred from their syntactic form.
     @End Reasoning
 
+    @Implementation
+    The AST value_type tag is one of 1=STRING, 2=INTEGER, 3=FLOAT,
+    4=BOOLEAN. For each, allocate a fresh HIRTypeInfo with the matching
+    tag and stamp size/alignment 8/8. The function is intentionally
+    independent of the source literal value: only the syntactic kind is
+    needed, which lets the literal-lowering path stay O(1).
+    @End Implementation
+
+    @Performance_Hints
+    Four integer comparisons; called once per literal. Hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure construction; no side effects. Unrecognised value_type tags
+    return 0 so future literal kinds fall through to the caller's
+    explicit type annotation path rather than receiving a phantom type.
+    @End Security_Scope
+
     Note: Map value type to HIRTypeInfo
     Note: Value types: 1=STRING, 2=INTEGER, 3=FLOAT, 4=BOOLEAN
     If value_type is equal to 2:  Note: INTEGER
@@ -2565,41 +3249,30 @@ Process called "infer_literal_type" takes context as Integer, value_type as Inte
     Return 0
 End Process
 
-Process called "infer_binary_result_type" takes context as Integer, operator as Integer, left_type as Integer, right_type as Integer returns Integer:
-    Note: Infer result type for binary operation
-
-    @Reasoning:
-    Binary operators have specific result types based on operator category
-    and operand types. Arithmetic ops preserve numeric types, comparisons
-    return Boolean, etc.
-    @End Reasoning
-
-    Note: Operator type checking implemented in infer_binary_result_type helper
-
-    If left_type is not equal to 0:
-        Return left_type
-    End If
-
-    Return right_type
-End Process
-
-Process called "infer_unary_result_type" takes context as Integer, operator as Integer, operand_type as Integer returns Integer:
-    Note: Infer result type for unary operation
-
-    @Reasoning:
-    Unary operators typically preserve operand type (-, +) or
-    return Boolean (logical NOT).
-    @End Reasoning
-
-    Return operand_type
-End Process
-
 Process called "create_optional_type" takes context as Integer, inner_type as Integer returns Integer:
     Note: Create optional type wrapper
 
     @Reasoning:
     Optional types wrap inner type with nullability.
     @End Reasoning
+
+    @Implementation
+    Allocate an HIRTypeInfo with kind TYPE_OPTIONAL, attach the inner
+    type via set_type_element_type, mark nullability with
+    set_type_nullability(1), and stamp the size as inner_size + 8 to
+    accommodate the discriminator word alongside the payload.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One HIRTypeInfo allocation plus three small writes.
+    @End Performance_Hints
+
+    @Security_Scope
+    Optional types are how the type system models nullable values;
+    they make missing-value handling explicit. The +8 size accounts for
+    the null discriminator so codegen can lay out the tag in one place
+    rather than scattered through ad-hoc checks.
+    @End Security_Scope
 
     If inner_type is equal to 0:
         Return 0
@@ -2621,53 +3294,6 @@ Process called "create_optional_type" takes context as Integer, inner_type as In
     Return optional_type
 End Process
 
-Process called "get_function_return_type" takes context as Integer, function_type as Integer returns Integer:
-    Note: Extract return type from function type
-
-    @Reasoning:
-    Function types contain return type information that must be extracted
-    for call expression type checking.
-    @End Reasoning
-
-    If function_type is equal to 0:
-        Return 0
-    End If
-
-    Note: Function return type extraction implemented in get_function_return_type helper
-    Return 0
-End Process
-
-Process called "get_array_element_type" takes context as Integer, array_type as Integer returns Integer:
-    Note: Extract element type from array/collection type
-
-    @Reasoning:
-    Array types contain element type that index operations return.
-    @End Reasoning
-
-    If array_type is equal to 0:
-        Return 0
-    End If
-
-    Note: Array element type extraction implemented in get_array_element_type helper
-    Return 0
-End Process
-
-Process called "get_iterable_element_type" takes context as Integer, iterable_type as Integer returns Integer:
-    Note: Extract element type from iterable type for for-loops
-
-    @Reasoning:
-    Iterables (arrays, lists, ranges) have element types that for-loop
-    iterator variables receive.
-    @End Reasoning
-
-    If iterable_type is equal to 0:
-        Return 0
-    End If
-
-    Note: Iterable element type extraction implemented in get_iterable_element_type helper
-    Return 0
-End Process
-
 Note: ============================================================================
 Note: Symbol Resolution
 Note: ============================================================================
@@ -2679,6 +3305,28 @@ Process called "resolve_symbol" takes context as Integer, name as Integer, scope
     Symbol resolution searches current scope and parent scopes for
     matching symbol by name.
     @End Reasoning
+
+    @Implementation
+    For the given scope, walk the three per-scope lists in order:
+    variables at offset 24 (count at 32), functions at offset 40 (count
+    at 48), and types at offset 56 (count at 64). Each list element is
+    an HIRSymbolInfo with its name pointer at offset 8; string_equals
+    matches by content. On miss, recurse into parent_scope at offset 8
+    of the scope record. Returns 0 when the entire chain is exhausted
+    without a match.
+    @End Implementation
+
+    @Performance_Hints
+    O(symbols_in_chain). Hot path: invoked for every identifier in the
+    AST. The three sequential list walks are linear in scope size;
+    nested scopes add to the chain length. A future optimisation would
+    replace the lists with hash tables keyed by name pointer.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read across the scope chain; no mutation. Name shadowing is
+    naturally honoured because nearer scopes are searched first.
+    @End Security_Scope
 
     If name is equal to 0:
         Return 0
@@ -2756,6 +3404,22 @@ Process called "get_symbol_type" takes symbol as Integer returns Integer:
     type checking and inference.
     @End Reasoning
 
+    @Implementation
+    Single 8-byte load from offset 24 of the HIRSymbolInfo. Returns 0
+    when the symbol pointer is null so callers can use the result as
+    a tri-state (no symbol / untyped symbol / typed symbol) without an
+    extra null check.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load. Hot path: every typed expression lowering
+    asks for the type of at least one symbol.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor; never mutates the symbol.
+    @End Security_Scope
+
     If symbol is equal to 0:
         Return 0
     End If
@@ -2772,6 +3436,24 @@ Process called "set_symbol_type" takes symbol as Integer, type_info as Integer r
     Symbols need type information attached during declaration processing.
     @End Reasoning
 
+    @Implementation
+    Single 8-byte store to offset 24 of the HIRSymbolInfo. Returns 1
+    on success and 0 when the symbol pointer is null. Overwrites any
+    existing type info without inspection — callers are responsible for
+    type unification before invoking.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory store. Called once per Let, parameter, field, and
+    type-inferred binding during AST→HIR lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Symbol-internal mutation. The caller must guarantee type_info is
+    a valid HIRTypeInfo pointer (or 0 to clear the slot); no validation
+    is performed here for performance.
+    @End Security_Scope
+
     If symbol is equal to 0:
         Return 0
     End If
@@ -2787,6 +3469,28 @@ Process called "add_symbol_to_scope" takes scope as Integer, symbol as Integer r
     @Reasoning:
     Symbols must be registered in scope for later resolution.
     @End Reasoning
+
+    @Implementation
+    Read the symbol kind from offset 16 of HIRSymbolInfo and route to
+    the matching per-scope list: variables list at offset 24 (count 32)
+    for kind 0/3, functions list at offset 40 (count 48) for kind 1, and
+    types list at offset 56 (count 64) for kind 2. Each insert appends
+    to the matching List and increments the count slot. Splitting by
+    symbol kind keeps resolve_symbol's three-pass lookup focused on the
+    relevant list.
+    @End Implementation
+
+    @Performance_Hints
+    Amortised O(1) per insert (List append). Called once per Let,
+    parameter, field, function, and type definition during lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Scope-internal mutation. The kind-based routing is what guarantees
+    resolve_symbol finds variables in the variables list and types in
+    the types list; misrouting would let a type name shadow a variable
+    or vice versa.
+    @End Security_Scope
 
     If scope is equal to 0:
         Return 0
@@ -2857,6 +3561,25 @@ Process called "get_symbol_id" takes symbol as Integer returns Integer:
     Symbols have unique IDs for referencing from HIR nodes.
     @End Reasoning
 
+    @Implementation
+    Returns the symbol pointer itself as the id. Pointer-as-id works
+    because every HIRSymbolInfo is allocated exactly once, so the
+    address uniquely identifies the symbol for the lifetime of the
+    builder context. Returns 0 when the symbol is null so HIR nodes
+    safely encode "unresolved".
+    @End Implementation
+
+    @Performance_Hints
+    O(1). Pure pass-through. Called from every HIR node that attaches
+    a resolved symbol — hot path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only. The pointer-as-id contract is internal: ids are only
+    valid for the lifetime of the builder context; destroy_builder_context
+    invalidates them.
+    @End Security_Scope
+
     If symbol is equal to 0:
         Return 0
     End If
@@ -2876,6 +3599,25 @@ Process called "resolve_member_index" takes context as Integer, object_type as I
     Given a type and member name, find the field index for offset calculation.
     Returns -1 if member not found.
     @End Reasoning
+
+    @Implementation
+    Read the field_types list at offset 72 of HIRTypeInfo (count at
+    offset 80) and linearly scan each field's HIRSymbolInfo name at
+    offset 8. string_equals matches by content; on hit the loop index
+    is returned. The -1 sentinel on miss distinguishes "not found" from
+    "field at index 0" which a plain 0 return could not.
+    @End Implementation
+
+    @Performance_Hints
+    O(fields). Member access is common; large records make this a warm
+    path. Hash-table indexing would amortise to O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure type-table read; no mutation. The -1 sentinel is the only
+    out-of-band value and is checked by lower_member_expression before
+    being used for offset arithmetic.
+    @End Security_Scope
 
     If object_type is equal to 0:
         Return negative 1
@@ -2927,6 +3669,27 @@ Process called "resolve_member_type" takes context as Integer, object_type as In
     @Reasoning:
     Given a type and member name, return the HIRTypeInfo of that field.
     @End Reasoning
+
+    @Implementation
+    Mirrors resolve_member_index but reads the matched field symbol's
+    type_info at offset 24 instead of returning the loop index. The
+    field_types list at offset 72 (count 80) is walked once; on a
+    name hit the field type pointer is returned. Missing fields return
+    0 rather than -1 because the caller treats a null type as "unknown,
+    error already reported by resolve_member_index".
+    @End Implementation
+
+    @Performance_Hints
+    O(fields). Called once per member-access lowering, alongside
+    resolve_member_index. Cache the (type, name) -> (index, type)
+    pair if member access becomes a hotspot.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure type-table read; no mutation. A null type result causes the
+    parent lowering to continue without an attached type, which the
+    semantic pass surfaces as a diagnostic.
+    @End Security_Scope
 
     If object_type is equal to 0:
         Return 0
@@ -2980,8 +3743,32 @@ Process called "infer_binary_result_type" takes context as Integer, operator as 
     @Reasoning:
     Binary operators have specific type rules. Arithmetic operators return
     numeric types, comparison operators return Boolean, logical operators
-    return Boolean if operands are Boolean.
+    return Boolean if operands are Boolean. The operator-aware branches
+    handle every operator class with explicit type promotion so the
+    HIR carries precise result types into downstream lowering.
     @End Reasoning
+
+    @Implementation
+    Branch by operator constant: OP_EQ/NE/LT/LE/GT/GE return a cached
+    Boolean type via create_boolean_type; OP_AND/OR likewise return
+    Boolean. Arithmetic operators (ADD/SUB/MUL/DIV/MOD) apply numeric
+    promotion: if either side is Float, return Float; otherwise prefer
+    Integer64 > Integer32 > Integer. The type kind is read from offset
+    0 of each operand's HIRTypeInfo so this works without a separate
+    type lookup.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). At most a few integer comparisons plus a single create_boolean_type
+    call (which itself is cached). Called once per binary expression
+    during lowering — hot path under arithmetic-heavy workloads.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure type computation; no allocation beyond create_boolean_type.
+    The promotion order is the language-level guarantee that arithmetic
+    follows a single deterministic rule across all operators.
+    @End Security_Scope
 
     Note: Define operator categories
     Let OP_ADD be 1
@@ -3088,8 +3875,27 @@ Process called "infer_unary_result_type" takes context as Integer, operator as I
 
     @Reasoning:
     Unary operators generally preserve operand type, except logical NOT
-    which returns Boolean.
+    which returns Boolean. The operator-aware branch on OP_NOT promotes
+    to Boolean while every other unary operator passes the operand type
+    through unchanged.
     @End Reasoning
+
+    @Implementation
+    Branch by operator constant. OP_NOT returns the cached Boolean type;
+    all other unary operators (OP_NEG and additional cases) preserve the
+    operand type by returning operand_type directly.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One integer comparison and at most one create_boolean_type
+    call. Hot path under expression-heavy code.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure type computation. The Boolean promotion of NOT is the language
+    guarantee preventing numeric values from accidentally negating
+    through the unary operator.
+    @End Security_Scope
 
     Note: Define operator constants
     Let OP_NOT be 1
@@ -3112,6 +3918,27 @@ Process called "create_boolean_type" takes context as Integer returns Integer:
     to avoid creating duplicate type info objects. We cache it at offset 56
     in the builder context.
     @End Reasoning
+
+    @Implementation
+    Read the cached Boolean pointer from offset 56 of the
+    HIRBuilderContext; if non-null return it directly. Otherwise
+    allocate a TYPE_BOOLEAN HIRTypeInfo, stamp size=1 alignment=1, and
+    cache the pointer back at offset 56 for subsequent calls. The
+    cache hit is the common case after the first lowering pass through
+    a function containing any comparison or logical operator.
+    @End Implementation
+
+    @Performance_Hints
+    Amortised O(1) per call. Cold-start path allocates once; warm path
+    is a single memory load. Hot path: every comparison/logical
+    operator and every Boolean literal goes through here.
+    @End Performance_Hints
+
+    @Security_Scope
+    Cache is per-builder-context, so cross-compilation contexts cannot
+    accidentally share the Boolean instance. destroy_builder_context
+    releases the cached type alongside the context.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -3146,6 +3973,26 @@ Process called "add_error" takes context as Integer, line as Integer, column as 
     Errors are accumulated during lowering for reporting to user.
     @End Reasoning
 
+    @Implementation
+    Allocate a 24-byte error record holding (line at 0, column at 8,
+    message at 16) and append it to the context's error_list (offset 32
+    of HIRBuilderContext). The list is initialised by create_builder_context
+    so a null check on it indicates a corrupted context and is rejected.
+    Returns 1 on success, 0 on failure (null context, missing list, or
+    allocation failure).
+    @End Implementation
+
+    @Performance_Hints
+    O(1) per error report excluding the underlying List append. Errors
+    are cold-path; the lowering's no-error fast path never reaches here.
+    @End Performance_Hints
+
+    @Security_Scope
+    Error accumulation is the only sanctioned channel through which
+    lowering surfaces diagnostics; lower_ast_to_hir consults the same
+    list to decide whether to return a valid HIR root.
+    @End Security_Scope
+
     If context is equal to 0:
         Return 0
     End If
@@ -3179,8 +4026,26 @@ Process called "get_array_element_type" takes context as Integer, array_type as 
     Note: Extract element type from array/collection type
 
     @Reasoning:
-    Arrays and collections store element type in HIRTypeInfo.
+    Arrays and collections store element type in HIRTypeInfo. The
+    accessor reads that pointer so index lowering and codegen can
+    propagate the element type without re-deriving it.
     @End Reasoning
+
+    @Implementation
+    Read the element pointer from offset 64 of HIRTypeInfo. The
+    element_type field is shared by every collection-like type (arrays,
+    lists, optional payloads) so this accessor is reusable across all
+    of them.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load. Called once per index lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. Returns 0 cleanly when the input type is null
+    so the caller's fallback path proceeds without a phantom pointer.
+    @End Security_Scope
 
     If array_type is equal to 0:
         Return 0
@@ -3196,8 +4061,27 @@ Process called "get_iterable_element_type" takes context as Integer, iterable_ty
     Note: Extract element type from iterable type (for For loops)
 
     @Reasoning:
-    Iterable types (arrays, lists, ranges) have element types.
+    Iterable types (arrays, lists, ranges) have element types. For-loop
+    lowering reads this accessor to bind the iterator variable to the
+    element type carried in the iterable's HIRTypeInfo.
     @End Reasoning
+
+    @Implementation
+    Read offset 64 of HIRTypeInfo, the same element_type slot that
+    arrays use. Iterable types are a superset of arrays here — the
+    layout decision deliberately unifies the two so for-loop and index
+    lowering share the same accessor.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load. Called once per For Each lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. A null result causes the for-loop iterator
+    binding to receive no inferred type, which the semantic pass
+    reports as a diagnostic.
+    @End Security_Scope
 
     If iterable_type is equal to 0:
         Return 0
@@ -3214,7 +4098,26 @@ Process called "get_function_return_type" takes context as Integer, function_typ
 
     @Reasoning:
     Function calls need to determine return type for type checking.
+    The accessor reads the return-type pointer stored in the function's
+    HIRTypeInfo so call-expression lowering can stamp the HIR call node
+    with its precise return type.
     @End Reasoning
+
+    @Implementation
+    Read offset 64 of HIRTypeInfo where function types store the return
+    type pointer. The element_type slot is reused for function return
+    type because the layout deliberately overlaps array/iterable element
+    type and function return type into a single field.
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load. Called once per call-expression lowering.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only accessor. A null return type yields a typeless call HIR
+    node, which downstream type-checking surfaces as a diagnostic.
+    @End Security_Scope
 
     If function_type is equal to 0:
         Return 0
@@ -3232,6 +4135,23 @@ Process called "is_type_boolean" takes context as Integer, type_info as Integer 
     @Reasoning:
     Conditions require Boolean type verification.
     @End Reasoning
+
+    @Implementation
+    Read the type kind tag at offset 0 of HIRTypeInfo and compare with
+    TYPE_BOOLEAN (constant 1). Returns 1 on match and 0 otherwise. A
+    null type_info returns 0 — callers that test condition types treat
+    that as "unknown, do not type-check".
+    @End Implementation
+
+    @Performance_Hints
+    O(1). One memory load and one comparison. Hot path: every If and
+    While condition runs through here.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only. The strict tag-equality check prevents accidental
+    coercion of integer types to Boolean.
+    @End Security_Scope
 
     If type_info is equal to 0:
         Return 0
@@ -3256,6 +4176,27 @@ Process called "types_compatible" takes context as Integer, from_type as Integer
     Type compatibility includes exact match, subtyping, and implicit conversions.
     For initial implementation, check exact type kind match.
     @End Reasoning
+
+    @Implementation
+    Fast path: if both pointers are equal, types are identical. Otherwise
+    read the type kind tags from offset 0 of each HIRTypeInfo and compare
+    them. Equal tags currently mean compatible — this matches the
+    bootstrap-level type system; future extensions (subtyping, generics)
+    will refine this without changing the calling convention.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) for primitives. Hot path: every Set statement and Return runs
+    a compatibility check. Pointer-equality short-circuit makes
+    redundant assignments (a as T = b as T where T identical) free.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure type computation; no allocation. The conservative "same kind
+    means compatible" rule is the language-level guarantee for the
+    bootstrap; later versions add structural and nominal subtyping
+    while preserving this surface.
+    @End Security_Scope
 
     If from_type is equal to 0:
         Return 0
@@ -3305,6 +4246,20 @@ Process called "check_match_exhaustiveness" takes context as Integer, match_stmt
     4. For numeric/string types, require wildcard (infinite space)
     5. For tuple/record types, recursively check nested patterns
     @End Implementation
+
+    @Performance_Hints
+    O(clause_count) for the wildcard scan, O(clause_count * variant_count)
+    in the worst case for enum coverage. The wildcard fast-exit makes
+    the typical "covers everything with _" case essentially free.
+    Boolean and enum coverage checks scan clauses once each.
+    @End Performance_Hints
+
+    @Security_Scope
+    Exhaustiveness is the static guard against runtime "no arm matched"
+    panics. The conservative default (return 0 when type info is
+    missing) forces the user to add explicit coverage rather than
+    risking silent UB.
+    @End Security_Scope
 
     Note: Quick check - if there's a wildcard pattern, match is exhaustive
     Let i be 0
@@ -3451,6 +4406,16 @@ Process called "get_tuple_element_type" takes tuple_type as Integer, element_ind
     - offset 64: component_count
     @End Implementation
 
+    @Performance_Hints
+    O(1). One type-kind compare and one List index. Hot only when
+    tuple patterns dominate; usually cold path.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only. Index bound check prevents out-of-range list access
+    when the pattern depth exceeds the tuple arity.
+    @End Security_Scope
+
     If tuple_type is equal to 0:
         Return 0
     End If
@@ -3507,6 +4472,17 @@ Process called "get_record_field_type" takes record_type as Integer, field_name 
     5. When match found, extract and return field's type_info
     6. Return 0 if field not found
     @End Implementation
+
+    @Performance_Hints
+    O(fields). Linear scan of field symbols. Pattern matching against
+    records pays this cost per field-name lookup; a hash index would
+    amortise to O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only. Field names are matched by string equality so spelling
+    mismatches return 0 cleanly rather than aliasing to nearby fields.
+    @End Security_Scope
 
     If record_type is equal to 0:
         Return 0
@@ -3586,6 +4562,19 @@ Process called "get_variant_payload_type" takes variant_type as Integer, variant
     5. When match found, extract and return variant's payload type_info (may be 0)
     6. Return 0 if variant not found
     @End Implementation
+
+    @Performance_Hints
+    O(variants). Linear scan. Pattern matching against ADTs touches
+    this per variant pattern; enums with many variants pay proportional
+    cost.
+    @End Performance_Hints
+
+    @Security_Scope
+    Read-only. A payload type of 0 is a valid result for nullary
+    variants (e.g. None in Optional), so callers must distinguish
+    "missing variant" from "no payload" by inspecting the surrounding
+    pattern context.
+    @End Security_Scope
 
     If variant_type is equal to 0:
         Return 0

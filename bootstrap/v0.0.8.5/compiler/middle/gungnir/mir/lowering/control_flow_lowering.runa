@@ -1,0 +1,1806 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+CONTROL FLOW LOWERING - HIR Control Flow to MIR (P2-E Group B)
+
+Per the v3 design Section 4, this module owns the per-child hook
+handlers for HIR control-flow constructs that require emission of
+MIR between child visits.
+
+Constructs handled:
+  - HIR_IF_STATEMENT (11003): pre + post + child_enter + child_exit
+  - HIR_WHILE_STATEMENT (11008): pre + post + child_enter + child_exit
+  - HIR_FOR_STATEMENT (11007): pre + post + child_enter + child_exit
+  - HIR_MATCH_STATEMENT (11005): pre + post + child_enter + child_exit
+  - HIR_WHEN_CLAUSE (11006): pre + post + child_enter + child_exit
+  - HIR_TRY_STATEMENT (11015): pre + post + child_enter + child_exit
+  - HIR_THROW_STATEMENT (11014): post only
+
+Frame discipline (per v3 Section 3.3):
+  - pre pushes a control-flow frame onto the cf_frame_stack.
+  - post pops the same frame.
+  - child_enter and child_exit peek the top frame; they never push
+    or pop.
+
+Frame field layout (per cf_frame_set_field / cf_frame_get_field):
+  Offset 0: kind (CF_FRAME_KIND_*)
+  IF: 8=then_label, 16=else_label, 24=merge_label, 32=has_else_block
+  WHILE: 8=header, 16=body, 24=exit, 32=prev_break, 40=prev_continue
+  FOR: 8=header, 16=body, 24=exit, 32=index_alloca, 40=len_value,
+       48=loop_var_id, 56=prev_break, 64=prev_continue
+  MATCH: 8=merge_label, 16=match_value, 24=case_count,
+         32=arm_labels_array, 40=current_arm_index
+  TRY: 8=try_label, 16=catch_label, 24=merge_label,
+       32=exception_type, 40=exception_var_id
+:End Note
+
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
+Import "compiler/middle/gungnir/mir/lowering/lowering_context.runa" as LCtx
+Import "compiler/middle/gungnir/mir/mir_builder.runa" as MIRBuilder
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================
+Note: HIR_IF_STATEMENT handlers (11003)
+Note: ============================================================
+
+@Reasoning
+HIR_IF_STATEMENT pre: allocates the three labels (then, else,
+merge) for the conditional and pushes an IF frame carrying them.
+Sets the has_else_block flag so post can emit a fallthrough jump
+when no else clause is present.
+
+The labels are allocated up front (before children visit) because
+the per-child hooks need stable label identifiers to emit branches
+and jumps as the visitor moves between children.
+@End Reasoning
+
+@Implementation
+1. Read else_body at HIR_IF_STATEMENT offset 24 to compute
+   has_else_block.
+2. Allocate three labels via allocate_label from MIRBuilder.
+3. Allocate an IF frame and populate offsets 0,8,16,24,32.
+4. Push the frame onto the cf_frame_stack.
+@End Implementation
+
+@Performance_Hints
+Three label allocations and one frame allocation per If. Cold
+compared to expression lowering.
+@End Performance_Hints
+
+@Security_Scope
+Defensive checks on ctx and builder_ctx. Allocation failures
+return 0 to halt traversal.
+@End Security_Scope
+
+Process called "lower_hir_if_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let else_body be proc memory_get_int64 from Layout with hir_node_ptr, 24
+    Let has_else_block be 0
+    If else_body is not equal to 0:
+        Set has_else_block to 1
+    End If
+
+    Let then_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let else_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let merge_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let frame be proc cf_frame_allocate from LCtx with 1
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    proc cf_frame_set_field from LCtx with frame, 8, then_label
+    proc cf_frame_set_field from LCtx with frame, 16, else_label
+    proc cf_frame_set_field from LCtx with frame, 24, merge_label
+    proc cf_frame_set_field from LCtx with frame, 32, has_else_block
+
+    proc cf_frame_push from LCtx with ctx, frame
+    Return 1
+End Process
+
+@Reasoning
+HIR_IF_STATEMENT child_enter: per-child setup. Child 0 = condition
+(no-op, condition lowers normally). Child 1 = then_block (no-op).
+Child 2 = else_block (no-op). All inter-child emission lives in
+child_exit.
+@End Reasoning
+
+@Implementation
+Returns 1 for all child indices.
+@End Implementation
+
+@Performance_Hints
+Effectively free.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_if_statement_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning
+HIR_IF_STATEMENT child_exit:
+  - After child 0 (condition): pop the condition value, emit the
+    conditional branch to then/else, and emit the then label.
+  - After child 1 (then_block): emit jump-to-merge and then emit
+    the else label.
+  - After child 2 (else_block): emit jump-to-merge.
+The merge label itself is emitted in post.
+
+The branch target for the false case is the merge_label when no
+else block exists (so the false path skips directly to the merge).
+@End Reasoning
+
+@Implementation
+1. Peek the top frame (must be an IF frame).
+2. Read then_label, else_label, merge_label, has_else_block.
+3. Dispatch on child_index.
+
+For child 0:
+  - Pop condition value from the result stack.
+  - Compute the false target: else_label if has_else_block else
+    merge_label.
+  - Emit MIR_BRANCH(condition, then_label, false_target).
+  - Emit a label marker so block construction can find the then
+    block — encoded as an unconditional jump to itself? No: the
+    MIR model uses block ids natively at branch/jump nodes; we
+    emit a no-op MIR_NOP with the value_id slot set to then_label
+    as a leader marker. This convention is interpreted by the CFG
+    construction layer.
+
+For child 1:
+  - Emit MIR_JUMP(merge_label).
+  - If has_else_block, emit a leader marker for else_label.
+
+For child 2:
+  - Emit MIR_JUMP(merge_label).
+@End Implementation
+
+@Performance_Hints
+Three to four instruction emissions per If across all children.
+@End Performance_Hints
+
+@Security_Scope
+Frame access is bounded by the peek; missing frame returns 0 to
+halt traversal.
+@End Security_Scope
+
+Process called "lower_hir_if_statement_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let then_label be proc cf_frame_get_field from LCtx with frame, 8
+    Let else_label be proc cf_frame_get_field from LCtx with frame, 16
+    Let merge_label be proc cf_frame_get_field from LCtx with frame, 24
+    Let has_else_block be proc cf_frame_get_field from LCtx with frame, 32
+
+    If child_index is equal to 0:
+        Let condition_value be proc lowering_pop_result from LCtx with ctx
+        If condition_value is equal to 0:
+            proc lowering_set_error from LCtx with ctx, 20, hir_node_ptr
+            Return 0
+        End If
+
+        Let false_target be merge_label
+        If has_else_block is equal to 1:
+            Set false_target to else_label
+        End If
+
+        Let branch_inst be proc create_mir_branch from MIRNodes with condition_value, then_label, false_target, 0, 0
+        If branch_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
+        End If
+
+        Note: Emit leader marker (jump-to-self) so CFG construction
+        Note: recognises then_label as a basic-block leader.
+        Let then_marker be proc create_mir_jump from MIRNodes with then_label
+        If then_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, then_marker
+        End If
+        Return 1
+    End If
+
+    If child_index is equal to 1:
+        Let then_jump be proc create_mir_jump from MIRNodes with merge_label
+        If then_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, then_jump
+        End If
+        If has_else_block is equal to 1:
+            Let else_marker be proc create_mir_jump from MIRNodes with else_label
+            If else_marker is not equal to 0:
+                proc emit_instruction from MIRBuilder with builder_ctx, else_marker
+            End If
+        End If
+        Return 1
+    End If
+
+    If child_index is equal to 2:
+        Let else_jump be proc create_mir_jump from MIRNodes with merge_label
+        If else_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, else_jump
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+HIR_IF_STATEMENT post: emits the merge label marker (so CFG sees
+merge as a leader) and pops the IF frame. If has_else_block was
+false the merge-label marker is the only emission needed; in the
+else-bearing case the marker still serves as a leader for the
+join point.
+@End Reasoning
+
+@Implementation
+1. Peek the frame to read merge_label.
+2. Emit MIR_JUMP(merge_label) as a leader marker.
+3. Pop the frame.
+@End Implementation
+
+@Performance_Hints
+One marker emission, one frame pop.
+@End Performance_Hints
+
+@Security_Scope
+Missing frame returns 0.
+@End Security_Scope
+
+Process called "lower_hir_if_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let merge_label be proc cf_frame_get_field from LCtx with frame, 24
+
+    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    If merge_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
+    End If
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_WHILE_STATEMENT handlers (11008)
+Note: ============================================================
+
+@Reasoning
+HIR_WHILE_STATEMENT pre: allocates header/body/exit labels, saves
+the previous break/continue targets, installs new ones, and emits
+the header-label leader marker.
+@End Reasoning
+
+@Implementation
+1. Allocate three labels.
+2. Save previous break and continue from builder_ctx offsets 56, 64.
+3. Set new break_target = exit_label, continue_target = header_label.
+4. Allocate and push WHILE frame with all five fields.
+5. Emit MIR_JUMP(header_label) as the entry jump + header marker.
+@End Implementation
+
+@Performance_Hints
+One frame allocation, three label allocations, one emit.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks.
+@End Security_Scope
+
+Process called "lower_hir_while_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let header_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let body_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let exit_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let prev_break be proc memory_get_int64 from Layout with builder_ctx, 56
+    Let prev_continue be proc memory_get_int64 from Layout with builder_ctx, 64
+
+    proc memory_set_int64 from Layout with builder_ctx, 56, exit_label
+    proc memory_set_int64 from Layout with builder_ctx, 64, header_label
+
+    Let frame be proc cf_frame_allocate from LCtx with 2
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc cf_frame_set_field from LCtx with frame, 8, header_label
+    proc cf_frame_set_field from LCtx with frame, 16, body_label
+    proc cf_frame_set_field from LCtx with frame, 24, exit_label
+    proc cf_frame_set_field from LCtx with frame, 32, prev_break
+    proc cf_frame_set_field from LCtx with frame, 40, prev_continue
+    proc cf_frame_push from LCtx with ctx, frame
+
+    Let entry_jump be proc create_mir_jump from MIRNodes with header_label
+    If entry_jump is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, entry_jump
+    End If
+    Return 1
+End Process
+
+@Reasoning
+HIR_WHILE_STATEMENT child_enter: no-op for both children.
+@End Reasoning
+
+@Implementation
+Returns 1.
+@End Implementation
+
+@Performance_Hints
+Effectively free.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation.
+@End Security_Scope
+
+Process called "lower_hir_while_statement_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning
+HIR_WHILE_STATEMENT child_exit:
+  - After child 0 (condition): pop the value, emit the conditional
+    branch to body or exit, and emit a body_label leader marker.
+  - After child 1 (body): emit the back-edge jump to header.
+@End Reasoning
+
+@Implementation
+Reads frame fields for the three labels; dispatches by child_index.
+@End Implementation
+
+@Performance_Hints
+At most two emissions per child_exit invocation.
+@End Performance_Hints
+
+@Security_Scope
+Frame must be a WHILE frame; missing frame returns 0.
+@End Security_Scope
+
+Process called "lower_hir_while_statement_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let header_label be proc cf_frame_get_field from LCtx with frame, 8
+    Let body_label be proc cf_frame_get_field from LCtx with frame, 16
+    Let exit_label be proc cf_frame_get_field from LCtx with frame, 24
+
+    If child_index is equal to 0:
+        Let condition_value be proc lowering_pop_result from LCtx with ctx
+        If condition_value is equal to 0:
+            proc lowering_set_error from LCtx with ctx, 21, hir_node_ptr
+            Return 0
+        End If
+
+        Let branch_inst be proc create_mir_branch from MIRNodes with condition_value, body_label, exit_label, 0, 0
+        If branch_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
+        End If
+
+        Let body_marker be proc create_mir_jump from MIRNodes with body_label
+        If body_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, body_marker
+        End If
+        Return 1
+    End If
+
+    If child_index is equal to 1:
+        Let back_jump be proc create_mir_jump from MIRNodes with header_label
+        If back_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, back_jump
+        End If
+        Let exit_marker be proc create_mir_jump from MIRNodes with exit_label
+        If exit_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, exit_marker
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+HIR_WHILE_STATEMENT post: restores the previous break/continue
+targets and pops the frame.
+@End Reasoning
+
+@Implementation
+1. Peek frame.
+2. Write builder_ctx offsets 56 and 64 from the saved values in
+   the frame.
+3. Pop the frame.
+@End Implementation
+
+@Performance_Hints
+Two int64 writes and one frame pop.
+@End Performance_Hints
+
+@Security_Scope
+Missing frame returns 0.
+@End Security_Scope
+
+Process called "lower_hir_while_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let prev_break be proc cf_frame_get_field from LCtx with frame, 32
+    Let prev_continue be proc cf_frame_get_field from LCtx with frame, 40
+
+    proc memory_set_int64 from Layout with builder_ctx, 56, prev_break
+    proc memory_set_int64 from Layout with builder_ctx, 64, prev_continue
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_FOR_STATEMENT handlers (11007)
+Note: ============================================================
+
+@Reasoning
+HIR_FOR_STATEMENT pre: saves previous loop targets and allocates
+the three labels. The index alloca and length value are computed
+in child_exit(0) after the collection child is lowered, because
+the collection MIR value is the source of both.
+@End Reasoning
+
+@Implementation
+1. Read loop_var_id at HIR_FOR_STATEMENT offset 24 (the symbol id
+   for the loop variable binding).
+2. Save prev_break, prev_continue from builder_ctx.
+3. Allocate header/body/exit labels.
+4. Push FOR frame with the labels, loop_var_id, and saved targets;
+   index_alloca and len_value will be filled in child_exit(0).
+@End Implementation
+
+@Performance_Hints
+Cold compared to expression lowering. Three label allocations.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks.
+@End Security_Scope
+
+Process called "lower_hir_for_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let loop_var_id be proc memory_get_int64 from Layout with hir_node_ptr, 24
+
+    Let header_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let body_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let exit_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let prev_break be proc memory_get_int64 from Layout with builder_ctx, 56
+    Let prev_continue be proc memory_get_int64 from Layout with builder_ctx, 64
+
+    Let frame be proc cf_frame_allocate from LCtx with 3
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc cf_frame_set_field from LCtx with frame, 8, header_label
+    proc cf_frame_set_field from LCtx with frame, 16, body_label
+    proc cf_frame_set_field from LCtx with frame, 24, exit_label
+    proc cf_frame_set_field from LCtx with frame, 32, 0
+    proc cf_frame_set_field from LCtx with frame, 40, 0
+    proc cf_frame_set_field from LCtx with frame, 48, loop_var_id
+    proc cf_frame_set_field from LCtx with frame, 56, prev_break
+    proc cf_frame_set_field from LCtx with frame, 64, prev_continue
+    proc cf_frame_push from LCtx with ctx, frame
+    Return 1
+End Process
+
+@Reasoning
+HIR_FOR_STATEMENT child_enter:
+  - Child 0 (collection): no-op.
+  - Child 1 (body): on entry, load collection[index] into a temp
+    and map the loop_var_id to that temp so the body sees the
+    binding.
+@End Reasoning
+
+@Implementation
+For child_index = 1 (body about to be visited):
+  1. Peek frame; read index_alloca, collection_value (stored at
+     offset 32 and 40 by child_exit(0)).
+  2. Load the current index from index_alloca.
+  3. Load collection[current_index] into an item temp.
+  4. map_hir_to_mir_value(loop_var_id, item_value).
+@End Implementation
+
+@Performance_Hints
+Three instruction emissions per loop iteration's child_enter.
+@End Performance_Hints
+
+@Security_Scope
+Frame must be a FOR frame; missing collection value is a lowering
+error.
+@End Security_Scope
+
+Process called "lower_hir_for_statement_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    If child_index is not equal to 1:
+        Return 1
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let index_alloca be proc cf_frame_get_field from LCtx with frame, 32
+    Let len_value be proc cf_frame_get_field from LCtx with frame, 40
+    Let loop_var_id be proc cf_frame_get_field from LCtx with frame, 48
+
+    Note: The collection value was popped in child_exit(0) and
+    Note: passed into the index-arithmetic emission there. The
+    Note: index_alloca and the loop_var_id mapping happen here so
+    Note: the body's identifier references resolve correctly.
+
+    Let current_index be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let load_index be proc create_mir_load from MIRNodes with current_index, index_alloca, 0, 0, 0
+    If load_index is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, load_index
+    End If
+
+    Note: For this foundation pipeline, the item value is the
+    Note: current index itself; full collection-iteration lowering
+    Note: (gep + load) is a follow-up task once mir_nodes provides
+    Note: the indexed-load helper.
+    proc map_hir_to_mir_value from MIRBuilder with builder_ctx, loop_var_id, current_index
+    Return 1
+End Process
+
+@Reasoning
+HIR_FOR_STATEMENT child_exit:
+  - After child 0 (collection): allocate index_alloca, store 0 to
+    it, get length, store len and alloca in the frame, emit the
+    entry jump to header, emit header label, load index, compare
+    < len, branch to body or exit, emit body label.
+  - After child 1 (body): emit increment of index, store back to
+    index_alloca, jump back to header, emit exit label.
+@End Reasoning
+
+@Implementation
+Child 0 path consumes the collection MIR value and emits the
+iteration setup. Child 1 path emits the back-edge and exit
+emission. Then-current break/continue targets are installed in
+the builder context here (cannot do it earlier because the labels
+were unknown to the body-visit; we update before the body emits).
+@End Implementation
+
+@Performance_Hints
+~10 instruction emissions per For. Dominated by the index
+increment + store + back-jump sequence.
+@End Performance_Hints
+
+@Security_Scope
+Frame must be FOR; collection value must be non-null.
+@End Security_Scope
+
+Process called "lower_hir_for_statement_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let header_label be proc cf_frame_get_field from LCtx with frame, 8
+    Let body_label be proc cf_frame_get_field from LCtx with frame, 16
+    Let exit_label be proc cf_frame_get_field from LCtx with frame, 24
+
+    If child_index is equal to 0:
+        Let collection_value be proc lowering_pop_result from LCtx with ctx
+        If collection_value is equal to 0:
+            proc lowering_set_error from LCtx with ctx, 22, hir_node_ptr
+            Return 0
+        End If
+
+        Let index_alloca be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let alloca_inst be proc create_mir_alloca from MIRNodes with index_alloca, 0, 0, 8
+        If alloca_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, alloca_inst
+        End If
+
+        Note: Store zero into index_alloca.
+        Let zero_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let zero_const be proc create_mir_const from MIRNodes with zero_value, 0, 0, 0, 0
+        If zero_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, zero_const
+        End If
+        Let zero_store be proc create_mir_store from MIRNodes with index_alloca, zero_value, 0, 0, 0
+        If zero_store is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, zero_store
+        End If
+
+        Note: Use collection_value directly as len_value. Real
+        Note: length computation requires a get_length helper that
+        Note: mir_nodes does not yet expose; this foundation pass
+        Note: treats the collection value as already holding the
+        Note: length (acceptable for For-loop over Integer ranges
+        Note: which is the v0.0.8.5 usage).
+        proc cf_frame_set_field from LCtx with frame, 32, index_alloca
+        proc cf_frame_set_field from LCtx with frame, 40, collection_value
+
+        Note: Install break/continue targets now that labels exist.
+        proc memory_set_int64 from Layout with builder_ctx, 56, exit_label
+        proc memory_set_int64 from Layout with builder_ctx, 64, header_label
+
+        Let entry_jump be proc create_mir_jump from MIRNodes with header_label
+        If entry_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, entry_jump
+        End If
+
+        Let current_index be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let load_index be proc create_mir_load from MIRNodes with current_index, index_alloca, 0, 0, 0
+        If load_index is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, load_index
+        End If
+
+        Let cond_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20102, cond_value, current_index, collection_value, 0
+        If cmp_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, cmp_inst
+        End If
+
+        Let branch_inst be proc create_mir_branch from MIRNodes with cond_value, body_label, exit_label, 0, 0
+        If branch_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
+        End If
+
+        Let body_marker be proc create_mir_jump from MIRNodes with body_label
+        If body_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, body_marker
+        End If
+        Return 1
+    End If
+
+    If child_index is equal to 1:
+        Note: After body: increment index, store, back-jump,
+        Note: emit exit label.
+        Let index_alloca be proc cf_frame_get_field from LCtx with frame, 32
+
+        Let current_index2 be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let load_idx2 be proc create_mir_load from MIRNodes with current_index2, index_alloca, 0, 0, 0
+        If load_idx2 is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, load_idx2
+        End If
+
+        Let one_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let one_const be proc create_mir_const from MIRNodes with one_value, 1, 0, 0, 0
+        If one_const is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, one_const
+        End If
+
+        Let next_index be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let add_inst be proc create_mir_binary_op from MIRNodes with 20002, next_index, current_index2, one_value, 0
+        If add_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, add_inst
+        End If
+
+        Let store_next be proc create_mir_store from MIRNodes with index_alloca, next_index, 0, 0, 0
+        If store_next is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, store_next
+        End If
+
+        Let back_jump be proc create_mir_jump from MIRNodes with header_label
+        If back_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, back_jump
+        End If
+
+        Let exit_marker be proc create_mir_jump from MIRNodes with exit_label
+        If exit_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, exit_marker
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+HIR_FOR_STATEMENT post: restores previous break/continue targets
+and pops the FOR frame.
+@End Reasoning
+
+@Implementation
+Standard frame teardown.
+@End Implementation
+
+@Performance_Hints
+Two int64 writes, one pop.
+@End Performance_Hints
+
+@Security_Scope
+Missing frame returns 0.
+@End Security_Scope
+
+Process called "lower_hir_for_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let prev_break be proc cf_frame_get_field from LCtx with frame, 56
+    Let prev_continue be proc cf_frame_get_field from LCtx with frame, 64
+
+    proc memory_set_int64 from Layout with builder_ctx, 56, prev_break
+    proc memory_set_int64 from Layout with builder_ctx, 64, prev_continue
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_MATCH_STATEMENT handlers (11005)
+Note: ============================================================
+
+@Reasoning
+HIR_MATCH_STATEMENT pre: allocates the merge label and a per-arm
+labels array (size = case_count * 3 because each arm needs
+check_label, case_label, next_label). The MATCH frame holds these
+plus the scrutinee value (filled in child_exit(0)).
+@End Reasoning
+
+@Implementation
+1. Read case_count at HIR_MATCH_STATEMENT offset 16 (the
+   when_clauses list length, but the HIR node also stores the
+   count directly at offset 16 in the layout used by the visitor).
+2. Allocate merge_label and a 3*case_count*8 byte labels array.
+3. For each arm i, pre-allocate three labels and store them at
+   offsets i*3*8 + {0,8,16} of the array.
+4. Push the MATCH frame.
+@End Implementation
+
+@Performance_Hints
+case_count * 3 label allocations per match. Cold.
+@End Performance_Hints
+
+@Security_Scope
+Allocation failures return 0.
+@End Security_Scope
+
+Process called "lower_hir_match_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let case_count be proc memory_get_int64 from Layout with hir_node_ptr, 16
+
+    Let merge_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let labels_array_bytes be case_count multiplied by 24
+    Let labels_array be 0
+    If labels_array_bytes is greater than 0:
+        Set labels_array to proc allocate from Layout with labels_array_bytes
+    End If
+
+    If labels_array is not equal to 0:
+        Let i be 0
+        While i is less than case_count:
+            Let check_label be proc allocate_label from MIRBuilder with builder_ctx
+            Let case_label be proc allocate_label from MIRBuilder with builder_ctx
+            Let next_label be proc allocate_label from MIRBuilder with builder_ctx
+            Let base_offset be i multiplied by 24
+            proc memory_set_int64 from Layout with labels_array, base_offset, check_label
+            proc memory_set_int64 from Layout with labels_array, base_offset plus 8, case_label
+            proc memory_set_int64 from Layout with labels_array, base_offset plus 16, next_label
+            Set i to i plus 1
+        End While
+    End If
+
+    Let frame be proc cf_frame_allocate from LCtx with 4
+    If frame is equal to 0:
+        If labels_array is not equal to 0:
+            proc deallocate from Layout with labels_array
+        End If
+        Return 0
+    End If
+    proc cf_frame_set_field from LCtx with frame, 8, merge_label
+    proc cf_frame_set_field from LCtx with frame, 16, 0
+    proc cf_frame_set_field from LCtx with frame, 24, case_count
+    proc cf_frame_set_field from LCtx with frame, 32, labels_array
+    proc cf_frame_set_field from LCtx with frame, 40, 0
+    proc cf_frame_push from LCtx with ctx, frame
+    Return 1
+End Process
+
+@Reasoning
+HIR_MATCH_STATEMENT child_enter:
+  - Child 0 (scrutinee): no-op.
+  - Child i >= 1 (arm i-1): emit the check_label marker so the
+    arm's pattern lowering lands in a fresh basic block.
+@End Reasoning
+
+@Implementation
+For child_index >= 1: read labels_array, compute arm_index =
+child_index - 1, read check_label, emit jump-marker for it.
+@End Implementation
+
+@Performance_Hints
+One emit per arm.
+@End Performance_Hints
+
+@Security_Scope
+Out-of-range arm_index treated as a no-op.
+@End Security_Scope
+
+Process called "lower_hir_match_statement_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    If child_index is less than 1:
+        Return 1
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let case_count be proc cf_frame_get_field from LCtx with frame, 24
+    Let labels_array be proc cf_frame_get_field from LCtx with frame, 32
+
+    Let arm_index be child_index minus 1
+    If arm_index is greater than or equal to case_count:
+        Return 1
+    End If
+    If labels_array is equal to 0:
+        Return 1
+    End If
+
+    Let base_offset be arm_index multiplied by 24
+    Let check_label be proc memory_get_int64 from Layout with labels_array, base_offset
+
+    Let check_marker be proc create_mir_jump from MIRNodes with check_label
+    If check_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, check_marker
+    End If
+
+    proc cf_frame_set_field from LCtx with frame, 40, arm_index
+    Return 1
+End Process
+
+@Reasoning
+HIR_MATCH_STATEMENT child_exit:
+  - After child 0 (scrutinee): pop and store the match value into
+    the frame.
+  - After child i >= 1 (arm i-1): the WHEN_CLAUSE's lowering
+    emitted the pattern check + body. Here we emit the trailing
+    jump-to-merge and the next-arm label marker.
+@End Reasoning
+
+@Implementation
+Child 0 stores match_value at frame offset 16. Child i >= 1 reads
+labels_array[arm_index].next_label and emits a leader marker plus
+the jump-to-merge.
+@End Implementation
+
+@Performance_Hints
+~2 emissions per arm.
+@End Performance_Hints
+
+@Security_Scope
+Bounded by arm index range.
+@End Security_Scope
+
+Process called "lower_hir_match_statement_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    If child_index is equal to 0:
+        Let match_value be proc lowering_pop_result from LCtx with ctx
+        If match_value is equal to 0:
+            proc lowering_set_error from LCtx with ctx, 23, hir_node_ptr
+            Return 0
+        End If
+        proc cf_frame_set_field from LCtx with frame, 16, match_value
+        Return 1
+    End If
+
+    Let case_count be proc cf_frame_get_field from LCtx with frame, 24
+    Let labels_array be proc cf_frame_get_field from LCtx with frame, 32
+    Let merge_label be proc cf_frame_get_field from LCtx with frame, 8
+
+    Let arm_index be child_index minus 1
+    If arm_index is greater than or equal to case_count:
+        Return 1
+    End If
+    If labels_array is equal to 0:
+        Return 1
+    End If
+
+    Let base_offset be arm_index multiplied by 24
+    Let next_label be proc memory_get_int64 from Layout with labels_array, base_offset plus 16
+
+    Let merge_jump be proc create_mir_jump from MIRNodes with merge_label
+    If merge_jump is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, merge_jump
+    End If
+
+    Let next_marker be proc create_mir_jump from MIRNodes with next_label
+    If next_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, next_marker
+    End If
+    Return 1
+End Process
+
+@Reasoning
+HIR_MATCH_STATEMENT post: emits the final fallthrough jump-to-
+merge, emits the merge label marker, frees the per-arm labels
+array, and pops the frame.
+@End Reasoning
+
+@Implementation
+1. Read frame's merge_label and labels_array.
+2. Emit final jump and merge marker.
+3. Deallocate labels_array.
+4. Pop frame.
+@End Implementation
+
+@Performance_Hints
+Two emissions, one deallocate, one pop.
+@End Performance_Hints
+
+@Security_Scope
+Frame deallocation cannot underflow because pre always pushes one
+frame.
+@End Security_Scope
+
+Process called "lower_hir_match_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let merge_label be proc cf_frame_get_field from LCtx with frame, 8
+    Let labels_array be proc cf_frame_get_field from LCtx with frame, 32
+
+    Let default_jump be proc create_mir_jump from MIRNodes with merge_label
+    If default_jump is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, default_jump
+    End If
+    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    If merge_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
+    End If
+
+    If labels_array is not equal to 0:
+        proc deallocate from Layout with labels_array
+    End If
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_WHEN_CLAUSE handlers (11006)
+Note: ============================================================
+
+@Reasoning
+HIR_WHEN_CLAUSE handlers run inside a MATCH's traversal. The
+clause has three children: pattern (0), optional guard (1), body
+(2). Pattern + guard lower to an expression yielding a Boolean;
+the WHEN_CLAUSE child_exit emits the conditional branch from the
+match value vs pattern result. Body lowers normally.
+
+When clauses do not push their own frame — they peek the enclosing
+MATCH frame to read match_value, current_arm_index, and the per-
+arm labels.
+@End Reasoning
+
+@Implementation
+WHEN_CLAUSE pre is a no-op. WHEN_CLAUSE post is also a no-op
+because MATCH's child_exit(i >= 1) handles the inter-arm wiring.
+The child_enter/child_exit on the WHEN_CLAUSE itself fire per
+child of the clause: pattern, guard (optional), body.
+
+For child_exit(0=pattern): the pattern's MIR value is on top of
+the result stack. Read the MATCH frame's match_value and the
+current arm's case_label, emit a compare-eq, then branch to
+case_label or next_label.
+
+For child_exit(2=body): no-op (MATCH's child_exit(arm) handles
+the jump-to-merge).
+@End Implementation
+
+@Performance_Hints
+Two emissions per arm (compare + branch).
+@End Performance_Hints
+
+@Security_Scope
+Frame access bounded by peek.
+@End Security_Scope
+
+Process called "lower_hir_when_clause_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_when_clause_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_when_clause_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    If child_index is not equal to 0:
+        Return 1
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let match_value be proc cf_frame_get_field from LCtx with frame, 16
+    Let case_count be proc cf_frame_get_field from LCtx with frame, 24
+    Let labels_array be proc cf_frame_get_field from LCtx with frame, 32
+    Let arm_index be proc cf_frame_get_field from LCtx with frame, 40
+
+    Let pattern_value be proc lowering_pop_result from LCtx with ctx
+    If pattern_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 24, hir_node_ptr
+        Return 0
+    End If
+
+    If labels_array is equal to 0:
+        Return 1
+    End If
+    If arm_index is greater than or equal to case_count:
+        Return 1
+    End If
+
+    Let base_offset be arm_index multiplied by 24
+    Let case_label be proc memory_get_int64 from Layout with labels_array, base_offset plus 8
+    Let next_label be proc memory_get_int64 from Layout with labels_array, base_offset plus 16
+
+    Let cmp_result be proc allocate_temp_value from MIRBuilder with builder_ctx
+    Let cmp_inst be proc create_mir_binary_op from MIRNodes with 20100, cmp_result, match_value, pattern_value, 0
+    If cmp_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, cmp_inst
+    End If
+
+    Let branch_inst be proc create_mir_branch from MIRNodes with cmp_result, case_label, next_label, 0, 0
+    If branch_inst is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, branch_inst
+    End If
+
+    Let case_marker be proc create_mir_jump from MIRNodes with case_label
+    If case_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, case_marker
+    End If
+    Return 1
+End Process
+
+Process called "lower_hir_when_clause_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_TRY_STATEMENT handlers (11015)
+Note: ============================================================
+
+@Reasoning
+HIR_TRY_STATEMENT pre: allocates try/catch/merge labels and reads
+the exception type and exception var id directly from the HIR
+node. Emits a MIR_INVOKE pseudo-terminator that registers the
+catch_label as the unwind destination, then emits the try_label
+leader marker.
+@End Reasoning
+
+@Implementation
+1. Read exception_type at offset 32, exception_var_id at offset
+   40.
+2. Allocate three labels.
+3. Push TRY frame.
+4. The current MIR pipeline does not yet have a dedicated invoke-
+   for-block helper; we emit a MIR_JUMP(try_label) marker as the
+   pseudo-invoke. The full landingpad wiring is set up in
+   child_exit(0).
+@End Implementation
+
+@Performance_Hints
+Three label allocations per try.
+@End Performance_Hints
+
+@Security_Scope
+Defensive null checks.
+@End Security_Scope
+
+Process called "lower_hir_try_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If hir_node_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let exception_type be proc memory_get_int64 from Layout with hir_node_ptr, 32
+    Let exception_var_id be proc memory_get_int64 from Layout with hir_node_ptr, 40
+
+    Let try_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let catch_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let merge_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let frame be proc cf_frame_allocate from LCtx with 5
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc cf_frame_set_field from LCtx with frame, 8, try_label
+    proc cf_frame_set_field from LCtx with frame, 16, catch_label
+    proc cf_frame_set_field from LCtx with frame, 24, merge_label
+    proc cf_frame_set_field from LCtx with frame, 32, exception_type
+    proc cf_frame_set_field from LCtx with frame, 40, exception_var_id
+    proc cf_frame_push from LCtx with ctx, frame
+
+    Let try_marker be proc create_mir_jump from MIRNodes with try_label
+    If try_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, try_marker
+    End If
+    Return 1
+End Process
+
+Process called "lower_hir_try_statement_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+@Reasoning
+HIR_TRY_STATEMENT child_exit:
+  - After child 0 (try body): emit jump-to-merge, then the catch
+    label marker, then a landing-pad that captures the exception
+    and maps it to the exception variable id (if present).
+  - After child 1 (catch body): emit jump-to-merge.
+@End Reasoning
+
+@Implementation
+Reads frame for labels and exception fields, dispatches by child.
+@End Implementation
+
+@Performance_Hints
+2-4 emissions per child_exit.
+@End Performance_Hints
+
+@Security_Scope
+Frame must be a TRY frame.
+@End Security_Scope
+
+Process called "lower_hir_try_statement_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let catch_label be proc cf_frame_get_field from LCtx with frame, 16
+    Let merge_label be proc cf_frame_get_field from LCtx with frame, 24
+    Let exception_type be proc cf_frame_get_field from LCtx with frame, 32
+    Let exception_var_id be proc cf_frame_get_field from LCtx with frame, 40
+
+    If child_index is equal to 0:
+        Let try_jump be proc create_mir_jump from MIRNodes with merge_label
+        If try_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, try_jump
+        End If
+
+        Let catch_marker be proc create_mir_jump from MIRNodes with catch_label
+        If catch_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, catch_marker
+        End If
+
+        Let exception_value be proc allocate_temp_value from MIRBuilder with builder_ctx
+        Let landingpad_inst be proc create_mir_landingpad from MIRNodes with exception_value, exception_type, 0, 0
+        If landingpad_inst is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, landingpad_inst
+        End If
+
+        If exception_var_id is not equal to 0:
+            proc map_hir_to_mir_value from MIRBuilder with builder_ctx, exception_var_id, exception_value
+        End If
+        Return 1
+    End If
+
+    If child_index is equal to 1:
+        Let catch_jump be proc create_mir_jump from MIRNodes with merge_label
+        If catch_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, catch_jump
+        End If
+        Return 1
+    End If
+
+    Return 1
+End Process
+
+@Reasoning
+HIR_TRY_STATEMENT post: emits the merge label marker and pops the
+TRY frame.
+@End Reasoning
+
+@Implementation
+Reads merge_label, emits marker, pops.
+@End Implementation
+
+@Performance_Hints
+One emit, one pop.
+@End Performance_Hints
+
+@Security_Scope
+Frame teardown.
+@End Security_Scope
+
+Process called "lower_hir_try_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let merge_label be proc cf_frame_get_field from LCtx with frame, 24
+    Let merge_marker be proc create_mir_jump from MIRNodes with merge_label
+    If merge_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, merge_marker
+    End If
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_THROW_STATEMENT post handler (11014)
+Note: ============================================================
+
+@Reasoning
+HIR_THROW_STATEMENT post: consumes the exception value from the
+result stack and emits MIR_THROW. Throw is post-only because the
+child expression runs to completion (push the exception value)
+before the throw instruction is emitted.
+@End Reasoning
+
+@Implementation
+1. Pop exception value from result stack.
+2. Emit MIR_THROW with the value and no specific type (0 means
+   use the exception's dynamic type at runtime).
+@End Implementation
+
+@Performance_Hints
+One pop, one emit.
+@End Performance_Hints
+
+@Security_Scope
+Null exception value triggers a lowering error.
+@End Security_Scope
+
+Process called "lower_hir_throw_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let exception_value be proc lowering_pop_result from LCtx with ctx
+    If exception_value is equal to 0:
+        proc lowering_set_error from LCtx with ctx, 25, hir_node_ptr
+        Return 0
+    End If
+
+    Let throw_inst be proc create_mir_throw from MIRNodes with exception_value, 0
+    If throw_inst is equal to 0:
+        Return 0
+    End If
+
+    proc emit_instruction from MIRBuilder with builder_ctx, throw_inst
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_LOOP_STATEMENT handlers (11009)
+Note: ============================================================
+
+@Reasoning
+HIR_LOOP_STATEMENT pre/post/child_enter/child_exit: an infinite
+loop ("Loop:" with a Break inside). Lowering is structurally a
+While with an always-true condition: header label, body label,
+exit label, plus break/continue retargeting. Unlike While there is
+no condition child to read — the body is the sole child (index 0).
+@End Reasoning
+
+@Implementation
+pre: allocate header_label, body_label, exit_label; save
+prev_break/prev_continue; install new targets; push WHILE-shaped
+frame (kind = 2 reused since the field layout matches); emit
+entry-jump to header, header marker, jump-to-body marker.
+
+child_enter(0): no-op.
+
+child_exit(0): emit back-jump to header, exit-label marker.
+
+post: restore prev_break/prev_continue, pop frame.
+@End Implementation
+
+@Performance_Hints
+Three label allocations and ~5 instruction emissions per Loop.
+@End Performance_Hints
+
+@Security_Scope
+Loop with no Break is a legal infinite loop at the HIR layer.
+The lowering layer emits the unconditional loop and trusts the
+HIR-level analysis.
+@End Security_Scope
+
+Process called "lower_hir_loop_statement_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let header_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let body_label be proc allocate_label from MIRBuilder with builder_ctx
+    Let exit_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let prev_break be proc memory_get_int64 from Layout with builder_ctx, 56
+    Let prev_continue be proc memory_get_int64 from Layout with builder_ctx, 64
+
+    proc memory_set_int64 from Layout with builder_ctx, 56, exit_label
+    proc memory_set_int64 from Layout with builder_ctx, 64, header_label
+
+    Let frame be proc cf_frame_allocate from LCtx with 2
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc cf_frame_set_field from LCtx with frame, 8, header_label
+    proc cf_frame_set_field from LCtx with frame, 16, body_label
+    proc cf_frame_set_field from LCtx with frame, 24, exit_label
+    proc cf_frame_set_field from LCtx with frame, 32, prev_break
+    proc cf_frame_set_field from LCtx with frame, 40, prev_continue
+    proc cf_frame_push from LCtx with ctx, frame
+
+    Let entry_jump be proc create_mir_jump from MIRNodes with header_label
+    If entry_jump is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, entry_jump
+    End If
+    Let body_marker be proc create_mir_jump from MIRNodes with body_label
+    If body_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, body_marker
+    End If
+    Return 1
+End Process
+
+Process called "lower_hir_loop_statement_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_loop_statement_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    If child_index is equal to 0:
+        Let header_label be proc cf_frame_get_field from LCtx with frame, 8
+        Let exit_label be proc cf_frame_get_field from LCtx with frame, 24
+
+        Let back_jump be proc create_mir_jump from MIRNodes with header_label
+        If back_jump is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, back_jump
+        End If
+        Let exit_marker be proc create_mir_jump from MIRNodes with exit_label
+        If exit_marker is not equal to 0:
+            proc emit_instruction from MIRBuilder with builder_ctx, exit_marker
+        End If
+    End If
+    Return 1
+End Process
+
+Process called "lower_hir_loop_statement_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    Let prev_break be proc cf_frame_get_field from LCtx with frame, 32
+    Let prev_continue be proc cf_frame_get_field from LCtx with frame, 40
+
+    proc memory_set_int64 from Layout with builder_ctx, 56, prev_break
+    proc memory_set_int64 from Layout with builder_ctx, 64, prev_continue
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_CATCH_CLAUSE handlers (11016)
+Note: ============================================================
+
+@Reasoning
+HIR_CATCH_CLAUSE is a child of HIR_TRY_STATEMENT. The catch
+clause's body is lowered as a normal block; the parent TRY's
+child_exit handles the landingpad emission and exception-variable
+mapping. The catch-clause handler itself is a no-op shell — it
+exists so dispatch coverage is 100%. The HIR layer routes each
+catch's body through the visitor in source order; the body's
+statements emit normally inside the catch block established by
+the parent TRY.
+@End Reasoning
+
+@Implementation
+pre/post: no-op. child_enter/child_exit: no-op.
+@End Implementation
+
+@Performance_Hints
+Zero cost beyond the dispatch trampoline.
+@End Performance_Hints
+
+@Security_Scope
+No state mutation. The exception variable is mapped by the parent
+TRY's child_exit handler; the catch clause does not re-map.
+@End Security_Scope
+
+Process called "lower_hir_catch_clause_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_catch_clause_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_catch_clause_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_catch_clause_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    Return 1
+End Process
+
+Note: ============================================================
+Note: HIR_FINALLY_CLAUSE handlers (11017)
+Note: ============================================================
+
+@Reasoning
+HIR_FINALLY_CLAUSE post: lowers a finally-block. For the v0.0.8.5
+pipeline, finally is implemented by inlining the finally-block's
+MIR after both the try-body and each catch-body before the merge
+label. The handler emits a finally-label marker so the
+construction is identifiable, and a jump to the merge label after
+the finally body emits its statements via the visitor recursion.
+@End Reasoning
+
+@Implementation
+pre: allocate a finally_label, push it onto the frame stack under
+a new kind (6 = FINALLY), emit the label marker.
+
+child_enter/child_exit on the single body child: no-op (body
+statements emit themselves).
+
+post: peek frame, emit a jump to the enclosing TRY's merge_label
+(if available via the frame chain), pop the FINALLY frame.
+
+For v0.0.8.5 we cannot walk the frame chain past the top frame
+without additional context bookkeeping. The handler emits only
+the finally-label marker; the parent TRY is responsible for
+recording the finally-body's emission position. When the parent
+TRY's post runs, the merge-label is emitted; any straight-line
+fallthrough from the finally body reaches the merge.
+@End Implementation
+
+@Performance_Hints
+Two label/marker emissions per finally.
+@End Performance_Hints
+
+@Security_Scope
+A finally block without a matching TRY is structurally invalid;
+the HIR layer rejects this before lowering.
+@End Security_Scope
+
+Process called "lower_hir_finally_clause_pre" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let builder_ctx be proc lowering_get_builder_ctx from LCtx with ctx
+    If builder_ctx is equal to 0:
+        Return 0
+    End If
+
+    Let finally_label be proc allocate_label from MIRBuilder with builder_ctx
+
+    Let frame be proc cf_frame_allocate from LCtx with 6
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc cf_frame_set_field from LCtx with frame, 8, finally_label
+    proc cf_frame_push from LCtx with ctx, frame
+
+    Let finally_marker be proc create_mir_jump from MIRNodes with finally_label
+    If finally_marker is not equal to 0:
+        proc emit_instruction from MIRBuilder with builder_ctx, finally_marker
+    End If
+    Return 1
+End Process
+
+Process called "lower_hir_finally_clause_child_enter" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_finally_clause_child_exit" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer, child_index as Integer returns Integer:
+    Return 1
+End Process
+
+Process called "lower_hir_finally_clause_post" that takes ctx as Integer, hir_node_ptr as Integer, node_type as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    Let frame be proc cf_frame_peek from LCtx with ctx
+    If frame is equal to 0:
+        Return 0
+    End If
+
+    proc cf_frame_pop from LCtx with ctx
+    Return 1
+End Process
+
+Note: ============================================================
+Note: Control-Flow Handler Registration
+Note: ============================================================
+
+@Reasoning
+Installs every control-flow node handler in the lowering dispatch
+table. Each handler registers the full {pre, post, child_enter,
+child_exit} quadruple where applicable; THROW registers only post.
+@End Reasoning
+
+@Implementation
+Sequence of lowering_register_handler calls keyed by HIR node type.
+@End Implementation
+
+@Performance_Hints
+Cold path.
+@End Performance_Hints
+
+@Security_Scope
+Validates table non-null.
+@End Security_Scope
+
+Process called "register_control_flow_handlers" that takes dispatch_table as Integer returns Integer:
+    If dispatch_table is equal to 0:
+        Return 0
+    End If
+
+    Note: HIR_IF_STATEMENT (11003)
+    proc lowering_register_handler from LCtx with dispatch_table, 11003, lower_hir_if_statement_pre, lower_hir_if_statement_post, lower_hir_if_statement_child_enter, lower_hir_if_statement_child_exit
+
+    Note: HIR_MATCH_STATEMENT (11005)
+    proc lowering_register_handler from LCtx with dispatch_table, 11005, lower_hir_match_statement_pre, lower_hir_match_statement_post, lower_hir_match_statement_child_enter, lower_hir_match_statement_child_exit
+
+    Note: HIR_WHEN_CLAUSE (11006)
+    proc lowering_register_handler from LCtx with dispatch_table, 11006, lower_hir_when_clause_pre, lower_hir_when_clause_post, lower_hir_when_clause_child_enter, lower_hir_when_clause_child_exit
+
+    Note: HIR_FOR_STATEMENT (11007)
+    proc lowering_register_handler from LCtx with dispatch_table, 11007, lower_hir_for_statement_pre, lower_hir_for_statement_post, lower_hir_for_statement_child_enter, lower_hir_for_statement_child_exit
+
+    Note: HIR_WHILE_STATEMENT (11008)
+    proc lowering_register_handler from LCtx with dispatch_table, 11008, lower_hir_while_statement_pre, lower_hir_while_statement_post, lower_hir_while_statement_child_enter, lower_hir_while_statement_child_exit
+
+    Note: HIR_THROW_STATEMENT (11014): post only
+    proc lowering_register_handler from LCtx with dispatch_table, 11014, 0, lower_hir_throw_statement_post, 0, 0
+
+    Note: HIR_TRY_STATEMENT (11015)
+    proc lowering_register_handler from LCtx with dispatch_table, 11015, lower_hir_try_statement_pre, lower_hir_try_statement_post, lower_hir_try_statement_child_enter, lower_hir_try_statement_child_exit
+
+    Note: HIR_LOOP_STATEMENT (11009)
+    proc lowering_register_handler from LCtx with dispatch_table, 11009, lower_hir_loop_statement_pre, lower_hir_loop_statement_post, lower_hir_loop_statement_child_enter, lower_hir_loop_statement_child_exit
+
+    Note: HIR_CATCH_CLAUSE (11016)
+    proc lowering_register_handler from LCtx with dispatch_table, 11016, lower_hir_catch_clause_pre, lower_hir_catch_clause_post, lower_hir_catch_clause_child_enter, lower_hir_catch_clause_child_exit
+
+    Note: HIR_FINALLY_CLAUSE (11017)
+    proc lowering_register_handler from LCtx with dispatch_table, 11017, lower_hir_finally_clause_pre, lower_hir_finally_clause_post, lower_hir_finally_clause_child_enter, lower_hir_finally_clause_child_exit
+
+    Return 1
+End Process

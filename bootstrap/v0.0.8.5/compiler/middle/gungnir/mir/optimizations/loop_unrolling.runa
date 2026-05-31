@@ -106,6 +106,24 @@ reducing loop overhead by factor K while maintaining correctness via remainder l
 
 Note: Create loop unrolling context with initialized data structures
 Process called "create_loop_unroll_context" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The context aggregates every long-lived data structure consulted by the
+    unrolling pipeline so downstream procs need only one pointer to access
+    CFG, dominance, SSA, the clone/rename maps, and the tunable thresholds.
+
+    Tunables matter for correctness AND code size:
+    - unroll_factor=4 balances ILP gains against I-cache pressure; matches
+      the typical width of modern superscalar pipelines.
+    - max_unroll_iterations=16 bounds full-unroll explosion: a 16-iter loop
+      with a 200-instruction body becomes 3200 instructions — already the
+      ceiling before profitability is rejected.
+    - code_size_threshold=200 prevents pathological unrolling of large
+      bodies, which destroys I-cache locality and hurts inlining downstream.
+
+    Centralizing these on the context (rather than as globals) lets the
+    optimizer caller override them per-function (hot loops vs. cold code).
+    @End Reasoning
+
     @Implementation
     Allocates 88-byte context structure on Tier 3 OWNED HEAP.
     Initializes CFG reference, empty loops list, computes dominance tree,
@@ -156,9 +174,31 @@ End Process
 
 Note: Destroy loop unrolling context and free all allocated memory
 Process called "destroy_loop_unroll_context" that takes context_ptr as Integer returns Nothing:
-    If context_ptr is equal to 0:
-        Return
-    End If
+    @Reasoning
+    The context owns a deep tree of allocations: loops list, then per-loop
+    body sets, back-edge lists (with allocated 16-byte pair structs),
+    induction-variable lists (with 88-byte IV structs), then dominance tree,
+    block-clone dictionary, and value-rename dictionary (whose values are
+    themselves lists). A single proc destroy call would leak the inner
+    structures and corrupt the heap; deterministic teardown is required.
+
+    Walk order matters: free children before parents, so the parent's
+    pointers are still valid when iterating. Edge pairs and IV structs
+    are released individually because they were individually allocated.
+    @End Reasoning
+
+    @Implementation
+    Deterministic post-order tear-down on Tier 3 OWNED HEAP:
+    1. For each LoopInfo: free body_blocks set, back_edges list (releasing
+       each 16-byte edge pair), induction_vars list (releasing each 88-byte
+       IV struct), then the 72-byte LoopInfo itself.
+    2. Free the loops list container.
+    3. Free dominance tree via Dominance.destroy_dominance.
+    4. Free block_clone_map dictionary.
+    5. Free value_rename_map: iterate keys, free each per-key rename list,
+       then free the outer dictionary.
+    6. Free the 88-byte context struct.
+    @End Implementation
 
     Note: Free loops list and all nested structures
     Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
@@ -264,6 +304,21 @@ End Process
 
 Note: Check if edge (source -> target) is a back edge using dominance
 Process called "is_back_edge" that takes source_id as Integer, target_id as Integer, dominance_ptr as Integer returns Integer:
+    @Reasoning
+    Natural-loop detection in v0.0.8.5 follows the standard dragon-book
+    definition: an edge B -> H is a back edge iff H dominates B. Using
+    dominance (rather than ad-hoc cycle-finding) is critical because:
+
+    - It picks out *reducible* loops only, the only kind the rest of the
+      optimization pipeline (LICM, vectorization, strength reduction) is
+      prepared to reason about.
+    - It scales linearly in CFG size when paired with a precomputed
+      dominance tree (single dominance query is amortized O(1) with the
+      Lengauer-Tarjan tree we build in create_loop_unroll_context).
+    - It naturally rejects irreducible flow (goto-spaghetti) which would
+      otherwise produce malformed LoopInfo and crash later phases.
+    @End Reasoning
+
     @Implementation
     A back edge occurs when the target dominates the source (target -> ... -> source -> target).
     This forms the basis of natural loop detection.
@@ -279,6 +334,19 @@ End Process
 
 Note: Find all back edges in the CFG
 Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
+    @Reasoning
+    The back-edge set is the seed of every subsequent loop analysis: each
+    back edge B -> H uniquely identifies one natural loop with header H and
+    latch B. Returning a freshly-allocated list (rather than mutating CFG
+    annotations) keeps this proc idempotent — callers may run it multiple
+    times across optimization passes without aliasing concerns.
+
+    Edge pairs are stored as 16-byte (source, target) structs rather than
+    as a packed encoding so subsequent passes (loop nesting, exit-block
+    discovery) can iterate them without bit-shifting. The 16 bytes are
+    owned by the returned list and released by destroy_loop_unroll_context.
+    @End Reasoning
+
     @Implementation
     Scans all edges in the CFG. For each edge (B -> H), checks if H dominates B.
     If so, (B -> H) is a back edge and H is a loop header.
@@ -297,7 +365,7 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
 
         While succ_idx is less than succ_count:
             Let succ_id be proc get from List with successors, succ_idx
-            Let is_back be is_back_edge(block_id, succ_id, dominance_ptr)
+            Let is_back be proc is_back_edge with block_id, succ_id, dominance_ptr
 
             If is_back is equal to 1:
                 Note: Allocate edge pair structure (16 bytes: source, target)
@@ -318,6 +386,25 @@ End Process
 
 Note: Compute natural loop body for back edge (latch -> header)
 Process called "compute_loop_body" that takes header_id as Integer, latch_id as Integer, cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The natural-loop body is precisely the set of blocks that can reach the
+    latch without first leaving the loop via the header. Computing it as a
+    reverse-flow worklist closure (rather than a structural region match)
+    correctly handles:
+
+    - Multi-block loops with internal branches (if/else inside the loop).
+    - Nested loops: the outer pass collects the union of nested + outer
+      bodies; the nesting-level computation in detect_natural_loops then
+      separates them.
+    - Self-loops (header == latch): the worklist exits immediately after
+      the early-return guard.
+
+    Block IDs are stored as strings inside the Set because the Set
+    primitive is keyed by String, not Integer. The int_to_string round-trip
+    is cheap relative to dominance queries and keeps the API uniform with
+    other set-of-blocks uses across the optimizer.
+    @End Reasoning
+
     @Implementation
     Natural loop body consists of all nodes that can reach the latch without
     going through the header. Uses worklist algorithm starting from latch,
@@ -381,6 +468,27 @@ End Process
 
 Note: Detect all natural loops in the CFG using back-edge analysis
 Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
+    @Reasoning
+    This is the entry point that converts raw CFG back-edge information
+    into the structured LoopInfo records the rest of the pipeline operates
+    on. One LoopInfo is emitted per back edge: in degenerate cases (a
+    header with two latches) this yields two LoopInfos sharing a header,
+    which is exactly what subsequent profitability analysis needs to merge
+    or reject.
+
+    Nesting level is computed inline rather than in a separate pass because
+    the back-edge list is already in hand: a body block that is itself the
+    target of any back edge in the function is a nested-loop header, and
+    each such hit increments the outer loop's nesting depth. Deeper loops
+    get higher nesting, which the AOTT runtime uses later to prioritize
+    optimization budget.
+
+    trip_count is initialized to -1 (unknown) and refined later by
+    analyze_trip_count, after induction-variable identification. This keeps
+    detection cheap and lets the pipeline skip trip-count analysis for
+    loops that fail an earlier profitability gate.
+    @End Reasoning
+
     @Implementation
     Natural loop detection algorithm:
     1. Find all back edges (B -> H where H dominates B)
@@ -393,7 +501,7 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
     Let dominance_ptr be proc memory_get_int64 from Layout with context_ptr, 16
     Let loops_list be proc memory_get_int64 from Layout with context_ptr, 8
 
-    Let back_edges be find_back_edges(cfg_ptr, dominance_ptr)
+    Let back_edges be proc find_back_edges with cfg_ptr, dominance_ptr
     Let back_edge_count be proc length from List with back_edges
     Let edge_idx be 0
 
@@ -402,7 +510,7 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
         Let latch_id be proc memory_get_int64 from Layout with edge_pair, 0
         Let header_id be proc memory_get_int64 from Layout with edge_pair, 8
 
-        Let body_blocks be compute_loop_body(header_id, latch_id, cfg_ptr)
+        Let body_blocks be proc compute_loop_body with header_id, latch_id, cfg_ptr
 
         Note: Allocate LoopInfo structure (72 bytes)
         Let loop_ptr be proc allocate_memory from Layout with 72, 8
@@ -462,6 +570,34 @@ End Process
 
 Note: Identify induction variables in a loop
 Process called "identify_induction_variables" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Reasoning
+    Canonical induction variables (BIVs: basic induction variables) are the
+    only IVs this pass is willing to act on, and that constraint is
+    intentional. Canonical means a header phi of exactly two operands —
+    init from the preheader, next from the latch — where the latch operand
+    is an add or subtract that takes the phi itself plus a loop-invariant
+    step.
+
+    Restricting to canonical form trades expressiveness for soundness:
+
+    - Multi-operand phis indicate complex control flow (loop with multiple
+      backedges, header reached from a non-preheader, etc.) where
+      unrolling correctness is fragile.
+    - Non-canonical update instructions (e.g., `next = step + phi` rather
+      than `next = phi + step`, or chained adds) require commutativity
+      reasoning the v0.0.8.5 MIR optimizer does not yet perform.
+    - Non-constant step values are *recorded* (step_is_constant = 0) but
+      defer trip-count analysis; without a constant step we cannot evaluate
+      the closed-form trip count below.
+
+    Derived (DIV: derived induction variables — c1 * BIV + c2 expressions)
+    are NOT identified here; strength_reduction.runa is the proper owner
+    of that analysis and runs as a separate pass.
+
+    Returns the count of canonical IVs found so the caller can short-circuit
+    profitability if no usable IV exists.
+    @End Reasoning
+
     @Implementation
     Induction variable pattern:
     - Phi node in loop header: iv = phi([init, preheader], [next, latch])
@@ -531,8 +667,8 @@ Process called "identify_induction_variables" that takes context_ptr as Integer,
                 If next_inst_ptr is not equal to 0:
                     Let next_opcode be proc get_opcode from MIR with next_inst_ptr
 
-                    Note: Check for add or sub instruction
-                    If next_opcode is equal to MIR.MIR_ADD or next_opcode is equal to MIR.MIR_SUB:
+                    Note: Check for add or sub instruction (MIR_ADD = 20002, MIR_SUB = 20003)
+                    If next_opcode is equal to 20002 or next_opcode is equal to 20003:
                         Let next_op0 be proc get_operand from MIR with next_inst_ptr, 0
                         Let next_op1 be proc get_operand from MIR with next_inst_ptr, 1
                         Let phi_result be proc get_result from MIR with phi_inst_ptr
@@ -592,6 +728,39 @@ End Process
 
 Note: Analyze loop exit condition to compute trip count
 Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Reasoning
+    Trip-count analysis is the single most decisive piece of information for
+    unrolling profitability:
+
+    - A known small constant trip count (<= max_unroll_iterations, i.e. 16)
+      unlocks FULL unrolling, which eliminates the loop entirely and exposes
+      iteration-specific constant folding (e.g., index-based array offsets
+      become compile-time constants).
+    - A known large constant or an unknown trip count steers the pipeline
+      to PARTIAL unrolling with a remainder loop, which still reduces
+      branch overhead by the unroll factor but keeps code size bounded.
+    - A trip count of 0 (e.g., `for(i=5; i<0; i++)`) causes the loop to be
+      entirely dead — we clamp to 0 and let DCE remove it.
+
+    Closed-form derivation requires init, bound, and step to all be
+    compile-time constants. We deliberately do NOT attempt symbolic trip
+    counts here (e.g., `for(i=0; i<N; i++)` where N is a function parameter)
+    because partial unrolling already covers that case without needing the
+    exact count. Adding symbolic trip-count analysis is reserved for a
+    future SCEV (scalar evolution) pass.
+
+    Comparison operator and step sign must agree: LT/LE require positive
+    step (counting up); GT/GE require negative step (counting down). The
+    handler returns -1 if signs disagree, signaling an infinite loop or a
+    loop that depends on integer overflow — neither is safely unrollable.
+
+    EQ/NE comparisons are recognized as comparisons but deliberately not
+    given closed-form trip counts: they create exit conditions whose trip
+    count depends on whether the IV's trajectory passes exactly through
+    the bound, which is fragile to wraparound and rarely arises in
+    production code that benefits from unrolling.
+    @End Reasoning
+
     @Implementation
     Trip count computation for canonical loops:
 
@@ -625,7 +794,8 @@ Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr 
     End If
 
     Let term_opcode be proc get_opcode from MIR with terminator_ptr
-    If term_opcode is not equal to MIR.MIR_BR_COND:
+    Note: MIR_BRANCH = 20301 (conditional branch)
+    If term_opcode is not equal to 20301:
         Return -1
     End If
 
@@ -642,7 +812,8 @@ Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr 
     Let cmp_opcode be proc get_opcode from MIR with cmp_inst_ptr
     Let is_comparison be 0
 
-    If cmp_opcode is equal to MIR.MIR_CMP_LT or cmp_opcode is equal to MIR.MIR_CMP_LE or cmp_opcode is equal to MIR.MIR_CMP_GT or cmp_opcode is equal to MIR.MIR_CMP_GE or cmp_opcode is equal to MIR.MIR_CMP_EQ or cmp_opcode is equal to MIR.MIR_CMP_NE:
+    Note: MIR comparison opcodes: MIR_EQ=20100, MIR_NE=20101, MIR_LT=20102, MIR_LE=20103, MIR_GT=20104, MIR_GE=20105
+    If cmp_opcode is equal to 20102 or cmp_opcode is equal to 20103 or cmp_opcode is equal to 20104 or cmp_opcode is equal to 20105 or cmp_opcode is equal to 20100 or cmp_opcode is equal to 20101:
         Set is_comparison to 1
     End If
 
@@ -699,31 +870,35 @@ Process called "analyze_trip_count" that takes context_ptr as Integer, loop_ptr 
         Let trip_count be -1
 
         Note: Compute trip count based on comparison operator
-        If cmp_opcode is equal to MIR.MIR_CMP_LT:
+        Note: MIR_LT = 20102 — for(i=init; i<bound; i+=step) — trips = (bound-init)/step
+        If cmp_opcode is equal to 20102:
             If step_amount is greater than 0:
                 Let range be bound_val minus init_val
                 Set trip_count to range divided by step_amount
             End If
         End If
 
-        If cmp_opcode is equal to MIR.MIR_CMP_LE:
+        Note: MIR_LE = 20103 — for(i=init; i<=bound; i+=step) — trips = (bound-init+1)/step
+        If cmp_opcode is equal to 20103:
             If step_amount is greater than 0:
                 Set range to bound_val minus init_val plus 1
                 Set trip_count to range divided by step_amount
             End If
         End If
 
-        If cmp_opcode is equal to MIR.MIR_CMP_GT:
+        Note: MIR_GT = 20104 — for(i=init; i>bound; i-=|step|) — trips = (init-bound)/|step|
+        If cmp_opcode is equal to 20104:
             If step_amount is less than 0:
-                Let abs_step be -step_amount
+                Let abs_step be 0 minus step_amount
                 Set range to init_val minus bound_val
                 Set trip_count to range divided by abs_step
             End If
         End If
 
-        If cmp_opcode is equal to MIR.MIR_CMP_GE:
+        Note: MIR_GE = 20105 — for(i=init; i>=bound; i-=|step|) — trips = (init-bound+1)/|step|
+        If cmp_opcode is equal to 20105:
             If step_amount is less than 0:
-                Set abs_step to -step_amount
+                Set abs_step to 0 minus step_amount
                 Set range to init_val minus bound_val plus 1
                 Set trip_count to range divided by abs_step
             End If
@@ -743,6 +918,51 @@ End Process
 
 Note: Determine if loop unrolling is profitable
 Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Reasoning
+    Unrolling is one of the few optimizations whose profitability is
+    genuinely hard to predict — it can either accelerate a hot loop by 2-3x
+    (through ILP, scheduling slack, and constant folding across iterations)
+    or destroy performance by busting the I-cache. The gating logic here is
+    conservative on purpose: a borderline candidate is rejected rather than
+    risk regressions.
+
+    The three rejection axes:
+
+    1. **Code-size threshold (200 instructions)** — beyond this, the
+       resulting unrolled body exceeds an L1 I-cache line group on most
+       modern x86-64 microarchitectures (32 KB / 16 instructions-per-line
+       budget). Full unrolling of a 200-instruction body at trip=16 would
+       produce 3,200 instructions — well into i-cache thrashing territory.
+
+    2. **Multiple exits** — early-exit blocks complicate unrolling because
+       each cloned iteration needs its own exit edge to the same target,
+       which can balloon successor sets and confuse downstream passes.
+       Single-exit loops have a clean "fall through to next iteration or
+       leave" shape that mirrors the unrolled-sequential layout.
+
+    3. **Non-inlinable function calls** — a call inside a loop body that
+       cannot be inlined is the dominant cost regardless of branch overhead.
+       Unrolling it just multiplies the call sites without reducing latency.
+       Inlinable calls are NOT a barrier: the inliner will subsequently
+       absorb them, and unrolling exposes the call sites to inlining.
+
+    The two acceptance buckets:
+
+    - **Return 2 (full unroll)** requires a small constant trip count
+      (<= 16). Full unrolling eliminates the loop and exposes per-iteration
+      constants — a 16-iteration loop with a clamp-and-shift body becomes
+      a flat 16-instruction sequence the CSE/GVN passes can collapse.
+
+    - **Return 1 (partial unroll)** is used for any other passable loop:
+      unknown trip count or large constant trip count, body small enough
+      that 4 copies stay within the partial threshold (50 instructions).
+      Factor 4 matches the typical superscalar issue width and is the
+      sweet spot for cleaning up branch overhead without code bloat.
+
+    Inline-size threshold (20 instructions) is independent of the unrolling
+    code-size threshold: it governs ONLY the inlinability lookahead.
+    @End Reasoning
+
     @Implementation
     Profitability analysis considers:
 
@@ -797,7 +1017,8 @@ Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop
                 Let inst_ptr be proc get from List with inst_list, inst_idx
                 Let opcode be proc get_opcode from MIR with inst_ptr
 
-                If opcode is equal to MIR.MIR_CALL:
+                Note: MIR_CALL = 20304
+                If opcode is equal to 20304:
                     Note: Check if this call is inlinable
                     Let callee_fn_ptr be proc get_call_target from MIR with inst_ptr
                     Let is_inlinable be 0
@@ -825,7 +1046,8 @@ Process called "is_profitable_to_unroll" that takes context_ptr as Integer, loop
                     End If
                 End If
 
-                If opcode is equal to MIR.MIR_LOAD or opcode is equal to MIR.MIR_STORE:
+                Note: MIR_LOAD = 20200, MIR_STORE = 20201
+                If opcode is equal to 20200 or opcode is equal to 20201:
                     Set memory_ops to memory_ops plus 1
                 End If
 
@@ -871,6 +1093,29 @@ End Process
 
 Note: Clone a basic block with unique suffix
 Process called "clone_block" that takes context_ptr as Integer, original_block_id as Integer, suffix as Integer returns Integer:
+    @Reasoning
+    Block cloning is the workhorse primitive of both full and partial
+    unrolling: each iteration of the unrolled loop becomes its own copy of
+    the body. The suffix-encoded id scheme (original_id * 1000 + suffix)
+    is deliberately simple — it produces unique, predictable, easily
+    debuggable block ids without needing a separate id allocator state on
+    the context.
+
+    The 1000 multiplier is safe because:
+    - The MIR builder reserves block ids below 1000 for canonical blocks;
+      cloned ids never collide with originals.
+    - Suffix range is bounded: full unroll uses 0..max_unroll_iterations
+      (i.e., 0..15), partial unroll uses 0..unroll_factor-1 plus the
+      remainder-loop suffix 9000. All fit cleanly within the [0, 1000)
+      window per original block.
+
+    Instructions are cloned via MIR's clone_instruction primitive, which
+    handles deep-copy semantics for operand vectors. SSA renaming is
+    delegated to rename_cloned_values rather than done inline — separating
+    structural cloning from value renaming keeps each phase
+    independently testable.
+    @End Reasoning
+
     @Implementation
     Block cloning creates a copy of all instructions in the block with new IDs.
 
@@ -922,6 +1167,30 @@ End Process
 
 Note: Rename SSA values in cloned block for specific iteration
 Process called "rename_cloned_values" that takes context_ptr as Integer, cloned_block_id as Integer, iteration as Integer returns Nothing:
+    @Reasoning
+    SSA's defining invariant is that every value has exactly one definition;
+    cloning a block N times produces N redundant definitions of every result
+    inside, violating SSA. Renaming restores the invariant by giving each
+    cloned definition a distinct SSA name keyed by iteration index.
+
+    The value_rename_map is a two-level structure: original_value_id ->
+    List indexed by iteration -> new value_id. This layout matters:
+
+    - It lets later iterations look up values produced by earlier
+      iterations (forward references in the unrolled body) without needing
+      to re-walk the cloned blocks.
+    - It supports out-of-order iteration processing (which the partial
+      unroller exploits when it clones for clone_idx = 1..unroll_factor-1
+      out of order).
+    - The list is grown lazily with zero-padding so set-at-index is safe
+      even when iterations are processed non-monotonically.
+
+    Operand rewriting consults this map only — original operands that have
+    no entry (loop-invariant values defined outside the loop) are
+    intentionally left untouched, since they remain valid across all
+    cloned iterations.
+    @End Reasoning
+
     @Implementation
     SSA renaming ensures each cloned instruction produces unique values.
 
@@ -1007,6 +1276,39 @@ End Process
 
 Note: Perform full loop unrolling (completely eliminate loop)
 Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Reasoning
+    Full unrolling is the maximally aggressive transformation: it replaces
+    the loop with a flat instruction sequence of trip_count copies of the
+    body, then removes the original header/latch/back-edge entirely. The
+    win comes from three compounding effects:
+
+    1. **Branch elimination** — the loop's back-edge branch is gone in
+       every iteration, removing branch-prediction pressure.
+    2. **Iteration-specific constant folding** — substituting the IV with
+       its actual constant value in each cloned body lets the constant_prop
+       and gvn passes collapse iteration-dependent expressions (e.g.,
+       `array[i*4 + 12]` with i=3 becomes `array[24]`, a constant offset).
+    3. **Cross-iteration scheduling** — the LIR scheduler can now interleave
+       instructions from different iterations, exploiting ILP that was
+       previously hidden behind the back-edge.
+
+    The proc returns 0 (failure) rather than partially-unrolling when:
+    - trip_count is non-positive or above max_unroll_iterations (caller
+      should have screened this, but defense-in-depth matters here because
+      a malformed unroll cannot be undone).
+    - No induction variable was found (no IV means no closed-form
+      substitution, so cloning produces a non-terminating residual loop).
+
+    Block connection order is preserved iteration-by-iteration: iteration N
+    flows into iteration N+1 via redirect_block_successor, and the final
+    iteration's last block redirects to the loop's original exit. This
+    keeps the post-unroll CFG well-formed for downstream passes.
+
+    Memory ownership: cloned_blocks_per_iteration is locally owned and
+    destroyed before return. The cloned blocks themselves now belong to
+    the CFG, which owns their lifetime via CFG.destroy.
+    @End Reasoning
+
     @Implementation
     Full unrolling transforms:
     ```
@@ -1077,9 +1379,9 @@ Process called "full_unroll_loop" that takes context_ptr as Integer, loop_ptr as
             Let block_id be proc string_to_int from MIR with block_id_str
 
             If block_id is not equal to header_id and block_id is not equal to latch_id:
-                Let cloned_block_id be clone_block(context_ptr, block_id, iter)
+                Let cloned_block_id be proc clone_block with context_ptr, block_id, iter
                 proc append from List with iteration_blocks, cloned_block_id
-                rename_cloned_values(context_ptr, cloned_block_id, iter)
+                proc rename_cloned_values with context_ptr, cloned_block_id, iter
 
                 Note: Substitute IV with constant
                 Let cloned_block_ptr be proc get_block_by_id from CFG with cfg_ptr, cloned_block_id
@@ -1171,6 +1473,39 @@ End Process
 
 Note: Perform partial loop unrolling with remainder loop
 Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr as Integer returns Integer:
+    @Reasoning
+    Partial unrolling is the fallback when full unrolling is unsafe or
+    unprofitable — typically when trip count is unknown or large. The
+    transformation does K-1 body clones inside the loop (so each iteration
+    processes K original iterations' worth of work) and multiplies the
+    induction step by K so the IV still advances by K original-iterations
+    per loop step.
+
+    The remainder loop is essential for correctness when N % K != 0: the
+    main unrolled loop only handles multiples of K, leaving 0..K-1 trailing
+    iterations to execute one-at-a-time. Without the remainder loop, an
+    arbitrary trip count would silently skip the trailing iterations and
+    introduce a wrong-answer bug — the single most dangerous failure mode
+    of any loop optimization.
+
+    Suffix 9000 is reserved for remainder blocks specifically so debug
+    output (block id printouts, dumped CFG diagrams) trivially distinguishes
+    the main unrolled body (suffix 1..K-1) from the remainder body
+    (suffix 9000). This convention applies repo-wide.
+
+    The remainder phi rewiring at the end is the subtle piece: the cloned
+    update instruction inherits the main loop's multiplied step (because
+    clone_instruction copies operands verbatim), and must be reset to the
+    original single-iteration step. Skipping this reset produces a
+    remainder loop that overshoots its bound — exactly the bug class the
+    remainder loop exists to prevent.
+
+    Unroll factor (4) is chosen on the context, not on the loop, because
+    making it loop-specific would require a heuristic that depends on body
+    size, IV usage, and microarchitecture — that decision properly lives in
+    the cost model, not in the transformer.
+    @End Reasoning
+
     @Implementation
     Partial unrolling with factor K transforms:
     ```
@@ -1230,8 +1565,8 @@ Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr
             Let block_id be proc string_to_int from MIR with block_id_str
 
             If block_id is not equal to header_id:
-                Let cloned_block_id be clone_block(context_ptr, block_id, clone_idx)
-                rename_cloned_values(context_ptr, cloned_block_id, clone_idx)
+                Let cloned_block_id be proc clone_block with context_ptr, block_id, clone_idx
+                proc rename_cloned_values with context_ptr, cloned_block_id, clone_idx
             End If
 
             Set block_idx to block_idx plus 1
@@ -1249,7 +1584,7 @@ Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr
     Let remainder_suffix be 9000
 
     Note: Clone header for remainder loop
-    Let remainder_header_id be clone_block(context_ptr, header_id, remainder_suffix)
+    Let remainder_header_id be proc clone_block with context_ptr, header_id, remainder_suffix
 
     Note: Clone body blocks for remainder loop (with different suffix)
     Let remainder_blocks be proc create from List
@@ -1259,17 +1594,17 @@ Process called "partial_unroll_loop" that takes context_ptr as Integer, loop_ptr
         Set block_id to proc string_to_int from MIR with block_id_str
 
         If block_id is not equal to header_id and block_id is not equal to latch_id:
-            Let remainder_block_id be clone_block(context_ptr, block_id, remainder_suffix)
+            Let remainder_block_id be proc clone_block with context_ptr, block_id, remainder_suffix
             proc append from List with remainder_blocks, remainder_block_id
             Note: Rename values in remainder block
-            rename_cloned_values(context_ptr, remainder_block_id, remainder_suffix)
+            proc rename_cloned_values with context_ptr, remainder_block_id, remainder_suffix
         End If
 
         Set block_idx to block_idx plus 1
     End While
 
     Note: Clone latch for remainder loop
-    Let remainder_latch_id be clone_block(context_ptr, latch_id, remainder_suffix)
+    Let remainder_latch_id be proc clone_block with context_ptr, latch_id, remainder_suffix
 
     Note: Connect main loop exit to remainder loop header
     Let main_latch_block be proc get_block_by_id from CFG with cfg_ptr, latch_id
@@ -1306,6 +1641,33 @@ End Process
 
 Note: Main entry point for loop unrolling optimization
 Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The pipeline is deliberately linear: detect, analyze, decide, transform,
+    repeat. Loops are processed in detection order (which is approximately
+    pre-order in the CFG), so outer loops are processed before inner ones.
+    This ordering matters because:
+
+    - Full-unrolling an outer loop creates K copies of any contained
+      inner-loop infrastructure, which the inner-loop pass would then have
+      to redo K times. Inner-first would avoid that redundancy, but
+      outer-first gives the inliner and constant_prop more cross-iteration
+      visibility before the inner-loop work happens.
+    - The decision was made to let the post-unroll pipeline re-run if a
+      transformation invalidated an inner loop's analyses. The optimizer
+      driver handles this via the standard fix-point loop in
+      mir_optimizer.runa; this proc only commits to a single sweep.
+
+    Per-loop transformation is independent — failure of one loop's unroll
+    does not abort the sweep. is_profitable_to_unroll has already
+    pre-screened, but full_unroll_loop and partial_unroll_loop each have
+    their own internal guards (no IV, malformed trip count) and return 0
+    silently when those fire. The pipeline trusts those guards and moves
+    on.
+
+    The proc returns 1 (success) even when no loops are unrolled; "no
+    work" is not a failure for an optimization pass.
+    @End Reasoning
+
     @Implementation
     Loop unrolling pipeline:
 
@@ -1321,14 +1683,14 @@ Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Int
     Returns 1 on success, 0 on failure.
     @End Implementation
 
-    Let context_ptr be create_loop_unroll_context(cfg_ptr)
+    Let context_ptr be proc create_loop_unroll_context with cfg_ptr
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Let loops_count be detect_natural_loops(context_ptr)
+    Let loops_count be proc detect_natural_loops with context_ptr
     If loops_count is equal to 0:
-        destroy_loop_unroll_context(context_ptr)
+        proc destroy_loop_unroll_context with context_ptr
         Return 1
     End If
 
@@ -1337,39 +1699,71 @@ Process called "optimize_function_with_loop_unrolling" that takes cfg_ptr as Int
 
     While loop_idx is less than loops_count:
         Let loop_ptr be proc get from List with loops_list, loop_idx
-        Let iv_count be identify_induction_variables(context_ptr, loop_ptr)
-        Let trip_count be analyze_trip_count(context_ptr, loop_ptr)
-        Let profitable be is_profitable_to_unroll(context_ptr, loop_ptr)
+        Let iv_count be proc identify_induction_variables with context_ptr, loop_ptr
+        Let trip_count be proc analyze_trip_count with context_ptr, loop_ptr
+        Let profitable be proc is_profitable_to_unroll with context_ptr, loop_ptr
 
         If profitable is equal to 2:
-            full_unroll_loop(context_ptr, loop_ptr)
+            proc full_unroll_loop with context_ptr, loop_ptr
         End If
 
         If profitable is equal to 1:
-            partial_unroll_loop(context_ptr, loop_ptr)
+            proc partial_unroll_loop with context_ptr, loop_ptr
         End If
 
         Set loop_idx to loop_idx plus 1
     End While
 
-    print_loop_unrolling_stats(context_ptr)
-    destroy_loop_unroll_context(context_ptr)
+    proc print_loop_unrolling_stats with context_ptr
+    proc destroy_loop_unroll_context with context_ptr
 
     Return 1
 End Process
 
 Note: Wrapper for optimization pass execution
 Process called "run_loop_unrolling_pass" that takes cfg_ptr as Integer returns Integer:
-    Let should_run be should_run_loop_unrolling(cfg_ptr)
+    @Reasoning
+    Thin façade so the optimizer pipeline can register every pass with a
+    uniform signature. The should_run gate is checked here (not inside
+    optimize_function_with_loop_unrolling) so the gate logic can be exposed
+    for cost-model introspection without forcing the full transformer to
+    instantiate a context.
+
+    Return 1 on skip is the optimizer pipeline's convention for "pass
+    voluntarily declined", distinct from 0 which would signal a hard error.
+    @End Reasoning
+
+    @Implementation
+    Gate first, transform second. should_run_loop_unrolling performs a
+    cheap CFG scan to confirm at least one back edge exists; only then do
+    we pay the cost of building the unroll context.
+    @End Implementation
+
+    Let should_run be proc should_run_loop_unrolling with cfg_ptr
     If should_run is equal to 0:
         Return 1
     End If
 
-    Return optimize_function_with_loop_unrolling(cfg_ptr)
+    Return proc optimize_function_with_loop_unrolling with cfg_ptr
 End Process
 
 Note: Check if loop unrolling pass should execute
 Process called "should_run_loop_unrolling" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The cheapest possible "does this function contain a loop?" approximation
+    is block count: a function with fewer than 2 blocks cannot contain a
+    loop (a loop requires at least a header and a latch, even when they
+    are the same block — that case still needs an entry block to dominate
+    it). This conservative gate avoids the expense of building a dominance
+    tree just to discover the function is loop-free.
+
+    A more precise gate would scan for back edges directly, but at that
+    point we're already paying most of the cost of the full pass. The
+    block-count heuristic is correct (no false negatives) and trades a
+    small false-positive rate (we may build a context for a 2-block
+    loop-free function) for a far cheaper check on the common case.
+    @End Reasoning
+
     Note: Check if CFG has loops (presence of back edges)
     Let blocks_count be proc get_block_count from CFG with cfg_ptr
     If blocks_count is less than 2:

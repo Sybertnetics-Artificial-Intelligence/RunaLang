@@ -15,447 +15,481 @@ limitations under the License.
 :End Note
 
 Note:
-This file handles MIR construction and HIR to MIR lowering.
+MIR BUILDER CONTEXT - HIR to MIR Lowering Substrate (P2-E Group B)
 
-This file performs the following tasks:
-- Process HIR to MIR lowering and MIR construction
-- Handle SSA form construction and phi node insertion
-- Manage control flow graph construction and basic block management
-- Process structured to unstructured control flow conversion
+After the P2-E v3 refactor, mir_builder.runa holds only the state and
+emission primitives shared by every HIR-to-MIR lowering handler. The
+per-node-type lowering logic lives in:
+  - compiler/middle/gungnir/mir/lowering/lowering_context.runa
+  - compiler/middle/gungnir/mir/lowering/expression_lowering.runa
+  - compiler/middle/gungnir/mir/lowering/statement_lowering.runa
+  - compiler/middle/gungnir/mir/lowering/control_flow_lowering.runa
+  - compiler/middle/gungnir/mir/lowering/definition_lowering.runa
 
-This file is essential because of the following reasons:
-- MIR construction enables SSA form and control flow graph representation
-- Proper MIR building ensures correct HIR to MIR transformation
-- MIR builder support enables Runa compilation for SSA-based optimization
+The 11 retained procs in this file:
+  - create_mir_builder_context           Allocate the per-pass context
+  - destroy_mir_builder_context          Free it
+  - mir_context_register_external        P2-D FFI externals registry insert
+  - mir_context_lookup_external          P2-D FFI externals registry read
+  - allocate_temp_value                  Fresh MIR SSA value id
+  - allocate_label                       Fresh basic-block label id
+  - map_hir_to_mir_value                 Bind HIR symbol id to MIR value id
+  - lookup_mir_value                     Resolve HIR symbol id to MIR value
+  - emit_instruction                     Append instruction + register definition
 
-This file consists of the following functions/features/operation types:
-- HIR to MIR lowering and MIR construction
-- SSA form construction and phi node insertion
-- Control flow graph construction and basic block management
-- Structured to unstructured control flow conversion
+The two helpers used by CFG construction:
+  - construct_cfg_from_instructions      Legacy public-API stub; current
+                                          CFG construction lives in
+                                          cfg.runa as build_cfg_from_
+                                          instructions
+  - find_block_by_label                  Linear search the legacy block
+                                          map; kept for backward compat
+                                          with external callers
 :End Note
 
-Note: ============================================================================
+Note: ============================================================
 Note: IMPORTS
-Note: ============================================================================
+Note: ============================================================
 
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
 Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
-Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
-Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
-Import "compiler/middle/gungnir/hir/hir.runa" as HIR
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dictionary
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
-Note: ============================================================================
-Note: PHASE 1: DATA STRUCTURES - MIR Builder Context
-Note: ============================================================================
-Note:
-The MIR builder maintains context during HIR→MIR lowering:
-  - Current function being built
-  - Current basic block being populated
-  - HIR value → MIR value mappings
-  - Label management for control flow
-  - Type information preservation
-:End Note
+Note: ============================================================
+Note: MIRBuilderContext type
+Note: ============================================================
+
+@Reasoning
+MIRBuilderContext carries the mutable state every lowering handler
+needs to share: the current MIR function being populated, the linear
+instruction list under construction, the HIR-to-MIR value map, fresh-
+id counters, the active break/continue targets for loop-aware
+statement lowering, and the externals registry for P2-D FFI metadata
+propagation.
+
+Memory layout (128 bytes):
+  Offset 0:  current_function (MIRFunction*)
+  Offset 8:  current_block (MIRBasicBlock*) - reserved for future use
+  Offset 16: instruction_list (List of MIR instruction*)
+  Offset 24: value_map (Dictionary HIR-id-string -> MIR-value-id)
+  Offset 32: value_map_count (Integer)
+  Offset 40: label_counter (Integer)
+  Offset 48: temp_counter (Integer)
+  Offset 56: break_target (block id or -1)
+  Offset 64: continue_target (block id or -1)
+  Offset 72: function_return_type (HIRTypeInfo*)
+  Offset 80: externals_dict (Dictionary name -> convention_id+1)
+@End Reasoning
+
+@Implementation
+Plain Tier 3 owned-heap struct. Field access goes through
+memory_get_int64 / memory_set_int64 from the Layout primitive.
+@End Implementation
+
+@Performance_Hints
+Heap-allocated; one per lowering pass.
+@End Performance_Hints
+
+@Security_Scope
+Pointer fields are caller-managed; lookups defensive against null.
+@End Security_Scope
 
 Type called "MIRBuilderContext":
-    @Reasoning
-    Maintains state during HIR to MIR lowering.
-
-    **CONTEXT STRUCTURE:**
-    ```
-    MIRBuilderContext:
-        current_function: MIRFunction pointer
-        current_block: MIRBasicBlock pointer
-        instruction_list: List of MIR instructions (before CFG construction)
-        value_map: HIR value ID → MIR value ID mapping (Dictionary for O(1) lookup)
-        value_map_count: Number of mappings
-        label_counter: Counter for generating unique labels
-        temp_counter: Counter for generating values
-        break_target: Block ID for break statements (-1 if none)
-        continue_target: Block ID for continue statements (-1 if none)
-        function_return_type: HIRTypeInfo for return type validation
-    ```
-
-    **MEMORY LAYOUT** (128 bytes total):
-    ```
-    Offset 0:  current_function (Integer - MIRFunction pointer)
-    Offset 8:  current_block (Integer - MIRBasicBlock pointer)
-    Offset 16: instruction_list (Integer - List pointer)
-    Offset 24: value_map (Integer - Dictionary pointer for HIR→MIR mappings)
-    Offset 32: value_map_count (Integer)
-    Offset 40: label_counter (Integer)
-    Offset 48: temp_counter (Integer)
-    Offset 56: break_target (Integer - block ID or -1)
-    Offset 64: continue_target (Integer - block ID or -1)
-    Offset 72: function_return_type (Integer - HIRTypeInfo pointer)
-    Offset 80: [reserved for future use]
-    ```
-
-    This context is passed through all lowering functions.
-    @End Reasoning
-
     current_function as Integer       Note: MIRFunction being built
-    current_block as Integer          Note: Current MIRBasicBlock
-    instruction_list as Integer       Note: instruction list
-    value_map as Integer              Note: HIR→MIR value mappings
-    value_map_count as Integer        Note: Number of mappings
-    label_counter as Integer          Note: Unique label generation
-    temp_counter as Integer           Note: value generation
-    break_target as Integer           Note: Break target block ID (-1 if none)
-    continue_target as Integer        Note: Continue target block ID (-1 if none)
-    function_return_type as Integer   Note: Function return type info
+    current_block as Integer          Note: Current MIRBasicBlock pointer
+    instruction_list as Integer       Note: List of emitted MIR instructions
+    value_map as Integer              Note: HIR id -> MIR value id Dictionary
+    value_map_count as Integer        Note: Number of mappings recorded
+    label_counter as Integer          Note: Monotonic label id counter
+    temp_counter as Integer           Note: Monotonic SSA value id counter
+    break_target as Integer           Note: Active loop exit label or -1
+    continue_target as Integer        Note: Active loop header label or -1
+    function_return_type as Integer   Note: Active function return type
 End Type
 
+Note: ============================================================
+Note: Context lifecycle
+Note: ============================================================
+
+@Reasoning
+Allocates a fresh MIRBuilderContext, initialises every field to safe
+defaults, creates the empty instruction list, value map, and
+externals registry.
+@End Reasoning
+
+@Implementation
+1. Allocate 128 bytes via the Layout primitive.
+2. Set every offset 0..72 to its initial value (0 or -1).
+3. Create the instruction list (List primitive) at offset 16.
+4. Create the value map (Dictionary primitive) at offset 24.
+5. Create the externals dictionary at offset 80.
+6. Return the context pointer.
+@End Implementation
+
+@Performance_Hints
+One large allocation plus two list/dict allocations. Cold path.
+@End Performance_Hints
+
+@Security_Scope
+Allocation failure cascades cleanly: caller checks the return value
+and bails out without leaking partial state.
+@End Security_Scope
+
 Process called "create_mir_builder_context" that returns Integer:
-    @Reasoning
-    Creates a new MIR builder context for HIR→MIR lowering.
-
-    **INITIALIZATION:**
-    - Allocates 128 bytes for the context
-    - Initializes all fields to safe defaults
-    - Creates empty instruction list
-    - Creates empty value mapping Dictionary (O(1) HIR→MIR lookup)
-    - Sets counters to 0
-    - Sets break/continue targets to -1 (invalid)
-
-    **TIER 3 (OWNED HEAP) ALLOCATION:**
-    The context is heap-allocated and owned by the caller.
-    Must be destroyed with destroy_mir_builder_context() when done.
-    @End Reasoning
-
-    Note: Allocate context structure (128 bytes)
-    Let context_ptr be Layout.allocate(128)
+    Let context_ptr be proc allocate from Layout with 128
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Initialize fields
-    Layout.memory_set_int64(context_ptr, 0, 0)    Note: current_function
-    Layout.memory_set_int64(context_ptr, 8, 0)    Note: current_block
+    proc memory_set_int64 from Layout with context_ptr, 0, 0
+    proc memory_set_int64 from Layout with context_ptr, 8, 0
 
-    Note: Create instruction list
-    Let inst_list be List.create()
-    Layout.memory_set_int64(context_ptr, 16, inst_list)
+    Let inst_list be proc create from List
+    proc memory_set_int64 from Layout with context_ptr, 16, inst_list
 
-    Note: Create value mapping Dictionary (HIR value ID -> MIR value ID)
-    Let value_map be Dictionary.create()
-    Layout.memory_set_int64(context_ptr, 24, value_map)
-    Layout.memory_set_int64(context_ptr, 32, 0)   Note: value_map_count
+    Let value_map be proc create from Dictionary
+    proc memory_set_int64 from Layout with context_ptr, 24, value_map
+    proc memory_set_int64 from Layout with context_ptr, 32, 0
 
-    Note: Initialize counters
-    Layout.memory_set_int64(context_ptr, 40, 0)   Note: label_counter
-    Layout.memory_set_int64(context_ptr, 48, 0)   Note: temp_counter
+    proc memory_set_int64 from Layout with context_ptr, 40, 0
+    proc memory_set_int64 from Layout with context_ptr, 48, 0
 
-    Note: Initialize break/continue targets to -1 (invalid)
-    Layout.memory_set_int64(context_ptr, 56, -1)  Note: break_target
-    Layout.memory_set_int64(context_ptr, 64, -1)  Note: continue_target
+    proc memory_set_int64 from Layout with context_ptr, 56, 0 minus 1
+    proc memory_set_int64 from Layout with context_ptr, 64, 0 minus 1
 
-    Note: Initialize return type to null
-    Layout.memory_set_int64(context_ptr, 72, 0)   Note: function_return_type
+    proc memory_set_int64 from Layout with context_ptr, 72, 0
 
-    Note: P2-D FFI: externals registry (Dictionary: name_string -> convention_id+1).
-    Note: Stores +1 to distinguish "not registered" (0) from convention_id=0 (c).
-    Let externals_dict be Dictionary.create()
-    Layout.memory_set_int64(context_ptr, 80, externals_dict)
+    Let externals_dict be proc create from Dictionary
+    proc memory_set_int64 from Layout with context_ptr, 80, externals_dict
 
     Return context_ptr
 End Process
 
+@Reasoning
+Registers an external function name with its calling convention in
+the MIR builder's per-context externals registry. The registry is
+consumed by call-expression lowering: when a call's callee
+identifier matches a registered name, the MIR_CALL node receives
+the FFI metadata (callee_is_external = 1, callee_convention_id =
+registered convention) so LIR / codegen can dispatch through the
+correct calling convention.
+
+Convention IDs are stored offset by +1 inside the dictionary so
+that the natural "miss returns 0" semantic distinguishes "not
+registered" from "registered with convention_id = 0 (FFI_CALLING
+_CONV_C)". Without the offset, registering a C-convention external
+would be indistinguishable from absence.
+@End Reasoning
+
+@Implementation
+Lazily allocates the externals Dictionary at offset 80 of the MIR
+builder context if not yet present (defensive against constructor
+paths that may have failed to allocate it). Inserts (name,
+convention_id + 1). Returns 1 on success, 0 on null inputs.
+@End Implementation
+
+@Performance_Hints
+Amortized O(1) dictionary insert. Called once per External
+declaration processed by definition_lowering; cold path.
+@End Performance_Hints
+
+@Security_Scope
+The registry is private to the MIR builder context. Only the HIR
+to MIR lowering for HIR_EXTERNAL_DECLARATION reaches this Process,
+and that code path has already validated the External's library,
+alias, and convention fields. User code cannot poison the
+registry.
+@End Security_Scope
+
 Process called "mir_context_register_external" that takes context_ptr as Integer, name as Integer, convention_id as Integer returns Integer:
-    @Reasoning
-    Registers an external function name with its calling convention in the
-    MIR builder's per-context externals registry. The registry is consumed
-    by lower_hir_call_expression: when a call's callee identifier matches a
-    registered name, the MIR_CALL node receives the FFI metadata
-    (callee_is_external = 1, callee_convention_id = registered convention)
-    so LIR / codegen can dispatch through the correct calling convention.
-
-    Convention IDs are stored offset by +1 inside the dictionary so that
-    the natural "miss returns 0" semantic distinguishes "not registered"
-    from "registered with convention_id = 0 (FFI_CALLING_CONV_C)". Without
-    the offset, registering a C-convention external would be
-    indistinguishable from absence.
-    @End Reasoning
-
-    @Implementation
-    Lazily allocates the externals Dictionary at offset 80 of the MIR
-    builder context if not yet present (defensive against constructor
-    paths that may have failed to allocate it). Inserts (name,
-    convention_id + 1). Returns 1 on success, 0 on null inputs.
-    @End Implementation
-
-    @Performance_Hints
-    Amortized O(1) dictionary insert. Called once per External declaration
-    processed by lower_hir_external_declaration; cold path.
-    @End Performance_Hints
-
-    @Security_Scope
-    The registry is private to the MIR builder context. Only the HIR-to-MIR
-    lowering for HIR_EXTERNAL_DECLARATION reaches this Process, and that
-    code path has already validated the External's library, alias, and
-    convention fields. User code cannot poison the registry.
-    @End Security_Scope
-
     If context_ptr is equal to 0:
         Return 0
     End If
     If name is equal to 0:
         Return 0
     End If
-    Let dict be Layout.memory_get_int64(context_ptr, 80)
+    Let dict be proc memory_get_int64 from Layout with context_ptr, 80
     If dict is equal to 0:
-        Set dict to Dictionary.create()
-        Layout.memory_set_int64(context_ptr, 80, dict)
+        Set dict to proc create from Dictionary
+        proc memory_set_int64 from Layout with context_ptr, 80, dict
     End If
-    Dictionary.set(dict, name, convention_id plus 1)
+    Let stored_value be convention_id plus 1
+    proc set from Dictionary with dict, name, stored_value
     Return 1
 End Process
+
+@Reasoning
+Returns the registered convention_id + 1 for an external name, or
+0 if the name is not registered. Callers (notably the call-
+expression post handler) subtract 1 from a nonzero return to
+recover the actual convention_id; a 0 return signals that the
+callee is a non-FFI function and the MIR_CALL node should not
+receive FFI metadata.
+@End Reasoning
+
+@Implementation
+Single dictionary lookup against the externals registry at offset
+80 of the MIR builder context. Returns 0 on null context, null
+name, or unallocated registry. The +1 encoding is decoded by the
+caller (this Process returns the raw stored value to preserve the
+"0 = miss" contract).
+@End Implementation
+
+@Performance_Hints
+Amortized O(1) dictionary lookup. Called once per HIR call
+expression lowering. Branch-predictable: most call sites in real
+programs do not target External Processes, so the miss path is
+the common case.
+@End Performance_Hints
+
+@Security_Scope
+Read-only accessor. A false negative (registered name reported as
+not-registered) would cause the MIR_CALL to lower without FFI
+metadata and degrade to the host calling convention, which is a
+correctness issue but not a safety issue.
+@End Security_Scope
 
 Process called "mir_context_lookup_external" that takes context_ptr as Integer, name as Integer returns Integer:
-    @Reasoning
-    Returns the registered convention_id + 1 for an external name, or 0 if
-    the name is not registered. Callers (notably lower_hir_call_expression)
-    subtract 1 from a nonzero return to recover the actual convention_id;
-    a 0 return signals that the callee is a non-FFI function and the
-    MIR_CALL node should not receive FFI metadata.
-    @End Reasoning
-
-    @Implementation
-    Single dictionary lookup against the externals registry at offset 80
-    of the MIR builder context. Returns 0 on null context, null name, or
-    unallocated registry. The +1 encoding is decoded by the caller (this
-    Process returns the raw stored value to preserve the "0 = miss"
-    contract).
-    @End Implementation
-
-    @Performance_Hints
-    Amortized O(1) dictionary lookup. Called once per HIR call expression
-    lowering. Branch-predictable: most call sites in real programs do not
-    target External Processes, so the miss path is the common case.
-    @End Performance_Hints
-
-    @Security_Scope
-    Read-only accessor. A false negative (registered name reported as
-    not-registered) would cause the MIR_CALL to lower without FFI
-    metadata and degrade to the host calling convention, which is a
-    correctness issue but not a safety issue. The HIR string interning
-    used for identifier keys eliminates false negatives in practice.
-    @End Security_Scope
-
     If context_ptr is equal to 0:
         Return 0
     End If
     If name is equal to 0:
         Return 0
     End If
-    Let dict be Layout.memory_get_int64(context_ptr, 80)
+    Let dict be proc memory_get_int64 from Layout with context_ptr, 80
     If dict is equal to 0:
         Return 0
     End If
-    Return Dictionary.get(dict, name)
+    Return proc get from Dictionary with dict, name
 End Process
 
+@Reasoning
+Destroys a MIR builder context and frees the per-pass auxiliary
+structures (instruction list, value map). The MIRFunction and
+basic blocks are NOT freed — they are owned by the MIRProgram.
+@End Reasoning
+
+@Implementation
+1. Destroy the instruction list at offset 16.
+2. Destroy the value map at offset 24.
+3. Destroy the externals dict at offset 80.
+4. Deallocate the context.
+@End Implementation
+
+@Performance_Hints
+Cold path; one teardown per lowering pass.
+@End Performance_Hints
+
+@Security_Scope
+Idempotent on null context.
+@End Security_Scope
+
 Process called "destroy_mir_builder_context" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Destroys a MIR builder context and frees all associated memory.
-
-    **CLEANUP:**
-    - Destroys instruction list
-    - Destroys value mapping Dictionary
-    - Frees context structure
-
-    Note: The MIRFunction and MIRBasicBlocks are NOT freed here
-    (they are owned by the MIRProgram).
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Destroy instruction list
-    Let inst_list be Layout.memory_get_int64(context_ptr, 16)
+    Let inst_list be proc memory_get_int64 from Layout with context_ptr, 16
     If inst_list is not equal to 0:
-        List.destroy(inst_list)
+        proc destroy from List with inst_list
     End If
 
-    Note: Destroy value mapping Dictionary
-    Let value_map be Layout.memory_get_int64(context_ptr, 24)
+    Let value_map be proc memory_get_int64 from Layout with context_ptr, 24
     If value_map is not equal to 0:
-        Dictionary.destroy(value_map)
+        proc destroy from Dictionary with value_map
     End If
 
-    Note: Free context structure
-    Layout.deallocate(context_ptr)
+    Let externals_dict be proc memory_get_int64 from Layout with context_ptr, 80
+    If externals_dict is not equal to 0:
+        proc destroy from Dictionary with externals_dict
+    End If
 
+    proc deallocate from Layout with context_ptr
     Return 1
 End Process
 
+Note: ============================================================
+Note: Id allocators
+Note: ============================================================
+
+@Reasoning
+Allocates a fresh MIR SSA value id. Value 0 is reserved for "no
+value" / void, so this counter starts at 1 and increments
+monotonically.
+@End Reasoning
+
+@Implementation
+Read counter at offset 48, increment in place, return the
+incremented value. Returns 0 on null context (treated as void).
+@End Implementation
+
+@Performance_Hints
+Inner-loop primitive — called once per MIR instruction that
+produces a value.
+@End Performance_Hints
+
+@Security_Scope
+Bounded by Int64 wrap (never reachable in practice).
+@End Security_Scope
+
 Process called "allocate_temp_value" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Allocates a new MIR value ID.
-
-    **VALUES:**
-    values are used for intermediate expression results.
-    Each gets a unique ID that increments from 1.
-
-    **VALUE ID SCHEME:**
-    - 0: Invalid/null value
-    - 1+: values (incremented by temp_counter)
-    - Function parameters and locals get specific IDs during function setup
-
-    This ensures each SSA value has a unique identifier.
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
-
-    Note: Get current counter (offset 48)
-    Let counter be Layout.memory_get_int64(context_ptr, 48)
-
-    Note: Increment counter
+    Let counter be proc memory_get_int64 from Layout with context_ptr, 48
     Set counter to counter plus 1
-    Layout.memory_set_int64(context_ptr, 48, counter)
-
-    Note: Return new value ID
+    proc memory_set_int64 from Layout with context_ptr, 48, counter
     Return counter
 End Process
 
+@Reasoning
+Allocates a fresh basic-block label id. Like temp values, labels
+are monotonic integer counters. Label 0 is the implicit entry
+block; subsequent labels start at 1.
+@End Reasoning
+
+@Implementation
+Read counter at offset 40, save current value as the new label,
+increment, return the saved value.
+@End Implementation
+
+@Performance_Hints
+Cold compared to temp-value allocation; only emitted at control-
+flow construct boundaries.
+@End Performance_Hints
+
+@Security_Scope
+Bounded by Int64 wrap.
+@End Security_Scope
+
 Process called "allocate_label" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Allocates a new unique label ID for basic blocks.
-
-    **LABEL SCHEME:**
-    Labels are used to identify basic blocks in the CFG.
-    Each gets a unique ID starting from 0.
-
-    **USAGE:**
-    - Entry block: label 0
-    - Other blocks: incrementing from 1
-    - Labels are resolved to block IDs after CFG construction
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
-
-    Note: Get current label counter (offset 40)
-    Let counter be Layout.memory_get_int64(context_ptr, 40)
-
-    Note: Save current value as label ID
+    Let counter be proc memory_get_int64 from Layout with context_ptr, 40
     Let label_id be counter
-
-    Note: Increment counter for next label
     Set counter to counter plus 1
-    Layout.memory_set_int64(context_ptr, 40, counter)
-
+    proc memory_set_int64 from Layout with context_ptr, 40, counter
     Return label_id
 End Process
 
+Note: ============================================================
+Note: HIR-to-MIR value mapping
+Note: ============================================================
+
+@Reasoning
+Records a HIR-symbol-id -> MIR-value-id mapping in the value map
+dictionary. The HIR identifier id is converted to a string key
+(Dictionary uses string keys) and the MIR value id stored as the
+value. Mapping is required so identifier-expression lowering can
+look up its corresponding MIR value.
+@End Reasoning
+
+@Implementation
+1. Read value map at offset 24.
+2. Convert hir_value_id to a string key.
+3. Dictionary.set the mapping.
+4. Increment the value_map_count.
+@End Implementation
+
+@Performance_Hints
+Amortized O(1). The integer-to-string conversion is the dominant
+cost per call.
+@End Performance_Hints
+
+@Security_Scope
+The dictionary owns the string keys; the value map's lifetime is
+tied to the builder context.
+@End Security_Scope
+
 Process called "map_hir_to_mir_value" that takes context_ptr as Integer, hir_value_id as Integer, mir_value_id as Integer returns Integer:
-    @Reasoning
-    Maps a HIR value ID to its corresponding MIR value ID.
-
-    **VALUE MAPPING:**
-    During lowering, HIR values (variables, expressions) are mapped to
-    MIR SSA values. This mapping allows us to reference the correct
-    MIR value when lowering HIR uses.
-
-    **STORAGE:**
-    Stored in Dictionary for O(1) lookup:
-      value_map[hir_value_id] = mir_value_id
-
-    **PERFORMANCE:**
-    Dictionary provides O(1) insertion and lookup, critical for
-    large functions with thousands of value mappings.
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get value map Dictionary (offset 24)
-    Let value_map be Layout.memory_get_int64(context_ptr, 24)
+    Let value_map be proc memory_get_int64 from Layout with context_ptr, 24
     If value_map is equal to 0:
         Return 0
     End If
 
-    Note: Convert HIR value ID to string for dictionary key
     Let hir_id_str be proc integer_to_string from StringCore with hir_value_id
-
-    Note: Store mapping: hir_value_id -> mir_value_id (O(1) insertion)
     proc set from Dictionary with value_map, hir_id_str, mir_value_id
 
-    Note: Increment mapping count (offset 32)
-    Let count be Layout.memory_get_int64(context_ptr, 32)
+    Let count be proc memory_get_int64 from Layout with context_ptr, 32
     Set count to count plus 1
-    Layout.memory_set_int64(context_ptr, 32, count)
+    proc memory_set_int64 from Layout with context_ptr, 32, count
 
     Return 1
 End Process
 
+@Reasoning
+Reads the MIR value id mapped to a HIR symbol id. Returns 0 if no
+mapping exists (treated as "undefined" by callers).
+@End Reasoning
+
+@Implementation
+1. Read the value map at offset 24.
+2. Convert hir_value_id to a string key.
+3. Dictionary.get returns the value or 0.
+@End Implementation
+
+@Performance_Hints
+Amortized O(1). The integer-to-string conversion dominates cost.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
 Process called "lookup_mir_value" that takes context_ptr as Integer, hir_value_id as Integer returns Integer:
-    @Reasoning
-    Looks up the MIR value ID corresponding to a HIR value ID.
-
-    **LOOKUP:**
-    O(1) Dictionary lookup using hir_value_id as key.
-    Returns MIR value ID if found, 0 if not found.
-
-    **PERFORMANCE:**
-    Dictionary provides O(1) lookup time, critical for compilation
-    performance in large functions. Replaces O(n) linear search.
-
-    **ALGORITHM:**
-    ```
-    key = string(hir_value_id)
-    mir_value_id = value_map[key]
-    return mir_value_id or 0
-    ```
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get value map Dictionary (offset 24)
-    Let value_map be Layout.memory_get_int64(context_ptr, 24)
+    Let value_map be proc memory_get_int64 from Layout with context_ptr, 24
     If value_map is equal to 0:
         Return 0
     End If
 
-    Note: Convert HIR value ID to string for dictionary key
     Let hir_id_str be proc integer_to_string from StringCore with hir_value_id
-
-    Note: Lookup mapping in Dictionary (O(1) lookup)
-    Let mir_value_id be proc get from Dictionary with value_map, hir_id_str
-
-    Note: Return MIR value ID (0 if not found)
-    Return mir_value_id
+    Return proc get from Dictionary with value_map, hir_id_str
 End Process
 
+Note: ============================================================
+Note: Instruction emission
+Note: ============================================================
+
+@Reasoning
+Emits a MIR instruction by appending it to the per-context
+instruction list. If the instruction defines a value (value_id is
+non-zero), the value-to-instruction mapping is registered on the
+current MIRFunction so later passes can locate the defining
+instruction by value id.
+@End Reasoning
+
+@Implementation
+1. Append the instruction to the list at offset 16.
+2. Read value_id at MIRNode offset 8.
+3. If non-zero, read current_function at builder offset 0 and call
+   register_value_definition.
+@End Implementation
+
+@Performance_Hints
+Inner loop. List.append is amortized O(1); the value-definition
+registration is O(1) dictionary insert per producing instruction.
+@End Performance_Hints
+
+@Security_Scope
+Defensive against null context, null instruction, and missing
+function (the registration step is skipped when no function is
+active).
+@End Security_Scope
+
 Process called "emit_instruction" that takes context_ptr as Integer, instruction_ptr as Integer returns Integer:
-    @Reasoning
-    Emits a MIR instruction into the current context's instruction list.
-
-    **EMISSION:**
-    Instructions are collected in a list during lowering.
-    After all instructions are emitted, they are organized into
-    basic blocks during CFG construction.
-
-    **CRITICAL:** Registers value definitions in the value_to_instruction map
-    so that variable names can be looked up via metadata.
-
-    **ORDER:**
-    Instructions are emitted in the order they should execute.
-    Control flow instructions (branch, jump) mark block boundaries.
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -463,2040 +497,108 @@ Process called "emit_instruction" that takes context_ptr as Integer, instruction
         Return 0
     End If
 
-    Note: Get instruction list (offset 16)
-    Let inst_list be Layout.memory_get_int64(context_ptr, 16)
+    Let inst_list be proc memory_get_int64 from Layout with context_ptr, 16
     If inst_list is equal to 0:
         Return 0
     End If
 
-    Note: Append instruction to list
-    List.append(inst_list, instruction_ptr)
+    proc append from List with inst_list, instruction_ptr
 
-    Note: CRITICAL: Register value definition for metadata lookup
-    Note: Get value_id from MIRNode (offset 8)
-    Let value_id be Layout.memory_get_int64(instruction_ptr, 8)
+    Let value_id be proc memory_get_int64 from Layout with instruction_ptr, 8
 
     If value_id is not equal to 0:
-        Note: This instruction produces a value - register it
-        Note: Get current function (offset 0 in context)
-        Let function_ptr be Layout.memory_get_int64(context_ptr, 0)
-
+        Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 0
         If function_ptr is not equal to 0:
-            Note: Register value_id -> instruction mapping
-            MIR.register_value_definition(function_ptr, value_id, instruction_ptr)
+            proc register_value_definition from MIR with function_ptr, value_id, instruction_ptr
         End If
     End If
 
     Return 1
 End Process
 
-Note: ============================================================================
-Note: PHASE 1: EXPRESSION LOWERING - HIR Expressions → MIR Instructions
-Note: ============================================================================
-Note:
-Note: HIR expressions are lowered to sequences of MIR instructions.
-Note: Each expression produces a MIR value (SSA value ID).
-
-
-Process called "lower_hir_literal" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_LITERAL to MIR_CONST instruction.
-
-    **HIR LITERAL NODE:**
-    Contains literal value and type information.
-
-    **MIR CONST:**
-    Creates a constant value in MIR SSA form.
-
-    **LOWERING:**
-    ```
-    HIR: <literal value=42, type=Integer>
-    MIR: %1 = const Integer 42
-    ```
-
-    Returns the MIR value ID for the constant.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Allocate value for const result
-    Let result_value be allocate_temp_value(context_ptr)
-
-    Note: Get literal value and type from HIR node
-    Note: HIRNode layout: type at offset 0, value at offset 8
-    Let literal_value be Layout.memory_get_int64(hir_node_ptr, 8)
-
-    Note: Create MIR const instruction
-    Let const_inst be MIRNodes.create_mir_const_instruction(result_value, literal_value)
-
-    Note: Emit instruction
-    emit_instruction(context_ptr, const_inst)
-
-    Return result_value
-End Process
-
-Process called "lower_hir_identifier" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_IDENTIFIER to MIR value lookup.
-
-    **HIR IDENTIFIER:**
-    References a variable or parameter by name/ID.
-
-    **MIR VALUE:**
-    In SSA form, identifiers are replaced by their SSA value IDs.
-    We lookup the MIR value that was assigned when the variable was defined.
-
-    **LOWERING:**
-    ```
-    HIR: <identifier name="x", id=42>
-    MIR: %5  (where %5 is the current SSA value for variable 42)
-    ```
-
-    Returns the MIR value ID for the identifier.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get HIR identifier ID from node
-    Note: HIRNode layout: identifier ID at offset 16
-    Let hir_id be Layout.memory_get_int64(hir_node_ptr, 16)
-
-    Note: Lookup corresponding MIR value
-    Let mir_value be lookup_mir_value(context_ptr, hir_id)
-
-    If mir_value is equal to 0:
-        Note: Variable not yet defined, error condition
-        Display "lower_hir_identifier: undefined variable"
-        Return 0
-    End If
-
-    Return mir_value
-End Process
-
-Process called "lower_hir_binary_expression" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_BINARY_EXPRESSION to MIR arithmetic/logical instruction.
-
-    **HIR BINARY EXPRESSION:**
-    Contains operator, left operand, right operand, result type.
-
-    **MIR BINARY OP:**
-    Creates appropriate MIR instruction (ADD, SUB, MUL, DIV, etc.)
-
-    **LOWERING:**
-    ```
-    HIR: <binary_op operator="+", left=<expr1>, right=<expr2>>
-    MIR: %1 = [lower expr1]
-         %2 = [lower expr2]
-         %3 = add %1, %2
-    ```
-
-    Returns the MIR value ID for the result.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get operator type from HIR node (offset 24)
-    Let operator be Layout.memory_get_int64(hir_node_ptr, 24)
-
-    Note: Get left and right operand HIR nodes (offsets 32, 40)
-    Let left_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-    Let right_hir be Layout.memory_get_int64(hir_node_ptr, 40)
-
-    Note: Lower left and right operands recursively
-    Let left_value be lower_hir_expression(context_ptr, left_hir)
-    Let right_value be lower_hir_expression(context_ptr, right_hir)
-
-    If left_value is equal to 0:
-        Return 0
-    End If
-    If right_value is equal to 0:
-        Return 0
-    End If
-
-    Note: Allocate value for result
-    Let result_value be allocate_temp_value(context_ptr)
-
-    Note: Map HIR operator to MIR opcode
-    Let mir_opcode be map_binary_operator_to_mir_opcode(operator)
-
-    Note: Create MIR binary instruction
-    Let binary_inst be MIRNodes.create_mir_binary_op(mir_opcode, result_value, left_value, right_value)
-
-    Note: Emit instruction
-    emit_instruction(context_ptr, binary_inst)
-
-    Return result_value
-End Process
-
-Process called "map_binary_operator_to_mir_opcode" that takes hir_operator as Integer returns Integer:
-    @Reasoning
-    Maps HIR binary operator to corresponding MIR opcode.
-
-    **OPERATOR MAPPING:**
-    HIR operators → MIR opcodes
-    - HIR_OP_ADD → MIR_ADD (20002)
-    - HIR_OP_SUB → MIR_SUB (20003)
-    - HIR_OP_MUL → MIR_MUL (20004)
-    - HIR_OP_DIV → MIR_DIV (20005)
-    - HIR_OP_MOD → MIR_MOD (20006)
-    - HIR_OP_EQ → MIR_EQ (20100)
-    - HIR_OP_NE → MIR_NE (20101)
-    - HIR_OP_LT → MIR_LT (20102)
-    - HIR_OP_LE → MIR_LE (20103)
-    - HIR_OP_GT → MIR_GT (20104)
-    - HIR_OP_GE → MIR_GE (20105)
-    - HIR_OP_AND → MIR_AND (20010)
-    - HIR_OP_OR → MIR_OR (20011)
-    - HIR_OP_XOR → MIR_XOR (20012)
-    @End Reasoning
-
-    Note: HIR operator constants (from hir.runa)
-    Note: Arithmetic
-    If hir_operator is equal to 1:  Note: HIR_OP_ADD
-        Return 20002           Note: MIR_ADD
-    End If
-    If hir_operator is equal to 2:  Note: HIR_OP_SUB
-        Return 20003           Note: MIR_SUB
-    End If
-    If hir_operator is equal to 3:  Note: HIR_OP_MUL
-        Return 20004           Note: MIR_MUL
-    End If
-    If hir_operator is equal to 4:  Note: HIR_OP_DIV
-        Return 20005           Note: MIR_DIV
-    End If
-    If hir_operator is equal to 5:  Note: HIR_OP_MOD
-        Return 20006           Note: MIR_MOD
-    End If
-
-    Note: Comparison
-    If hir_operator is equal to 10:  Note: HIR_OP_EQ
-        Return 20100            Note: MIR_EQ
-    End If
-    If hir_operator is equal to 11:  Note: HIR_OP_NE
-        Return 20101            Note: MIR_NE
-    End If
-    If hir_operator is equal to 12:  Note: HIR_OP_LT
-        Return 20102            Note: MIR_LT
-    End If
-    If hir_operator is equal to 13:  Note: HIR_OP_LE
-        Return 20103            Note: MIR_LE
-    End If
-    If hir_operator is equal to 14:  Note: HIR_OP_GT
-        Return 20104            Note: MIR_GT
-    End If
-    If hir_operator is equal to 15:  Note: HIR_OP_GE
-        Return 20105            Note: MIR_GE
-    End If
-
-    Note: Bitwise/Logical
-    If hir_operator is equal to 20:  Note: HIR_OP_AND
-        Return 20010            Note: MIR_AND
-    End If
-    If hir_operator is equal to 21:  Note: HIR_OP_OR
-        Return 20011            Note: MIR_OR
-    End If
-    If hir_operator is equal to 22:  Note: HIR_OP_XOR
-        Return 20012            Note: MIR_XOR
-    End If
-
-    Note: Default: unknown operator, return NOP
-    Return 20000  Note: MIR_NOP
-End Process
-
-Process called "lower_hir_unary_expression" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_UNARY_EXPRESSION to MIR unary instruction.
-
-    **HIR UNARY EXPRESSION:**
-    Contains operator and operand.
-
-    **MIR UNARY OP:**
-    Creates appropriate MIR instruction (NEG, NOT, etc.)
-
-    **LOWERING:**
-    ```
-    HIR: <unary_op operator="-", operand=<expr>>
-    MIR: %1 = [lower expr]
-         %2 = neg %1
-    ```
-
-    Returns the MIR value ID for the result.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get operator type from HIR node (offset 24)
-    Let operator be Layout.memory_get_int64(hir_node_ptr, 24)
-
-    Note: Get operand HIR node (offset 32)
-    Let operand_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-
-    Note: Lower operand recursively
-    Let operand_value be lower_hir_expression(context_ptr, operand_hir)
-
-    If operand_value is equal to 0:
-        Return 0
-    End If
-
-    Note: Allocate value for result
-    Let result_value be allocate_temp_value(context_ptr)
-
-    Note: Map HIR operator to MIR opcode
-    Let mir_opcode be map_unary_operator_to_mir_opcode(operator)
-
-    Note: Create MIR unary instruction
-    Let unary_inst be MIRNodes.create_mir_unary_op(mir_opcode, result_value, operand_value)
-
-    Note: Emit instruction
-    emit_instruction(context_ptr, unary_inst)
-
-    Return result_value
-End Process
-
-Process called "map_unary_operator_to_mir_opcode" that takes hir_operator as Integer returns Integer:
-    @Reasoning
-    Maps HIR unary operator to corresponding MIR opcode.
-
-    **OPERATOR MAPPING:**
-    - HIR_OP_NEG → MIR_NEG (20007)
-    - HIR_OP_NOT → MIR_NOT (20013)
-    @End Reasoning
-
-    If hir_operator is equal to 1:  Note: HIR_OP_NEG
-        Return 20007           Note: MIR_NEG
-    End If
-    If hir_operator is equal to 2:  Note: HIR_OP_NOT
-        Return 20013           Note: MIR_NOT
-    End If
-
-    Note: Default: unknown operator
-    Return 20000  Note: MIR_NOP
-End Process
-
-Process called "lower_hir_call_expression" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_CALL_EXPRESSION to MIR_CALL instruction.
-
-    **HIR CALL:**
-    Contains callee (function name/pointer) and arguments list.
-
-    **MIR CALL:**
-    Creates a call instruction with result value and argument list.
-
-    **LOWERING:**
-    ```
-    HIR: <call callee="foo", args=[<expr1>, <expr2>]>
-    MIR: %1 = [lower expr1]
-         %2 = [lower expr2]
-         %3 = call @foo(%1, %2)
-    ```
-
-    Returns the MIR value ID for the call result.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get callee function name/ID (offset 32)
-    Let callee be Layout.memory_get_int64(hir_node_ptr, 32)
-
-    Note: Get arguments list (offset 40)
-    Let args_list be Layout.memory_get_int64(hir_node_ptr, 40)
-
-    Note: Get return type (offset 48 in lower_hir_call_expression's HIR layout convention).
-    Note: Used to populate the MIR_CALL return_type field for downstream type-aware lowering.
-    Let return_type be Layout.memory_get_int64(hir_node_ptr, 48)
-
-    Note: Lower all arguments
-    Let mir_args be List.create()
-
-    Let arg_count be List.length(args_list)
-    Let i be 0
-    While i is less than arg_count:
-        Let arg_hir be List.get(args_list, i)
-        Let arg_value be lower_hir_expression(context_ptr, arg_hir)
-        If arg_value is not equal to 0:
-            List.append(mir_args, arg_value)
-        End If
-        Set i to i plus 1
-    End While
-
-    Note: Compute the count of successfully lowered arguments. May be smaller
-    Note: than the HIR-level arg_count if any argument lowering failed (returned 0);
-    Note: in that case the lowered call carries only the successful subset, which
-    Note: matches the actual operand list emitted into mir_args.
-    Let lowered_arg_count be List.length(mir_args)
-
-    Note: Allocate value for call result
-    Let result_value be allocate_temp_value(context_ptr)
-
-    Note: Create MIR call instruction.
-    Note: All 7 parameters of create_mir_call (post-P2-D FFI extension) are supplied:
-    Note:   result_value_id  -> the MIR value ID receiving the call's return value
-    Note:   callee           -> direct callee name string pointer (HIR-level identifier)
-    Note:   arguments        -> List of lowered MIR value IDs
-    Note:   argument_count   -> count of operands actually placed in `arguments`
-    Note:   return_type      -> HIR return-type pointer (0 if untyped)
-    Note:   is_indirect      -> 0 for direct calls (callee is a named function);
-    Note:                       indirect calls take a separate HIR path that sets this
-    Note:   is_tail_call     -> 0 by default; tail_call optimization pass sets this later
-    Note: FFI metadata (callee_is_external, callee_convention_id) is populated by
-    Note: mir_call_set_ffi_metadata below when the callee resolves to a registered
-    Note: external in the MIR builder context.
-    Let call_inst be MIRNodes.create_mir_call(result_value, callee, mir_args, lowered_arg_count, return_type, 0, 0)
-
-    Note: P2-D FFI: If the callee resolves to a registered external in the MIR
-    Note: builder context's externals registry, propagate its convention_id and
-    Note: mark callee_is_external=1 on the MIR_CALL node. This drives LIR call
-    Note: lowering through the proper calling-convention dispatch path (D-FFI-07/08).
-    If call_inst is not equal to 0:
-        If callee is not equal to 0:
-            Let external_marker be mir_context_lookup_external(context_ptr, callee)
-            If external_marker is not equal to 0:
-                Let resolved_convention be external_marker minus 1
-                MIRNodes.mir_call_set_ffi_metadata(call_inst, 1, resolved_convention)
-            End If
-        End If
-    End If
-
-    Note: Emit instruction
-    emit_instruction(context_ptr, call_inst)
-
-    Return result_value
-End Process
-
-Process called "lower_hir_expression" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    **MAIN EXPRESSION LOWERING DISPATCHER**
-
-    Dispatches to appropriate lowering function based on HIR node type.
-
-    **SUPPORTED EXPRESSIONS:**
-    - HIR_LITERAL (10000) → lower_hir_literal
-    - HIR_IDENTIFIER (10001) → lower_hir_identifier
-    - HIR_BINARY_EXPRESSION (10002) → lower_hir_binary_expression
-    - HIR_UNARY_EXPRESSION (10003) → lower_hir_unary_expression
-    - HIR_CALL_EXPRESSION (10005) → lower_hir_call_expression
-
-    Returns MIR value ID for the expression result, or 0 on error.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get HIR node type (offset 0)
-    Let node_type be Layout.memory_get_int64(hir_node_ptr, 0)
-
-    Note: Dispatch to appropriate lowering function
-    If node_type is equal to 10000:  Note: HIR_LITERAL
-        Return lower_hir_literal(context_ptr, hir_node_ptr)
-    End If
-
-    If node_type is equal to 10001:  Note: HIR_IDENTIFIER
-        Return lower_hir_identifier(context_ptr, hir_node_ptr)
-    End If
-
-    If node_type is equal to 10002:  Note: HIR_BINARY_EXPRESSION
-        Return lower_hir_binary_expression(context_ptr, hir_node_ptr)
-    End If
-
-    If node_type is equal to 10003:  Note: HIR_UNARY_EXPRESSION
-        Return lower_hir_unary_expression(context_ptr, hir_node_ptr)
-    End If
-
-    If node_type is equal to 10005:  Note: HIR_CALL_EXPRESSION
-        Return lower_hir_call_expression(context_ptr, hir_node_ptr)
-    End If
-
-    Note: Unsupported expression type
-    Display "lower_hir_expression: unsupported HIR node type " joined with node_type
-    Return 0
-End Process
-
-Note: ============================================================================
-Note: PHASE 1: STATEMENT LOWERING - HIR Statements → MIR Instructions
-Note: ============================================================================
-
-Process called "lower_hir_let_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_LET_STATEMENT to MIR alloca + store.
-
-    **HIR LET:**
-    Variable declaration with initialization.
-    ```
-    Let x be 42
-    ```
-
-    **MIR LOWERING:**
-    ```
-    %1 = alloca type(x)      ; Allocate stack space
-    %2 = const 42            ; Lower initializer
-    store %2, %1             ; Store value to allocation
-    ```
-
-    Maps the HIR variable ID to the MIR allocation value.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get variable name, variable ID, and initializer
-    Note: HIRLetStatement structure (assuming): name at offset 16, var_id at offset 24, init at offset 32
-    Let var_name be Layout.memory_get_int64(hir_node_ptr, 16)
-    Let var_id be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let init_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-
-    Note: Get type information from HIR node (offset 8)
-    Let type_info be Layout.memory_get_int64(hir_node_ptr, 8)
-
-    Note: Allocate stack space for variable
-    Let alloca_value be allocate_temp_value(context_ptr)
-    Let alloca_inst be MIRNodes.create_mir_alloca(alloca_value, 8)  Note: 8 bytes for Integer
-
-    Note: CRITICAL: Create and attach metadata with variable name
-    If var_name is not equal to 0:
-        Note: Get source location from HIR node (if available, offsets 40, 48)
-        Let source_line be Layout.memory_get_int64(hir_node_ptr, 40)
-        Let source_column be Layout.memory_get_int64(hir_node_ptr, 48)
-
-        Note: Create MIRMetadata with variable name
-        Let metadata_ptr be MIRNodes.create_mir_metadata(var_name, 0, source_line, source_column, type_info)
-
-        If metadata_ptr is not equal to 0:
-            Note: Attach metadata to alloca instruction (offset 64 in MIRNode)
-            Layout.memory_set_int64(alloca_inst, 64, metadata_ptr)
-        End If
-    End If
-
-    emit_instruction(context_ptr, alloca_inst)
-
-    Note: Map HIR variable to MIR alloca value
-    map_hir_to_mir_value(context_ptr, var_id, alloca_value)
-
-    Note: Lower initializer expression
-    If init_hir is not equal to 0:
-        Let init_value be lower_hir_expression(context_ptr, init_hir)
-
-        Note: Store initialized value
-        If init_value is not equal to 0:
-            Let store_inst be MIRNodes.create_mir_store(init_value, alloca_value)
-            emit_instruction(context_ptr, store_inst)
-        End If
-    End If
-
-    Return 1
-End Process
-
-Process called "lower_hir_set_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_SET_STATEMENT to MIR store.
-
-    **HIR SET:**
-    Variable assignment.
-    ```
-    Set x to 42
-    ```
-
-    **MIR LOWERING:**
-    ```
-    %1 = const 42           ; Lower value expression
-    %2 = [lookup x]         ; Get variable's alloca
-    store %1, %2            ; Store new value
-    ```
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get target variable ID and value expression (offsets 24, 32)
-    Let var_id be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let value_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-
-    Note: Lower value expression
-    Let value_mir be lower_hir_expression(context_ptr, value_hir)
-    If value_mir is equal to 0:
-        Return 0
-    End If
-
-    Note: Lookup variable's MIR value (alloca)
-    Let var_mir be lookup_mir_value(context_ptr, var_id)
-    If var_mir is equal to 0:
-        Display "lower_hir_set_statement: undefined variable"
-        Return 0
-    End If
-
-    Note: Create store instruction
-    Let store_inst be MIRNodes.create_mir_store(value_mir, var_mir)
-    emit_instruction(context_ptr, store_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_return_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_RETURN_STATEMENT to MIR_RETURN.
-
-    **HIR RETURN:**
-    Return from function with optional value.
-    ```
-    Return 42
-    ```
-
-    **MIR LOWERING:**
-    ```
-    %1 = const 42           ; Lower return value
-    return %1               ; Return with value
-    ```
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get return value expression (offset 24, may be null for void returns)
-    Let return_hir be Layout.memory_get_int64(hir_node_ptr, 24)
-
-    Let return_value be 0
-    If return_hir is not equal to 0:
-        Note: Lower return value expression
-        Set return_value to lower_hir_expression(context_ptr, return_hir)
-    End If
-
-    Note: Create return instruction
-    Let return_inst be MIRNodes.create_mir_return(return_value)
-    emit_instruction(context_ptr, return_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    **MAIN STATEMENT LOWERING DISPATCHER**
-
-    Dispatches to appropriate lowering function based on HIR statement type.
-
-    **SUPPORTED STATEMENTS (Full Coverage):**
-    - HIR_LET_STATEMENT (11000) → lower_hir_let_statement
-    - HIR_SET_STATEMENT (11001) → lower_hir_set_statement
-    - HIR_IF_STATEMENT (11002) → lower_hir_if_statement
-    - HIR_WHILE_LOOP (11003) → lower_hir_while_loop
-    - HIR_FOR_LOOP (11004) → lower_hir_for_loop
-    - HIR_BREAK_STATEMENT (11005) → lower_hir_break_statement
-    - HIR_CONTINUE_STATEMENT (11006) → lower_hir_continue_statement
-    - HIR_MATCH_STATEMENT (11007) → lower_hir_match_statement
-    - HIR_TRY_STATEMENT (11008) → lower_hir_try_statement
-    - HIR_THROW_STATEMENT (11009) → lower_hir_throw_statement
-    - HIR_RETURN_STATEMENT (11010) → lower_hir_return_statement
-    - HIR_EXPRESSION_STATEMENT (11019) → lower_hir_expression
-
-    Returns 1 on success, 0 on error.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get HIR statement type (offset 0)
-    Let stmt_type be Layout.memory_get_int64(hir_node_ptr, 0)
-
-    Note: Dispatch to appropriate lowering function
-    If stmt_type is equal to 11000:  Note: HIR_LET_STATEMENT
-        Return lower_hir_let_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11001:  Note: HIR_SET_STATEMENT
-        Return lower_hir_set_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11002:  Note: HIR_IF_STATEMENT
-        Return lower_hir_if_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11003:  Note: HIR_WHILE_LOOP
-        Return lower_hir_while_loop(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11004:  Note: HIR_FOR_LOOP
-        Return lower_hir_for_loop(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11005:  Note: HIR_BREAK_STATEMENT
-        Return lower_hir_break_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11006:  Note: HIR_CONTINUE_STATEMENT
-        Return lower_hir_continue_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11007:  Note: HIR_MATCH_STATEMENT
-        Return lower_hir_match_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11008:  Note: HIR_TRY_STATEMENT
-        Return lower_hir_try_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11009:  Note: HIR_THROW_STATEMENT
-        Return lower_hir_throw_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11010:  Note: HIR_RETURN_STATEMENT
-        Return lower_hir_return_statement(context_ptr, hir_node_ptr)
-    End If
-
-    If stmt_type is equal to 11019:  Note: HIR_EXPRESSION_STATEMENT
-        Note: Lower expression and discard result
-        lower_hir_expression(context_ptr, hir_node_ptr)
-        Return 1
-    End If
-
-    Note: Unsupported statement type
-    Display "lower_hir_statement: unsupported HIR statement type " joined with stmt_type
-    Return 0
-End Process
-
-Note: ============================================================================
-Note: PHASE 2: ADVANCED CONTROL FLOW LOWERING
-Note: ============================================================================
-
-HIR structured control flow (loops, if, match) is converted to
-MIR unstructured control flow (labels, branches, jumps).
-:End Note
-
-Process called "lower_hir_if_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_IF_STATEMENT to MIR conditional branch.
-
-    **HIR IF:**
-    ```
-    If condition:
-        then_body
-    Otherwise:
-        else_body
-    End If
-    ```
-
-    **MIR LOWERING:**
-    ```
-    %cond = [lower condition]
-    br %cond, label %then_block, label %else_block
-
-    then_block:
-        [lower then_body]
-        jump %merge_block
-
-    else_block:
-        [lower else_body]
-        jump %merge_block
-
-    merge_block:
-        [continue]
-    ```
-
-    **CFG STRUCTURE:**
-    Creates branch with two targets, merges at continuation block.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get condition, then body, else body (offsets 24, 32, 40)
-    Let condition_hir be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let then_body_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-    Let else_body_hir be Layout.memory_get_int64(hir_node_ptr, 40)
-
-    Note: Lower condition expression
-    Let condition_value be lower_hir_expression(context_ptr, condition_hir)
-    If condition_value is equal to 0:
-        Return 0
-    End If
-
-    Note: Allocate labels for then, else, merge blocks
-    Let then_label be allocate_label(context_ptr)
-    Let else_label be allocate_label(context_ptr)
-    Let merge_label be allocate_label(context_ptr)
-
-    Note: Create conditional branch instruction
-    Let branch_inst be MIRNodes.create_mir_conditional_branch(condition_value, then_label, else_label)
-    emit_instruction(context_ptr, branch_inst)
-
-    Note: Emit label for then block
-    Let then_label_inst be MIRNodes.create_mir_label(then_label)
-    emit_instruction(context_ptr, then_label_inst)
-
-    Note: Lower then body
-    If then_body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, then_body_hir)
-    End If
-
-    Note: Jump to merge block
-    Let then_jump_inst be MIRNodes.create_mir_jump(merge_label)
-    emit_instruction(context_ptr, then_jump_inst)
-
-    Note: Emit label for else block
-    Let else_label_inst be MIRNodes.create_mir_label(else_label)
-    emit_instruction(context_ptr, else_label_inst)
-
-    Note: Lower else body (if present)
-    If else_body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, else_body_hir)
-    End If
-
-    Note: Jump to merge block
-    Let else_jump_inst be MIRNodes.create_mir_jump(merge_label)
-    emit_instruction(context_ptr, else_jump_inst)
-
-    Note: Emit merge block label
-    Let merge_label_inst be MIRNodes.create_mir_label(merge_label)
-    emit_instruction(context_ptr, merge_label_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_while_loop" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_WHILE_LOOP to MIR loop with conditional branch.
-
-    **HIR WHILE:**
-    ```
-    While condition:
-        body
-    End While
-    ```
-
-    **MIR LOWERING:**
-    ```
-    jump %header_block
-
-    header_block:
-        %cond = [lower condition]
-        br %cond, label %body_block, label %exit_block
-
-    body_block:
-        [lower body]
-        jump %header_block
-
-    exit_block:
-        [continue]
-    ```
-
-    **BREAK/CONTINUE SUPPORT:**
-    Sets break_target = exit_block, continue_target = header_block
-    for nested break/continue statements.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get condition and body (offsets 24, 32)
-    Let condition_hir be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let body_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-
-    Note: Allocate labels for header, body, exit blocks
-    Let header_label be allocate_label(context_ptr)
-    Let body_label be allocate_label(context_ptr)
-    Let exit_label be allocate_label(context_ptr)
-
-    Note: Save previous break/continue targets
-    Let prev_break be Layout.memory_get_int64(context_ptr, 56)
-    Let prev_continue be Layout.memory_get_int64(context_ptr, 64)
-
-    Note: Set new break/continue targets for this loop
-    Layout.memory_set_int64(context_ptr, 56, exit_label)   Note: break_target
-    Layout.memory_set_int64(context_ptr, 64, header_label) Note: continue_target
-
-    Note: Jump to header block
-    Let entry_jump be MIRNodes.create_mir_jump(header_label)
-    emit_instruction(context_ptr, entry_jump)
-
-    Note: Emit header block label
-    Let header_label_inst be MIRNodes.create_mir_label(header_label)
-    emit_instruction(context_ptr, header_label_inst)
-
-    Note: Lower condition expression
-    Let condition_value be lower_hir_expression(context_ptr, condition_hir)
-    If condition_value is equal to 0:
-        Note: Restore previous targets before returning
-        Layout.memory_set_int64(context_ptr, 56, prev_break)
-        Layout.memory_set_int64(context_ptr, 64, prev_continue)
-        Return 0
-    End If
-
-    Note: Create conditional branch (if true, enter body; if false, exit)
-    Let branch_inst be MIRNodes.create_mir_conditional_branch(condition_value, body_label, exit_label)
-    emit_instruction(context_ptr, branch_inst)
-
-    Note: Emit body block label
-    Let body_label_inst be MIRNodes.create_mir_label(body_label)
-    emit_instruction(context_ptr, body_label_inst)
-
-    Note: Lower loop body
-    If body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, body_hir)
-    End If
-
-    Note: Jump back to header
-    Let back_jump be MIRNodes.create_mir_jump(header_label)
-    emit_instruction(context_ptr, back_jump)
-
-    Note: Emit exit block label
-    Let exit_label_inst be MIRNodes.create_mir_label(exit_label)
-    emit_instruction(context_ptr, exit_label_inst)
-
-    Note: Restore previous break/continue targets
-    Layout.memory_set_int64(context_ptr, 56, prev_break)
-    Layout.memory_set_int64(context_ptr, 64, prev_continue)
-
-    Return 1
-End Process
-
-Process called "lower_hir_for_loop" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_FOR_LOOP to MIR loop with iterator initialization.
-
-    **HIR FOR:**
-    ```
-    For Each item in collection:
-        body
-    End For
-    ```
-
-    **MIR LOWERING:**
-    ```
-    %iter = [initialize iterator from collection]
-    %len = [get collection length]
-    %index = alloca Integer
-    store 0, %index
-
-    header_block:
-        %i = load %index
-        %cond = %i < %len
-        br %cond, label %body_block, label %exit_block
-
-    body_block:
-        %item = [load collection[i]]
-        [lower body with item bound]
-        %next_i = %i + 1
-        store %next_i, %index
-        jump %header_block
-
-    exit_block:
-        [continue]
-    ```
-
-    **ITERATOR SUPPORT:**
-    Handles both index-based iteration and iterator protocol.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get loop variable, collection, and body (offsets 24, 32, 40)
-    Let loop_var_id be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let collection_hir be Layout.memory_get_int64(hir_node_ptr, 32)
-    Let body_hir be Layout.memory_get_int64(hir_node_ptr, 40)
-
-    Note: Lower collection expression
-    Let collection_value be lower_hir_expression(context_ptr, collection_hir)
-    If collection_value is equal to 0:
-        Return 0
-    End If
-
-    Note: Allocate index variable on stack
-    Let index_alloca be allocate_temp_value(context_ptr)
-    Let alloca_inst be MIRNodes.create_mir_alloca(index_alloca, 8)
-    emit_instruction(context_ptr, alloca_inst)
-
-    Note: Initialize index to 0
-    Let zero_value be allocate_temp_value(context_ptr)
-    Let zero_const be MIRNodes.create_mir_const_instruction(zero_value, 0)
-    emit_instruction(context_ptr, zero_const)
-    Let init_store be MIRNodes.create_mir_store(zero_value, index_alloca)
-    emit_instruction(context_ptr, init_store)
-
-    Note: Get collection length (using GEP + load for list/array)
-    Let len_value be allocate_temp_value(context_ptr)
-    Let len_inst be MIRNodes.create_mir_get_length(len_value, collection_value)
-    emit_instruction(context_ptr, len_inst)
-
-    Note: Allocate labels
-    Let header_label be allocate_label(context_ptr)
-    Let body_label be allocate_label(context_ptr)
-    Let exit_label be allocate_label(context_ptr)
-
-    Note: Save and set break/continue targets
-    Let prev_break be Layout.memory_get_int64(context_ptr, 56)
-    Let prev_continue be Layout.memory_get_int64(context_ptr, 64)
-    Layout.memory_set_int64(context_ptr, 56, exit_label)
-    Layout.memory_set_int64(context_ptr, 64, header_label)
-
-    Note: Jump to header
-    Let entry_jump be MIRNodes.create_mir_jump(header_label)
-    emit_instruction(context_ptr, entry_jump)
-
-    Note: Header block - check condition
-    Let header_label_inst be MIRNodes.create_mir_label(header_label)
-    emit_instruction(context_ptr, header_label_inst)
-
-    Note: Load current index
-    Let current_index be allocate_temp_value(context_ptr)
-    Let load_index be MIRNodes.create_mir_load(current_index, index_alloca)
-    emit_instruction(context_ptr, load_index)
-
-    Note: Compare index < length
-    Let cond_value be allocate_temp_value(context_ptr)
-    Let cmp_inst be MIRNodes.create_mir_binary_op(20102, cond_value, current_index, len_value)  Note: MIR_LT
-    emit_instruction(context_ptr, cmp_inst)
-
-    Note: Branch on condition
-    Let branch_inst be MIRNodes.create_mir_conditional_branch(cond_value, body_label, exit_label)
-    emit_instruction(context_ptr, branch_inst)
-
-    Note: Body block
-    Let body_label_inst be MIRNodes.create_mir_label(body_label)
-    emit_instruction(context_ptr, body_label_inst)
-
-    Note: Load collection[index] into loop variable
-    Let item_value be allocate_temp_value(context_ptr)
-    Let item_load be MIRNodes.create_mir_array_access(item_value, collection_value, current_index)
-    emit_instruction(context_ptr, item_load)
-
-    Note: Map loop variable to item value
-    map_hir_to_mir_value(context_ptr, loop_var_id, item_value)
-
-    Note: Lower loop body
-    If body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, body_hir)
-    End If
-
-    Note: Increment index
-    Let one_value be allocate_temp_value(context_ptr)
-    Let one_const be MIRNodes.create_mir_const_instruction(one_value, 1)
-    emit_instruction(context_ptr, one_const)
-
-    Let next_index be allocate_temp_value(context_ptr)
-    Let add_inst be MIRNodes.create_mir_binary_op(20002, next_index, current_index, one_value)  Note: MIR_ADD
-    emit_instruction(context_ptr, add_inst)
-
-    Note: Store incremented index
-    Let store_next be MIRNodes.create_mir_store(next_index, index_alloca)
-    emit_instruction(context_ptr, store_next)
-
-    Note: Jump back to header
-    Let back_jump be MIRNodes.create_mir_jump(header_label)
-    emit_instruction(context_ptr, back_jump)
-
-    Note: Exit block
-    Let exit_label_inst be MIRNodes.create_mir_label(exit_label)
-    emit_instruction(context_ptr, exit_label_inst)
-
-    Note: Restore break/continue targets
-    Layout.memory_set_int64(context_ptr, 56, prev_break)
-    Layout.memory_set_int64(context_ptr, 64, prev_continue)
-
-    Return 1
-End Process
-
-Process called "lower_hir_break_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_BREAK_STATEMENT to MIR jump to loop exit block.
-
-    **HIR BREAK:**
-    ```
-    Break
-    ```
-
-    **MIR LOWERING:**
-    ```
-    jump %exit_block  ; where exit_block is the loop's exit target
-    ```
-
-    **LOOP CONTEXT:**
-    The break_target field in the context holds the current loop's exit label.
-    If break_target is -1, this is an error (break outside of loop).
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get current break target (offset 56)
-    Let break_target be Layout.memory_get_int64(context_ptr, 56)
-
-    If break_target is equal to -1:
-        Display "lower_hir_break_statement: break outside of loop"
-        Return 0
-    End If
-
-    Note: Create jump to break target
-    Let jump_inst be MIRNodes.create_mir_jump(break_target)
-    emit_instruction(context_ptr, jump_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_continue_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_CONTINUE_STATEMENT to MIR jump to loop header.
-
-    **HIR CONTINUE:**
-    ```
-    Continue
-    ```
-
-    **MIR LOWERING:**
-    ```
-    jump %header_block  ; where header_block is the loop's header
-    ```
-
-    **LOOP CONTEXT:**
-    The continue_target field holds the current loop's header label.
-    If continue_target is -1, this is an error (continue outside of loop).
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get current continue target (offset 64)
-    Let continue_target be Layout.memory_get_int64(context_ptr, 64)
-
-    If continue_target is equal to -1:
-        Display "lower_hir_continue_statement: continue outside of loop"
-        Return 0
-    End If
-
-    Note: Create jump to continue target
-    Let jump_inst be MIRNodes.create_mir_jump(continue_target)
-    emit_instruction(context_ptr, jump_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_match_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_MATCH_STATEMENT to MIR branch chain or switch.
-
-    **HIR MATCH:**
-    ```
-    Match expression:
-        When pattern1:
-            body1
-        When pattern2:
-            body2
-        Otherwise:
-            default_body
-    End Match
-    ```
-
-    **MIR LOWERING (BRANCH CHAIN):**
-    ```
-    %value = [lower expression]
-
-    check1:
-        %match1 = compare %value with pattern1
-        br %match1, label %case1_block, label %check2
-
-    case1_block:
-        [lower body1]
-        jump %merge_block
-
-    check2:
-        %match2 = compare %value with pattern2
-        br %match2, label %case2_block, label %default_block
-
-    case2_block:
-        [lower body2]
-        jump %merge_block
-
-    default_block:
-        [lower default_body]
-        jump %merge_block
-
-    merge_block:
-        [continue]
-    ```
-
-    **OPTIMIZATION:**
-    For dense integer patterns, use MIR_SWITCH instruction.
-    For sparse/complex patterns, use branch chain.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get match expression and case list (offsets 24, 32)
-    Let match_expr_hir be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let cases_list be Layout.memory_get_int64(hir_node_ptr, 32)
-
-    Note: Lower match expression
-    Let match_value be lower_hir_expression(context_ptr, match_expr_hir)
-    If match_value is equal to 0:
-        Return 0
-    End If
-
-    Note: Allocate merge label
-    Let merge_label be allocate_label(context_ptr)
-
-    Note: Get number of cases
-    Let case_count be List.length(cases_list)
-
-    Note: Process each case
-    Let i be 0
-    While i is less than case_count:
-        Let case_node be List.get(cases_list, i)
-
-        Note: Get pattern and body (offsets 0, 8)
-        Let pattern_hir be Layout.memory_get_int64(case_node, 0)
-        Let body_hir be Layout.memory_get_int64(case_node, 8)
-
-        Note: Allocate labels for this case
-        Let check_label be allocate_label(context_ptr)
-        Let case_label be allocate_label(context_ptr)
-        Let next_label be allocate_label(context_ptr)
-
-        Note: Emit check label
-        Let check_label_inst be MIRNodes.create_mir_label(check_label)
-        emit_instruction(context_ptr, check_label_inst)
-
-        Note: Lower pattern (for simple patterns, this is a comparison)
-        Let pattern_value be lower_hir_expression(context_ptr, pattern_hir)
-
-        Note: Compare match value with pattern
-        Let cmp_result be allocate_temp_value(context_ptr)
-        Let cmp_inst be MIRNodes.create_mir_binary_op(20100, cmp_result, match_value, pattern_value)  Note: MIR_EQ
-        emit_instruction(context_ptr, cmp_inst)
-
-        Note: Branch: if match, go to case body; otherwise, check next
-        Let branch_inst be MIRNodes.create_mir_conditional_branch(cmp_result, case_label, next_label)
-        emit_instruction(context_ptr, branch_inst)
-
-        Note: Emit case body label
-        Let case_label_inst be MIRNodes.create_mir_label(case_label)
-        emit_instruction(context_ptr, case_label_inst)
-
-        Note: Lower case body
-        If body_hir is not equal to 0:
-            lower_hir_statement(context_ptr, body_hir)
-        End If
-
-        Note: Jump to merge
-        Let case_jump be MIRNodes.create_mir_jump(merge_label)
-        emit_instruction(context_ptr, case_jump)
-
-        Note: Emit next check label
-        Let next_label_inst be MIRNodes.create_mir_label(next_label)
-        emit_instruction(context_ptr, next_label_inst)
-
-        Set i to i plus 1
-    End While
-
-    Note: After all cases, jump to merge (default case if no match)
-    Let default_jump be MIRNodes.create_mir_jump(merge_label)
-    emit_instruction(context_ptr, default_jump)
-
-    Note: Emit merge label
-    Let merge_label_inst be MIRNodes.create_mir_label(merge_label)
-    emit_instruction(context_ptr, merge_label_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_try_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_TRY_STATEMENT to MIR exception handling instructions.
-
-    **HIR TRY:**
-    ```
-    Try:
-        body
-    Catch exception_type as var:
-        handler
-    End Try
-    ```
-
-    **MIR LOWERING:**
-    ```
-    invoke label %try_block, label %catch_block
-
-    try_block:
-        [lower body]
-        jump %merge_block
-
-    catch_block:
-        %exc = landingpad
-        [lower handler with exception bound to var]
-        jump %merge_block
-
-    merge_block:
-        [continue]
-    ```
-
-    **EXCEPTION MODEL:**
-    Uses invoke/landingpad instructions for zero-cost exception handling.
-    Compatible with both native exception mechanisms and runtime-based unwinding.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get try body, exception type, exception var, catch body (offsets 24, 32, 40, 48)
-    Let try_body_hir be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let exception_type be Layout.memory_get_int64(hir_node_ptr, 32)
-    Let exception_var_id be Layout.memory_get_int64(hir_node_ptr, 40)
-    Let catch_body_hir be Layout.memory_get_int64(hir_node_ptr, 48)
-
-    Note: Allocate labels
-    Let try_label be allocate_label(context_ptr)
-    Let catch_label be allocate_label(context_ptr)
-    Let merge_label be allocate_label(context_ptr)
-
-    Note: Create invoke instruction (try block with exception handler)
-    Let invoke_inst be MIRNodes.create_mir_invoke(try_label, catch_label)
-    emit_instruction(context_ptr, invoke_inst)
-
-    Note: Emit try block label
-    Let try_label_inst be MIRNodes.create_mir_label(try_label)
-    emit_instruction(context_ptr, try_label_inst)
-
-    Note: Lower try body
-    If try_body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, try_body_hir)
-    End If
-
-    Note: If try succeeds, jump to merge
-    Let try_jump be MIRNodes.create_mir_jump(merge_label)
-    emit_instruction(context_ptr, try_jump)
-
-    Note: Emit catch block label
-    Let catch_label_inst be MIRNodes.create_mir_label(catch_label)
-    emit_instruction(context_ptr, catch_label_inst)
-
-    Note: Create landingpad to receive exception
-    Let exception_value be allocate_temp_value(context_ptr)
-    Let landingpad_inst be MIRNodes.create_mir_landingpad(exception_value, exception_type)
-    emit_instruction(context_ptr, landingpad_inst)
-
-    Note: Map exception variable to exception value
-    If exception_var_id is not equal to 0:
-        map_hir_to_mir_value(context_ptr, exception_var_id, exception_value)
-    End If
-
-    Note: Lower catch body
-    If catch_body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, catch_body_hir)
-    End If
-
-    Note: Jump to merge
-    Let catch_jump be MIRNodes.create_mir_jump(merge_label)
-    emit_instruction(context_ptr, catch_jump)
-
-    Note: Emit merge label
-    Let merge_label_inst be MIRNodes.create_mir_label(merge_label)
-    emit_instruction(context_ptr, merge_label_inst)
-
-    Return 1
-End Process
-
-Process called "lower_hir_throw_statement" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_THROW_STATEMENT to MIR throw instruction.
-
-    **HIR THROW:**
-    ```
-    Throw exception_value
-    ```
-
-    **MIR LOWERING:**
-    ```
-    %exc_val = [lower exception_value]
-    throw %exc_val
-    ```
-
-    **EXCEPTION PROPAGATION:**
-    The throw instruction unwinds the stack to the nearest catch handler.
-    If no handler is found, the program terminates.
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get exception value expression (offset 24)
-    Let exception_hir be Layout.memory_get_int64(hir_node_ptr, 24)
-
-    Note: Lower exception value
-    Let exception_value be lower_hir_expression(context_ptr, exception_hir)
-    If exception_value is equal to 0:
-        Return 0
-    End If
-
-    Note: Create throw instruction
-    Let throw_inst be MIRNodes.create_mir_throw(exception_value)
-    emit_instruction(context_ptr, throw_inst)
-
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: UPDATE STATEMENT DISPATCHER
-Note: ============================================================================
-
-Process called "update_statement_dispatcher" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    **EXTENDED STATEMENT LOWERING DISPATCHER**
-
-    This updates the lower_hir_statement dispatcher to include
-    all Phase 2 statement types.
-
-    **FULL STATEMENT COVERAGE:**
-    - HIR_LET_STATEMENT (11000)
-    - HIR_SET_STATEMENT (11001)
-    - HIR_IF_STATEMENT (11002)
-    - HIR_WHILE_LOOP (11003)
-    - HIR_FOR_LOOP (11004)
-    - HIR_BREAK_STATEMENT (11005)
-    - HIR_CONTINUE_STATEMENT (11006)
-    - HIR_MATCH_STATEMENT (11007)
-    - HIR_TRY_STATEMENT (11008)
-    - HIR_THROW_STATEMENT (11009)
-    - HIR_RETURN_STATEMENT (11010)
-    - HIR_EXPRESSION_STATEMENT (11019)
-
-    This is a helper to document the complete dispatcher logic.
-    The actual lower_hir_statement will be updated inline.
-    @End Reasoning
-
-    Note: This is documentation only, not executable
-    Return 1
-End Process
-
-Note: ============================================================================
-Note: PHASE 2: DECLARATION LOWERING - HIR Declarations → MIR Functions
-Note: ============================================================================
-
-Process called "lower_hir_process_definition" that takes context_ptr as Integer, hir_node_ptr as Integer returns Integer:
-    @Reasoning
-    Lowers HIR_PROCESS_DEFINITION to MIR function.
-
-    **HIR PROCESS:**
-    ```
-    Process called "function_name" that takes param1 as Type1, param2 as Type2 returns ReturnType:
-        body
-    End Process
-    ```
-
-    **MIR FUNCTION STRUCTURE:**
-    ```
-    function @function_name(%param1: Type1, %param2: Type2) -> ReturnType:
-        entry_block:
-            [allocate parameter storage]
-            [lower body statements]
-            [implicit return if needed]
-    ```
-
-    **LOWERING STEPS:**
-    1. Create MIR function
-    2. Set up entry block
-    3. Allocate storage for parameters
-    4. Map HIR parameters to MIR values
-    5. Lower function body
-    6. Insert implicit return for void functions
-    7. Run CFG construction
-    8. Run SSA construction
-    @End Reasoning
-
-    If context_ptr is equal to 0:
-        Return 0
-    End If
-    If hir_node_ptr is equal to 0:
-        Return 0
-    End If
-
-    Note: Get function name, parameters, return type, body (offsets 24, 32, 40, 48)
-    Let function_name be Layout.memory_get_int64(hir_node_ptr, 24)
-    Let parameters_list be Layout.memory_get_int64(hir_node_ptr, 32)
-    Let return_type be Layout.memory_get_int64(hir_node_ptr, 40)
-    Let body_hir be Layout.memory_get_int64(hir_node_ptr, 48)
-
-    Note: Create new MIR function
-    Let mir_function be MIRNodes.create_mir_function(function_name)
-    If mir_function is equal to 0:
-        Return 0
-    End If
-
-    Note: Set current function in context
-    Layout.memory_set_int64(context_ptr, 0, mir_function)
-
-    Note: Set return type in context
-    Layout.memory_set_int64(context_ptr, 72, return_type)
-
-    Note: Create entry block label
-    Let entry_label be allocate_label(context_ptr)
-    Let entry_label_inst be MIRNodes.create_mir_label(entry_label)
-    emit_instruction(context_ptr, entry_label_inst)
-
-    Note: Process parameters - allocate storage and create mappings
-    Let param_count be List.length(parameters_list)
-    Let i be 0
-    While i is less than param_count:
-        Let param_node be List.get(parameters_list, i)
-
-        Note: Get parameter ID and type (offsets 0, 8)
-        Let param_id be Layout.memory_get_int64(param_node, 0)
-        Let param_type be Layout.memory_get_int64(param_node, 8)
-
-        Note: Allocate stack space for parameter
-        Let param_alloca be allocate_temp_value(context_ptr)
-        Let alloca_inst be MIRNodes.create_mir_alloca(param_alloca, 8)
-        emit_instruction(context_ptr, alloca_inst)
-
-        Note: Create parameter value
-        Let param_value be allocate_temp_value(context_ptr)
-
-        Note: Store parameter to allocated space
-        Let store_inst be MIRNodes.create_mir_store(param_value, param_alloca)
-        emit_instruction(context_ptr, store_inst)
-
-        Note: Map HIR parameter to MIR alloca
-        map_hir_to_mir_value(context_ptr, param_id, param_alloca)
-
-        Set i to i plus 1
-    End While
-
-    Note: Lower function body
-    If body_hir is not equal to 0:
-        lower_hir_statement(context_ptr, body_hir)
-    End If
-
-    Note: Check if body ended with return; if not, add implicit return
-    Let inst_list be Layout.memory_get_int64(context_ptr, 16)
-    Let inst_count be List.length(inst_list)
-    If inst_count is greater than 0:
-        Let last_inst be List.get(inst_list, inst_count minus 1)
-        Let last_opcode be MIRNodes.get_instruction_opcode(last_inst)
-
-        Note: If last instruction is not return, add implicit return
-        If last_opcode is not equal to 20310:  Note: MIR_RETURN
-            Let void_return be MIRNodes.create_mir_return(0)
-            emit_instruction(context_ptr, void_return)
-        End If
-    End If
-
-    Note: Build CFG from instruction list
-    Let cfg be construct_cfg_from_instructions(context_ptr)
-
-    Note: Run SSA construction on CFG
-    If cfg is not equal to 0:
-        SSA.construct_ssa_form(cfg)
-    End If
-
-    Note: Attach CFG to MIR function
-    MIRNodes.set_function_cfg(mir_function, cfg)
-
-    Return mir_function
-End Process
-
-Note: ============================================================================
-Note: PHASE 2: CFG CONSTRUCTION - Build Control Flow Graph
-Note: ============================================================================
+Note: ============================================================
+Note: CFG helpers (legacy public surface)
+Note: ============================================================
+
+@Reasoning
+construct_cfg_from_instructions is the legacy public entry point
+that callers in pre-P2-E code expected as the per-function CFG
+construction trigger. The modern path lives in cfg.runa as
+build_cfg_from_instructions(function_ptr) and is invoked directly
+by the process-definition post handler in definition_lowering.runa.
+
+This proc is retained as a stable forwarding shim: given a builder
+context, it pulls out the current_function pointer and delegates
+to the cfg.runa entry point. External code that still imports
+mir_builder for CFG construction continues to work without
+modification.
+@End Reasoning
+
+@Implementation
+1. Read current_function at builder offset 0.
+2. Delegate to build_cfg_from_instructions from CFG with that
+   function.
+3. Return the cfg pointer the CFG layer attached to the function.
+@End Implementation
+
+@Performance_Hints
+Pure forwarding; one indirect call.
+@End Performance_Hints
+
+@Security_Scope
+Null function returns 0.
+@End Security_Scope
 
 Process called "construct_cfg_from_instructions" that takes context_ptr as Integer returns Integer:
-    @Reasoning
-    Constructs a CFG from the flat instruction list.
-
-    **ALGORITHM:**
-    1. Identify block boundaries (labels, branches, jumps)
-    2. Create basic blocks for each region
-    3. Populate blocks with instructions
-    4. Build edges between blocks based on control flow
-    5. Set entry and exit blocks
-
-    **BLOCK BOUNDARIES:**
-    - Labels mark block starts
-    - Branches/jumps mark block ends
-    - Returns mark block ends
-    - Fallthrough creates implicit edges
-
-    **RESULT:**
-    Returns a MIRControlFlowGraph with populated blocks and edges.
-    @End Reasoning
-
     If context_ptr is equal to 0:
         Return 0
     End If
-
-    Note: Get instruction list
-    Let inst_list be Layout.memory_get_int64(context_ptr, 16)
-    If inst_list is equal to 0:
+    Let function_ptr be proc memory_get_int64 from Layout with context_ptr, 0
+    If function_ptr is equal to 0:
         Return 0
     End If
-
-    Let inst_count be List.length(inst_list)
-    If inst_count is equal to 0:
-        Note: Empty function, create single empty block
-        Let empty_cfg be CFG.create_cfg()
-        Let empty_block be CFG.create_basic_block(0)
-        CFG.add_block(empty_cfg, empty_block)
-        CFG.set_entry_block(empty_cfg, empty_block)
-        Return empty_cfg
-    End If
-
-    Note: Create CFG
-    Let cfg be CFG.create_cfg()
-
-    Note: Pass 1: Identify block boundaries
-    Let block_starts be List.create()
-    Let block_map be List.create()  Note: Maps label_id -> block_id
-
-    Let current_block be CFG.create_basic_block(0)
-    CFG.add_block(cfg, current_block)
-    List.append(block_starts, 0)  Note: Entry block starts at instruction 0
-
-    Let i be 0
-    While i is less than inst_count:
-        Let inst be List.get(inst_list, i)
-        Let opcode be MIRNodes.get_instruction_opcode(inst)
-
-        Note: Check if this is a label (block start)
-        If opcode is equal to 20301:  Note: MIR_LABEL
-            Note: New block starts here
-            Let label_id be MIRNodes.get_label_id(inst)
-            Let new_block be CFG.create_basic_block(label_id)
-            CFG.add_block(cfg, new_block)
-            List.append(block_starts, i)
-
-            Note: Map label to block
-            List.append(block_map, label_id)
-            List.append(block_map, new_block)
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Pass 2: Populate blocks with instructions
-    Let block_count be List.length(block_starts)
-    Set i to 0
-    While i is less than block_count:
-        Let block_start be List.get(block_starts, i)
-        Let current_block_id be i
-
-        Note: Determine block end (next block start or end of list)
-        Let block_end be inst_count
-        If i plus 1 is less than block_count:
-            Set block_end to List.get(block_starts, i plus 1)
-        End If
-
-        Note: Get block from CFG
-        Set current_block to CFG.get_block(cfg, current_block_id)
-
-        Note: Add instructions to block
-        Let j be block_start
-        While j is less than block_end:
-            Set inst to List.get(inst_list, j)
-            CFG.add_instruction_to_block(current_block, inst)
-            Set j to j plus 1
-        End While
-
-        Set i to i plus 1
-    End While
-
-    Note: Pass 3: Build edges based on control flow
-    Set i to 0
-    While i is less than block_count:
-        Set current_block to CFG.get_block(cfg, i)
-        Let block_insts be CFG.get_block_instructions(current_block)
-        Let block_inst_count be List.length(block_insts)
-
-        If block_inst_count is greater than 0:
-            Let last_inst be List.get(block_insts, block_inst_count minus 1)
-            Let terminator_opcode be MIRNodes.get_instruction_opcode(last_inst)
-
-            Note: Handle different terminator types
-            If terminator_opcode is equal to 20302:  Note: MIR_BRANCH (conditional)
-                Note: Get true and false targets
-                Let true_label be MIRNodes.get_branch_true_label(last_inst)
-                Let false_label be MIRNodes.get_branch_false_label(last_inst)
-
-                Note: Find blocks with those labels
-                Let true_block be find_block_by_label(block_map, true_label)
-                Let false_block be find_block_by_label(block_map, false_label)
-
-                Note: Add edges
-                If true_block is not equal to 0:
-                    CFG.add_edge(cfg, current_block, true_block)
-                End If
-                If false_block is not equal to 0:
-                    CFG.add_edge(cfg, current_block, false_block)
-                End If
-            End If
-
-            If terminator_opcode is equal to 20303:  Note: MIR_JUMP (unconditional)
-                Note: Get target label
-                Let target_label be MIRNodes.get_jump_target_label(last_inst)
-                Let target_block be find_block_by_label(block_map, target_label)
-
-                Note: Add edge
-                If target_block is not equal to 0:
-                    CFG.add_edge(cfg, current_block, target_block)
-                End If
-            End If
-
-            If terminator_opcode is equal to 20310:  Note: MIR_RETURN
-                Note: Return has no successors, mark as exit block
-                CFG.mark_exit_block(cfg, current_block)
-            End If
-
-            Note: For non-terminator last instructions, add fallthrough edge
-            If terminator_opcode is not equal to 20302:  Note: Not BRANCH
-                If terminator_opcode is not equal to 20303:  Note: Not JUMP
-                    If terminator_opcode is not equal to 20310:  Note: Not RETURN
-                        Note: Fallthrough to next block
-                        If i plus 1 is less than block_count:
-                            Let next_block be CFG.get_block(cfg, i plus 1)
-                            CFG.add_edge(cfg, current_block, next_block)
-                        End If
-                    End If
-                End If
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Set entry block (first block)
-    Let entry_block be CFG.get_block(cfg, 0)
-    CFG.set_entry_block(cfg, entry_block)
-
-    Return cfg
+    Return proc build_cfg_from_instructions from CFG with function_ptr
 End Process
 
+@Reasoning
+find_block_by_label is a legacy linear-search helper over the
+label-to-block mapping used by the pre-P2-E hand-rolled CFG
+construction. The modern CFG construction in cfg.runa indexes
+basic blocks by id directly and does not need this helper, but
+the proc is retained for any external caller that still uses the
+old "build a flat label-to-block list, then linear-scan" pattern.
+
+The block_map is a List with pairs (label_id, block_ptr) laid out
+flat: [label_id_0, block_ptr_0, label_id_1, block_ptr_1, ...].
+@End Reasoning
+
+@Implementation
+Linear scan in steps of 2. Returns 0 if not found.
+@End Implementation
+
+@Performance_Hints
+O(N) in the number of blocks. Only called from legacy code paths.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
 Process called "find_block_by_label" that takes block_map as Integer, label_id as Integer returns Integer:
-    @Reasoning
-    Finds a basic block ID from the label→block mapping.
-
-    **BLOCK MAP STRUCTURE:**
-    List of pairs: [label_id1, block_id1, label_id2, block_id2, ...]
-
-    **SEARCH:**
-    Linear search for label_id, return corresponding block_id.
-    @End Reasoning
-
     If block_map is equal to 0:
         Return 0
     End If
 
-    Let map_count be List.length(block_map)
+    Let map_count be proc length from List with block_map
     Let i be 0
     While i is less than map_count:
-        Let map_label be List.get(block_map, i)
+        Let map_label be proc get from List with block_map, i
         If map_label is equal to label_id:
-            Let block_id be List.get(block_map, i plus 1)
-            Return block_id
+            Let pair_index be i plus 1
+            Return proc get from List with block_map, pair_index
         End If
         Set i to i plus 2
     End While
 
     Return 0
-End Process
-
-Note: ============================================================================
-Note: PHASE 2: SSA INTEGRATION - Invoke SSA Construction
-Note: ============================================================================
-
-Note: SSA construction is handled by the existing ssa.runa infrastructure.
-Note: The construct_ssa_form function is called on the CFG after construction.
-Note: This integrates the Cytron algorithm for phi placement and variable renaming.
-
-Note: ============================================================================
-Note: PHASE 2: MAIN ENTRY POINTS - Public API
-Note: ============================================================================
-
-Process called "lower_hir_external_declaration" that takes hir_external as Integer returns Integer:
-    @Reasoning
-    **HIR EXTERNAL DECLARATION → MIR LOWERING (P2-D FFI Foundation)**
-
-    Lowers a HIRExternalDeclaration to a declaration-only MIRFunction with:
-    - is_external = 1 (so codegen emits only the .extern directive)
-    - library_name, alias_name, convention_id propagated for codegen and linker driver
-
-    No CFG, no body, no parameters are lowered — the function signature alone
-    (name + return type) plus the FFI metadata is sufficient for the linker to
-    resolve the symbol and for codegen to emit a call site through the recorded
-    calling convention.
-    @End Reasoning
-
-    @Implementation
-    HIRExternalDeclaration layout (per hir.runa):
-      offset 104: name
-      offset 112: alias_name
-      offset 120: library_name
-      offset 144: return_type (HIRTypeInfo pointer)
-      offset 152: convention_id
-      offset 168: flags
-
-    Result MIRFunction (P2-D offset audit 2026-05-24):
-      name (offset 0): the Runa-side name
-      return_type (offset 32): the HIR type info
-      hir_node (offset 72): back-pointer to the HIR external declaration
-      is_external (offset 80): authoritative — set to 1 via mir_function_set_external
-      metadata (offset 88): optional metadata pointer
-      library_name (offset 96): for linker registration
-      alias_name (offset 104): for .extern emission
-      convention_id (offset 112): for per-call-site convention dispatch
-    @End Implementation
-
-    If hir_external is equal to 0:
-        Return 0
-    End If
-
-    Note: Read HIRExternalDeclaration fields
-    Let ext_name be Layout.memory_get_int64(hir_external, 104)
-    Let ext_alias be Layout.memory_get_int64(hir_external, 112)
-    Let ext_library be Layout.memory_get_int64(hir_external, 120)
-    Let ext_return_type be Layout.memory_get_int64(hir_external, 144)
-    Let ext_convention_id be Layout.memory_get_int64(hir_external, 152)
-
-    Note: Create MIRFunction (declaration only — no CFG body needed)
-    Let mir_function be MIR.create_mir_function(ext_name, ext_return_type, hir_external)
-    If mir_function is equal to 0:
-        Return 0
-    End If
-
-    Note: Mark as external and populate FFI metadata
-    proc mir_function_set_external from MIR with mir_function, ext_library, ext_alias, ext_convention_id
-
-    Return mir_function
-End Process
-
-Process called "build_mir_from_hir" that takes hir_program as Integer returns Integer:
-    @Reasoning
-    **MAIN ENTRY POINT FOR MIR CONSTRUCTION**
-
-    Builds complete MIR representation from HIR program.
-
-    **INPUT:**
-    HIR program with type-checked, semantically validated declarations.
-
-    **OUTPUT:**
-    MIR program with:
-    - MIR functions with SSA form
-    - Control flow graphs
-    - Complete instruction sequences
-
-    **ALGORITHM:**
-    1. Create MIR program structure
-    2. Iterate over HIR declarations
-    3. Lower each process definition to MIR function
-    4. Add each MIR function to MIR program
-    5. Return complete MIR program
-
-    **USAGE:**
-    ```
-    mir_program = build_mir_from_hir(hir_program)
-    ```
-    @End Reasoning
-
-    If hir_program is equal to 0:
-        Display "build_mir_from_hir: null HIR program"
-        Return 0
-    End If
-
-    Note: Create MIR program structure
-    Let mir_program be MIRNodes.create_mir_program()
-    If mir_program is equal to 0:
-        Display "build_mir_from_hir: failed to create MIR program"
-        Return 0
-    End If
-
-    Note: Create builder context
-    Let context be create_mir_builder_context()
-    If context is equal to 0:
-        Display "build_mir_from_hir: failed to create builder context"
-        Return 0
-    End If
-
-    Note: Get HIR declarations list
-    Let decls_list be HIR.get_program_declarations(hir_program)
-    If decls_list is equal to 0:
-        Display "build_mir_from_hir: no declarations in HIR program"
-        destroy_mir_builder_context(context)
-        Return mir_program
-    End If
-
-    Note: Process each declaration
-    Let decl_count be List.length(decls_list)
-    Display "build_mir_from_hir: lowering " joined with decl_count joined with " declarations"
-
-    Let i be 0
-    While i is less than decl_count:
-        Let decl_hir be List.get(decls_list, i)
-        Let decl_type be Layout.memory_get_int64(decl_hir, 0)
-
-        Note: Check if this is a process definition
-        If decl_type is equal to 12000:  Note: HIR_PROCESS_DEFINITION
-            Display "build_mir_from_hir: lowering process definition " joined with i
-
-            Note: Lower process to MIR function
-            Let mir_function be lower_hir_process_definition(context, decl_hir)
-
-            If mir_function is not equal to 0:
-                Note: Add function to MIR program
-                MIRNodes.add_function_to_program(mir_program, mir_function)
-                Display "build_mir_from_hir: successfully lowered function"
-            Otherwise:
-                Display "build_mir_from_hir: failed to lower function"
-            End If
-
-            Note: Reset context for next function
-            destroy_mir_builder_context(context)
-            Set context to create_mir_builder_context()
-        End If
-
-        Note: P2-D FFI: Handle external declaration (HIR_EXTERNAL_DECLARATION = 12004).
-        Note: Creates a declaration-only MIRFunction with is_external=1 and full FFI metadata.
-        Note: Also registers the external in the MIR builder context so subsequent
-        Note: MIR_CALL nodes referencing this name pick up the FFI metadata (D-FFI-07/08).
-        If decl_type is equal to 12004:
-            Display "build_mir_from_hir: lowering external declaration " joined with i
-
-            Let mir_external be lower_hir_external_declaration(decl_hir)
-            If mir_external is not equal to 0:
-                MIRNodes.add_function_to_program(mir_program, mir_external)
-
-                Note: Register in context externals registry (FFI metadata propagation
-                Note: into call sites at lower_hir_call_expression time).
-                Let ext_runa_name be Layout.memory_get_int64(decl_hir, 104)
-                Let ext_convention be Layout.memory_get_int64(decl_hir, 152)
-                If ext_runa_name is not equal to 0:
-                    mir_context_register_external(context, ext_runa_name, ext_convention)
-                End If
-
-                Display "build_mir_from_hir: successfully lowered external"
-            Otherwise:
-                Display "build_mir_from_hir: failed to lower external declaration"
-            End If
-        End If
-
-        Set i to i plus 1
-    End While
-
-    Note: Cleanup builder context
-    destroy_mir_builder_context(context)
-
-    Display "build_mir_from_hir: MIR construction complete"
-    Return mir_program
-End Process
-
-Process called "build_mir_from_hir_function" that takes hir_function as Integer returns Integer:
-    @Reasoning
-    **SINGLE FUNCTION MIR CONSTRUCTION**
-
-    Builds MIR for a single HIR function.
-
-    **INPUT:**
-    Single HIR function/process definition.
-
-    **OUTPUT:**
-    MIR function with SSA form and CFG.
-
-    **USAGE:**
-    ```
-    mir_func = build_mir_from_hir_function(hir_func)
-    ```
-
-    Useful for incremental compilation or testing individual functions.
-    @End Reasoning
-
-    If hir_function is equal to 0:
-        Display "build_mir_from_hir_function: null HIR function"
-        Return 0
-    End If
-
-    Note: Create builder context
-    Let context be create_mir_builder_context()
-    If context is equal to 0:
-        Display "build_mir_from_hir_function: failed to create context"
-        Return 0
-    End If
-
-    Note: Lower function
-    Let mir_function be lower_hir_process_definition(context, hir_function)
-
-    Note: Cleanup context
-    destroy_mir_builder_context(context)
-
-    If mir_function is equal to 0:
-        Display "build_mir_from_hir_function: lowering failed"
-        Return 0
-    End If
-
-    Display "build_mir_from_hir_function: successfully built MIR function"
-    Return mir_function
 End Process

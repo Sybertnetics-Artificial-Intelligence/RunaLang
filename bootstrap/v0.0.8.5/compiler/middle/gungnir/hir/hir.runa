@@ -254,13 +254,44 @@ Process called "create_hir_node" takes node_type as Integer, line as Integer, co
     @Reasoning:
     HIR nodes extend AST nodes with semantic information including type data,
     scope information, and symbol resolution. Each HIR node must maintain
-    a link to its original AST node for error reporting.
+    a link to its original AST node for error reporting. This is the primary
+    factory function used by every higher-level HIR constructor in the file;
+    every expression, statement, declaration, and pattern is built atop a
+    HIRNode header, so the layout chosen here propagates to all downstream
+    IR consumers (semantic analyzer, type checker, MIR lowering, code gen).
     @End Reasoning
 
     @Implementation:
-    HIRNode structure: 13 fields × 8 bytes = 104 bytes
-    We allocate memory, initialize all fields to zero/null, and return pointer.
+    HIRNode structure: 13 fields x 8 bytes = 104 bytes.
+    Allocation goes through Layout.allocate which dispatches to the active
+    arena/heap tier; the returned pointer doubles as the node identity for
+    the rest of the compiler. Field layout (offsets in bytes):
+      0:  node_type, 8: line, 16: column, 24: children list pointer,
+      32: child_count, 40: value, 48: value_type, 56: metadata,
+      64: parent, 72: type_info, 80: scope_id, 88: symbol_id, 96: ast_node.
+    All fields except node_type/line/column are zero-initialized so that
+    later setters can detect uninitialized state via the zero sentinel.
+    Allocation failure (returned 0) is forwarded to the caller unchanged.
     @End Implementation
+
+    @Performance_Hints:
+    Hot path: invoked once per HIR construction (potentially thousands of
+    calls per compilation unit). The 13 individual memory_set_int64 stores
+    could be fused into a single block memset(0) plus three targeted stores
+    once a fast-zero primitive is wired through Layout; until then the
+    explicit per-field stores keep the layout self-documenting and trace-
+    friendly. Allocation is the dominant cost, not the field initialization.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Returns a raw owned pointer into the HIR arena. The caller takes
+    ownership of the node and is responsible for attaching it to a parent
+    (via add_hir_node) so that the program-tree walker reaches it during
+    cleanup. Returning 0 on allocation failure is the documented contract;
+    callers MUST check for 0 before dereferencing or memory corruption will
+    result. The 104-byte block is fully initialized before return so no
+    uninitialized field can leak through to consumers.
+    @End Security_Scope
 
     Let node_size be 104
     Let node be proc allocate from Layout with node_size
@@ -293,13 +324,41 @@ Process called "create_hir_type_info" takes type_kind as Integer returns Integer
     @Reasoning:
     Type information is central to HIR's semantic representation. Every typed
     expression must have associated HIRTypeInfo with complete type details
-    including size, alignment, nullability, and generic parameters.
+    including size, alignment, nullability, and generic parameters. Without
+    a freshly allocated HIRTypeInfo, the type checker cannot annotate the
+    node with resolved types, and downstream MIR lowering cannot select the
+    correct machine representation. Each HIRTypeInfo is owned 1:1 by the
+    HIR node it annotates; sharing is forbidden to keep mutation local.
     @End Reasoning
 
     @Implementation:
-    HIRTypeInfo structure: 15 fields × 8 bytes = 120 bytes
-    Initialize with type kind and default values.
+    HIRTypeInfo structure: 15 fields x 8 bytes = 120 bytes. Allocate via
+    Layout.allocate, then store type_kind at offset 0 and zero every other
+    field. Field layout: 0:type_kind, 8:type_name, 16:size, 24:alignment,
+    32:is_signed, 40:is_nullable, 48:is_mutable, 56:is_reference,
+    64:element_type, 72:field_types, 80:field_count, 88:generic_params,
+    96:generic_count, 104:constraints, 112:constraint_count. Size and
+    alignment default to 0 (meaning "unresolved"); the type checker fills
+    these once it has resolved the underlying type through the type table.
     @End Implementation
+
+    @Performance_Hints:
+    Called once per typed expression and once per declaration that carries
+    an explicit type ascription. On larger programs that approaches the
+    HIR node count, so the 15 stores dominate this proc's cost. Field
+    layout deliberately groups frequently-read flags (is_signed through
+    is_reference) into one cache line with size/alignment, allowing later
+    type-checker passes to fetch them with a single load.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Returns a raw owned pointer that the caller MUST attach to a HIR node
+    via set_hir_node_type_info; orphaned type-info blocks leak until the
+    arena is reset. The function returns 0 on allocation failure - callers
+    must check this and propagate the error, since dereferencing 0 will
+    fault. No user input flows into the allocation size, so this proc is
+    not exposed to size-based memory attacks.
+    @End Security_Scope
 
     Let type_info_size be 120
     Let type_info be proc allocate from Layout with type_info_size
@@ -378,6 +437,46 @@ Process called "create_hir_external_declaration" takes name as Integer, library_
     Note: Optional fields (alias_name, framework_name, params, return_type, etc.) are
     Note: zero-initialized and set via setter accessors.
 
+    @Reasoning:
+    External declarations represent the FFI boundary between Runa and the
+    host C/system world. They cannot use the standard 104-byte HIRNode
+    because they require additional metadata for the linker driver and
+    calling-convention dispatcher: the Runa name, the C alias, the library,
+    the calling convention, and the link type. By allocating a 192-byte
+    block that begins with the standard HIRNode header, we keep the node
+    polymorphic - generic HIR walkers see the base header, FFI-aware passes
+    cast to the extended layout via the documented offsets.
+    @End Reasoning
+
+    @Implementation:
+    Allocate HIR_EXTERNAL_DECL_SIZE (192) bytes. Fill the standard HIRNode
+    header at offsets 0-96, then the FFI-specific fields at offsets 104-184.
+    The value field at offset 40 mirrors name so generic walkers that read
+    the value slot still see the function identifier. A children list is
+    created up-front so callers can append parameter nodes without having
+    to lazily initialize the list. Defaults: alias=0 (same as name),
+    framework=0, convention=0 (c), link_type=0 (default-dynamic),
+    flags=0, ownership=0 (default), encoding=0 (utf8).
+    @End Implementation
+
+    @Performance_Hints:
+    Cold path: invoked once per External declaration in a source file. Cost
+    is dominated by the 23 memory_set_int64 stores and one List.create
+    call. Not worth optimizing - external declarations are rare relative
+    to other HIR nodes.
+    @End Performance_Hints
+
+    @Security_Scope:
+    The returned pointer owns the children list it created via
+    List.create. The caller is responsible for attaching the node to the
+    program declarations list so the children list reaches the cleanup
+    walker. Failure to allocate is reported via 0 return - callers MUST
+    check. The name and library_name parameters are stored verbatim, so
+    callers must ensure those pointers remain valid for the lifetime of
+    the HIR program; lowering from AST keeps these in the AST string
+    pool, which outlives HIR.
+    @End Security_Scope
+
     Let node be proc allocate from Layout with HIR_EXTERNAL_DECL_SIZE
     If node is equal to 0:
         Return 0
@@ -417,6 +516,16 @@ Process called "create_hir_external_declaration" takes name as Integer, library_
 End Process
 
 Process called "hir_external_get_name" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the Runa-side identifier string pointer for an external declaration.
+    This is the name used in the Runa source (e.g., "puts"), not the linker
+    alias. Calling-convention dispatch and import resolution both read this
+    field to look up the function in the program's symbol table.
+    @End Reasoning
+    @Implementation:
+    Read the int64 at HIR_EXTERNAL_OFFSET_NAME (offset 104). Null-check
+    the node pointer first to prevent fault on stale/uninitialized values.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -424,6 +533,21 @@ Process called "hir_external_get_name" takes node as Integer returns Integer:
 End Process
 
 Process called "hir_external_set_alias_name" takes node as Integer, alias as Integer returns Integer:
+    @Reasoning:
+    Stores the C-side symbol name when it differs from the Runa-side name.
+    This is set when the user writes `external "puts" as "puts_alias"` or
+    when the AST lowering detects an explicit alias. The linker driver
+    will resolve symbols via the alias if present.
+    @End Reasoning
+    @Implementation:
+    Write the alias int64 at HIR_EXTERNAL_OFFSET_ALIAS (offset 112).
+    Return 1 on success, 0 on null node.
+    @End Implementation
+    @Security_Scope:
+    The alias pointer is stored verbatim; caller must keep the underlying
+    string alive for the HIR program's lifetime. Writing 0 is legal and
+    means "no alias - use the Runa-side name instead".
+    @End Security_Scope
     If node is equal to 0:
         Return 0
     End If
@@ -432,6 +556,16 @@ Process called "hir_external_set_alias_name" takes node as Integer, alias as Int
 End Process
 
 Process called "hir_external_get_alias_name" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the effective linker symbol name: the alias if one was set,
+    otherwise the Runa-side name. This fallback rule lets calling code
+    treat every external as having an alias without checking explicitly,
+    simplifying the symbol-emission path in code generation.
+    @End Reasoning
+    @Implementation:
+    Read offset 112 (alias). If non-zero, return it. Otherwise read
+    offset 104 (name) and return that. Null-check the node pointer.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -443,6 +577,14 @@ Process called "hir_external_get_alias_name" takes node as Integer returns Integ
 End Process
 
 Process called "hir_external_get_library_name" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the library identifier string the function was declared from
+    (e.g., "libc", "kernel32"). The linker driver uses this to register
+    library dependencies and choose between static and dynamic linkage.
+    @End Reasoning
+    @Implementation:
+    Read int64 at HIR_EXTERNAL_OFFSET_LIBRARY (offset 120). Null-check.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -450,6 +592,15 @@ Process called "hir_external_get_library_name" takes node as Integer returns Int
 End Process
 
 Process called "hir_external_set_framework_name" takes node as Integer, framework as Integer returns Integer:
+    @Reasoning:
+    Stores a macOS framework hint (e.g., "CoreFoundation"). Only the
+    darwin linker driver consults this field; on other platforms it is
+    ignored. Setting it is optional and defaults to 0 in the constructor.
+    @End Reasoning
+    @Implementation:
+    Write int64 at HIR_EXTERNAL_OFFSET_FRAMEWORK (offset 128). Return 1
+    on success, 0 on null node.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -458,6 +609,13 @@ Process called "hir_external_set_framework_name" takes node as Integer, framewor
 End Process
 
 Process called "hir_external_get_framework_name" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the macOS framework hint if set, 0 otherwise. The darwin
+    backend uses this to emit `-framework <name>` link directives.
+    @End Reasoning
+    @Implementation:
+    Read int64 at offset 128. Null-check the node pointer.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -465,6 +623,15 @@ Process called "hir_external_get_framework_name" takes node as Integer returns I
 End Process
 
 Process called "hir_external_set_params" takes node as Integer, params as Integer returns Integer:
+    @Reasoning:
+    Stores the parameter list pointer for an external declaration. The
+    list contains HIR parameter nodes (not full HIR types - those resolve
+    later in the semantic analyzer). The calling-convention dispatcher
+    walks this list to materialize the C ABI argument-passing sequence.
+    @End Reasoning
+    @Implementation:
+    Write int64 at HIR_EXTERNAL_OFFSET_PARAMS (offset 136).
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -473,6 +640,14 @@ Process called "hir_external_set_params" takes node as Integer, params as Intege
 End Process
 
 Process called "hir_external_get_params" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the parameter-list pointer for FFI call lowering. Consumers
+    iterate this list via List.length / List.get to walk the declared
+    parameter sequence.
+    @End Reasoning
+    @Implementation:
+    Read int64 at offset 136. Null-check.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -480,6 +655,14 @@ Process called "hir_external_get_params" takes node as Integer returns Integer:
 End Process
 
 Process called "hir_external_set_return_type" takes node as Integer, return_type as Integer returns Integer:
+    @Reasoning:
+    Records the return-type HIRTypeInfo pointer for the FFI declaration.
+    The semantic analyzer uses this to type-check call sites and the
+    code generator uses it to select the return-value register/slot.
+    @End Reasoning
+    @Implementation:
+    Write int64 at HIR_EXTERNAL_OFFSET_RETURN_TYPE (offset 144).
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -488,6 +671,14 @@ Process called "hir_external_set_return_type" takes node as Integer, return_type
 End Process
 
 Process called "hir_external_get_return_type" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the HIRTypeInfo pointer for the declared return type, or 0
+    if none has been attached. Callers that need the resolved type
+    should consult set_type_size_and_alignment results.
+    @End Reasoning
+    @Implementation:
+    Read int64 at offset 144. Null-check.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -495,6 +686,19 @@ Process called "hir_external_get_return_type" takes node as Integer returns Inte
 End Process
 
 Process called "hir_external_set_convention_id" takes node as Integer, convention as Integer returns Integer:
+    @Reasoning:
+    Stores the calling-convention id selected for this external. Encoded
+    values: 0=c, 1=stdcall, 2=fastcall, 3=cdecl, 4=syscall, 5=objc.
+    The code generator dispatches argument marshalling based on this id.
+    @End Reasoning
+    @Implementation:
+    Write int64 at HIR_EXTERNAL_OFFSET_CONVENTION (offset 152).
+    @End Implementation
+    @Security_Scope:
+    Convention id is consumed by the calling-convention dispatcher, which
+    will assume the id is in the documented range. Out-of-range values
+    fall through to the default (c) path safely; no out-of-bounds writes.
+    @End Security_Scope
     If node is equal to 0:
         Return 0
     End If
@@ -503,6 +707,13 @@ Process called "hir_external_set_convention_id" takes node as Integer, conventio
 End Process
 
 Process called "hir_external_get_convention_id" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the encoded calling-convention id. Used by the FFI call-site
+    lowering pass to route to the correct argument-marshalling module.
+    @End Reasoning
+    @Implementation:
+    Read int64 at offset 152. Null-check.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -510,6 +721,15 @@ Process called "hir_external_get_convention_id" takes node as Integer returns In
 End Process
 
 Process called "hir_external_set_link_type" takes node as Integer, link_type as Integer returns Integer:
+    @Reasoning:
+    Records how this external is to be linked: 0=default-dynamic,
+    1=static, 2=dynamic. The linker driver uses this together with the
+    library_name to decide whether the symbol resolves via static archive
+    or via PLT entry / dynamic stub.
+    @End Reasoning
+    @Implementation:
+    Write int64 at HIR_EXTERNAL_OFFSET_LINK_TYPE (offset 160).
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -518,6 +738,12 @@ Process called "hir_external_set_link_type" takes node as Integer, link_type as 
 End Process
 
 Process called "hir_external_get_link_type" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the link-type encoding for use by the linker driver.
+    @End Reasoning
+    @Implementation:
+    Read int64 at offset 160. Null-check.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -525,6 +751,20 @@ Process called "hir_external_get_link_type" takes node as Integer returns Intege
 End Process
 
 Process called "hir_external_set_flags" takes node as Integer, flags as Integer returns Integer:
+    @Reasoning:
+    Stores the packed FFI flag bitmask. Bit 0=unsafe, bit 1=lazy_load,
+    bit 2=variadic. Reserved bits (3+) are forward-compatibility slots
+    for future FFI options. The bitmask is intentionally packed into one
+    int64 so a single load suffices for all attribute checks.
+    @End Reasoning
+    @Implementation:
+    Write int64 at HIR_EXTERNAL_OFFSET_FLAGS (offset 168).
+    @End Implementation
+    @Security_Scope:
+    The unsafe bit gates lifetime-check elision; setting it must remain
+    a deliberate caller decision, never inferred. The hir_external_lower_
+    from_ast pass is the only authorized setter from a non-test caller.
+    @End Security_Scope
     If node is equal to 0:
         Return 0
     End If
@@ -533,6 +773,15 @@ Process called "hir_external_set_flags" takes node as Integer, flags as Integer 
 End Process
 
 Process called "hir_external_get_flags" takes node as Integer returns Integer:
+    @Reasoning:
+    Returns the raw flag bitmask. Prefer the typed predicates
+    hir_external_is_unsafe / hir_external_is_variadic for individual bits;
+    this raw accessor is mainly for the AST-to-HIR copy and for debug
+    dumps.
+    @End Reasoning
+    @Implementation:
+    Read int64 at offset 168. Null-check.
+    @End Implementation
     If node is equal to 0:
         Return 0
     End If
@@ -540,6 +789,20 @@ Process called "hir_external_get_flags" takes node as Integer returns Integer:
 End Process
 
 Process called "hir_external_is_unsafe" takes node as Integer returns Integer:
+    @Reasoning:
+    Typed predicate for the unsafe bit. The semantic analyzer uses this
+    to enable / suppress borrow-check warnings around calls to this
+    external. Encapsulating the bit position here keeps the bit layout
+    private to this module.
+    @End Reasoning
+    @Implementation:
+    Read flags from offset 168, mask bit 0 (value 1). Return 1 if set,
+    0 otherwise (normalized boolean, not the raw bitwise result).
+    @End Implementation
+    @Performance_Hints:
+    Called per FFI call site during semantic analysis. The bitwise-and
+    + branch is two instructions on every supported backend.
+    @End Performance_Hints
     If node is equal to 0:
         Return 0
     End If
@@ -552,6 +815,20 @@ Process called "hir_external_is_unsafe" takes node as Integer returns Integer:
 End Process
 
 Process called "hir_external_is_variadic" takes node as Integer returns Integer:
+    @Reasoning:
+    Typed predicate for the variadic bit. The code generator needs this
+    to switch to the variadic calling-convention path (e.g., passing the
+    floating-point arg count in %al on x86-64 SysV for printf-class
+    functions).
+    @End Reasoning
+    @Implementation:
+    Read flags from offset 168, mask bit 2 (value 4). Return 1 if set,
+    0 otherwise (normalized boolean).
+    @End Implementation
+    @Performance_Hints:
+    Called per FFI call site during code generation; same two-instruction
+    cost as hir_external_is_unsafe.
+    @End Performance_Hints
     If node is equal to 0:
         Return 0
     End If
@@ -565,11 +842,49 @@ End Process
 
 Process called "hir_external_lower_from_ast" takes ast_node as Integer returns Integer:
     Note: Lower an AST_EXTERNAL_DECLARATION (offset 80+) into a HIRExternalDeclaration.
-    Note: This is the AST→HIR connector for the FFI declaration. It copies the FFI
+    Note: This is the AST-to-HIR connector for the FFI declaration. It copies the FFI
     Note: metadata (alias, convention, link_type, flags, framework) into the HIR node,
     Note: preserves the parameter list as HIR-untyped-parameter list (type resolution
     Note: occurs in the semantic analyzer), and links back to the original AST node
     Note: via ast_node field at offset 96.
+
+    @Reasoning:
+    This is the dedicated AST-to-HIR connector for external declarations.
+    Generic AST-to-HIR lowering cannot handle externals because they carry
+    FFI-only metadata (calling convention, link type, framework hint, flag
+    bitmask) that have no AST equivalent in the standard AST node layout.
+    By isolating the copy logic here we keep the broader lowering pipeline
+    free of FFI concerns and we ensure that any future change to the AST
+    external-decl layout requires only a single point of update.
+    @End Reasoning
+
+    @Implementation:
+    Read the eleven FFI fields out of the AST node at the documented
+    offsets (Decision 2 layout):
+      80=name, 88=params, 104=return_type, 112=library, 120=alias,
+      128=convention, 136=link_type, 144=flags, 152=framework,
+      8=line, 16=column.
+    Construct a fresh HIRExternalDeclaration via create_hir_external_
+    declaration, then copy each FFI field via the setter chain. Finally
+    write the back-reference to the source AST node at HIRNode offset 96
+    so the diagnostics pass can recover source locations from this HIR
+    node. Returns 0 if the AST node is null or HIR allocation fails.
+    @End Implementation
+
+    @Performance_Hints:
+    Called once per external declaration per compilation; not a hot path.
+    The eleven setter calls each do one null-check + one store, so total
+    cost is dominated by the create_hir_external_declaration allocation.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Reads the AST node's FFI metadata verbatim - the AST is the source of
+    truth for the user's declared linkage and unsafe markers. The HIR
+    node takes ownership of those values; the AST string pool outlives
+    the HIR program by construction (parser owns the pool), so the stored
+    pointers remain valid. Returning 0 on null ast_node prevents a
+    downstream fault during semantic analysis.
+    @End Security_Scope
 
     If ast_node is equal to 0:
         Return 0
@@ -615,13 +930,38 @@ Process called "create_hir_scope_info" takes scope_kind as Integer, parent_scope
     @Reasoning:
     Scope tracking is essential for name resolution and symbol lookup. Each
     scope maintains its own symbol tables for variables, functions, and types,
-    with parent scope for lexical scoping.
+    with parent scope for lexical scoping. Scopes form a stack at parse time
+    and a tree at analysis time: child scopes look up unresolved names by
+    walking parent pointers until a binding is found or the global scope is
+    reached. The scope_id used elsewhere in HIR is the scope_info pointer
+    itself, providing a stable identity for the lifetime of the program.
     @End Reasoning
 
     @Implementation:
-    HIRScopeInfo structure: 9 fields × 8 bytes = 72 bytes
-    Allocate and initialize with scope kind and parent.
+    HIRScopeInfo structure: 9 fields x 8 bytes = 72 bytes. Allocate via
+    Layout.allocate. Field layout: 0:scope_id, 8:parent_scope, 16:scope_kind,
+    24:variables list, 32:variable_count, 40:functions list,
+    48:function_count, 56:types list, 64:type_count. The scope_id field
+    is initialized to the block's own address so each scope is uniquely
+    identifiable regardless of nesting depth. The three list pointers are
+    zero-initialized; they will be lazily created when symbols are added.
     @End Implementation
+
+    @Performance_Hints:
+    Called once per nested scope in the program (one per function, one per
+    block, one per loop). On large programs that scales linearly with
+    nesting depth times block count, but it is dwarfed by HIR node creation
+    overall. The pointer-as-id trick avoids needing a global counter.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Returns an owned pointer to a 72-byte block. Caller must attach the
+    scope to its parent (via parent_scope linkage) and to whichever HIR
+    nodes reference the scope (via set_hir_node_scope_id) so the scope
+    reaches the cleanup walker. Allocation failure surfaces as a 0 return;
+    callers MUST check before walking the parent chain or other accessor
+    use will fault.
+    @End Security_Scope
 
     Let scope_info_size be 72
     Let scope_info be proc allocate from Layout with scope_info_size
@@ -652,13 +992,39 @@ Process called "create_hir_symbol_info" takes symbol_name as Integer, symbol_kin
     @Reasoning:
     Symbol information tracks every declared entity (variables, functions, types)
     with complete metadata including type, visibility, mutability, and usage tracking.
-    This enables proper name resolution and unused variable detection.
+    This enables proper name resolution and unused variable detection. Symbols are
+    referenced from HIR nodes by symbol_id (stored at HIRNode offset 88), so any
+    HIR identifier or call resolved during semantic analysis points back to a
+    HIRSymbolInfo block. First/last use tracking supports the "unused variable"
+    diagnostic and informs lifetime analysis.
     @End Reasoning
 
     @Implementation:
-    HIRSymbolInfo structure: 11 fields × 8 bytes = 88 bytes
-    Generate unique symbol ID and initialize all fields.
+    HIRSymbolInfo structure: 11 fields x 8 bytes = 88 bytes. Allocate via
+    Layout.allocate. Field layout: 0:symbol_id, 8:symbol_name, 16:symbol_kind,
+    24:type_info, 32:scope_id, 40:declaration_node, 48:is_public,
+    56:is_mutable, 64:is_used, 72:first_use_line, 80:last_use_line.
+    The symbol_id is the block address - same self-id trick as scope info.
+    is_used is initialized to 0 so the unused-symbol pass can detect symbols
+    that are declared but never referenced. type_info starts null; the type
+    checker fills it when the symbol's declaration is processed.
     @End Implementation
+
+    @Performance_Hints:
+    Called once per declared variable, function, type, or parameter. On a
+    large source file this can reach thousands of allocations. Field
+    layout is intentionally cache-line-friendly: the first 64 bytes
+    contain the fields read on every name lookup (id/name/kind/type/scope),
+    so a single line load satisfies the hot path.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Returns an owned pointer; caller must register the symbol with its
+    enclosing scope so it reaches the cleanup walker. symbol_name is
+    stored verbatim - caller is responsible for the lifetime of that
+    string (the AST/HIR string pool covers this in normal compilation).
+    Allocation failure returns 0; callers must check.
+    @End Security_Scope
 
     Let symbol_info_size be 88
     Let symbol_info be proc allocate from Layout with symbol_info_size
@@ -691,13 +1057,38 @@ Process called "create_hir_ownership_info" takes variable_symbol as Integer retu
     @Reasoning:
     Ownership information is critical for Runa's memory safety. We track
     ownership status (owned, borrowed, moved), active borrows, and lifetimes
-    to enforce borrowing rules at compile time.
+    to enforce borrowing rules at compile time. Each declared variable gets
+    one HIROwnershipInfo at the point of its declaration; the borrow-checker
+    pass mutates ownership_status as the variable flows through assignments,
+    borrows, and moves, and appends borrower symbol ids as references are
+    created.
     @End Reasoning
 
     @Implementation:
-    HIROwnershipInfo structure: 9 fields × 8 bytes = 72 bytes
-    Initialize with owned status and zero borrows.
+    HIROwnershipInfo structure: 9 fields x 8 bytes = 72 bytes. Allocate via
+    Layout.allocate. Field layout: 0:variable_symbol, 8:ownership_status,
+    16:borrow_count, 24:is_mutable, 32:lifetime_id, 40:declaration_line,
+    48:moved_line, 56:borrowers list, 64:borrower_count.
+    ownership_status encoding: 0=owned, 1=shared_borrow, 2=mut_borrow,
+    3=moved. Initialized to owned with zero borrows; the borrow checker
+    will transition this as the symbol is used. moved_line stays 0 until
+    a move is observed.
     @End Implementation
+
+    @Performance_Hints:
+    Called once per declared variable. The borrow checker reads these
+    blocks repeatedly during analysis, so the 72-byte size keeps the most
+    common case (no borrowers) fully in one cache line.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Returns an owned pointer; caller must register the ownership info
+    with its variable's HIRSymbolInfo so the borrow checker can find it.
+    The borrowers list is null until first borrow; consumers must call
+    List.create on first append. Allocation failure returns 0 - callers
+    must check before accessing any field, particularly because the
+    borrow-check pass treats absent ownership info as "trivially owned".
+    @End Security_Scope
 
     Let ownership_info_size be 72
     Let ownership_info be proc allocate from Layout with ownership_info_size
@@ -725,13 +1116,35 @@ Process called "create_hir_lifetime_info" takes lifetime_name as Integer, scope_
     @Reasoning:
     Lifetime information enables static analysis of reference validity.
     Each lifetime has a scope, start/end lines, and optional parent for
-    lifetime subtyping and variance analysis.
+    lifetime subtyping and variance analysis. The lifetime_id is the
+    pointer-as-id trick so every distinct allocation has a distinct id
+    without a global counter. Parent lifetime support enables variance
+    analysis on generic types parameterized by lifetimes.
     @End Reasoning
 
     @Implementation:
-    HIRLifetimeInfo structure: 6 fields × 8 bytes = 48 bytes
-    Generate unique lifetime ID and initialize.
+    HIRLifetimeInfo structure: 6 fields x 8 bytes = 48 bytes. Allocate
+    via Layout.allocate. Field layout: 0:lifetime_id, 8:lifetime_name,
+    16:scope_id, 24:start_line, 32:end_line, 40:parent_lifetime.
+    Start/end line default to 0 (unresolved); the borrow checker fills
+    these once it has observed the lifetime's first and last use.
+    Parent lifetime starts at 0 meaning "no parent" - the analysis pass
+    sets it when subtyping relationships are discovered.
     @End Implementation
+
+    @Performance_Hints:
+    Called per declared lifetime parameter and per implicit reference
+    lifetime. Cheap relative to other HIR allocations because the block
+    is only 48 bytes.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Returns an owned 48-byte pointer; the caller must wire it into the
+    appropriate scope's lifetime table. lifetime_name is stored verbatim
+    so the source string must outlive the HIR program. Allocation failure
+    returns 0 - callers must check before using lifetime_id, since 0 is
+    also used as the "no parent" sentinel in other lifetime blocks.
+    @End Security_Scope
 
     Let lifetime_info_size be 48
     Let lifetime_info be proc allocate from Layout with lifetime_info_size
@@ -761,8 +1174,21 @@ Process called "get_hir_node_type" takes node as Integer returns Integer:
     Note: Get node type from HIR node
 
     @Reasoning:
-    Provides safe access to node type with null check.
+    Returns the node_type constant (HIR_LITERAL, HIR_IDENTIFIER, etc.) of
+    the supplied node. Every HIR walker switches on this value to choose a
+    handler, so the accessor is foundational to all HIR traversal.
     @End Reasoning
+
+    @Implementation:
+    Read the int64 at HIRNode offset 0. Null-check the node pointer first
+    so that stale or sentinel zero values return 0 rather than faulting.
+    @End Implementation
+
+    @Performance_Hints:
+    Hottest accessor in the file - every walker reads node_type at least
+    once per visit. The single load plus one null branch is the minimum
+    work possible while remaining null-safe.
+    @End Performance_Hints
 
     If node is equal to 0:
         Return 0
@@ -775,8 +1201,19 @@ Process called "get_hir_node_type_info" takes node as Integer returns Integer:
     Note: Get type information from HIR node
 
     @Reasoning:
-    Returns pointer to HIRTypeInfo for type analysis.
+    Returns the HIRTypeInfo pointer attached to a node, or 0 if none has
+    been resolved yet. Consumers use this during type checking and during
+    machine-code generation to fetch size/alignment and structural details.
     @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRNode offset 72. Null-check the node pointer.
+    @End Implementation
+
+    @Performance_Hints:
+    Read on the hot type-checking path; the single load + branch shape
+    keeps it inlinable by future optimizers.
+    @End Performance_Hints
 
     If node is equal to 0:
         Return 0
@@ -789,8 +1226,22 @@ Process called "set_hir_node_type_info" takes node as Integer, type_info as Inte
     Note: Set type information for HIR node
 
     @Reasoning:
-    Associates type information with HIR node during type checking.
+    Associates a freshly created HIRTypeInfo with a HIR node during the
+    type-resolution pass. This is the canonical entry point for attaching
+    type information; the constructor reserves offset 72 for this purpose.
     @End Reasoning
+
+    @Implementation:
+    Write the type_info int64 to HIRNode offset 72. Null-check the node
+    pointer first; returns 0 on null, 1 on success.
+    @End Implementation
+
+    @Security_Scope:
+    Stores the type_info pointer verbatim, transferring ownership in the
+    sense that the HIR node now references that block. Caller must not
+    free the type_info while the HIR node is live. Writing 0 is legal
+    and means "clear the type binding".
+    @End Security_Scope
 
     If node is equal to 0:
         Return 0
@@ -803,6 +1254,16 @@ End Process
 Process called "get_hir_node_scope_id" takes node as Integer returns Integer:
     Note: Get scope ID from HIR node
 
+    @Reasoning:
+    Returns the scope id stored in the HIR node, identifying the lexical
+    scope this node belongs to. Name resolution starts from this scope and
+    walks parent_scope pointers to find symbol bindings.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRNode offset 80. Null-check first.
+    @End Implementation
+
     If node is equal to 0:
         Return 0
     End If
@@ -812,6 +1273,18 @@ End Process
 
 Process called "set_hir_node_scope_id" takes node as Integer, scope_id as Integer returns Integer:
     Note: Set scope ID for HIR node
+
+    @Reasoning:
+    Records which scope this HIR node was constructed in. Set during HIR
+    lowering when the lowering pass currently has the enclosing scope on
+    its stack. Required for downstream name-resolution and borrow-checker
+    passes.
+    @End Reasoning
+
+    @Implementation:
+    Write scope_id int64 at HIRNode offset 80. Returns 1 on success,
+    0 on null node.
+    @End Implementation
 
     If node is equal to 0:
         Return 0
@@ -824,6 +1297,16 @@ End Process
 Process called "get_hir_node_symbol_id" takes node as Integer returns Integer:
     Note: Get symbol ID from HIR node
 
+    @Reasoning:
+    Returns the resolved symbol id (HIRSymbolInfo pointer) for identifiers,
+    references, and definitions. 0 means "unresolved" - that is the state
+    before semantic analysis runs.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRNode offset 88. Null-check.
+    @End Implementation
+
     If node is equal to 0:
         Return 0
     End If
@@ -833,6 +1316,16 @@ End Process
 
 Process called "set_hir_node_symbol_id" takes node as Integer, symbol_id as Integer returns Integer:
     Note: Set symbol ID for HIR node
+
+    @Reasoning:
+    Records the result of name resolution: this HIR node refers to the
+    given HIRSymbolInfo. Subsequent passes use this binding directly
+    rather than re-running scope lookups.
+    @End Reasoning
+
+    @Implementation:
+    Write symbol_id int64 at HIRNode offset 88.
+    @End Implementation
 
     If node is equal to 0:
         Return 0
@@ -847,8 +1340,23 @@ Process called "link_hir_to_ast" takes hir_node as Integer, ast_node as Integer 
 
     @Reasoning:
     Maintains connection to original source for error messages with
-    accurate line/column information.
+    accurate line/column information. The HIR carries its own line/column,
+    but the AST node is also needed for some diagnostics that quote source
+    text (the AST has tokens, the HIR does not), and for refactoring
+    tooling that needs to map HIR-derived changes back to source spans.
     @End Reasoning
+
+    @Implementation:
+    Write the AST node pointer to HIRNode offset 96 (the ast_node back-
+    reference slot). Returns 1 on success, 0 on null hir_node.
+    @End Implementation
+
+    @Security_Scope:
+    Stores a reference to the AST node; the AST must outlive the HIR for
+    this back-reference to remain valid. In normal compilation the AST is
+    owned by the same arena as the HIR, so this lifetime constraint is
+    automatically satisfied.
+    @End Security_Scope
 
     If hir_node is equal to 0:
         Return 0
@@ -867,8 +1375,23 @@ Process called "set_type_size_and_alignment" takes type_info as Integer, size as
 
     @Reasoning:
     Type size and alignment are computed during type checking and stored
-    for memory layout calculations in later stages.
+    for memory layout calculations in later stages. The two fields are
+    set together because they are always determined by the same analysis
+    step (the type-size resolver); pairing them in one accessor halves
+    the call overhead and makes their mutual consistency explicit.
     @End Reasoning
+
+    @Implementation:
+    Write size to HIRTypeInfo offset 16 and alignment to offset 24. Null-
+    check type_info and return 0 on failure, 1 on success.
+    @End Implementation
+
+    @Security_Scope:
+    Both size and alignment values are written verbatim. Callers must
+    supply consistent values (size must be a multiple of alignment for
+    array storage); this proc does not validate the relationship - the
+    type-size resolver is the trusted source.
+    @End Security_Scope
 
     If type_info is equal to 0:
         Return 0
@@ -882,6 +1405,17 @@ End Process
 Process called "set_type_nullability" takes type_info as Integer, is_nullable as Integer returns Integer:
     Note: Mark type as nullable (Optional type)
 
+    @Reasoning:
+    Optional types (T?) are tracked via a single flag on the underlying
+    HIRTypeInfo rather than as a separate wrapping type, simplifying type
+    equality checks. The semantic analyzer sets this when it sees the
+    optional type-syntax on a declaration.
+    @End Reasoning
+
+    @Implementation:
+    Write is_nullable int64 (0 or 1) to HIRTypeInfo offset 40. Null-check.
+    @End Implementation
+
     If type_info is equal to 0:
         Return 0
     End If
@@ -892,6 +1426,16 @@ End Process
 
 Process called "set_type_mutability" takes type_info as Integer, is_mutable as Integer returns Integer:
     Note: Mark type as mutable or immutable
+
+    @Reasoning:
+    Records whether values of this type may be mutated through this
+    binding. Used by the borrow checker to validate Set statements and
+    by reference-type construction to choose between & and &mut.
+    @End Reasoning
+
+    @Implementation:
+    Write is_mutable int64 (0 or 1) to HIRTypeInfo offset 48. Null-check.
+    @End Implementation
 
     If type_info is equal to 0:
         Return 0
@@ -906,8 +1450,21 @@ Process called "set_type_element_type" takes type_info as Integer, element_type 
 
     @Reasoning:
     Container types (arrays, optionals) reference their element type
-    for recursive type checking and size calculations.
+    for recursive type checking and size calculations. The element-type
+    pointer is single-valued (not a list), because container types in
+    this representation always have exactly one element type; tuple and
+    record types use the field_types list instead.
     @End Reasoning
+
+    @Implementation:
+    Write element_type pointer to HIRTypeInfo offset 64. Null-check.
+    @End Implementation
+
+    @Security_Scope:
+    Stores the element-type pointer verbatim. The pointed-to HIRTypeInfo
+    must outlive the containing type_info, which is guaranteed when both
+    live in the same HIR arena.
+    @End Security_Scope
 
     If type_info is equal to 0:
         Return 0
@@ -920,6 +1477,16 @@ End Process
 Process called "get_type_size" takes type_info as Integer returns Integer:
     Note: Get size in bytes of type
 
+    @Reasoning:
+    Returns the size-in-bytes used for stack-frame layout, struct field
+    offsets, and array striding in the code generator.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRTypeInfo offset 16. Null-check. A 0 result means
+    the type is generic or has not yet been resolved.
+    @End Implementation
+
     If type_info is equal to 0:
         Return 0
     End If
@@ -929,6 +1496,16 @@ End Process
 
 Process called "get_type_alignment" takes type_info as Integer returns Integer:
     Note: Get alignment requirement of type
+
+    @Reasoning:
+    Returns the alignment-in-bytes used to pad fields and align stack
+    slots so loads and stores satisfy the target platform's alignment
+    constraints.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRTypeInfo offset 24. Null-check.
+    @End Implementation
 
     If type_info is equal to 0:
         Return 0
@@ -940,6 +1517,16 @@ End Process
 Process called "is_type_nullable" takes type_info as Integer returns Integer:
     Note: Check if type is nullable
 
+    @Reasoning:
+    Predicate used by the null-safety pass to decide whether dereferencing
+    a value of this type requires an explicit null check.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRTypeInfo offset 40 and return it directly (the
+    stored value is already a 0/1 boolean). Null-check the type_info.
+    @End Implementation
+
     If type_info is equal to 0:
         Return 0
     End If
@@ -949,6 +1536,15 @@ End Process
 
 Process called "is_type_mutable" takes type_info as Integer returns Integer:
     Note: Check if type is mutable
+
+    @Reasoning:
+    Predicate consulted by the borrow checker when validating Set
+    statements: assigning to an immutable binding is a compile error.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRTypeInfo offset 48. Null-check.
+    @End Implementation
 
     If type_info is equal to 0:
         Return 0
@@ -967,8 +1563,24 @@ Process called "create_hir_program" returns Integer:
     @Reasoning:
     The HIR program is the root of the HIR tree, containing all top-level
     declarations and statements. It serves as the entry point for semantic
-    analysis and code generation.
+    analysis and code generation. The program node is constructed with
+    node_type 0 to distinguish it from any expression/statement/declaration
+    kind; downstream passes detect the root by checking for this sentinel.
     @End Reasoning
+
+    @Implementation:
+    Build a fresh HIRNode via create_hir_node(0, 0, 0). On failure
+    (allocation error) propagate the 0. Otherwise overwrite the children
+    pointer at HIRNode offset 24 with a freshly created List so callers
+    can append declarations without lazy-initialization checks.
+    @End Implementation
+
+    @Security_Scope:
+    Returns an owned program-root pointer that owns its children List.
+    This pointer is the root of the entire HIR forest, and is what the
+    cleanup walker uses to reach every owned HIR allocation. Lose this
+    pointer and you leak the whole HIR.
+    @End Security_Scope
 
     Let program_node be proc create_hir_node with 0, 0, 0
 
@@ -988,8 +1600,23 @@ Process called "create_hir_block" returns Integer:
 
     @Reasoning:
     Block statements create a new lexical scope for variables and maintain
-    a list of statements. Blocks are fundamental to control flow structures.
+    a list of statements. Blocks are fundamental to control flow structures:
+    if/otherwise arms, loop bodies, function bodies, and explicit Begin/End
+    blocks are all HIR_BLOCK_STATEMENT nodes underneath.
     @End Reasoning
+
+    @Implementation:
+    Build a fresh HIRNode with node_type HIR_BLOCK_STATEMENT. Initialize
+    the children list at HIRNode offset 24 so callers can append
+    statements via add_statement_to_hir_block without the lazy-create
+    branch firing on the first append.
+    @End Implementation
+
+    @Security_Scope:
+    Returns an owned pointer that owns its children List. Caller must
+    attach this block to a parent (program, if statement, etc.) so the
+    cleanup walker can reach it.
+    @End Security_Scope
 
     Let block_node be proc create_hir_node with HIR_BLOCK_STATEMENT, 0, 0
 
@@ -1009,6 +1636,18 @@ Process called "get_program_declarations" takes program_node as Integer returns 
     Note: HIR programs store children at offset 24 (the standard HIRNode children list).
     Note: Each child is a top-level declaration: HIR_PROCESS_DEFINITION, HIR_TYPE_DEFINITION,
     Note: HIR_EXTERNAL_DECLARATION, HIR_IMPORT_STATEMENT, etc.
+
+    @Reasoning:
+    Exposes the program root's children list so external passes can
+    enumerate top-level declarations without depending on the HIRNode
+    layout offset directly. Keeping the offset constant private to this
+    file lets us reshape HIRNode without churning callers.
+    @End Reasoning
+
+    @Implementation:
+    Read int64 at HIRNode offset 24. Null-check the program_node first.
+    @End Implementation
+
     If program_node is equal to 0:
         Return 0
     End If
@@ -1021,7 +1660,35 @@ Process called "add_statement_to_hir_block" takes block_node as Integer, stateme
     @Reasoning:
     Blocks maintain an ordered list of statements. We append statements and
     update the child count for efficient traversal during analysis passes.
+    Setting the parent pointer on the appended statement enables back-
+    propagation of analysis results (e.g., bubbling up unreachable-code
+    diagnostics to the enclosing block).
     @End Reasoning
+
+    @Implementation:
+    1. Read the children list at HIRNode offset 24. If it is 0, lazily
+       create one (defensive against blocks constructed outside
+       create_hir_block).
+    2. Append the statement to the list.
+    3. Increment child_count at offset 32.
+    4. Set the statement's parent pointer at offset 64 to the block.
+    Returns 1 on success, 0 if either argument is null.
+    @End Implementation
+
+    @Performance_Hints:
+    Called once per statement in every block during HIR lowering. The
+    lazy-create branch is normally not taken because create_hir_block
+    already initialized the list; keeping it for safety against direct
+    HIRNode construction by future callers.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Transfers ownership of the statement into the block: the block is
+    now responsible for reaching the statement during cleanup. The
+    statement's parent pointer is overwritten unconditionally, so callers
+    must not append a statement that is already owned by a different
+    block (double-parenting would lose the original parent linkage).
+    @End Security_Scope
 
     If block_node is equal to 0:
         Return 0
@@ -1060,7 +1727,34 @@ Process called "add_hir_node" takes parent_node as Integer, child_node as Intege
     @Reasoning:
     Generic function to add any child node to any parent node. Used for
     building the HIR tree structure and maintaining parent-child relationships.
+    Distinct from add_statement_to_hir_block in that it is type-agnostic:
+    callers use this for AST constructs that do not map cleanly to a
+    "block of statements" (e.g., a match expression's arms attached to
+    the match node, a function definition's parameter list attached to
+    the function node).
     @End Reasoning
+
+    @Implementation:
+    Identical structure to add_statement_to_hir_block:
+    1. Read children list at parent offset 24; lazy-create if absent.
+    2. Append child_node.
+    3. Increment child_count at parent offset 32.
+    4. Set child's parent pointer at child offset 64.
+    Returns 1 on success, 0 if either parent or child is null.
+    @End Implementation
+
+    @Performance_Hints:
+    Called once per HIR parent-child edge during lowering. The two int64
+    reads + one list-append + two int64 writes are the irreducible cost
+    of maintaining a doubly-linked HIR tree.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Transfers ownership of child_node into parent_node. Same caveat as
+    add_statement_to_hir_block: a child that is already owned by another
+    parent will have its parent pointer overwritten, severing the
+    original linkage; callers must ensure single-parenting.
+    @End Security_Scope
 
     If parent_node is equal to 0:
         Return 0
@@ -1099,8 +1793,21 @@ Process called "create_hir_identifier" takes name as Integer returns Integer:
     @Reasoning:
     Identifiers reference variables, functions, or other named entities.
     The identifier stores the name as its value and will be resolved to
-    a symbol during semantic analysis.
+    a symbol during semantic analysis. Until name resolution runs, the
+    symbol_id field is 0 (unresolved); after resolution it holds a
+    HIRSymbolInfo pointer.
     @End Reasoning
+
+    @Implementation:
+    Build a HIRNode of type HIR_IDENTIFIER. Store the name string
+    pointer at the node's value slot (HIRNode offset 40). symbol_id at
+    offset 88 remains 0 until the resolver visits this node.
+    @End Implementation
+
+    @Performance_Hints:
+    Identifiers are among the most common HIR nodes. Two stores plus the
+    base allocation is the irreducible cost.
+    @End Performance_Hints
 
     Let id_node be proc create_hir_node with HIR_IDENTIFIER, 0, 0
 
@@ -1120,7 +1827,25 @@ Process called "create_hir_string_literal" takes value as Integer returns Intege
     @Reasoning:
     String literals are typed constant expressions. We create a literal node
     with the string value and set up basic type information for string type.
+    Attaching HIRTypeInfo at construction means the type checker can skip
+    re-deriving the type for literal nodes, treating them as already typed.
     @End Reasoning
+
+    @Implementation:
+    1. Create base HIRNode of type HIR_LITERAL.
+    2. Store the string pointer at value slot offset 40.
+    3. Tag value_type at offset 48 with sentinel 1 (string).
+    4. Allocate a HIRTypeInfo of kind HIR_BASIC_TYPE and attach it at
+       offset 72 (type_info slot). If type-info allocation fails the
+       literal node is still returned without type info; downstream
+       passes will detect the missing type and re-derive it.
+    @End Implementation
+
+    @Security_Scope:
+    The string pointer is stored verbatim. The pointed-to string must
+    outlive the HIR program; in normal compilation the string pool is
+    owned by the AST/HIR arena and this is automatic.
+    @End Security_Scope
 
     Let lit_node be proc create_hir_node with HIR_LITERAL, 0, 0
 
@@ -1147,8 +1872,19 @@ Process called "create_hir_boolean_literal" takes value as Integer returns Integ
     Note: Create HIR boolean literal expression node
 
     @Reasoning:
-    Boolean literals (true/false) are typed constant expressions with Boolean type.
+    Boolean literals (true/false) are typed constant expressions with Boolean
+    type. Constructed with type info already attached, so the type checker
+    treats them as already typed and skips re-derivation.
     @End Reasoning
+
+    @Implementation:
+    1. Create base HIRNode of type HIR_LITERAL.
+    2. Store boolean value (0 or 1) at value slot offset 40.
+    3. Tag value_type at offset 48 with sentinel 2 (boolean).
+    4. Attach a HIR_BASIC_TYPE HIRTypeInfo at offset 72. If type-info
+       allocation fails the literal still returns - type info is
+       optional but desirable for constant-folding.
+    @End Implementation
 
     Let lit_node be proc create_hir_node with HIR_LITERAL, 0, 0
 
@@ -1177,7 +1913,21 @@ Process called "create_hir_list_literal" returns Integer:
     @Reasoning:
     List literals represent compile-time array/list values. We create an
     array literal node and initialize its elements list for population.
+    The elements list is created eagerly so that add_element_to_hir_list
+    never has to take the lazy-create branch on a fresh literal.
     @End Reasoning
+
+    @Implementation:
+    1. Create a HIRNode of type HIR_ARRAY_LITERAL.
+    2. Create a fresh List and store it at children slot offset 24.
+    Element type is left undetermined; the type checker derives it from
+    the first element appended, then validates compatibility for the rest.
+    @End Implementation
+
+    @Security_Scope:
+    Returns an owned pointer that owns its elements List. Must be
+    attached to a parent so the cleanup walker can reach it.
+    @End Security_Scope
 
     Let list_node be proc create_hir_node with HIR_ARRAY_LITERAL, 0, 0
 
@@ -1198,8 +1948,26 @@ Process called "add_element_to_hir_list" takes list_node as Integer, element as 
     @Reasoning:
     List literals maintain an ordered sequence of element expressions.
     We append elements and track the count for type checking (all elements
-    must be compatible types).
+    must be compatible types). Same parent-pointer-update pattern as
+    add_statement_to_hir_block, just specialized to the list-literal node
+    so the element-count field has the correct semantic meaning for
+    list-specific diagnostics.
     @End Reasoning
+
+    @Implementation:
+    1. Null-check both list_node and element.
+    2. Read children list at HIRNode offset 24; lazy-create if absent.
+    3. Append the element.
+    4. Increment child_count at offset 32 (used as element_count for
+       list literals - same field, distinct semantic role).
+    5. Set element's parent pointer at offset 64 to the list_node.
+    Returns 1 on success.
+    @End Implementation
+
+    @Security_Scope:
+    Transfers ownership of element into list_node. Same single-parent
+    invariant as add_statement_to_hir_block.
+    @End Security_Scope
 
     If list_node is equal to 0:
         Return 0

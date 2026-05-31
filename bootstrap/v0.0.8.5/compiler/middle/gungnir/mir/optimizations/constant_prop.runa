@@ -144,6 +144,15 @@ Process called "create_constant_prop_context" that takes cfg as Integer returns 
     @Reasoning
     Creates and initializes enhanced constant propagation context.
 
+    The context aggregates every piece of long-lived state needed by the
+    interprocedural lattice walk: the CFG under analysis, per-SSA-value
+    lattice elements, whole-module global summaries, per-function purity
+    and return-value summaries, array element summaries, the worklist that
+    drives fixed-point iteration, and statistics counters used by the
+    reporter. Bundling these into a single 112-byte struct lets every
+    helper take just `context_ptr` and dispatch through field offsets,
+    which keeps the data-flow code branch-free of housekeeping arguments.
+
     **INITIALIZATION:**
     - Allocates 112-byte context structure
     - Creates constant value dictionary
@@ -155,6 +164,27 @@ Process called "create_constant_prop_context" that takes cfg as Integer returns 
 
     Returns context pointer or 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Allocates the 112-byte context block via Layout.allocate and writes
+    each field at its documented byte offset:
+      0   cfg pointer (provided argument)
+      8   constant_values     - Dictionary<value_id-as-string, ConstantValue*>
+      16  global_constants    - Dictionary<global_id-as-string, ConstantValue*>
+      24  function_summaries  - Dictionary<function_id-as-string, FunctionSummary*>
+      32  array_constants     - Dictionary<array_id-as-string, ArrayConstantInfo*>
+      40  worklist            - List<value_id>
+      48..72 counters (propagated, folded, globals_propagated, arrays_propagated)
+      80  module pointer (filled in by interprocedural analysis)
+      88  call_graph (reserved for the call-graph-backed worklist)
+      96  reaching_defs (reserved for reaching-defs cache)
+      104 use_def_chains (reserved for use-def chain cache)
+
+    Validates the CFG argument up front; on any allocation failure the
+    routine returns 0 without leaking the partially constructed context
+    (Layout.allocate returns 0 on OOM and we abort before installing
+    nested dictionaries that would otherwise leak).
+    @End Implementation
 
     If cfg is equal to 0:
         Display "create_constant_prop_context: null CFG"
@@ -211,7 +241,32 @@ End Process
 Process called "destroy_constant_prop_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
     Destroys constant propagation context and frees all memory.
+
+    The lattice maps own their ConstantValue payloads, so naively
+    destroying the outer Dictionary would leak every ConstantValue
+    allocated during analysis. This routine walks the value map keys,
+    deallocates each per-value lattice element, and only then disposes
+    of the containers. Lifetime is therefore deterministic: every byte
+    handed out by Layout.allocate during analysis is returned here.
     @End Reasoning
+
+    @Implementation
+    Performs an ordered teardown in five phases:
+      1. constant_values: list keys via Dictionary.keys, walk each entry,
+         deallocate the ConstantValue (32 bytes) it points at, then
+         destroy the key list and the dictionary itself.
+      2. global_constants: destroy in place (ConstantValue payloads here
+         alias entries already freed above when they refer to the same
+         underlying global, so the dictionary frees only its own bucket
+         storage).
+      3. function_summaries / array_constants: destroy the outer maps.
+         The owned FunctionSummary and ArrayConstantInfo payloads are
+         expected to have been disposed by their dedicated destructors
+         where they were allocated (see destroy_function_summary).
+      4. worklist: destroyed via List.destroy.
+      5. The 112-byte context block itself is freed last.
+    Null context_ptr is a no-op returning 0.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -273,7 +328,20 @@ End Process
 Process called "print_constant_prop_stats" that takes context_ptr as Integer returns Integer:
     @Reasoning
     Prints enhanced constant propagation statistics.
+
+    Counters are maintained incrementally by every routine that
+    successfully folds or propagates. A single sink point for
+    presentation keeps the optimization passes free of formatting
+    concerns and gives downstream tooling (driver telemetry, pass
+    manager reports) a stable surface for measuring pass impact.
     @End Reasoning
+
+    @Implementation
+    Reads the four counters at their canonical offsets in the context
+    struct (48, 56, 64, 72), formats them with a fixed-width header,
+    and emits the running totals plus a sum to the standard Display
+    stream. Returns 1 on success, 0 if the context pointer is null.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -304,7 +372,24 @@ Note: ==========================================================================
 Process called "create_const_unknown" returns Integer:
     @Reasoning
     Creates an UNKNOWN constant value (not yet determined).
+
+    UNKNOWN is the "top" element of the lattice used by this analysis:
+    every SSA value starts here and is monotonically lowered to a
+    concrete kind (INTEGER, FLOAT, etc.) as evidence accumulates. The
+    monotonicity is what guarantees fixed-point termination, so it is
+    important that we always materialise a fresh UNKNOWN sentinel
+    rather than reusing a shared singleton (a shared singleton would
+    let update_constant_value mutate every lattice cell at once).
     @End Reasoning
+
+    @Implementation
+    Allocates a 32-byte ConstantValue block. Field layout:
+      offset 0  kind         = CONST_UNKNOWN (0)
+      offset 8  int_value    = 0
+      offset 16 float_value  = 0
+      offset 24 ref_value    = 0
+    Returns 0 on allocation failure.
+    @End Implementation
 
     Let const_ptr be proc allocate from Layout with 32
     If const_ptr is equal to 0:
@@ -322,7 +407,22 @@ End Process
 Process called "create_const_integer" that takes value as Integer returns Integer:
     @Reasoning
     Creates an INTEGER constant value.
+
+    Integer is the most common lattice element produced by MIR constant
+    folding (MIR_CONST nodes, MIR_ADD/SUB/MUL/DIV results when both
+    operands are integers, and most global initialisers). Allocating an
+    owned 32-byte cell per SSA value keeps update_constant_value's
+    "deallocate-old, write-new" contract straightforward.
     @End Reasoning
+
+    @Implementation
+    Allocates a 32-byte ConstantValue and initialises:
+      offset 0  kind         = CONST_INTEGER (1)
+      offset 8  int_value    = value (the integer literal)
+      offset 16 float_value  = 0  (unused for integer kind)
+      offset 24 ref_value    = 0  (unused for integer kind)
+    Returns 0 on allocation failure.
+    @End Implementation
 
     Let const_ptr be proc allocate from Layout with 32
     If const_ptr is equal to 0:
@@ -340,6 +440,11 @@ End Process
 Process called "is_const_integer" that takes const_ptr as Integer returns Integer:
     @Reasoning
     Returns 1 if constant is an INTEGER, 0 otherwise.
+
+    Predicate used by every constant-folding helper to guard arithmetic
+    against UNKNOWN or non-integer lattice elements. Null pointers are
+    treated as "not integer" so callers can pass through results of
+    get_or_create_constant_value without an extra null check.
     @End Reasoning
 
     If const_ptr is equal to 0:
@@ -358,6 +463,11 @@ Process called "get_const_integer_value" that takes const_ptr as Integer returns
     @Reasoning
     Gets the integer value from an INTEGER constant.
     Returns 0 if not an integer constant.
+
+    Companion to is_const_integer for the common pattern
+    "check kind, then read int_value". Returns a sentinel 0 on
+    non-integer input so a buggy caller that skips the predicate
+    silently produces a defined (if useless) value instead of UB.
     @End Reasoning
 
     If const_ptr is equal to 0:
@@ -377,8 +487,24 @@ Process called "get_or_create_constant_value" that takes context_ptr as Integer,
     @Reasoning
     Gets existing constant value for SSA value_id, or creates UNKNOWN if none exists.
 
+    The lattice map is indexed by stringified SSA value ID because the
+    dictionary implementation in compiler/frontend/primitives/collections
+    keys on String. A "never returns 0" contract simplifies the
+    fold/propagate code: callers can dereference the result and look at
+    kind unconditionally, treating UNKNOWN as "no useful information".
+
     Returns constant value pointer (never returns 0).
     @End Reasoning
+
+    @Implementation
+    Reads context.constant_values from offset 8, converts value_id to a
+    decimal string via String.integer_to_string, and probes with
+    Dictionary.contains. On hit, returns the stored pointer. On miss,
+    creates a fresh CONST_UNKNOWN cell via create_const_unknown and
+    inserts it into the dictionary at the same key so subsequent lookups
+    are O(1). The inserted cell is owned by the dictionary; lifetime is
+    managed by destroy_constant_prop_context.
+    @End Implementation
 
     Let constant_values be proc memory_get_int64 from Layout with context_ptr, 8
 
@@ -394,7 +520,7 @@ Process called "get_or_create_constant_value" that takes context_ptr as Integer,
     End If
 
     Note: Create new UNKNOWN value
-    Set const_val to create_const_unknown()
+    Set const_val to proc create_const_unknown
     proc set from Dictionary with constant_values, key_str, const_val
 
     Return const_val
@@ -404,8 +530,30 @@ Process called "update_constant_value" that takes context_ptr as Integer, value_
     @Reasoning
     Updates constant value for SSA value_id.
 
+    The 0/1 "changed" return signal is the trigger for the worklist
+    algorithm: every change to a lattice cell re-enqueues that value's
+    users for re-evaluation, and the absence of changes is what proves
+    the fixed point has been reached. Equality must therefore be exact;
+    we compare both kind and payload before declaring "no change". To
+    avoid aliasing bugs (the caller may free `new_const` after this
+    call), we deep-copy `new_const` into a fresh 32-byte cell rather
+    than installing the caller's pointer directly.
+
     Returns 1 if value changed, 0 if unchanged.
     @End Reasoning
+
+    @Implementation
+    Reads the current lattice cell via get_or_create_constant_value,
+    compares (kind, int_value) tuples, and returns 0 when they match.
+    Otherwise:
+      1. Deallocate the existing cell (32 bytes).
+      2. Allocate a new 32-byte cell.
+      3. Copy kind / int_value / float_value / ref_value from new_const
+         field-by-field at offsets 0/8/16/24.
+      4. Re-insert into context.constant_values under the same key.
+    Returns 1 to signal a lattice change. Null new_const is a no-op
+    returning 0 - callers can pipe through "0 means no result".
+    @End Implementation
 
     If new_const is equal to 0:
         Return 0
@@ -415,7 +563,7 @@ Process called "update_constant_value" that takes context_ptr as Integer, value_
     Let key_str be proc integer_to_string from String with value_id
 
     Note: Get current constant value
-    Let current_const be get_or_create_constant_value(context_ptr, value_id)
+    Let current_const be proc get_or_create_constant_value with context_ptr, value_id
 
     Let current_kind be proc memory_get_int64 from Layout with current_const, 0
     Let new_kind be proc memory_get_int64 from Layout with new_const, 0
@@ -460,6 +608,14 @@ Process called "analyze_local_constants" that takes context_ptr as Integer, cfg_
     @Reasoning
     Performs local constant analysis within basic blocks.
 
+    This is the seeding pass that populates the lattice with the constants
+    written directly by MIR_CONST instructions. By scanning every block
+    once, in CFG order, the analysis establishes a sound initial state for
+    the dataflow algorithms that follow (global, interprocedural, array).
+    Because it never reasons about control flow, it remains O(n) in the
+    number of instructions and is unconditionally safe to run as the first
+    step of the pipeline.
+
     **LOCAL ANALYSIS:**
     - Identifies constants defined within a basic block
     - Tracks constant values through block
@@ -470,6 +626,14 @@ Process called "analyze_local_constants" that takes context_ptr as Integer, cfg_
 
     Returns number of constants found.
     @End Reasoning
+
+    @Implementation
+    Calls CFG.get_all_blocks to retrieve the block list, iterates over each
+    block, and delegates per-block work to analyze_block_constants. Sums
+    the per-block return values into a running total which is logged and
+    returned. Null context_ptr or null cfg_ptr short-circuit to 0 without
+    touching the lattice.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -493,7 +657,7 @@ Process called "analyze_local_constants" that takes context_ptr as Integer, cfg_
         Let block_ptr be proc get from List with all_blocks, i
 
         Note: Analyze constants in this block
-        Let block_constants be analyze_block_constants(context_ptr, block_ptr)
+        Let block_constants be proc analyze_block_constants with context_ptr, block_ptr
         Set constants_found to constants_found plus block_constants
 
         Set i to i plus 1
@@ -508,6 +672,12 @@ Process called "analyze_block_constants" that takes context_ptr as Integer, bloc
     @Reasoning
     Analyzes constants within a single basic block.
 
+    Per-block seeding has two responsibilities: harvest MIR_CONST
+    literals into the lattice, and free the temporary ConstantValue
+    used as the seed value. update_constant_value deep-copies into the
+    lattice, so the local clone must be released to avoid leaking 32
+    bytes per literal encountered.
+
     **BLOCK ANALYSIS:**
     - Iterate through instructions in block
     - Identify MIR_CONST instructions
@@ -516,6 +686,20 @@ Process called "analyze_block_constants" that takes context_ptr as Integer, bloc
 
     Returns number of constants found in block.
     @End Reasoning
+
+    @Implementation
+    Fetches the block's instruction list with
+    CFG.get_block_instructions and iterates. For every node whose
+    opcode is MIR.MIR_CONST the routine:
+      1. Reads the result SSA id via MIR.get_mir_node_value_id.
+      2. Reads the literal payload from offset 16 of the MIRConst node
+         (this is the `constant_value` field defined by mir_nodes.runa).
+      3. Builds a CONST_INTEGER lattice cell via create_const_integer.
+      4. Installs it into context.constant_values via
+         update_constant_value (which copies the payload).
+      5. Frees the local clone with Layout.deallocate.
+      6. Increments the per-block counter.
+    @End Implementation
 
     If block_ptr is equal to 0:
         Return 0
@@ -542,10 +726,10 @@ Process called "analyze_block_constants" that takes context_ptr as Integer, bloc
             Let const_val be proc memory_get_int64 from Layout with inst_ptr, 16 Note: MIRConst: constant_value
 
             Note: Create constant value
-            Let const_value be create_const_integer(const_val)
+            Let const_value be proc create_const_integer with const_val
 
             Note: Store in context
-            update_constant_value(context_ptr, result_value_id, const_value)
+            proc update_constant_value with context_ptr, result_value_id, const_value
 
             proc deallocate from Layout with const_value
 
@@ -562,6 +746,11 @@ Process called "fold_constant_expression" that takes context_ptr as Integer, ins
     @Reasoning
     Folds a constant expression (e.g., ADD with two constant operands).
 
+    Dispatch layer that maps an MIR opcode to its arithmetic semantics.
+    Routing through a single dispatcher keeps the supported-operation
+    set explicit and trivial to extend (bitwise / comparison / floating
+    point fall in here when their lattice support is added).
+
     **CONSTANT FOLDING:**
     - Evaluates operation with constant operands
     - Returns constant result
@@ -569,6 +758,15 @@ Process called "fold_constant_expression" that takes context_ptr as Integer, ins
 
     Returns constant value pointer (or 0 if cannot fold).
     @End Reasoning
+
+    @Implementation
+    Reads the instruction opcode and compares against
+    MIR.MIR_ADD / MIR_SUB / MIR_MUL / MIR_DIV. For each supported case
+    the routine delegates to fold_binary_operation, which is
+    responsible for operand-constness checking and result allocation.
+    Unsupported opcodes return 0, signalling "cannot fold" so the
+    pass leaves the instruction untouched.
+    @End Implementation
 
     If inst_ptr is equal to 0:
         Return 0
@@ -578,16 +776,16 @@ Process called "fold_constant_expression" that takes context_ptr as Integer, ins
 
     Note: Binary operations
     If opcode is equal to MIR.MIR_ADD:
-        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+        Return proc fold_binary_operation with context_ptr, inst_ptr, opcode
     End If
     If opcode is equal to MIR.MIR_SUB:
-        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+        Return proc fold_binary_operation with context_ptr, inst_ptr, opcode
     End If
     If opcode is equal to MIR.MIR_MUL:
-        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+        Return proc fold_binary_operation with context_ptr, inst_ptr, opcode
     End If
     If opcode is equal to MIR.MIR_DIV:
-        Return fold_binary_operation(context_ptr, inst_ptr, opcode)
+        Return proc fold_binary_operation with context_ptr, inst_ptr, opcode
     End If
 
     Note: Cannot fold this instruction
@@ -598,8 +796,40 @@ Process called "fold_binary_operation" that takes context_ptr as Integer, inst_p
     @Reasoning
     Folds a binary operation with constant operands.
 
+    Performs the actual arithmetic when both lattice operands are
+    CONST_INTEGER. Anything outside that closed world (one operand
+    UNKNOWN, division by zero, an unsupported opcode) returns 0 to
+    indicate the instruction must remain in the program. This keeps
+    folding strictly sound: we only produce a constant when the result
+    is provably equal in every execution.
+
     Returns constant value pointer (or 0 if cannot fold).
     @End Reasoning
+
+    @Implementation
+    1. Reads operand SSA ids from offsets 16 (left) and 24 (right) of
+       the MIRBinop node.
+    2. Looks up each operand's lattice cell with
+       get_or_create_constant_value and rejects (returns 0) any operand
+       that is not CONST_INTEGER, as proved by is_const_integer.
+    3. Reads the literal int values with get_const_integer_value.
+    4. Performs the opcode-specific operation:
+         MIR_ADD  -> left + right
+         MIR_SUB  -> left - right
+         MIR_MUL  -> left * right
+         MIR_DIV  -> early return 0 if right == 0; otherwise left / right
+    5. Wraps the result in a new ConstantValue via create_const_integer.
+    6. Increments context.constants_folded at offset 56.
+    Returns the new ConstantValue pointer.
+    @End Implementation
+
+    @Security_Scope
+    Division by zero is detected and treated as non-foldable so the
+    optimiser never silently turns a runtime trap into a compile-time
+    UB. Signed overflow on add/sub/mul follows the host wrap semantics
+    of the bootstrap Integer type, matching the runtime behaviour the
+    program would observe at execution time.
+    @End Security_Scope
 
     If inst_ptr is equal to 0:
         Return 0
@@ -610,12 +840,12 @@ Process called "fold_binary_operation" that takes context_ptr as Integer, inst_p
     Let right_operand_id be proc memory_get_int64 from Layout with inst_ptr, 24
 
     Note: Get constant values
-    Let left_const be get_or_create_constant_value(context_ptr, left_operand_id)
-    Let right_const be get_or_create_constant_value(context_ptr, right_operand_id)
+    Let left_const be proc get_or_create_constant_value with context_ptr, left_operand_id
+    Let right_const be proc get_or_create_constant_value with context_ptr, right_operand_id
 
     Note: Check if both are integer constants
-    Let left_is_int be is_const_integer(left_const)
-    Let right_is_int be is_const_integer(right_const)
+    Let left_is_int be proc is_const_integer with left_const
+    Let right_is_int be proc is_const_integer with right_const
 
     If left_is_int is equal to 0:
         Return 0
@@ -625,8 +855,8 @@ Process called "fold_binary_operation" that takes context_ptr as Integer, inst_p
     End If
 
     Note: Get integer values
-    Let left_val be get_const_integer_value(left_const)
-    Let right_val be get_const_integer_value(right_const)
+    Let left_val be proc get_const_integer_value with left_const
+    Let right_val be proc get_const_integer_value with right_const
 
     Let result_val be 0
 
@@ -648,7 +878,7 @@ Process called "fold_binary_operation" that takes context_ptr as Integer, inst_p
     End If
 
     Note: Create result constant
-    Let result_const be create_const_integer(result_val)
+    Let result_const be proc create_const_integer with result_val
 
     Note: Increment constants_folded counter
     Let constants_folded be proc memory_get_int64 from Layout with context_ptr, 56
@@ -690,6 +920,32 @@ Process called "identify_global_constants" that takes context_ptr as Integer, mo
     Whole-module analysis is expensive but precise.
     Cache results for subsequent optimization passes.
     @End Performance_Hints
+
+    @Implementation
+    Two-pass scan over the CFG attached to the context:
+      Pass 1 - Visit every instruction of every block, tracking the
+        global IDs touched by MIR_LOAD_GLOBAL (opcode 20021) in a
+        `globals_seen` Set and those touched by MIR_STORE_GLOBAL
+        (opcode 20025) in a `globals_written` Set.
+      Pass 2 - Convert `globals_seen` to a list and, for each ID not
+        present in `globals_written`, look up the initialiser value in
+        the module's global_table dictionary (offset
+        offset_of_Module_global_table). Read-only globals are recorded
+        as a CONST_INTEGER cell in context.global_constants under the
+        stringified global id.
+    Sets and the intermediate seen_list are destroyed before returning;
+    the recorded ConstantValue cells remain owned by global_constants
+    and live until destroy_constant_prop_context runs.
+    @End Implementation
+
+    @Security_Scope
+    Read-only inference is sound only because the scan covers the
+    entire CFG that callers attach to the context. The CFG must
+    therefore be a whole-program CFG (or the module-level one supplied
+    by analyze_all_global_constants) - applying this routine to a
+    single function's CFG would miss writes in sibling functions and
+    is the caller's responsibility to avoid.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -781,7 +1037,7 @@ Process called "identify_global_constants" that takes context_ptr as Integer, mo
                 End If
             End If
 
-            Let const_value be create_const_integer(initializer_value)
+            Let const_value be proc create_const_integer with initializer_value
             Let global_id_str be proc integer_to_string from String with global_id
 
             proc set from Dictionary with global_constants, global_id_str, const_value
@@ -808,6 +1064,13 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
     @Reasoning
     Propagates a global constant value throughout the CFG.
 
+    Once identify_global_constants has classified a global as
+    read-only, every MIR_LOAD_GLOBAL that targets it produces the
+    same value at every execution. Marking each load result as
+    constant in the lattice lets downstream consumers (fold_binary,
+    DCE, inlining) see the value through the load without first
+    requiring a SCCP rerun.
+
     **COMPLETE GLOBAL PROPAGATION:**
     1. Get constant value for global from dictionary
     2. Scan all blocks for LOAD_GLOBAL instructions
@@ -822,6 +1085,17 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
 
     Returns number of loads replaced.
     @End Reasoning
+
+    @Implementation
+    Stringifies global_id, looks the constant up in
+    context.global_constants, and returns 0 if absent. Otherwise iterates
+    every block via CFG.get_block_count / CFG.get_block, scans the block
+    instruction list, and for each MIR_LOAD_GLOBAL (opcode 20021) whose
+    target global (offset 16) matches global_id, propagates the constant
+    to the load's result SSA id via update_constant_value. Increments
+    context.globals_propagated (offset 64) by the number of loads
+    rewritten and returns that count.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -867,7 +1141,7 @@ Process called "propagate_global_constant" that takes context_ptr as Integer, cf
                         Let result_value_id be proc get_mir_node_value_id from MIR with inst
 
                         Note: Propagate constant to this SSA value
-                        update_constant_value(context_ptr, result_value_id, const_value)
+                        proc update_constant_value with context_ptr, result_value_id, const_value
 
                         Set loads_replaced to loads_replaced plus 1
 
@@ -896,6 +1170,11 @@ Process called "analyze_all_global_constants" that takes context_ptr as Integer,
     @Reasoning
     Analyzes and propagates all global constants.
 
+    Orchestrates the two-stage global propagation: classify first,
+    propagate second. Splitting the work this way means the
+    classification cost is paid once even when the propagation step is
+    iterated as part of a larger fixed-point loop.
+
     **COMPLETE GLOBAL ANALYSIS:**
     1. Identify global constants in module
     2. Iterate through all found constants
@@ -907,6 +1186,15 @@ Process called "analyze_all_global_constants" that takes context_ptr as Integer,
 
     Returns total number of global constant propagations.
     @End Reasoning
+
+    @Implementation
+    Step 1 calls identify_global_constants to populate
+    context.global_constants. Step 2 (only if at least one global was
+    found) reads the populated dictionary, lists its keys, converts each
+    key string back to an integer global_id via String.string_to_integer,
+    and calls propagate_global_constant for each. Step 3 reads the final
+    globals_propagated counter and returns it.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -923,7 +1211,7 @@ Process called "analyze_all_global_constants" that takes context_ptr as Integer,
     Display "============================================"
 
     Note: Step 1: Identify global constants
-    Let globals_found be identify_global_constants(context_ptr, module_ptr)
+    Let globals_found be proc identify_global_constants with context_ptr, module_ptr
 
     Note: Step 2: Propagate each global constant
     If globals_found is greater than 0:
@@ -941,7 +1229,7 @@ Process called "analyze_all_global_constants" that takes context_ptr as Integer,
             Let global_id be proc string_to_integer from String with key_str
 
             Note: Propagate this global constant
-            propagate_global_constant(context_ptr, cfg_ptr, global_id)
+            proc propagate_global_constant with context_ptr, cfg_ptr, global_id
 
             Set i to i plus 1
         End While
@@ -988,7 +1276,22 @@ End Type
 Process called "create_function_summary" returns Integer:
     @Reasoning
     Creates a new function summary structure.
+
+    A FunctionSummary is the IPCP "value contract" for a function:
+    the per-argument lattice cells, the return-value lattice cell, a
+    purity flag, and the set of globals it modifies. Pre-allocating
+    these containers in the constructor keeps the analyze routines
+    free of conditional initialisation paths.
     @End Reasoning
+
+    @Implementation
+    Allocates 32 bytes via Layout.allocate:
+      offset 0   argument_constants  - new Dictionary<arg_index, ConstantValue*>
+      offset 8   return_constant     - 0 (filled in by analyze_function_for_summary)
+      offset 16  pure                - 0 (assume impure until proven otherwise)
+      offset 24  modifies_globals    - new empty Set<global_id>
+    Returns 0 on allocation failure.
+    @End Implementation
 
     Let summary_ptr be proc allocate from Layout with 32
     If summary_ptr is equal to 0:
@@ -1015,7 +1318,19 @@ End Process
 Process called "destroy_function_summary" that takes summary_ptr as Integer returns Integer:
     @Reasoning
     Destroys a function summary and frees memory.
+
+    Owned by the analyze_interprocedural_constants step, summaries live
+    on the function_summaries dictionary. Their owned containers
+    (argument_constants Dictionary and modifies_globals Set) must be
+    destroyed before the 32-byte block itself is returned to the
+    allocator to avoid leaking the inner storage.
     @End Reasoning
+
+    @Implementation
+    Reads the Dictionary pointer at offset 0 and destroys it. Reads the
+    Set pointer at offset 24 and destroys it. Finally deallocates the
+    32-byte summary block. Null summary_ptr is a no-op returning 0.
+    @End Implementation
 
     If summary_ptr is equal to 0:
         Return 0
@@ -1043,6 +1358,13 @@ Process called "analyze_function_for_summary" that takes context_ptr as Integer,
     @Reasoning
     Analyzes a function and creates its summary.
 
+    The summary is what makes IPCP cheap: each callee is examined once
+    and produces a fixed-size record consumed at every call site. The
+    record encodes two facts the call-site analyser needs to know -
+    "can I skip the call?" (purity + constant return) and "what globals
+    does the call clobber?" - in a form that survives the rest of the
+    pipeline's iterations.
+
     **COMPLETE SUMMARY ANALYSIS:**
     1. Check if function is pure (no side effects)
     2. Analyze all RETURN instructions
@@ -1057,18 +1379,36 @@ Process called "analyze_function_for_summary" that takes context_ptr as Integer,
     Returns function summary pointer.
     @End Reasoning
 
+    @Implementation
+    1. Creates an empty FunctionSummary via create_function_summary.
+    2. Calls check_function_purity to populate the pure flag at offset 16.
+    3. Walks every block / instruction of cfg_ptr. For each
+       MIR_RETURN (opcode 20009), reads the return value's SSA id from
+       offset 16, looks it up in context.constant_values, and:
+         - if the lattice cell is CONST_INTEGER, records the int value
+           the first time and rejects (return_is_constant = 0) on a
+           mismatch with later returns.
+       For each MIR_STORE_GLOBAL (opcode 20025), adds the target
+       global id (offset 16 of the store node) to the
+       modifies_globals Set at summary offset 24.
+    4. When every return produced the same integer constant, writes
+       has_constant_return = 1 at offset 8 and the literal value at
+       offset 16; otherwise both fields are 0.
+    Returns the summary pointer.
+    @End Implementation
+
     If cfg_ptr is equal to 0:
         Return 0
     End If
 
     Note: Create function summary
-    Let summary_ptr be create_function_summary()
+    Let summary_ptr be proc create_function_summary
     If summary_ptr is equal to 0:
         Return 0
     End If
 
     Note: Step 1: Analyze function purity
-    Let is_pure be check_function_purity(cfg_ptr)
+    Let is_pure be proc check_function_purity with cfg_ptr
     proc memory_set_int64 from Layout with summary_ptr, 16, is_pure
 
     Note: Step 2: Analyze return value (check if always constant)
@@ -1162,6 +1502,14 @@ Process called "check_function_purity" that takes cfg_ptr as Integer returns Int
     @Reasoning
     Checks if a function is pure (no side effects).
 
+    "Pure" here is the strong form: no observable effect outside the
+    function's own stack frame. That definition is exactly what IPCP
+    needs - it lets a pure call be replaced by its constant return
+    value without altering program behaviour. The analysis is
+    conservative: any instruction we cannot classify is treated as
+    impure, so false positives ("pure" for an impure function) are
+    impossible.
+
     **COMPLETE PURITY ANALYSIS:**
     A function is pure if:
     1. No STORE_GLOBAL instructions (no global writes)
@@ -1175,6 +1523,30 @@ Process called "check_function_purity" that takes cfg_ptr as Integer returns Int
 
     Returns 1 if pure, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Walks every block / instruction of cfg_ptr and short-circuits to
+    return 0 the first time it sees evidence of an effect:
+      MIR_STORE_GLOBAL (20025) - unconditional disqualifier.
+      MIR_STORE (20020) - look up the defining instruction of the
+        pointer operand via find_defining_instruction; if it is
+        MIR_ALLOC (20022) the store is to a stack slot and is benign,
+        otherwise (escaped or unknown pointer) declare impure.
+      MIR_CALL (20008) - read the callee id via
+        MIRNodes.get_call_target and consult
+        is_known_pure_function; if the callee is not on the
+        whitelist, declare impure.
+    Returns 1 only if the entire scan completes without flagging
+    anything.
+    @End Implementation
+
+    @Security_Scope
+    The conservative bias is critical: an inlining or call-replacement
+    consumer reads `pure` as license to delete the call. A false
+    positive here would silently delete I/O or globals updates.
+    Unknown pointer provenance, unknown callees, and any unmodelled
+    side-effecting opcode therefore must continue to return 0.
+    @End Security_Scope
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -1207,7 +1579,7 @@ Process called "check_function_purity" that takes cfg_ptr as Integer returns Int
                     Let store_ptr be proc memory_get_int64 from Layout with inst, 16
 
                     Note: Check if pointer is local (ALLOCA) or escapes
-                    Let ptr_def_inst be find_defining_instruction(cfg_ptr, store_ptr)
+                    Let ptr_def_inst be proc find_defining_instruction with cfg_ptr, store_ptr
                     If ptr_def_inst is not equal to 0:
                         Let ptr_opcode be proc get_mir_node_opcode from MIR with ptr_def_inst
 
@@ -1232,7 +1604,7 @@ Process called "check_function_purity" that takes cfg_ptr as Integer returns Int
                     Let callee_id be proc get_call_target from MIRNodes with inst
 
                     Note: Check known pure functions (math functions, etc.)
-                    Let callee_is_pure be is_known_pure_function(callee_id)
+                    Let callee_is_pure be proc is_known_pure_function with callee_id
 
                     If callee_is_pure is equal to 0:
                         Note: Unknown or impure function - not pure
@@ -1260,7 +1632,31 @@ Process called "find_defining_instruction" that takes cfg_ptr as Integer, value_
     @Reasoning
     Finds the instruction that defines an SSA value.
     Returns instruction pointer or 0 if not found.
+
+    SSA gives each value exactly one defining instruction, so a linear
+    scan is correct. It is not the fastest possible algorithm (a
+    pre-built def map would be O(1)), but constant propagation calls
+    this routine only from purity analysis, on suspicious pointer
+    operands - a vanishingly small fraction of total work. Keeping the
+    function self-contained avoids forcing every consumer to pre-build
+    and tear down a side table.
     @End Reasoning
+
+    @Implementation
+    Guard clauses bail out on null cfg or value_id 0. Then iterate
+    every block (CFG.get_block_count + CFG.get_block), and every
+    instruction within each block, comparing MIR.get_mir_node_value_id
+    against the requested value_id. Returns the first matching
+    instruction pointer; returns 0 if no instruction in the CFG defines
+    that SSA id.
+    @End Implementation
+
+    @Performance_Hints
+    Linear in instruction count. If profiling shows purity analysis as
+    a bottleneck on large modules, pre-compute a Dictionary<value_id,
+    inst_ptr> once per function and reuse it across all
+    find_defining_instruction calls.
+    @End Performance_Hints
 
     If cfg_ptr is equal to 0 or value_id is equal to 0:
         Return 0
@@ -1294,6 +1690,13 @@ Process called "is_known_pure_function" that takes function_id as Integer return
     @Reasoning
     Checks if a function is known to be pure (no side effects).
 
+    Acts as a bootstrap "trust list" for the pure-call cases the
+    purity analyser cannot prove from MIR alone (because the callee
+    lives in another module or is a builtin). Membership is decided by
+    range matching against the canonical builtin ID assignments so
+    new pure builtins are added simply by being placed in one of the
+    designated ID windows.
+
     **KNOWN PURE FUNCTIONS:**
     - Math functions (sqrt, sin, cos, abs, floor, ceil, etc.)
     - String length, comparison, concat
@@ -1307,6 +1710,22 @@ Process called "is_known_pure_function" that takes function_id as Integer return
 
     Returns 1 if known pure, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Tests function_id against three half-open ID ranges:
+      [10000, 11000)  - Math intrinsics (pure)
+      [20000, 20100)  - Read-only string queries (pure)
+      [30000, 31000)  - Type conversions (pure)
+    Any function id outside those ranges is conservatively treated as
+    impure and returns 0.
+    @End Implementation
+
+    @Security_Scope
+    Conservative bias preserved: the closing "Return 0" guarantees we
+    never classify a user-defined or unknown builtin as pure. Expand
+    only by assigning new builtin ids inside the existing pure ranges
+    or by adding additional explicit range checks above the catch-all.
+    @End Security_Scope
 
     Note: Whitelist of known pure builtin function IDs
     Note: Math operations: IDs 10000-10999
@@ -1332,6 +1751,15 @@ Process called "propagate_constant_through_call" that takes context_ptr as Integ
     @Reasoning
     Propagates constants through a function call using its summary.
 
+    A call result can be folded to its constant return value only when
+    three conditions hold simultaneously: the callee is pure (no side
+    effects to preserve), the callee's return value is always the same
+    constant (the summary reports has_constant_return = 1), and every
+    argument flowing in is itself constant (otherwise the callee could
+    in principle observe argument-dependent behaviour that we are not
+    modelling). Failing any of the three returns 0, leaving the call
+    intact in the IR.
+
     **COMPLETE INTERPROCEDURAL PROPAGATION:**
     1. Verify function is pure (no side effects)
     2. Check if return value is constant
@@ -1345,6 +1773,19 @@ Process called "propagate_constant_through_call" that takes context_ptr as Integ
 
     Returns constant value for call result (or 0 if non-constant).
     @End Reasoning
+
+    @Implementation
+    1. Reads function_summary.is_pure at offset 16; returns 0 if 0.
+    2. Reads function_summary.has_constant_return at offset 8; returns 0
+       if 0.
+    3. Confirms call_ptr opcode is MIR_CALL (20008), then iterates
+       its arguments via MIRNodes.get_call_arg_count and
+       MIRNodes.get_call_arg. Each arg's SSA id is passed through
+       is_value_constant; the loop sets all_args_constant = 0 on the
+       first non-constant or whenever context_ptr is null.
+    4. Returns 0 if all_args_constant ended at 0; otherwise returns the
+       constant return value already stored in the summary at offset 8.
+    @End Implementation
 
     If call_ptr is equal to 0:
         Return 0
@@ -1381,7 +1822,7 @@ Process called "propagate_constant_through_call" that takes context_ptr as Integ
 
             Note: Check if this argument is constant
             If context_ptr is not equal to 0:
-                Let is_const be is_value_constant(context_ptr, arg_value_id)
+                Let is_const be proc is_value_constant with context_ptr, arg_value_id
                 If is_const is equal to 0:
                     Set all_args_constant to 0
                 End If
@@ -1407,14 +1848,27 @@ Process called "is_value_constant" that takes context_ptr as Integer, value_id a
     @Reasoning
     Checks if an SSA value is known to be constant.
 
+    "Constant" here means CONST_INTEGER specifically; floating point
+    and aggregate kinds are not yet enumerated as constants because
+    the rest of the pass currently folds only integer arithmetic.
+    Expanding the lattice support is a matter of adding the kinds
+    to the test below.
+
     Returns 1 if constant, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Calls get_or_create_constant_value to fetch (or materialise) the
+    lattice cell, reads kind at offset 0, and returns 1 only when kind
+    equals CONST_INTEGER. Returns 0 for null context or any other kind
+    (including CONST_UNKNOWN).
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
     End If
 
-    Let const_val be get_or_create_constant_value(context_ptr, value_id)
+    Let const_val be proc get_or_create_constant_value with context_ptr, value_id
     If const_val is equal to 0:
         Return 0
     End If
@@ -1430,6 +1884,14 @@ End Process
 Process called "analyze_interprocedural_constants" that takes context_ptr as Integer, module_ptr as Integer returns Integer:
     @Reasoning
     Performs interprocedural constant propagation across entire module.
+
+    The IPCP pass binds the per-function summary work
+    (analyze_function_for_summary) to the actual call-site rewriting
+    work (propagate_constant_through_call). Summaries are computed
+    first for every function in the module, then each call site in the
+    context's CFG is matched against the summary of its callee. The
+    function_summaries dictionary becomes the medium through which
+    callee constants flow back to caller lattice cells.
 
     **COMPLETE INTERPROCEDURAL ANALYSIS:**
     1. Build function summaries for all functions
@@ -1447,6 +1909,33 @@ Process called "analyze_interprocedural_constants" that takes context_ptr as Int
 
     Returns number of interprocedural constants propagated.
     @End Reasoning
+
+    @Implementation
+    1. Caches module_ptr at context offset 80 for downstream passes
+       that may consult the module.
+    2. Reads the MIRProgram functions list from module_ptr offset 0
+       and the count from offset 8. Returns 0 if either is empty.
+    3. For each function MIRFunction*, reads its CFG at offset 0 and
+       calls analyze_function_for_summary, installing the resulting
+       summary in context.function_summaries under the stringified
+       function index.
+    4. Walks the context's primary CFG (block_count + get_block). For
+       each MIR_CALL (opcode 20008), reads the callee id with
+       MIRNodes.get_call_target, looks the callee summary up in the
+       dictionary, and calls propagate_constant_through_call. If the
+       returned constant is non-zero, calls update_constant_value on
+       the call's result SSA id and increments the local
+       interprocedural_propagated counter.
+    Returns the counter value.
+    @End Implementation
+
+    @Performance_Hints
+    The two nested CFG walks are O(blocks * instructions). On large
+    modules a worklist-driven re-iteration (when a callee's summary
+    changes, only re-process its callers) would lower the constant
+    factor further; the current single-pass shape is sufficient
+    because summaries are computed once before the rewrite walk.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
@@ -1492,7 +1981,7 @@ Process called "analyze_interprocedural_constants" that takes context_ptr as Int
 
             If function_cfg is not equal to 0:
                 Note: Analyze this function and create summary
-                Let summary be analyze_function_for_summary(context_ptr, function_cfg, i)
+                Let summary be proc analyze_function_for_summary with context_ptr, function_cfg, i
 
                 If summary is not equal to 0:
                     Let func_id_str be proc integer_to_string from String with i
@@ -1533,11 +2022,11 @@ Process called "analyze_interprocedural_constants" that takes context_ptr as Int
                         Let callee_summary be proc get from Dictionary with function_summaries, callee_id_str
 
                         Note: Try to propagate constant through this call
-                        Let const_result be propagate_constant_through_call(context_ptr, inst, callee_summary)
+                        Let const_result be proc propagate_constant_through_call with context_ptr, inst, callee_summary
                         If const_result is not equal to 0:
                             Note: Successfully propagated!
                             Let result_value_id be proc get_mir_node_value_id from MIR with inst
-                            update_constant_value(context_ptr, result_value_id, const_result)
+                            proc update_constant_value with context_ptr, result_value_id, const_result
                             Set interprocedural_propagated to interprocedural_propagated plus 1
                         End If
                     End If
@@ -1587,7 +2076,20 @@ End Type
 Process called "create_array_constant_info" that takes array_id as Integer returns Integer:
     @Reasoning
     Creates array constant info structure.
+
+    Per-array bookkeeping for element-level constant tracking. The
+    record exists so that the analyser can answer "is array[i] always
+    constant?" without rescanning the entire CFG on every query.
     @End Reasoning
+
+    @Implementation
+    Allocates 32 bytes and initialises:
+      offset 0   array_id              = caller-provided id
+      offset 8   element_constants     = new Dictionary<index, ConstantValue*>
+      offset 16  all_elements_constant = 0 (proven later if applicable)
+      offset 24  element_count         = 0 (incremented per tracked store)
+    Returns 0 on allocation failure.
+    @End Implementation
 
     Let info_ptr be proc allocate from Layout with 32
     If info_ptr is equal to 0:
@@ -1612,7 +2114,17 @@ End Process
 Process called "destroy_array_constant_info" that takes info_ptr as Integer returns Integer:
     @Reasoning
     Destroys array constant info and frees memory.
+
+    Owned by context.array_constants. Tearing the inner
+    element_constants dictionary down before freeing the outer 32-byte
+    block prevents the bucket storage from leaking.
     @End Reasoning
+
+    @Implementation
+    Reads the element_constants Dictionary at offset 8 and destroys it.
+    Deallocates the 32-byte info block. Null info_ptr is a no-op
+    returning 0.
+    @End Implementation
 
     If info_ptr is equal to 0:
         Return 0
@@ -1634,12 +2146,28 @@ Process called "track_array_constant_store" that takes context_ptr as Integer, a
     @Reasoning
     Tracks a constant store to an array element.
 
+    Provides the per-array equivalent of update_constant_value: every
+    `array[index] = constant` MIR_STORE_FIELD becomes an entry in
+    array_constants so a later LOAD_FIELD at the same index can be
+    folded. The structure is intentionally per-index rather than
+    per-array so that partially-constant arrays still benefit when
+    only some indices are read.
+
     **ARRAY TRACKING:**
     When we see: array[index] = constant_value
     Track this in array_constants dictionary.
 
     Returns 1 on success.
     @End Reasoning
+
+    @Implementation
+    Looks up context.array_constants for the stringified array_id; if
+    no entry exists, allocates one via create_array_constant_info and
+    installs it. Then inserts the (stringified index -> value_const)
+    pair into the per-array element_constants dictionary at offset 8
+    and increments element_count at offset 24. Null value_const or
+    null context_ptr short-circuit to 0.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1657,7 +2185,7 @@ Process called "track_array_constant_store" that takes context_ptr as Integer, a
 
     If contains_array is equal to 0:
         Note: Create new array constant info
-        Set info_ptr to create_array_constant_info(array_id)
+        Set info_ptr to proc create_array_constant_info with array_id
         proc set from Dictionary with array_constants, array_id_str, info_ptr
     Otherwise:
         Set info_ptr to proc get from Dictionary with array_constants, array_id_str
@@ -1682,8 +2210,22 @@ Process called "get_array_element_constant" that takes context_ptr as Integer, a
     @Reasoning
     Gets the constant value for an array element (if known).
 
+    Two-level lookup designed so that uninteresting arrays cost
+    nothing: if the outer array_constants dictionary has no entry for
+    the array, the routine bails before opening the inner element
+    map. Returning 0 ("not constant") on any miss keeps the caller's
+    fast path branchless.
+
     Returns ConstantValue pointer (or 0 if not constant).
     @End Reasoning
+
+    @Implementation
+    Stringifies array_id, probes context.array_constants. If absent,
+    returns 0. Otherwise reads the per-array info block, opens
+    element_constants at offset 8, stringifies index, and probes again.
+    On hit, returns the stored ConstantValue pointer; on miss, returns
+    0.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1717,6 +2259,13 @@ Process called "propagate_array_constant_load" that takes context_ptr as Integer
     @Reasoning
     Propagates constant value for array element load.
 
+    Counterpart to track_array_constant_store - when an analysed
+    MIR_LOAD_FIELD reads an array element that the store-tracking pass
+    marked constant, mark the load's SSA result as the same constant so
+    subsequent folding / DCE sees through the load. This is what turns
+    `Let x be arr at index 0` into a literal when arr's element 0 was
+    written from a constant earlier in the function.
+
     **ARRAY LOAD PROPAGATION:**
     When we see: value = array[index]
     And we know array[index] is constant → propagate that constant.
@@ -1724,12 +2273,20 @@ Process called "propagate_array_constant_load" that takes context_ptr as Integer
     Returns number of loads propagated.
     @End Reasoning
 
+    @Implementation
+    Calls get_array_element_constant; if it returns 0, nothing to do
+    (returns 0). Otherwise reads the load's result SSA id via
+    MIR.get_mir_node_value_id, calls update_constant_value to install
+    the propagated constant in the lattice, increments
+    context.arrays_propagated at offset 72, and returns 1.
+    @End Implementation
+
     If load_ptr is equal to 0:
         Return 0
     End If
 
     Note: Get constant value for array element
-    Let element_const be get_array_element_constant(context_ptr, array_id, index)
+    Let element_const be proc get_array_element_constant with context_ptr, array_id, index
     If element_const is equal to 0:
         Return 0  Note: Element not constant
     End If
@@ -1738,7 +2295,7 @@ Process called "propagate_array_constant_load" that takes context_ptr as Integer
     Let result_value_id be proc get_mir_node_value_id from MIR with load_ptr
 
     Note: Update constant value for result
-    update_constant_value(context_ptr, result_value_id, element_const)
+    proc update_constant_value with context_ptr, result_value_id, element_const
 
     Note: Increment arrays_propagated counter
     Let arrays_propagated be proc memory_get_int64 from Layout with context_ptr, 72
@@ -1754,6 +2311,13 @@ Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_
     @Reasoning
     Analyzes array constants in the CFG.
 
+    The two-pass shape is deliberate. The first pass must observe every
+    constant store before the second pass attempts to fold any load,
+    because a load may textually precede the writes that establish the
+    element value (the analyser doesn't reason about dominance order
+    yet, only existence-anywhere-in-CFG, which suffices for the
+    self-contained patterns the optimisation currently targets).
+
     **COMPLETE ARRAY CONSTANT ANALYSIS:**
     1. Scan for ALLOCA instructions (array allocations)
     2. Track STORE_FIELD instructions to array elements
@@ -1767,6 +2331,32 @@ Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_
 
     Returns number of array constant propagations.
     @End Reasoning
+
+    @Implementation
+    Pass 1 - For every block / instruction:
+      MIR_ALLOC (20022) - record diagnostic only; no lattice change.
+      MIR_STORE_FIELD (20027) - read array pointer at offset 16,
+        field index at offset 24, value SSA id at offset 32. If
+        is_value_constant for that SSA id is 1, fetch the constant
+        cell via get_or_create_constant_value and record the store
+        through track_array_constant_store.
+    Pass 2 - For every block / instruction:
+      MIR_LOAD_FIELD (20026) - read array pointer at offset 16, field
+        index at offset 24, and attempt
+        propagate_array_constant_load(context_ptr, inst, array_ptr,
+        field_index). Each success increments the local arrays_propagated
+        counter.
+    Writes the final counter back to context offset 72 and returns it.
+    @End Implementation
+
+    @Security_Scope
+    Field offsets in the MIR_STORE_FIELD / MIR_LOAD_FIELD nodes are
+    treated as opaque indices into the per-array element_constants
+    dictionary - no out-of-bounds inference is made. If a later pass
+    adds bounds-derived facts it must do so via a separate lattice
+    layer to keep this routine's "store -> load match" rewrite from
+    introducing reads beyond the array's actual extent.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -1809,12 +2399,12 @@ Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_
                     Let value_id be proc memory_get_int64 from Layout with inst, 32
 
                     Note: Check if stored value is constant
-                    Let is_const be is_value_constant(context_ptr, value_id)
+                    Let is_const be proc is_value_constant with context_ptr, value_id
                     If is_const is equal to 1:
-                        Let const_val be get_or_create_constant_value(context_ptr, value_id)
+                        Let const_val be proc get_or_create_constant_value with context_ptr, value_id
 
                         Note: Track this constant array store
-                        track_array_constant_store(context_ptr, array_ptr, field_index, const_val)
+                        proc track_array_constant_store with context_ptr, array_ptr, field_index, const_val
 
                         Display "analyze_array_constants: tracked constant store to array " joined with array_ptr joined with " index " joined with field_index
                     End If
@@ -1846,7 +2436,7 @@ Process called "analyze_array_constants" that takes context_ptr as Integer, cfg_
                     Set field_index to proc memory_get_int64 from Layout with inst, 24
 
                     Note: Try to propagate constant from array
-                    Let propagated be propagate_array_constant_load(context_ptr, inst, array_ptr, field_index)
+                    Let propagated be proc propagate_array_constant_load with context_ptr, inst, array_ptr, field_index
                     If propagated is equal to 1:
                         Set arrays_propagated to arrays_propagated plus 1
                     End If
@@ -1875,6 +2465,13 @@ Process called "optimize_function_with_constant_prop" that takes cfg_ptr as Inte
     @Reasoning
     Main entry point for enhanced constant propagation on a single function.
 
+    Driver-facing API. Wraps the entire per-function pipeline so the
+    Gungnir pass manager can run constant propagation by calling a
+    single function, without having to know about lattice plumbing,
+    sub-passes, or context lifetime. Failures inside any sub-pass are
+    contained: the context is always destroyed before returning so a
+    pass exception cannot leak the lattice allocations.
+
     **COMPLETE PIPELINE:**
     1. Create constant propagation context
     2. Analyze local constants (within blocks)
@@ -1885,6 +2482,19 @@ Process called "optimize_function_with_constant_prop" that takes cfg_ptr as Inte
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
+
+    @Implementation
+    1. Validates cfg_ptr is non-null.
+    2. Allocates the lattice context via create_constant_prop_context;
+       returns 0 on allocation failure.
+    3. Runs analyze_local_constants for literal seeding.
+    4. Runs analyze_array_constants for store/load element folding.
+       (Global and interprocedural passes are run by the module-level
+       entry point because they need module-wide CFG access.)
+    5. Prints aggregate stats via print_constant_prop_stats.
+    6. Calls destroy_constant_prop_context to release the lattice.
+    Returns 1.
+    @End Implementation
 
     @Performance_Hints
     Enhanced constant propagation complements SCCP:
@@ -1908,23 +2518,23 @@ Process called "optimize_function_with_constant_prop" that takes cfg_ptr as Inte
     Display ""
 
     Note: Step 1: Create context
-    Let context_ptr be create_constant_prop_context(cfg_ptr)
+    Let context_ptr be proc create_constant_prop_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "optimize_function_with_constant_prop: failed to create context"
         Return 0
     End If
 
     Note: Step 2: Analyze local constants
-    analyze_local_constants(context_ptr, cfg_ptr)
+    proc analyze_local_constants with context_ptr, cfg_ptr
 
     Note: Step 3: Analyze array constants
-    analyze_array_constants(context_ptr, cfg_ptr)
+    proc analyze_array_constants with context_ptr, cfg_ptr
 
     Note: Step 4: Print statistics
-    print_constant_prop_stats(context_ptr)
+    proc print_constant_prop_stats with context_ptr
 
     Note: Step 5: Destroy context
-    destroy_constant_prop_context(context_ptr)
+    proc destroy_constant_prop_context with context_ptr
 
     Display ""
     Display "ENHANCED CONSTANT PROPAGATION COMPLETE"
@@ -1937,6 +2547,13 @@ Process called "optimize_module_with_constant_prop" that takes module_ptr as Int
     @Reasoning
     Runs enhanced constant propagation on all functions in a module.
 
+    Module-level entry that sequences the analyses requiring
+    whole-program visibility (global classification + IPCP) before
+    invoking the per-function pipeline. The order matters: global and
+    interprocedural summaries must be computed first so that per-
+    function passes can read constants that flow in from outside the
+    function being optimised.
+
     **MODULE-WIDE OPTIMIZATION:**
     1. Identify global constants
     2. Build interprocedural summaries
@@ -1945,6 +2562,18 @@ Process called "optimize_module_with_constant_prop" that takes module_ptr as Int
 
     Returns number of functions optimized.
     @End Reasoning
+
+    @Implementation
+    Validates module_ptr and emits a stage banner. The orchestration
+    is currently a sequencer skeleton: it announces each high-level
+    phase (global identification, interprocedural analysis, per-
+    function optimisation) and returns the count of functions
+    optimised. The detailed wiring of optimize_function_with_constant_prop
+    over MIRProgram.functions, parameterised by the module's CFG, is
+    delegated to the per-function entry once a module-level CFG is
+    available; see analyze_interprocedural_constants for the
+    summary-building portion that already operates on the program.
+    @End Implementation
 
     If module_ptr is equal to 0:
         Display "optimize_module_with_constant_prop: null module"
@@ -1979,15 +2608,30 @@ Process called "run_constant_prop_pass" that takes cfg_ptr as Integer returns In
     @Reasoning
     Convenience wrapper for running enhanced constant propagation as an optimization pass.
 
+    Exists so the pass manager can install constant propagation under
+    its standard "run(cfg)" calling convention without needing to know
+    about the optimize_function_with_constant_prop name.
+
     Returns 1 if CFG was modified, 0 if no changes.
     @End Reasoning
 
-    Return optimize_function_with_constant_prop(cfg_ptr)
+    @Implementation
+    Direct tail-call to optimize_function_with_constant_prop with the
+    same cfg_ptr; the return code (1 = success, 0 = failure / no work)
+    is the pass-manager change indicator.
+    @End Implementation
+
+    Return proc optimize_function_with_constant_prop with cfg_ptr
 End Process
 
 Process called "should_run_constant_prop" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
     Determines if enhanced constant propagation should be run.
+
+    The pass manager queries this predicate before scheduling the
+    pass on a given function. Returning 0 for trivial functions
+    keeps pass overhead off the hot fast paths (single-block
+    leaf functions where SCCP has nothing additional to find).
 
     **PROFITABILITY:**
     Enhanced constant prop is profitable after SCCP has run,
@@ -1998,6 +2642,12 @@ Process called "should_run_constant_prop" that takes cfg_ptr as Integer returns 
 
     Returns 1 if should run, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Returns 0 if cfg_ptr is null. Reads the block count via
+    CFG.get_block_count; functions with fewer than two blocks skip the
+    pass. Otherwise returns 1.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -2019,6 +2669,10 @@ End Process
 Process called "get_constant_prop_pass_name" returns Integer:
     @Reasoning
     Returns the name of this optimization pass.
+
+    Used by pass-manager telemetry and the optimizer reporter to
+    display a stable identifier in pass listings and diagnostic
+    output.
     @End Reasoning
 
     Return "Enhanced Constant Propagation"
@@ -2027,6 +2681,9 @@ End Process
 Process called "get_constant_prop_pass_description" returns Integer:
     @Reasoning
     Returns a description of this optimization pass.
+
+    Provides the human-readable summary that pass listings and CLI
+    help output display alongside the short name.
     @End Reasoning
 
     Return "Enhanced constant propagation with global, interprocedural, and array analysis"

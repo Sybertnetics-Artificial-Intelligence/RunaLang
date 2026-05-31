@@ -115,13 +115,36 @@ Process called "create_dse_context" that takes cfg as Integer returns Integer:
     Creates and initializes DSE context structure.
 
     Allocates:
-    - Main DSE context
-    - Alias analysis context
-    - Store information tracking
-    - Liveness sets (GEN/KILL/IN/OUT)
+    - Main DSE context (DSEContext)
+    - Alias analysis context (Anderson's points-to)
+    - Store information list (StoreInfo)
+    - Live-stores set (set of StoreInfo indices)
+    - Liveness sets (GEN/KILL/IN/OUT) as Dictionary[BlockId, Set[StoreIdx]]
+    - Counters for eliminated / forwarded / stack-eliminated stores
 
-    Returns context pointer or 0 on failure.
+    Returns context pointer or 0 on failure (allocation failure path).
+
+    Lifetime: caller owns the returned context and MUST destroy it via
+    destroy_dse_context to avoid leaking the alias context, store list,
+    and the four liveness dictionaries.
     @End Reasoning
+
+    @Implementation
+    Process: "create_dse_context"
+    Steps:
+        1. Reject null cfg input (return 0).
+        2. Allocate the top-level DSEContext via Layout.allocate; bail on failure.
+        3. Write the cfg pointer into the cfg field.
+        4. Create the AliasAnalysisContext via create_alias_analysis_context;
+           store it in alias_analysis field. This also runs Anderson's points-to.
+        5. Create an empty List for stores; store handle + zero count.
+        6. Create an empty Set for live_stores.
+        7. Create four empty Dictionaries (gen, kill, in, out); store handles.
+        8. Zero the three counters.
+        9. Return the context pointer.
+    Failure handling: returns 0 only on the top-level allocate failure; sub-
+    allocations propagate via their own contracts (called creators return 0).
+    @End Implementation
 
     If cfg is equal to 0:
         Return 0
@@ -139,7 +162,7 @@ Process called "create_dse_context" that takes cfg as Integer returns Integer:
     proc memory_set_integer from Layout with context_ptr, cfg_offset, cfg
 
     Note: Create alias analysis context
-    Let alias_context be create_alias_analysis_context(cfg)
+    Let alias_context be proc create_alias_analysis_context with cfg
     Let alias_offset be proc offset_of_DSEContext_alias_analysis from Layout
     proc memory_set_integer from Layout with context_ptr, alias_offset, alias_context
 
@@ -188,8 +211,31 @@ End Process
 
 Process called "destroy_dse_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Deallocates all DSE context structures.
+    Deallocates every structure owned by the DSE context: the alias context,
+    the StoreInfo list and each contained StoreInfo, the live_stores Set,
+    and the four liveness Dictionaries (gen, kill, in, out). Treating null
+    as a no-op success simplifies caller error paths.
+
+    Must mirror the allocations in create_dse_context one-for-one to avoid
+    leaks, hence the verbose per-field destruction.
     @End Reasoning
+
+    @Implementation
+    Process: "destroy_dse_context"
+    Steps:
+        1. If context_ptr is null, return 1 (idempotent destroy).
+        2. Read alias_analysis pointer and call destroy_alias_analysis_context
+           if non-null.
+        3. Read stores list pointer:
+           - Read store_count.
+           - For each i in [0, store_count), destroy_store_info(stores[i]).
+           - Destroy the list itself.
+        4. Read live_stores Set; destroy if non-null.
+        5. Read each of gen_sets, kill_sets, in_sets, out_sets; destroy
+           each Dictionary if non-null.
+        6. Deallocate the top-level DSEContext via Layout.deallocate.
+        7. Return 1.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 1
@@ -199,7 +245,7 @@ Process called "destroy_dse_context" that takes context_ptr as Integer returns I
     Let alias_offset be proc offset_of_DSEContext_alias_analysis from Layout
     Let alias_context be proc memory_get_integer from Layout with context_ptr, alias_offset
     If alias_context is not equal to 0:
-        destroy_alias_analysis_context(alias_context)
+        proc destroy_alias_analysis_context with alias_context
     End If
 
     Note: Destroy store tracking
@@ -213,7 +259,7 @@ Process called "destroy_dse_context" that takes context_ptr as Integer returns I
         While i is less than store_count:
             Let store_info be proc get from List with stores, i
             If store_info is not equal to 0:
-                destroy_store_info(store_info)
+                proc destroy_store_info with store_info
             End If
             Set i to i plus 1
         End While
@@ -261,8 +307,21 @@ End Process
 
 Process called "destroy_store_info" that takes store_info as Integer returns Integer:
     @Reasoning
-    Deallocates store info structure.
+    Deallocates a single StoreInfo, including its owned kills Set.
+
+    Idempotent on null input. Separate from destroy_dse_context so the
+    list-walk in that destructor can call this per-element helper.
     @End Reasoning
+
+    @Implementation
+    Process: "destroy_store_info"
+    Steps:
+        1. Return 1 immediately if store_info is null.
+        2. Read the kills field via Layout offset.
+        3. Destroy the kills Set if non-null.
+        4. Deallocate the StoreInfo struct via Layout.deallocate.
+        5. Return 1.
+    @End Implementation
 
     If store_info is equal to 0:
         Return 1
@@ -281,8 +340,27 @@ End Process
 
 Process called "print_dse_stats" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Prints DSE statistics for reporting.
+    Prints DSE statistics for human-readable reporting.
+
+    Shows the three independent counters (dead-store-eliminated, store-to-
+    load-forwarded, dead-stack-store-eliminated) plus their sum. The sum
+    is informative because the pipeline driver uses it as the headline
+    "DSE produced N optimizations" figure.
+
+    Bails out cleanly on null input so the standalone entry can call this
+    without an extra guard.
     @End Reasoning
+
+    @Implementation
+    Process: "print_dse_stats"
+    Steps:
+        1. Return 0 if context_ptr is null.
+        2. Read DSEContext.eliminated_count via Layout offset.
+        3. Read DSEContext.forwarded_count.
+        4. Read DSEContext.stack_eliminated_count.
+        5. Emit Display lines for each counter and the total.
+        6. Return 1.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -318,12 +396,33 @@ Process called "create_alias_analysis_context" that takes cfg as Integer returns
     Creates alias analysis context with points-to information.
 
     Implements Anderson's flow-insensitive points-to analysis:
-    - Inclusion-based constraint solving
-    - Transitive closure computation
-    - Memory location tracking
+    - Inclusion-based constraint solving (P ⊆ Q means points-to(P) ⊆ points-to(Q))
+    - Transitive closure computation via worklist iteration to fixed point
+    - Memory location tracking (each alloca/heap allocation gets a unique tag)
+
+    Why flow-insensitive: dead-store elimination tolerates the precision loss
+    of merging all program points, since the may-alias and must-alias queries
+    only require sound over-/under-approximations. Flow-sensitive analysis
+    would require per-statement points-to sets, multiplying memory by the
+    block count without changing DSE's eliminate/keep decisions in most cases.
 
     Returns alias context or 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Process: "create_alias_analysis_context"
+    Steps:
+        1. Reject null cfg input (return 0).
+        2. Allocate the AliasAnalysisContext struct.
+        3. Store the cfg handle in the cfg field.
+        4. Create the points-to map (Dictionary[VarId, PointsToInfo]).
+        5. Create the memory_locations List and zero the location_count.
+        6. Create the def_use_chains Dictionary (per-variable use lists).
+        7. Run compute_points_to_sets immediately to populate the map.
+        8. Return the context pointer.
+    Post-condition: the returned context has fully-converged points-to sets
+    ready for may_alias / must_alias / no_alias queries.
+    @End Implementation
 
     If cfg is equal to 0:
         Return 0
@@ -358,15 +457,39 @@ Process called "create_alias_analysis_context" that takes cfg as Integer returns
     proc memory_set_integer from Layout with context_ptr, def_use_offset, def_use
 
     Note: Run points-to analysis
-    compute_points_to_sets(context_ptr)
+    proc compute_points_to_sets with context_ptr
 
     Return context_ptr
 End Process
 
 Process called "destroy_alias_analysis_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Deallocates alias analysis context.
+    Deallocates the alias analysis context and every owned sub-structure:
+    points-to map and contained PointsToInfo + Set entries, the memory
+    locations list and each MemoryLocation, and the def-use chains.
+
+    Idempotent on null input (returns success without touching memory).
     @End Reasoning
+
+    @Implementation
+    Process: "destroy_alias_analysis_context"
+    Steps:
+        1. If context_ptr is null, return 1.
+        2. Read points_to_map; if non-null:
+           a. Enumerate Dictionary keys.
+           b. For each key, fetch its PointsToInfo:
+              - Destroy its points_to_set Set.
+              - Deallocate the PointsToInfo struct.
+           c. Destroy the keys list.
+           d. Destroy the points-to Dictionary.
+        3. Read memory_locations list; if non-null:
+           a. Read location_count.
+           b. For each entry, deallocate the MemoryLocation struct.
+           c. Destroy the list.
+        4. Read def_use_chains Dictionary; destroy if non-null.
+        5. Deallocate the AliasAnalysisContext struct.
+        6. Return 1.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 1
@@ -435,12 +558,55 @@ Process called "compute_points_to_sets" that takes alias_context as Integer retu
     @Reasoning
     Computes points-to sets using Anderson's algorithm:
 
-    1. Build inclusion constraints from pointer operations
-    2. Iteratively solve constraints until fixed point
-    3. Compute transitive closure
+    1. Build inclusion constraints from pointer operations:
+       - ALLOCA: dest -> new memory location (direct points-to)
+       - STORE *p = v: for each L in pts(p), pts(L) += pts(v) (indirect)
+       - LOAD d = *p: pts(d) = union over L in pts(p) of pts(L)
+       - GEP d = p + off: pts(d) inherits pts(p) with offset adjustment
+    2. Iteratively solve constraints until fixed point (Kleene iteration)
+    3. Compute transitive closure (handled implicitly by repeated application)
 
-    This is flow-insensitive (ignores control flow) but sound.
+    Convergence: the lattice is points-to sets ordered by ⊆, with a finite
+    universe (the set of memory locations declared in the function). Each
+    iteration either grows at least one set or terminates; the chain length
+    is bounded by |memory_locations|^2 in the worst case.
+
+    Safety cap: a hard ceiling of 100 iterations guards against pathological
+    inputs or bugs. Anderson's analysis is known to converge in O(n^3) time
+    in theory; for real MIR functions 100 iterations is generously above
+    the empirical worst case.
+
+    This is flow-insensitive (ignores control flow) but sound (every run-time
+    points-to fact is contained in the computed sets).
     @End Reasoning
+
+    @Implementation
+    Process: "compute_points_to_sets"
+    Steps:
+        1. Null-guard alias_context (return 0).
+        2. Fetch cfg and points_to_map from the alias context.
+        3. Phase 1: Constraint collection.
+           a. Allocate a temporary constraints List.
+           b. For each block, for each instruction, dispatch on opcode:
+              - MIR_ALLOCA (20001) -> extract_alloca_constraint
+              - MIR_STORE (20020) -> extract_store_constraint
+              - MIR_LOAD (20021) -> extract_load_constraint
+              - MIR_GET_ELEMENT_PTR (20025) -> extract_gep_constraint
+           c. Each extractor appends its constraint to the list.
+        4. Phase 2: Fixed-point solve.
+           a. Loop while a "changed" flag is set.
+           b. For each constraint, call apply_constraint; if it widened any
+              set it returns 1 and we record progress.
+           c. After scanning all constraints, if no change occurred, halt.
+           d. Increment an iteration counter; if it exceeds 100, print a
+              warning and stop (defensive cap).
+        5. Phase 3: Cleanup.
+           a. Destroy the constraints list (the constraint objects themselves
+              remain owned by the alias context for query reuse).
+        6. Return 1.
+    Complexity: O(iterations * |constraints|) with iterations bounded by the
+    set-growth depth. For typical functions this is sub-quadratic.
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 0
@@ -470,19 +636,19 @@ Process called "compute_points_to_sets" that takes alias_context as Integer retu
 
             Note: Extract constraints based on instruction type
             If opcode is equal to 20001:  Note: MIR_ALLOCA (stack allocation)
-                extract_alloca_constraint(inst, constraints, alias_context)
+                proc extract_alloca_constraint with inst, constraints, alias_context
             End If
 
             If opcode is equal to 20020:  Note: MIR_STORE
-                extract_store_constraint(inst, constraints, alias_context)
+                proc extract_store_constraint with inst, constraints, alias_context
             End If
 
             If opcode is equal to 20021:  Note: MIR_LOAD
-                extract_load_constraint(inst, constraints, alias_context)
+                proc extract_load_constraint with inst, constraints, alias_context
             End If
 
             If opcode is equal to 20025:  Note: MIR_GET_ELEMENT_PTR
-                extract_gep_constraint(inst, constraints, alias_context)
+                proc extract_gep_constraint with inst, constraints, alias_context
             End If
 
             Set inst_idx to inst_idx plus 1
@@ -504,7 +670,7 @@ Process called "compute_points_to_sets" that takes alias_context as Integer retu
 
         While i is less than constraint_count:
             Let constraint be proc get from List with constraints, i
-            Let result be apply_constraint(constraint, points_to_map)
+            Let result be proc apply_constraint with constraint, points_to_map
 
             If result is equal to 1:
                 Set changed to 1
@@ -528,22 +694,39 @@ End Process
 
 Process called "extract_alloca_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Extracts constraint from stack allocation (alloca).
+    Extracts the Anderson constraint corresponding to a stack allocation.
 
-    Creates new memory location and adds it to points-to set of destination.
+    Each alloca creates a fresh abstract memory location that, by construction,
+    aliases nothing else. We register it with the alias context (so later
+    queries can find its classification flags) and emit a direct constraint
+    binding the destination SSA value to that fresh location.
     @End Reasoning
+
+    @Implementation
+    Process: "extract_alloca_constraint"
+    Steps:
+        1. Read dest_reg via MIRNodes.get_destination.
+        2. Read alloca_size via MIRNodes.get_alloca_size.
+        3. Call create_memory_location(dest_reg, 0, alloca_size, 1, 0, 0)
+           to construct a stack-classified MemoryLocation.
+        4. Call add_memory_location(alias_context, location) to register
+           it with the alias context's memory_locations list.
+        5. Build a direct constraint via create_points_to_constraint
+           and append to the constraints list.
+        6. Return 1.
+    @End Implementation
 
     Let dest_reg be proc get_destination from MIRNodes with inst
     Let alloca_size be proc get_alloca_size from MIRNodes with inst
 
     Note: Create memory location for this allocation
-    Let location be create_memory_location(dest_reg, 0, alloca_size, 1, 0, 0)
+    Let location be proc create_memory_location with dest_reg, 0, alloca_size, 1, 0, 0
 
     Note: Add location to context
-    add_memory_location(alias_context, location)
+    proc add_memory_location with alias_context, location
 
     Note: Create constraint: dest_reg points-to location
-    Let constraint be create_points_to_constraint(dest_reg, location)
+    Let constraint be proc create_points_to_constraint with dest_reg, location
     proc append from List with constraints, constraint
 
     Return 1
@@ -551,18 +734,30 @@ End Process
 
 Process called "extract_store_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Extracts constraint from store instruction.
+    Extracts the Anderson constraint corresponding to *ptr = value.
 
-    If storing a pointer, adds constraint that what pointer points to
-    now points to stored value's points-to set.
+    The constraint is "store-indirect": at solve time we read pts(ptr) and
+    add pts(value) into pts(L) for every L in pts(ptr). We do not perform
+    the union here; we record the participating operands so the solver
+    can apply the rule to a fixed point.
     @End Reasoning
+
+    @Implementation
+    Process: "extract_store_constraint"
+    Steps:
+        1. Read ptr_reg via MIRNodes.get_store_pointer.
+        2. Read value_reg via MIRNodes.get_store_value.
+        3. Call create_store_constraint(ptr_reg, value_reg).
+        4. Append the constraint to the constraints list.
+        5. Return 1.
+    @End Implementation
 
     Let ptr_reg be proc get_store_pointer from MIRNodes with inst
     Let value_reg be proc get_store_value from MIRNodes with inst
 
     Note: Create constraint: *ptr_reg = value_reg
     Note: This means: for all x in points_to(ptr_reg), points_to(x) += points_to(value_reg)
-    Let constraint be create_store_constraint(ptr_reg, value_reg)
+    Let constraint be proc create_store_constraint with ptr_reg, value_reg
     proc append from List with constraints, constraint
 
     Return 1
@@ -570,17 +765,29 @@ End Process
 
 Process called "extract_load_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Extracts constraint from load instruction.
+    Extracts the Anderson constraint corresponding to dest = *ptr.
 
-    Adds constraint that destination points to union of what pointer might point to.
+    The constraint is "load-indirect": at solve time pts(dest) receives
+    the union of pts(L) for each L in pts(ptr). We record the operands
+    here; application happens in apply_load_constraint.
     @End Reasoning
+
+    @Implementation
+    Process: "extract_load_constraint"
+    Steps:
+        1. Read dest_reg via MIRNodes.get_destination.
+        2. Read ptr_reg via MIRNodes.get_load_pointer.
+        3. Call create_load_constraint(dest_reg, ptr_reg).
+        4. Append to the constraints list.
+        5. Return 1.
+    @End Implementation
 
     Let dest_reg be proc get_destination from MIRNodes with inst
     Let ptr_reg be proc get_load_pointer from MIRNodes with inst
 
     Note: Create constraint: dest_reg = *ptr_reg
     Note: This means: points_to(dest_reg) = union of points_to(x) for x in points_to(ptr_reg)
-    Let constraint be create_load_constraint(dest_reg, ptr_reg)
+    Let constraint be proc create_load_constraint with dest_reg, ptr_reg
     proc append from List with constraints, constraint
 
     Return 1
@@ -588,17 +795,31 @@ End Process
 
 Process called "extract_gep_constraint" that takes inst as Integer, constraints as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Extracts constraint from GEP (get element pointer) instruction.
+    Extracts the Anderson constraint corresponding to dest = base + offset.
 
-    GEP computes address, so result points to same location as base with offset.
+    GEP computes a derived address; the resulting points-to-set is the
+    set of (base_target + offset) over every base_target in pts(base).
+    Recording the offset enables apply_gep_constraint to synthesize new
+    MemoryLocations with shifted offsets — the field-sensitivity machinery.
     @End Reasoning
+
+    @Implementation
+    Process: "extract_gep_constraint"
+    Steps:
+        1. Read dest_reg via MIRNodes.get_destination.
+        2. Read base_reg via MIRNodes.get_gep_base.
+        3. Read offset via MIRNodes.get_gep_offset.
+        4. Call create_gep_constraint(dest_reg, base_reg, offset).
+        5. Append to the constraints list.
+        6. Return 1.
+    @End Implementation
 
     Let dest_reg be proc get_destination from MIRNodes with inst
     Let base_reg be proc get_gep_base from MIRNodes with inst
     Let offset be proc get_gep_offset from MIRNodes with inst
 
     Note: Create constraint: dest_reg points to base with offset
-    Let constraint be create_gep_constraint(dest_reg, base_reg, offset)
+    Let constraint be proc create_gep_constraint with dest_reg, base_reg, offset
     proc append from List with constraints, constraint
 
     Return 1
@@ -606,8 +827,24 @@ End Process
 
 Process called "create_memory_location" that takes base as Integer, offset as Integer, size as Integer, is_stack as Integer, is_heap as Integer, is_global as Integer returns Integer:
     @Reasoning
-    Creates MemoryLocation structure.
+    Allocates and initializes a MemoryLocation record describing an
+    abstract memory region used by the alias analysis. The combination
+    of (base, offset, size) identifies the region; the three Boolean
+    flags (is_stack, is_heap, is_global) classify it for the predicates
+    is_stack_location / is_global_location consumed by DSE.
+
+    Returns the allocated pointer or 0 on allocation failure.
     @End Reasoning
+
+    @Implementation
+    Process: "create_memory_location"
+    Steps:
+        1. Compute MemoryLocation struct size via Layout.size_of_MemoryLocation.
+        2. Allocate via Layout.allocate; return 0 if allocation failed.
+        3. Write the six fields (base, offset, size, is_stack, is_heap,
+           is_global) at their Layout offsets via memory_set_integer.
+        4. Return the pointer.
+    @End Implementation
 
     Let loc_size be proc size_of_MemoryLocation from Layout
     Let loc_ptr be proc allocate from Layout with loc_size
@@ -638,8 +875,23 @@ End Process
 
 Process called "add_memory_location" that takes alias_context as Integer, location as Integer returns Integer:
     @Reasoning
-    Adds memory location to alias context tracking.
+    Appends a freshly-created MemoryLocation to the alias context's
+    memory_locations list and bumps the location_count field. The list
+    is the canonical enumeration the predicates is_stack_location and
+    is_global_location traverse during their queries.
+
+    Validates both pointers so callers do not have to.
     @End Reasoning
+
+    @Implementation
+    Process: "add_memory_location"
+    Steps:
+        1. Return 0 if alias_context or location is null.
+        2. Read the memory_locations list pointer from the context.
+        3. Append the location to that list via List.append.
+        4. Read current location_count, increment by one, write back.
+        5. Return 1.
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 0
@@ -666,8 +918,19 @@ Note: ==========================================================================
 
 Process called "create_points_to_constraint" that takes variable as Integer, location as Integer returns Integer:
     @Reasoning
-    Creates a simple points-to constraint: variable -> location
+    Allocates a 24-byte direct points-to constraint (variable -> location).
+    Layout: word 0 = type tag (1), word 1 = variable id, word 2 = location id.
     @End Reasoning
+
+    @Implementation
+    Process: "create_points_to_constraint"
+    Steps:
+        1. Allocate 24 bytes via Layout.allocate.
+        2. Write type tag 1 at offset 0.
+        3. Write variable at offset 8.
+        4. Write location at offset 16.
+        5. Return the pointer.
+    @End Implementation
 
     Note: Constraint type 1: Direct points-to
     Let constraint be proc allocate from Layout with 24
@@ -679,8 +942,17 @@ End Process
 
 Process called "create_store_constraint" that takes ptr as Integer, value as Integer returns Integer:
     @Reasoning
-    Creates store constraint: *ptr = value
+    Allocates a 24-byte store-indirect constraint (*ptr = value).
+    Layout: word 0 = type tag (2), word 1 = ptr id, word 2 = value id.
     @End Reasoning
+
+    @Implementation
+    Process: "create_store_constraint"
+    Steps:
+        1. Allocate 24 bytes.
+        2. Write tag 2 at offset 0, ptr at 8, value at 16.
+        3. Return the pointer.
+    @End Implementation
 
     Note: Constraint type 2: Store (indirect)
     Let constraint be proc allocate from Layout with 24
@@ -692,8 +964,17 @@ End Process
 
 Process called "create_load_constraint" that takes dest as Integer, ptr as Integer returns Integer:
     @Reasoning
-    Creates load constraint: dest = *ptr
+    Allocates a 24-byte load-indirect constraint (dest = *ptr).
+    Layout: word 0 = type tag (3), word 1 = dest id, word 2 = ptr id.
     @End Reasoning
+
+    @Implementation
+    Process: "create_load_constraint"
+    Steps:
+        1. Allocate 24 bytes.
+        2. Write tag 3 at offset 0, dest at 8, ptr at 16.
+        3. Return the pointer.
+    @End Implementation
 
     Note: Constraint type 3: Load (indirect)
     Let constraint be proc allocate from Layout with 24
@@ -705,8 +986,19 @@ End Process
 
 Process called "create_gep_constraint" that takes dest as Integer, base as Integer, offset as Integer returns Integer:
     @Reasoning
-    Creates GEP constraint: dest = base + offset
+    Allocates a 32-byte GEP constraint (dest = base + offset). The extra
+    word relative to the other constraint shapes stores the field offset
+    that field-sensitive Anderson's analysis needs.
+    Layout: word 0 = type tag (4), word 1 = dest, word 2 = base, word 3 = offset.
     @End Reasoning
+
+    @Implementation
+    Process: "create_gep_constraint"
+    Steps:
+        1. Allocate 32 bytes.
+        2. Write tag 4 at offset 0, dest at 8, base at 16, offset at 24.
+        3. Return the pointer.
+    @End Implementation
 
     Note: Constraint type 4: Offset
     Let constraint be proc allocate from Layout with 32
@@ -719,9 +1011,30 @@ End Process
 
 Process called "apply_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
     @Reasoning
-    Applies a constraint to the points-to sets.
-    Returns 1 if any set changed, 0 otherwise.
+    Applies a single Anderson-style constraint to the points-to sets and
+    reports whether the application widened any set.
+
+    The four constraint types correspond to MIR opcodes that affect
+    pointer semantics:
+        1 -> direct      (alloca:  variable -> location)
+        2 -> store       (*ptr = value)
+        3 -> load        (dest = *ptr)
+        4 -> gep         (dest = base + offset)
+
+    Returns 1 if any set changed, 0 otherwise. The Boolean return is the
+    "progress" signal driving the outer fixed-point loop.
     @End Reasoning
+
+    @Implementation
+    Process: "apply_constraint"
+    Steps:
+        1. Null-guard constraint (return 0).
+        2. Read constraint type word at offset 0.
+        3. Dispatch to the appropriate per-type applier.
+        4. Return whatever the applier returns; an unknown type yields 0.
+    Invariant: a type word outside {1,2,3,4} cannot grow any set, so
+    returning 0 is sound for forward-compatibility.
+    @End Implementation
 
     If constraint is equal to 0:
         Return 0
@@ -730,19 +1043,19 @@ Process called "apply_constraint" that takes constraint as Integer, points_to_ma
     Let constraint_type be proc memory_get_integer from Layout with constraint, 0
 
     If constraint_type is equal to 1:
-        Return apply_direct_constraint(constraint, points_to_map)
+        Return proc apply_direct_constraint with constraint, points_to_map
     End If
 
     If constraint_type is equal to 2:
-        Return apply_store_constraint(constraint, points_to_map)
+        Return proc apply_store_constraint with constraint, points_to_map
     End If
 
     If constraint_type is equal to 3:
-        Return apply_load_constraint(constraint, points_to_map)
+        Return proc apply_load_constraint with constraint, points_to_map
     End If
 
     If constraint_type is equal to 4:
-        Return apply_gep_constraint(constraint, points_to_map)
+        Return proc apply_gep_constraint with constraint, points_to_map
     End If
 
     Return 0
@@ -750,9 +1063,25 @@ End Process
 
 Process called "apply_direct_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
     @Reasoning
-    Applies direct constraint: variable -> location
-    Adds location to variable's points-to set.
+    Applies direct constraint: variable -> location.
+
+    Direct constraints come from allocations (alloca produces a unique
+    abstract location whose only source is the allocation itself). This
+    is the base case of Anderson's inclusion-based solver.
     @End Reasoning
+
+    @Implementation
+    Process: "apply_direct_constraint"
+    Steps:
+        1. Read variable id (offset 8) and target location (offset 16).
+        2. Look up PointsToInfo for the variable.
+        3. If absent, allocate a new PointsToInfo, attach an empty Set,
+           and register it in the points-to map. This lazy initialization
+           keeps the map sparse for variables that never participate.
+        4. Test whether the location is already in the points-to set;
+           if not, add it and return 1 (progress).
+        5. Return 0 if no growth occurred.
+    @End Implementation
 
     Let variable be proc memory_get_integer from Layout with constraint, 8
     Let location be proc memory_get_integer from Layout with constraint, 16
@@ -790,11 +1119,39 @@ End Process
 
 Process called "apply_store_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
     @Reasoning
-    Applies store constraint: *ptr = value
+    Applies store constraint: *ptr = value.
 
-    For each location L in points_to(ptr):
-        points_to(L) += points_to(value)
+    Semantics: for each abstract location L that ptr might point to, that
+    location's points-to set gains every target currently reachable through
+    value. This is the "store-into-points-to" rule that gives Anderson's
+    analysis its indirect inclusion power.
+
+    Iteration shape:
+        For each L in points-to-set of ptr:
+            points-to-set of L gains every element of points-to-set of value
+
+    Returns 1 if any of the |pts(ptr)| union operations widened a set.
     @End Reasoning
+
+    @Implementation
+    Process: "apply_store_constraint"
+    Steps:
+        1. Read ptr (offset 8) and value (offset 16) from the constraint.
+        2. Look up PointsToInfo for ptr; bail out (return 0) if absent
+           (no points-to information yet -> no store can fire).
+        3. Look up PointsToInfo for value; bail out if absent.
+        4. Snapshot pts(ptr) into a working list via Set.to_list so that
+           we can iterate without mutating the set we are reading from.
+        5. For each target_location in that list:
+           a. Look up its PointsToInfo; allocate one lazily if missing,
+              attaching an empty points-to set and registering it.
+           b. Union the value's points-to set into target's points-to set.
+           c. If union_into reported growth, set the changed flag.
+        6. Destroy the temporary list.
+        7. Return the changed flag.
+    Aliasing note: snapshotting pts(ptr) prevents concurrent-modification
+    bugs when pts(ptr) and pts(target) coincide for some target.
+    @End Implementation
 
     Let ptr be proc memory_get_integer from Layout with constraint, 8
     Let value be proc memory_get_integer from Layout with constraint, 16
@@ -858,10 +1215,37 @@ End Process
 
 Process called "apply_load_constraint" that takes constraint as Integer, points_to_map as Integer returns Integer:
     @Reasoning
-    Applies load constraint: dest = *ptr
+    Applies load constraint: dest = *ptr.
 
-    points_to(dest) = union of points_to(L) for all L in points_to(ptr)
+    Semantics: the destination value of a load inherits every potential
+    target reachable by dereferencing ptr. This is the dual of the store
+    rule, propagating inclusion downward through pointer reads.
+
+    Iteration shape:
+        points-to-set of dest gains every element of the union over
+        L in points-to-set of ptr of points-to-set of L
+
+    Returns 1 if pts(dest) grew during this application.
     @End Reasoning
+
+    @Implementation
+    Process: "apply_load_constraint"
+    Steps:
+        1. Read dest (offset 8) and ptr (offset 16) from the constraint.
+        2. Look up PointsToInfo for ptr; bail out if absent.
+        3. Get-or-create PointsToInfo for dest (lazy initialization with an
+           empty points-to set).
+        4. Snapshot pts(ptr) via Set.to_list.
+        5. For each source_location in pts(ptr):
+           a. Look up its PointsToInfo; skip silently if missing (no
+              targets known yet means nothing to copy).
+           b. Union the source's points-to set into pts(dest).
+           c. If union_into reported growth, set the changed flag.
+        6. Return the changed flag.
+    Note: we deliberately do NOT allocate empty PointsToInfo for sources
+    that are missing; doing so would not change the result of the union
+    and would waste memory.
+    @End Implementation
 
     Let dest be proc memory_get_integer from Layout with constraint, 8
     Let ptr be proc memory_get_integer from Layout with constraint, 16
@@ -881,7 +1265,7 @@ Process called "apply_load_constraint" that takes constraint as Integer, points_
     Let dest_info be proc get from Dictionary with points_to_map, dest
     If dest_info is equal to 0:
         Let info_size be proc size_of_PointsToInfo from Layout
-        Set dest_info to allocate(info_size)
+        Set dest_info to proc allocate from Layout with info_size
 
         Let var_id_offset be proc offset_of_PointsToInfo_variable_id from Layout
         proc memory_set_integer from Layout with dest_info, var_id_offset, dest
@@ -945,8 +1329,25 @@ Process called "apply_gep_constraint" that takes constraint as Integer, points_t
     @End Reasoning
 
     @Implementation
-    This implements field-sensitive Anderson's analysis, which is standard
-    in deployment compilers for handling struct field accesses and array indexing.
+    Process: "apply_gep_constraint"
+    Steps:
+        1. Read dest (offset 8), base (offset 16), gep_offset (offset 24).
+        2. Look up PointsToInfo for base; bail if absent.
+        3. Get-or-create PointsToInfo for dest with an empty points-to set.
+        4. Snapshot pts(base) into a working list.
+        5. For each base_location in pts(base):
+           a. Read the source MemoryLocation struct (base, offset, size,
+              is_stack, is_heap, is_global fields via Layout offsets).
+           b. Synthesize a new MemoryLocation with the same base and class
+              flags but with offset = source.offset + gep_offset.
+           c. Add the synthetic location to pts(dest); if the add reported
+              that the element was new, set the changed flag.
+        6. Return the changed flag.
+    Field sensitivity rationale: by encoding the offset into the abstract
+    location identity, two GEPs into the same base but different offsets
+    produce distinct points-to entries, so a store to base+8 is no-alias
+    with a store to base+16 in the eyes of may_alias. This is the standard
+    deployment-grade refinement over plain Anderson's.
     @End Implementation
 
     Let dest be proc memory_get_integer from Layout with constraint, 8
@@ -1010,7 +1411,7 @@ Process called "apply_gep_constraint" that takes constraint as Integer, points_t
 
         Note: Create new memory location with combined offset
         Let new_offset be loc_offset plus gep_offset
-        Let new_location be create_memory_location(loc_base, new_offset, loc_size, loc_is_stack, loc_is_heap, loc_is_global)
+        Let new_location be proc create_memory_location with loc_base, new_offset, loc_size, loc_is_stack, loc_is_heap, loc_is_global
 
         If new_location is not equal to 0:
             Note: Add offset-specific location to dest's points-to set
@@ -1030,10 +1431,50 @@ End Process
 
 Process called "may_alias" that takes alias_context as Integer, location1 as Integer, location2 as Integer returns Integer:
     @Reasoning
-    Returns 1 if location1 and location2 MAY alias (conservative).
+    Returns 1 if location1 and location2 MAY alias (conservative may-alias query).
 
-    Two locations may alias if their points-to sets intersect.
+    MAY-ALIAS RULES (Anderson's flow-insensitive points-to model):
+    1. Reflexivity: a location MAY-alias itself. If location1 equals location2,
+       return 1 unconditionally; this short-circuits the points-to lookup.
+    2. Missing alias context: if the analysis was never built, all queries must
+       be conservative (return 1). DSE callers will then keep all stores live,
+       which is safe but loses no soundness.
+    3. Missing points-to-info: if either operand is not registered in the
+       points-to map, we have not proved disjointness, so we report 1 (may
+       alias). This is critical for SSA values that bypass alloca/load/store
+       and never participate in pointer arithmetic.
+    4. Intersection test: with both points-to sets known, intersection-
+       non-empty implies a shared target object exists, hence the operands
+       MAY alias at run time. We use Set.intersects for an O(min(|s1|,|s2|))
+       probe rather than constructing the actual intersection.
+
+    SOUNDNESS: every must-alias pair is also a may-alias pair; every false
+    answer is a definite no-alias certificate; every true answer is only
+    conservative (could be no-alias at run time but the analysis could not
+    prove it).
+
+    PRECISION: precision degrades to "all pointers may alias" when the
+    analysis cannot resolve a value's points-to set. This is intentional;
+    DSE's correctness depends on may-alias being a sound over-approximation.
     @End Reasoning
+
+    @Implementation
+    Process: "may_alias"
+    Steps:
+        1. Null-guard alias_context (return 1: conservative may-alias).
+        2. Reflexivity short-circuit (location1 equals location2 returns 1).
+        3. Fetch the points-to map from the alias context via Layout.
+        4. Look up PointsToInfo for both locations.
+        5. If either is missing, return 1 (could not prove disjointness).
+        6. Extract each location's points-to Set from PointsToInfo.
+        7. Call Set.intersects to test for a shared element; return the
+           result directly (1 = may alias, 0 = proven no-alias).
+    Invariants:
+        - Caller must hold a stable PointsToInfo handle for the duration
+          of this call; points-to maps are not thread-safe.
+        - Result is monotone w.r.t. points-to set growth: enlarging either
+          points-to set can never flip a "may-alias=1" to "may-alias=0".
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 1
@@ -1068,10 +1509,54 @@ End Process
 
 Process called "must_alias" that takes alias_context as Integer, location1 as Integer, location2 as Integer returns Integer:
     @Reasoning
-    Returns 1 if location1 and location2 MUST alias (precisely).
+    Returns 1 if location1 and location2 MUST alias at every execution.
 
-    Two locations must alias if they have identical, singleton points-to sets.
+    MUST-ALIAS RULES (singleton-points-to model):
+    1. Trivial identity: location1 equals location2 implies must-alias.
+    2. Missing alias context: cannot prove must-alias, default to 0.
+       (May-alias defaults to 1 in the missing case; must-alias defaults
+       to 0. The asymmetry is intentional: may-alias is the conservative
+       direction, must-alias is the optimistic direction.)
+    3. Missing points-to-info: cannot prove must-alias, return 0.
+    4. Singleton constraint: BOTH points-to sets must have exactly one
+       element. If either set has size != 1, the values could legally
+       resolve to different targets at run time, so must-alias is rejected.
+    5. Same singleton: when both sets have exactly one element each, the
+       must-alias question reduces to comparing the two singleton elements.
+       Equal -> must-alias=1; unequal -> must-alias=0.
+
+    USE IN DSE: must-alias is the predicate that authorizes a store to
+    KILL an earlier store. If store_A at location L1 is followed (in the
+    same block, with no intervening side-effecting operation) by store_B
+    where must_alias(L1, L2)=1, then store_A is dead. May-alias is NOT
+    sufficient for kill: a may-alias relationship leaves the earlier store
+    potentially live on one of the aliased paths.
+
+    SOUNDNESS: false must-alias is fatal (could delete a live store and
+    corrupt the program), so we require the singleton-and-equal proof.
+    Returning 0 in any ambiguous case is the safe default.
     @End Reasoning
+
+    @Implementation
+    Process: "must_alias"
+    Steps:
+        1. Null-guard alias_context (return 0: cannot prove must-alias).
+        2. Reflexivity short-circuit (location1 equals location2 returns 1).
+        3. Fetch the points-to map from the alias context.
+        4. Look up PointsToInfo for both locations; return 0 if either missing.
+        5. Read each PointsToInfo.points_to_set handle.
+        6. Compute Set.size for each; if either size is not 1, return 0
+           (a non-singleton points-to set cannot uniquely identify a target).
+        7. Materialize one-element lists via Set.to_list to extract the
+           singleton targets.
+        8. Compare the two targets: equal -> must-alias=1; otherwise 0.
+        9. Free the temporary lists allocated in step 7 before returning.
+    Edge cases:
+        - Both sets empty: size != 1, return 0. This correctly handles
+          uninitialized PointsToInfo with no targets recorded yet.
+        - One singleton, one multi: return 0; precision lost when either
+          side has multiple targets.
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 0
@@ -1131,8 +1616,35 @@ Process called "no_alias" that takes alias_context as Integer, location1 as Inte
     @Reasoning
     Returns 1 if location1 and location2 definitely DO NOT alias.
 
-    Locations don't alias if their points-to sets are disjoint.
+    NO-ALIAS RULES (the complement of may-alias under the same model):
+    - no_alias(L1, L2) = 1 iff points-to-set(L1) ∩ points-to-set(L2) = ∅
+    - When either points-to-info is missing we cannot prove disjointness,
+      so we return 0 (no proof of no-alias).
+    - When the locations are syntactically identical, they trivially share
+      a target, so no_alias returns 0.
+
+    DSE USE: no_alias enables aggressive code motion across stores. A store
+    can be moved past another instruction without changing program semantics
+    when no_alias proves the two memory references are disjoint.
+
+    SOUNDNESS: false no-alias is fatal (could move a store past an aliasing
+    load, breaking semantics). We require an explicit disjoint-set proof.
     @End Reasoning
+
+    @Implementation
+    Process: "no_alias"
+    Steps:
+        1. Null-guard alias_context (return 0: cannot prove disjointness).
+        2. Reject reflexive case (same location, return 0).
+        3. Fetch points-to map and look up both PointsToInfo entries.
+        4. Return 0 if either entry is missing (no proof of disjointness).
+        5. Read both points-to Sets.
+        6. Call Set.intersects; if it returns 0 (no shared element), return 1.
+        7. Otherwise return 0 (intersection non-empty, may alias).
+    Symmetry: no_alias(L1, L2) = no_alias(L2, L1) by intersection commutativity.
+    Relationship to may_alias: no_alias(L1, L2) implies NOT may_alias(L1, L2),
+    but the converse does not hold when points-to-info is missing.
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 0
@@ -1176,15 +1688,39 @@ Note: ==========================================================================
 
 Process called "collect_stores" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Collects all store instructions from CFG and creates StoreInfo structures.
+    Collects all store instructions from CFG and creates a StoreInfo for each.
 
     For each store:
-    - Records instruction, block ID, memory location
-    - Initializes liveness to 0 (dead until proven live)
-    - Creates empty kills set
+    - Records the instruction pointer, parent block id, and pointer operand
+      treated as the abstract memory location key for alias queries
+    - Initializes liveness to 0 (dead until proven live by the liveness pass)
+    - Creates an empty kills Set (filled later by compute_store_kills)
+
+    The store list it builds is the canonical worklist for every later phase
+    (liveness analysis, dead-store elimination, store-to-load forwarding,
+    dead-stack-store elimination), so this pass is run exactly once.
 
     Returns count of stores collected.
     @End Reasoning
+
+    @Implementation
+    Process: "collect_stores"
+    Steps:
+        1. Null-guard dse_context (return 0).
+        2. Fetch cfg, stores list, and alias_context from the DSE context.
+        3. Initialize a local store_count counter to 0.
+        4. Iterate every block via CFG.get_block_count + CFG.get_block.
+        5. For each instruction in the block:
+           a. Read its opcode via MIRNodes.get_opcode.
+           b. Skip unless opcode == 20020 (MIR_STORE).
+           c. Allocate a StoreInfo struct.
+           d. Set instruction pointer, block_id, and pointer operand
+              (used as the memory_location key).
+           e. Set is_live=0 and create an empty kills Set.
+           f. Append to the stores list and increment store_count.
+        6. Write store_count back into DSEContext.store_count.
+        7. Return store_count.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -1263,13 +1799,40 @@ End Process
 
 Process called "compute_store_kills" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Computes kill sets for stores:
-    For each pair of stores (S1, S2):
-        if S1 dominates S2 AND must_alias(S1.location, S2.location):
-            S2 kills S1
+    Computes the KILL relationship between stores. Store B kills store A
+    when (a) A and B occur in the same basic block, (b) B follows A in
+    program order, and (c) the alias query must_alias(A.location, B.location)
+    succeeds. Under these conditions the value written by A is dead because
+    B overwrites the same memory before any other observable use.
 
-    This identifies stores that are immediately overwritten.
+    Restricting kills to same-block is intentionally conservative: cross-
+    block kills require a full dominance analysis with no aliasing stores
+    on intervening paths, which is the responsibility of the liveness data
+    flow pass (analyze_store_liveness). compute_store_kills captures only
+    the easy cases that data flow would otherwise have to re-derive.
+
+    The result is stored as a per-store kills Set populated with the indices
+    of stores that this store kills, used by the liveness pass to propagate
+    deadness.
     @End Reasoning
+
+    @Implementation
+    Process: "compute_store_kills"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch stores list, store_count, and alias_context.
+        3. Outer loop i over [0, store_count):
+           a. Read store_i.block_id and store_i.memory_location.
+           b. Inner loop j over [i+1, store_count):
+              - Read store_j.block_id; skip pair if blocks differ.
+              - Read store_j.memory_location.
+              - Call must_alias(alias_context, location_i, location_j).
+              - On must-alias = 1, add i to store_j.kills set
+                (store_j kills the earlier store_i).
+        4. Return 1 unconditionally (success).
+    Complexity: O(store_count^2 * must_alias_cost). Acceptable in practice
+    because store_count rarely exceeds a few hundred per function.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -1310,7 +1873,7 @@ Process called "compute_store_kills" that takes dse_context as Integer returns I
                 Let location_j be proc memory_get_integer from Layout with store_j, location_j_offset
 
                 Note: Check if locations must alias
-                Let aliases be must_alias(alias_context, location_i, location_j)
+                Let aliases be proc must_alias with alias_context, location_i, location_j
 
                 If aliases is equal to 1:
                     Note: Store j kills store i (overwrites same location)
@@ -1331,16 +1894,46 @@ End Process
 
 Process called "analyze_store_liveness" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Performs backward data flow analysis to compute store liveness:
+    Performs backward data flow analysis to compute store liveness.
 
-    1. Initialize: all stores dead except those with observable effects
-    2. Mark stores with side effects as live (volatile, I/O, etc.)
-    3. Mark stores whose values are loaded as live
-    4. Propagate liveness backward through may-alias relationships
-    5. Iterate until fixed point
+    Phases:
+    1. Initialize: all stores dead except those with observable effects.
+    2. Mark stores with side effects as live (volatile, I/O, store-to-
+       global, store-to-escaped-pointer — see store_has_observable_effects).
+    3. Mark stores whose values are subsequently loaded as live (a load
+       that may-alias a store keeps that store live).
+    4. Propagate liveness backward through may-alias relationships: if a
+       live store's value depends on the result of an earlier load, the
+       store-instructions feeding that load become live by transitivity.
+    5. Iterate until fixed point (no new stores become live).
 
-    This is conservative - marks stores live if they MIGHT be used.
+    This is conservative — marks stores live if they MIGHT be used. False
+    positives waste optimization opportunity but never break correctness.
+
+    Convergence: liveness only grows (monotone increasing), and the set of
+    stores is finite, so the loop must terminate. A defensive cap of 50
+    iterations guards against pathological aliasing.
     @End Reasoning
+
+    @Implementation
+    Process: "analyze_store_liveness"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch stores list, store_count, alias_context, and cfg.
+        3. Phase 1: mark_stores_with_side_effects (initial live set).
+        4. Phase 2: mark_stores_used_by_loads (extend live set via loads).
+        5. Phase 3: iterative propagation.
+           a. Loop while a changed flag remains set.
+           b. For each store_i in stores:
+              - Read is_live; skip if 0 (only live stores propagate).
+              - Read stored_value.
+              - Call propagate_liveness_to_dependencies(ctx, stored_value)
+                to mark any store whose result flows into stored_value as
+                live. If new liveness was discovered, set changed.
+           c. Increment iteration counter; abort the loop with a warning
+              if it exceeds 50 (defensive cap).
+        6. Return 1.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -1359,10 +1952,10 @@ Process called "analyze_store_liveness" that takes dse_context as Integer return
     Let cfg be proc memory_get_integer from Layout with dse_context, cfg_offset
 
     Note: Phase 1: Mark stores with observable effects as live
-    mark_stores_with_side_effects(dse_context)
+    proc mark_stores_with_side_effects with dse_context
 
     Note: Phase 2: Mark stores whose values are loaded
-    mark_stores_used_by_loads(dse_context)
+    proc mark_stores_used_by_loads with dse_context
 
     Note: Phase 3: Iterative liveness propagation
     Let changed be 1
@@ -1385,7 +1978,7 @@ Process called "analyze_store_liveness" that takes dse_context as Integer return
                 Let stored_value be proc memory_get_integer from Layout with store_i, stored_value_offset
 
                 Note: If stored value comes from a load, mark that load's stores as live
-                Let result be propagate_liveness_to_dependencies(dse_context, stored_value)
+                Let result be proc propagate_liveness_to_dependencies with dse_context, stored_value
                 If result is equal to 1:
                     Set changed to 1
                 End If
@@ -1405,12 +1998,29 @@ End Process
 
 Process called "mark_stores_with_side_effects" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Marks stores that have observable side effects as live:
-    - Stores to volatile locations
-    - Stores to global variables
-    - Stores that escape the function
-    - Stores to I/O locations
+    Marks every store whose effects are observable outside the SSA value
+    graph as live. These stores cannot be eliminated under any alias
+    discipline because their visible behavior (volatile semantics, store
+    to global memory, store through an escaped pointer) is part of the
+    program's contract with the outside world.
+
+    Acts as the seed set for the liveness fixed-point computation: stores
+    transitively reachable from these will also become live.
     @End Reasoning
+
+    @Implementation
+    Process: "mark_stores_with_side_effects"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch stores list, store_count, and alias_context.
+        3. For each store_info in the stores list:
+           a. Read the underlying MIR instruction pointer.
+           b. Call store_has_observable_effects(inst, alias_context).
+           c. If 1, set store_info.is_live to 1 and increment marked_count.
+        4. Return marked_count.
+    Note: this pass runs once; the iterative liveness loop only consumes
+    its output, never re-invokes it.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -1435,7 +2045,7 @@ Process called "mark_stores_with_side_effects" that takes dse_context as Integer
         Let inst be proc memory_get_integer from Layout with store_info, inst_offset
 
         Note: Check if store has side effects
-        Let has_side_effects be store_has_observable_effects(inst, alias_context)
+        Let has_side_effects be proc store_has_observable_effects with inst, alias_context
 
         If has_side_effects is equal to 1:
             Let is_live_offset be proc offset_of_StoreInfo_is_live from Layout
@@ -1451,8 +2061,34 @@ End Process
 
 Process called "store_has_observable_effects" that takes inst as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Returns 1 if store has observable side effects.
+    Returns 1 if the store instruction has effects observable outside the
+    optimization's reach. Such stores are forced live in the liveness pass.
+
+    Three sufficient conditions:
+    1. The store is volatile (the IR carries an is_volatile flag set when
+       the source carries C-style volatile or Runa's equivalent).
+    2. The pointer operand denotes a global location (writes to globals are
+       visible to other compilation units and to debugger inspection).
+    3. The pointer operand has escaped the function (captured by an outer
+       pointer, returned, stored to memory the analysis cannot track).
+
+    All three are necessary checks because a store can be "ordinary" by one
+    measure yet observable by another (e.g., non-volatile but escaping).
     @End Reasoning
+
+    @Implementation
+    Process: "store_has_observable_effects"
+    Steps:
+        1. Reject null inst (return 0; no work).
+        2. Query MIRNodes.is_volatile_store; return 1 immediately if set.
+        3. Read the pointer operand via MIRNodes.get_store_pointer.
+        4. Call is_global_location(ptr, alias_context); return 1 if so.
+        5. Call pointer_escapes(ptr, alias_context); return 1 if escaped.
+        6. Return 0 (no observable effect detected).
+    Short-circuit ordering: cheapest predicate first (volatile flag is a
+    direct field read), then global check (O(memory_locations)), then
+    escape analysis (O(blocks * instructions) — the most expensive).
+    @End Implementation
 
     If inst is equal to 0:
         Return 0
@@ -1466,13 +2102,13 @@ Process called "store_has_observable_effects" that takes inst as Integer, alias_
 
     Note: Check if store to global
     Let ptr_reg be proc get_store_pointer from MIRNodes with inst
-    Let is_global be is_global_location(ptr_reg, alias_context)
+    Let is_global be proc is_global_location with ptr_reg, alias_context
     If is_global is equal to 1:
         Return 1
     End If
 
     Note: Check if store escapes
-    Let escapes be pointer_escapes(ptr_reg, alias_context)
+    Let escapes be proc pointer_escapes with ptr_reg, alias_context
     If escapes is equal to 1:
         Return 1
     End If
@@ -1482,8 +2118,33 @@ End Process
 
 Process called "is_global_location" that takes location as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Checks if location refers to global memory.
+    Reports whether the supplied SSA value's abstract memory location is
+    classified as global by the alias context.
+
+    Conservative default: when alias_context is null we return 1 (treat as
+    global) so callers that depend on this predicate err on the safe side
+    (the safe side here is to mark the store live).
+
+    Lookup discipline: we scan the alias context's memory_locations list
+    rather than relying on a hash from value-id to is_global flag, because
+    the same abstract location can be referenced by many SSA values; the
+    canonical attributes live with the MemoryLocation struct.
     @End Reasoning
+
+    @Implementation
+    Process: "is_global_location"
+    Steps:
+        1. If alias_context is null, return 1 (conservative: treat as global).
+        2. Fetch memory_locations list and location_count from the context.
+        3. For i in [0, location_count):
+           a. Read mem_loc = memory_locations[i].
+           b. Read mem_loc.base via Layout.offset_of_MemoryLocation_base.
+           c. If base equals the requested location, read mem_loc.is_global
+              via Layout.offset_of_MemoryLocation_is_global and return it.
+        4. Fall through: if no record matched, return 1 (conservative).
+    Conservativeness: returning 1 when we lack information forces the store
+    to be treated as observable, which is the safe direction for DSE.
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 1
@@ -1518,11 +2179,30 @@ End Process
 
 Process called "is_function_parameter" that takes value_id as Integer, cfg as Integer returns Integer:
     @Reasoning
-    Returns 1 if value_id is a function parameter.
+    Returns 1 if value_id is a function parameter (defined by an MIR_PARAM
+    instruction in the function entry block).
 
-    **IMPLEMENTATION:**
-    Check if the value is defined by a parameter instruction in the entry block.
+    Why this matters for DSE: stores into a value that came from a parameter
+    pointer may be visible to the caller, so they are considered escaping.
+    A precise pointer analysis would propagate escape facts; here we
+    short-circuit on the syntactic property of being a parameter.
     @End Reasoning
+
+    @Implementation
+    Process: "is_function_parameter"
+    Steps:
+        1. Reject null value_id or null cfg (return 0).
+        2. Fetch the entry block (block index 0).
+        3. Bail out (return 0) if the entry block pointer is null.
+        4. Get the entry block's instruction list via CFG.get_block_instructions.
+        5. Walk instructions; for each:
+           a. Read opcode; consider only MIR_PARAM (20024).
+           b. Read result_id at offset 8 of the instruction.
+           c. If result_id equals value_id, return 1.
+        6. After exhausting the entry block, return 0.
+    Edge case: MIR conventions place all parameter declarations at the top
+    of the entry block, so we never need to traverse further.
+    @End Implementation
 
     If value_id is equal to 0 or cfg is equal to 0:
         Return 0
@@ -1560,14 +2240,29 @@ End Process
 
 Process called "is_allocation_function" that takes function_name_ptr as Integer returns Integer:
     @Reasoning
-    Returns 1 if function name is a known allocation function.
+    Returns 1 if function name matches a known heap-allocation function.
 
-    **KNOWN ALLOCATORS:**
-    - malloc, calloc, realloc, aligned_alloc
-    - new, new[] (C++)
-    - GC_malloc (Boehm GC)
-    - Custom allocators can be registered via compiler flags
+    KNOWN ALLOCATORS:
+    - malloc, calloc, realloc, aligned_alloc (POSIX C)
+    - operator new (C++)
+    - GC_malloc (Boehm garbage collector)
+    Custom allocators can be added by extending the list below.
+
+    Why this exists: the escape and heap-flag analyses need to identify
+    heap allocations to classify the returned pointer correctly. Distinct
+    allocators map to distinct abstract MemoryLocations.
     @End Reasoning
+
+    @Implementation
+    Process: "is_allocation_function"
+    Steps:
+        1. Reject null function_name_ptr (return 0).
+        2. Compare against each known allocator name in turn using
+           StringCore.string_equals; return 1 on the first match.
+        3. Return 0 if no allocator name matched.
+    Comparison order: most common first (malloc, calloc) so the common
+    case short-circuits early; rare names (GC_malloc) checked last.
+    @End Implementation
 
     If function_name_ptr is equal to 0:
         Return 0
@@ -1618,11 +2313,31 @@ End Process
 
 Process called "is_heap_allocation" that takes value_id as Integer, cfg as Integer returns Integer:
     @Reasoning
-    Returns 1 if value_id is a heap allocation (malloc, calloc, etc.).
+    Returns 1 if value_id is a heap allocation, either via the MIR_ALLOC
+    opcode (Runa heap allocation) or via a CALL to a known allocator.
 
-    **IMPLEMENTATION:**
-    Check if the value is defined by a call to allocation functions.
+    Stores into heap allocations are conservatively escaping because heap
+    data may outlive the function and be visible to other code paths.
     @End Reasoning
+
+    @Implementation
+    Process: "is_heap_allocation"
+    Steps:
+        1. Reject null value_id or null cfg (return 0).
+        2. Walk every block. For each instruction:
+           a. Read result_id (offset 8); skip if not equal to value_id.
+           b. Read opcode.
+           c. If opcode is MIR_ALLOC (20022), return 1.
+           d. If opcode is MIR_CALL (20008):
+              - Read callee via MIRNodes.get_call_target.
+              - If is_allocation_function(callee) returns 1, return 1.
+              - Otherwise return 1 conservatively (unknown function may
+                allocate; we cannot prove it does not).
+           e. Any other defining opcode: return 0 (definitely not heap).
+        3. If we never found the definition, return 1 (conservative
+           default — the alias context lacks the producer, so assume
+           heap to keep the store live).
+    @End Implementation
 
     If value_id is equal to 0 or cfg is equal to 0:
         Return 0
@@ -1655,7 +2370,7 @@ Process called "is_heap_allocation" that takes value_id as Integer, cfg as Integ
                         Let callee be proc get_call_target from MIRNodes with inst
 
                         Note: Check if callee is known allocation function
-                        Let is_alloc_fn be is_allocation_function(callee)
+                        Let is_alloc_fn be proc is_allocation_function with callee
                         If is_alloc_fn is equal to 1:
                             Return 1
                         End If
@@ -1703,6 +2418,29 @@ Process called "pointer_escapes" that takes pointer as Integer, alias_context as
     It provides precise escape analysis for local stack allocations
     while being conservative for heap allocations and function parameters.
     @End Performance_Hints
+
+    @Implementation
+    Process: "pointer_escapes"
+    Steps:
+        1. Null-guard pointer and alias_context (both return 1: conservative).
+        2. Fetch cfg from alias_context.
+        3. For every block, for every instruction:
+           a. Read opcode.
+           b. MIR_RETURN (20009): read return_value; if equals pointer,
+              the pointer escapes via return — return 1.
+           c. MIR_CALL (20008): walk every call argument; if any equals
+              pointer, the pointer escapes via call — return 1.
+           d. MIR_STORE (20020): if stored_value equals pointer:
+              - Read dest_ptr (the address being stored INTO).
+              - is_function_parameter(dest_ptr, cfg) -> escapes via param.
+              - is_heap_allocation(dest_ptr, cfg) -> escapes via heap store.
+              - In either case, return 1.
+           e. MIR_PHI (20023): if result_id equals pointer, skip (this
+              is the PHI defining the pointer, not a use).
+        4. Return 0 (no escape path observed).
+    Soundness: any condition we cannot decide is treated as escape (return 1).
+    The default-1 contract on null inputs is critical to that discipline.
+    @End Implementation
 
     If pointer is equal to 0:
         Return 1
@@ -1768,13 +2506,13 @@ Process called "pointer_escapes" that takes pointer as Integer, alias_context as
                         Note: we can prove the destination is local stack memory
 
                         Note: If storing to function parameter or global, escapes
-                        Let dest_is_param be is_function_parameter(dest_ptr, cfg)
+                        Let dest_is_param be proc is_function_parameter with dest_ptr, cfg
                         If dest_is_param is equal to 1:
                             Return 1
                         End If
 
                         Note: If storing to heap allocation, escapes
-                        Let dest_is_heap be is_heap_allocation(dest_ptr, cfg)
+                        Let dest_is_heap be proc is_heap_allocation with dest_ptr, cfg
                         If dest_is_heap is equal to 1:
                             Return 1
                         End If
@@ -1802,12 +2540,33 @@ End Process
 
 Process called "mark_stores_used_by_loads" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Marks stores whose stored values are loaded as live.
+    Marks stores whose written values may be loaded later as live.
 
     For each load instruction:
-    - Find stores that may provide the loaded value
-    - Mark those stores as live
+    - Compute may_alias(load.pointer, store.memory_location) for every
+      collected store
+    - Every may-aliasing store is conservatively kept live, because the
+      load could observe its written value at run time
+
+    This is the second seed phase for the liveness fixed point (after
+    mark_stores_with_side_effects). The fixed point then propagates from
+    here through data-flow dependencies in propagate_liveness_to_dependencies.
     @End Reasoning
+
+    @Implementation
+    Process: "mark_stores_used_by_loads"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch cfg, stores, store_count, and alias_context.
+        3. For every block, for every instruction with opcode MIR_LOAD (20021):
+           a. Read the load's pointer operand.
+           b. For each store_info in the stores list:
+              - Read store_info.memory_location.
+              - Call may_alias(alias_context, load_ptr, store_location).
+              - If may-alias and store_info.is_live was 0, set it to 1
+                and increment marked_count.
+        4. Return marked_count.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -1853,7 +2612,7 @@ Process called "mark_stores_used_by_loads" that takes dse_context as Integer ret
                     Let store_location be proc memory_get_integer from Layout with store_info, location_offset
 
                     Note: Check if load and store may alias
-                    Let aliases be may_alias(alias_context, ptr_reg, store_location)
+                    Let aliases be proc may_alias with alias_context, ptr_reg, store_location
 
                     If aliases is equal to 1:
                         Note: This store may be loaded, mark as live
@@ -1904,6 +2663,36 @@ Process called "propagate_liveness_to_dependencies" that takes dse_context as In
     The visited set prevents exponential blowup from shared dependencies.
     @End Performance_Hints
 
+    @Implementation
+    Process: "propagate_liveness_to_dependencies"
+    Steps:
+        1. Null-guard dse_context and value_reg.
+        2. Fetch cfg, stores list, and alias_context from DSE context.
+        3. Create a visited Set (prevents re-walking the same SSA value).
+        4. Create a worklist List seeded with value_reg.
+        5. Loop while the worklist is non-empty:
+           a. Pop the head of the worklist as current_value.
+           b. If already visited, continue. Otherwise add to visited.
+           c. Locate the defining instruction via find_defining_instruction.
+           d. Skip if no defining instruction exists (parameter or constant).
+           e. Dispatch on opcode of the defining instruction:
+              - MIR_LOAD (20019): for every store that may-aliases the
+                load pointer, mark it live (if not already), increment
+                marked_count, and append the store's stored value to
+                the worklist. Also enqueue the pointer operand.
+              - Binary ops (MIR_ADD 20010 / MIR_SUB 20011 / MIR_MUL 20012 /
+                MIR_DIV 20013 / MIR_MOD 20014): enqueue left and right.
+              - MIR_CMP (20015): enqueue cmp_left and cmp_right.
+              - Unary ops (MIR_NEG 20016 / MIR_NOT 20017): enqueue the
+                unary operand.
+              - MIR_PHI (20023): enqueue every PHI operand value.
+              - MIR_CALL (20008): enqueue every call argument.
+        6. Destroy the visited Set and worklist List.
+        7. Return marked_count.
+    Correctness: the visited set is critical; otherwise PHI nodes can
+    create cycles that would loop indefinitely.
+    @End Implementation
+
     If dse_context is equal to 0 or value_reg is equal to 0:
         Return 0
     End If
@@ -1941,7 +2730,7 @@ Process called "propagate_liveness_to_dependencies" that takes dse_context as In
             proc add from Set with visited, current_value
 
             Note: Find instruction defining current_value
-            Let def_inst be find_defining_instruction(cfg, current_value)
+            Let def_inst be proc find_defining_instruction with cfg, current_value
             If def_inst is not equal to 0:
                 Let opcode be proc get_opcode from MIRNodes with def_inst
 
@@ -1960,7 +2749,7 @@ Process called "propagate_liveness_to_dependencies" that takes dse_context as In
                         Let store_ptr be proc get_store_pointer from MIRNodes with store_inst
 
                         Note: Check if store and load alias using proper alias analysis
-                        Let aliases be may_alias(alias_context, store_ptr, ptr)
+                        Let aliases be proc may_alias with alias_context, store_ptr, ptr
                         If aliases is equal to 1:
                             Note: This store may provide the load - mark as live
                             Let is_live_offset be proc offset_of_StoreInfo_is_live from Layout
@@ -2040,12 +2829,35 @@ End Process
 
 Process called "find_defining_instruction" that takes cfg as Integer, value_id as Integer returns Integer:
     @Reasoning
-    Finds the instruction that defines value_id.
+    Finds the instruction that defines value_id by performing a linear
+    scan over every instruction in every block. Returns the instruction
+    pointer or 0 if no defining instruction is recorded.
 
-    **IMPLEMENTATION:**
-    Linear search through all blocks and instructions.
-    Returns pointer to defining instruction or 0 if not found.
+    The MIR encoding places the result SSA id at offset 8 of every value-
+    producing instruction, so the search is a single read per instruction.
+
+    Why linear rather than a cached map: this helper is invoked from the
+    liveness fixed-point loop where the search is bounded by the function
+    body's instruction count and the visited-set caching in the caller
+    keeps the amortized cost low. A persistent value-to-instruction map
+    would have to be invalidated on every IR mutation; the linear scan
+    is robust under arbitrary intermediate edits.
     @End Reasoning
+
+    @Implementation
+    Process: "find_defining_instruction"
+    Steps:
+        1. Reject null cfg or null value_id (return 0).
+        2. Read block_count.
+        3. For each block i:
+           a. Get the block via CFG.get_block.
+           b. Get the block's instruction list.
+           c. For each instruction j:
+              - Skip null entries.
+              - Read result_id at offset 8 via Layout.memory_get_int64.
+              - If equal to value_id, return the instruction pointer.
+        4. Return 0 (not found).
+    @End Implementation
 
     If cfg is equal to 0 or value_id is equal to 0:
         Return 0
@@ -2079,10 +2891,34 @@ End Process
 
 Process called "eliminate_dead_stores" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Removes all stores marked as dead (is_live = 0).
+    Removes from the MIR every store whose StoreInfo.is_live remains 0
+    after the liveness fixed point has converged.
 
-    Returns count of eliminated stores.
+    The liveness pass is the predicate: anything not provably needed (by
+    side effects, by a downstream load, or by transitive data flow) is
+    safe to delete. Removal is performed via MIRNodes.remove_instruction
+    which detaches the instruction from its block while preserving SSA
+    invariants of remaining users.
+
+    Returns count of stores actually eliminated (remove_instruction may
+    fail in pathological cases — e.g., when the store has uses that the
+    liveness analysis missed — in which case we count only successes).
     @End Reasoning
+
+    @Implementation
+    Process: "eliminate_dead_stores"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch stores list and store_count.
+        3. Iterate i over [0, store_count):
+           a. Read store_info.is_live.
+           b. If is_live == 0:
+              - Read store_info.instruction.
+              - Call proc remove_instruction from MIRNodes on the inst.
+              - If it returned 1, increment eliminated_count.
+        4. Write eliminated_count back into DSEContext.eliminated_count.
+        5. Return eliminated_count.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -2130,15 +2966,38 @@ Note: ==========================================================================
 
 Process called "perform_store_to_load_forwarding" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Performs store-to-load forwarding optimization:
+    Performs store-to-load forwarding optimization.
 
     For each load L from location M:
-    - Find dominating store S to location M
-    - If M must-alias and no intervening stores:
-        Replace L's result with S's stored value
+    - Find a dominating store S writing to a location must-aliasing M.
+    - If found, replace L's result with S's stored value.
 
-    This eliminates unnecessary memory roundtrips.
+    This eliminates a memory round-trip: rather than spill the value out
+    to memory and read it back, downstream uses of L are rewired to use
+    S's stored value directly. The original store is left in place;
+    subsequent DSE iterations may remove it if it is no longer needed.
+
+    must_alias (not may_alias) is required: forwarding a value from a
+    location that only might match would be unsound (the load could
+    actually observe a different value at run time).
     @End Reasoning
+
+    @Implementation
+    Process: "perform_store_to_load_forwarding"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch cfg, stores, store_count, and alias_context.
+        3. For each block, for each instruction with opcode MIR_LOAD (20021):
+           a. Read load.pointer.
+           b. Call find_dominating_store(ctx, block_idx, inst_idx, ptr).
+           c. If non-null:
+              - Read the dominating store's stored_value.
+              - Call proc replace_load_with_value from MIRNodes with the
+                load instruction and the stored value.
+              - On success, increment forwarded_count.
+        4. Write forwarded_count back into DSEContext.forwarded_count.
+        5. Return forwarded_count.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -2176,7 +3035,7 @@ Process called "perform_store_to_load_forwarding" that takes dse_context as Inte
                 Let ptr_reg be proc get_load_pointer from MIRNodes with inst
 
                 Note: Find dominating store
-                Let dominating_store be find_dominating_store(dse_context, block_idx, inst_idx, ptr_reg)
+                Let dominating_store be proc find_dominating_store with dse_context, block_idx, inst_idx, ptr_reg
 
                 If dominating_store is not equal to 0:
                     Note: Forward store value to load
@@ -2205,13 +3064,38 @@ End Process
 
 Process called "find_dominating_store" that takes dse_context as Integer, load_block as Integer, load_inst_idx as Integer, load_ptr as Integer returns Integer:
     @Reasoning
-    Finds the nearest dominating store that must-alias with the load location.
+    Finds the nearest dominating store that must-alias the load location.
 
-    Searches backward from load instruction in same block first,
-    then considers dominating blocks.
+    Implementation strategy: scan stores in reverse order (nearest first).
+    A store dominates a load in the same block when it appears at a lower
+    instruction index. For full cross-block dominance, the dominance tree
+    would be consulted; the current scope is intra-block forwarding
+    (the common case).
 
-    Returns StoreInfo pointer or 0 if none found.
+    must-alias is required (not may-alias): forwarding under may-alias is
+    unsound (see perform_store_to_load_forwarding).
+
+    Returns the StoreInfo pointer of the dominating store, or 0 if none
+    is found within the current block.
     @End Reasoning
+
+    @Implementation
+    Process: "find_dominating_store"
+    Steps:
+        1. Null-guard dse_context (return 0).
+        2. Fetch stores, store_count, alias_context, cfg.
+        3. Iterate stores backward: i from store_count - 1 down to 0.
+        4. For each store_info:
+           a. Read store_info.block_id; skip unless equal to load_block.
+           b. Read the underlying store instruction.
+           c. Look up the store's index in the block's instruction list
+              by linear scan over CFG.get_block_instructions.
+           d. If store_inst_idx is in [0, load_inst_idx):
+              - Read store_info.memory_location.
+              - Call must_alias(alias_context, load_ptr, store_location).
+              - On must-alias = 1, return store_info.
+        5. Return 0 (no dominating store found).
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -2267,7 +3151,7 @@ Process called "find_dominating_store" that takes dse_context as Integer, load_b
                 Let store_location be proc memory_get_integer from Layout with store_info, location_offset
 
                 Note: Check if must-alias
-                Let aliases be must_alias(alias_context, load_ptr, store_location)
+                Let aliases be proc must_alias with alias_context, load_ptr, store_location
 
                 If aliases is equal to 1:
                     Note: Found dominating store with must-alias
@@ -2289,16 +3173,45 @@ Note: ==========================================================================
 
 Process called "eliminate_dead_stack_stores" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Eliminates stores to stack locations that are never read:
+    Eliminates stores to stack locations that are never read.
 
-    1. Identify stack allocations (alloca)
-    2. Find stores to those locations
-    3. Check if stored values are ever loaded
-    4. Eliminate stores with no loads
+    Stack locations have a strictly bounded scope: anything written to a
+    stack slot can only be observed within the function (assuming the
+    address does not escape). When no subsequent load aliases the stack
+    slot, the store is provably dead, irrespective of side-effect rules
+    that apply to global or heap memory.
 
-    This is more aggressive than general DSE because stack locations
-    have limited scope.
+    Steps:
+    1. Identify stack allocations (alloca) via is_stack_location.
+    2. Find stores to those locations.
+    3. Check whether the stack location is ever loaded.
+    4. Eliminate stores when no load is observed.
+
+    This pass is more aggressive than general DSE because stack-locality
+    gives us a stronger structural argument for deadness.
     @End Reasoning
+
+    @Implementation
+    Process: "eliminate_dead_stack_stores"
+    Steps:
+        1. Null-guard dse_context.
+        2. Fetch stores, store_count, alias_context.
+        3. For each store_info in stores:
+           a. Read store_info.memory_location.
+           b. Call is_stack_location(location, alias_context).
+           c. If stack-classified:
+              - Call stack_location_is_loaded(ctx, location) to test for
+                any may-aliasing load anywhere in the CFG.
+              - If never loaded:
+                * Read store_info.instruction.
+                * Call proc remove_instruction from MIRNodes on the inst.
+                * Increment eliminated_count on success.
+        4. Write eliminated_count back into DSEContext.stack_eliminated_count.
+        5. Return eliminated_count.
+    Soundness: this elimination relies on the escape analysis built into
+    the alias context — if a stack address has escaped (e.g., its pointer
+    is returned), the location should already not be classified as stack.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -2324,11 +3237,11 @@ Process called "eliminate_dead_stack_stores" that takes dse_context as Integer r
         Let location be proc memory_get_integer from Layout with store_info, location_offset
 
         Note: Check if location is stack
-        Let is_stack be is_stack_location(location, alias_context)
+        Let is_stack be proc is_stack_location with location, alias_context
 
         If is_stack is equal to 1:
             Note: Check if this stack store is ever loaded
-            Let is_loaded be stack_location_is_loaded(dse_context, location)
+            Let is_loaded be proc stack_location_is_loaded with dse_context, location
 
             If is_loaded is equal to 0:
                 Note: Stack store is never loaded, eliminate it
@@ -2354,8 +3267,27 @@ End Process
 
 Process called "is_stack_location" that takes location as Integer, alias_context as Integer returns Integer:
     @Reasoning
-    Checks if location refers to stack memory.
+    Reports whether the abstract memory location at the given key is
+    classified as stack-allocated.
+
+    Conservative default: when alias_context is null we return 0 (NOT
+    stack). Unlike is_global_location which returns 1 in the null case
+    (treat as observable), is_stack_location returns 0 because callers
+    use this to enable aggressive elimination — defaulting to "yes,
+    stack" would be unsound.
     @End Reasoning
+
+    @Implementation
+    Process: "is_stack_location"
+    Steps:
+        1. Null-guard alias_context (return 0).
+        2. Fetch memory_locations list and location_count.
+        3. For each mem_loc in the list:
+           a. Read mem_loc.base.
+           b. If base equals the queried location, read mem_loc.is_stack
+              via the Layout offset and return it.
+        4. Fall through: return 0 (no record means not classified stack).
+    @End Implementation
 
     If alias_context is equal to 0:
         Return 0
@@ -2389,8 +3321,29 @@ End Process
 
 Process called "stack_location_is_loaded" that takes dse_context as Integer, location as Integer returns Integer:
     @Reasoning
-    Returns 1 if location is ever loaded from.
+    Returns 1 if any load anywhere in the CFG may-aliases the given stack
+    location. Used by eliminate_dead_stack_stores to decide whether a
+    stack store can be safely removed.
+
+    Uses may-alias (not must-alias) because the goal is to find ANY
+    possible reader — being conservative here means we keep more stores
+    alive, which is the safe direction. A false-positive load (we report
+    it is loaded when in reality the may-alias never fires) only costs
+    optimization; a false-negative would silently corrupt the program.
     @End Reasoning
+
+    @Implementation
+    Process: "stack_location_is_loaded"
+    Steps:
+        1. Null-guard dse_context (return 0).
+        2. Fetch cfg and alias_context.
+        3. Walk every block, every instruction:
+           a. Read opcode; consider only MIR_LOAD (20021).
+           b. Read the load's pointer operand.
+           c. Call may_alias(alias_context, ptr_reg, location).
+           d. If may-alias, return 1 immediately.
+        4. Return 0 (no aliasing load found).
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -2420,7 +3373,7 @@ Process called "stack_location_is_loaded" that takes dse_context as Integer, loc
                 Let ptr_reg be proc get_load_pointer from MIRNodes with inst
 
                 Note: Check if may alias with our location
-                Let aliases be may_alias(alias_context, ptr_reg, location)
+                Let aliases be proc may_alias with alias_context, ptr_reg, location
 
                 If aliases is equal to 1:
                     Return 1
@@ -2442,17 +3395,39 @@ Note: ==========================================================================
 
 Process called "run_dse_algorithm" that takes dse_context as Integer returns Integer:
     @Reasoning
-    Main DSE orchestrator. Runs all phases in sequence:
+    Main DSE orchestrator. Drives the six analysis and transformation
+    phases in the order required for soundness:
 
-    1. Collect stores
-    2. Compute kill sets
-    3. Analyze store liveness
-    4. Eliminate dead stores
-    5. Perform store-to-load forwarding
-    6. Eliminate dead stack stores
+    1. collect_stores       - populate the StoreInfo worklist.
+    2. compute_store_kills  - find same-block kill pairs.
+    3. analyze_store_liveness - data-flow seed and propagate liveness.
+    4. eliminate_dead_stores  - remove every store still marked dead.
+    5. perform_store_to_load_forwarding - rewire loads to prior stores.
+    6. eliminate_dead_stack_stores - aggressive stack-local cleanup.
+
+    Phase ordering matters: liveness analysis (3) must precede elimination
+    (4) since it computes the predicate. Forwarding (5) operates on the
+    surviving stores; the stack cleanup (6) runs last so it does not
+    interfere with the earlier liveness-driven elimination.
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Process: "run_dse_algorithm"
+    Steps:
+        1. Null-guard dse_context.
+        2. Print a startup banner via Display.
+        3. Phase 1: store_count = collect_stores(ctx).
+           - Print the count; return 1 (success-no-op) if zero.
+        4. Phase 2: compute_store_kills(ctx).
+        5. Phase 3: analyze_store_liveness(ctx).
+        6. Phase 4: eliminated = eliminate_dead_stores(ctx); display count.
+        7. Phase 5: forwarded = perform_store_to_load_forwarding(ctx); display.
+        8. Phase 6: stack_eliminated = eliminate_dead_stack_stores(ctx); display.
+        9. Display the completion message.
+        10. Return 1.
+    @End Implementation
 
     If dse_context is equal to 0:
         Return 0
@@ -2463,7 +3438,7 @@ Process called "run_dse_algorithm" that takes dse_context as Integer returns Int
 
     Note: Phase 1: Collect stores
     Display "Phase 1: Collecting stores..."
-    Let store_count be collect_stores(dse_context)
+    Let store_count be proc collect_stores with dse_context
     Display "Found " joined with store_count joined with " stores"
     Display ""
 
@@ -2474,29 +3449,29 @@ Process called "run_dse_algorithm" that takes dse_context as Integer returns Int
 
     Note: Phase 2: Compute kill sets
     Display "Phase 2: Computing store kill sets..."
-    compute_store_kills(dse_context)
+    proc compute_store_kills with dse_context
     Display ""
 
     Note: Phase 3: Analyze liveness
     Display "Phase 3: Analyzing store liveness..."
-    analyze_store_liveness(dse_context)
+    proc analyze_store_liveness with dse_context
     Display ""
 
     Note: Phase 4: Eliminate dead stores
     Display "Phase 4: Eliminating dead stores..."
-    Let eliminated be eliminate_dead_stores(dse_context)
+    Let eliminated be proc eliminate_dead_stores with dse_context
     Display "Eliminated " joined with eliminated joined with " dead stores"
     Display ""
 
     Note: Phase 5: Store-to-load forwarding
     Display "Phase 5: Performing store-to-load forwarding..."
-    Let forwarded be perform_store_to_load_forwarding(dse_context)
+    Let forwarded be proc perform_store_to_load_forwarding with dse_context
     Display "Forwarded " joined with forwarded joined with " stores to loads"
     Display ""
 
     Note: Phase 6: Dead stack store elimination
     Display "Phase 6: Eliminating dead stack stores..."
-    Let stack_eliminated be eliminate_dead_stack_stores(dse_context)
+    Let stack_eliminated be proc eliminate_dead_stack_stores with dse_context
     Display "Eliminated " joined with stack_eliminated joined with " dead stack stores"
     Display ""
 
@@ -2511,15 +3486,21 @@ Note: ==========================================================================
 
 Process called "optimize_dead_store_elimination" that takes cfg as Integer returns Integer:
     @Reasoning
-    **MAIN STANDALONE ENTRY POINT**
+    MAIN STANDALONE ENTRY POINT.
 
-    Runs dead store elimination independently.
-    Can be called outside the main optimization pipeline.
+    Runs dead store elimination independently. Can be called outside the
+    main optimization pipeline (e.g., from focused unit tests or from
+    debugging tools that want to run DSE in isolation).
 
-    **USAGE:**
+    Responsibilities beyond the algorithm itself:
+    - Allocate and own the DSEContext lifetime.
+    - Verify the MIR after transformation (catches optimizer bugs early).
+    - Print human-readable statistics.
+
+    USAGE:
     ```
-    Let cfg be mir_builder_build(hir_function)
-    Let success be optimize_dead_store_elimination(cfg)
+    Let cfg be proc mir_builder_build with hir_function
+    Let success be proc optimize_dead_store_elimination with cfg
     If success is equal to 1:
         Note: DSE completed successfully
     End If
@@ -2527,6 +3508,30 @@ Process called "optimize_dead_store_elimination" that takes cfg as Integer retur
 
     Returns 1 if successful, 0 if failed.
     @End Reasoning
+
+    @Implementation
+    Process: "optimize_dead_store_elimination"
+    Steps:
+        1. Reject null cfg (display error, return 0).
+        2. Print start banner.
+        3. Create the DSE context (calls create_dse_context).
+        4. Run the algorithm via run_dse_algorithm.
+        5. Verify the resulting MIR via Verifier.verify_mir.
+           - On failure, print an error, destroy the context, return 0.
+        6. Print statistics via print_dse_stats.
+        7. Destroy the context.
+        8. Print completion banner.
+        9. Return the run_dse_algorithm result.
+    Lifetime guarantee: the DSE context is always destroyed before
+    returning, even on the verification-failure path, preventing leaks.
+    @End Implementation
+
+    @Security_Scope
+    This entry point runs a sound optimization that may delete MIR
+    instructions. Verification is mandatory in standalone mode to catch
+    any bug that would otherwise produce silently incorrect code; the
+    failure path refuses to return success without verification passing.
+    @End Security_Scope
 
     If cfg is equal to 0:
         Display "optimize_dead_store_elimination: null CFG"
@@ -2539,14 +3544,14 @@ Process called "optimize_dead_store_elimination" that takes cfg as Integer retur
     Display ""
 
     Note: Create DSE context
-    Let context_ptr be create_dse_context(cfg)
+    Let context_ptr be proc create_dse_context with cfg
     If context_ptr is equal to 0:
         Display "optimize_dead_store_elimination: failed to create context"
         Return 0
     End If
 
     Note: Run DSE algorithm
-    Let result be run_dse_algorithm(context_ptr)
+    Let result be proc run_dse_algorithm with context_ptr
 
     Note: Verify MIR correctness
     Display ""
@@ -2555,17 +3560,17 @@ Process called "optimize_dead_store_elimination" that takes cfg as Integer retur
     If verification_result is equal to 0:
         Display "ERROR: MIR verification failed after DSE"
         Display "This indicates a bug in the optimizer"
-        destroy_dse_context(context_ptr)
+        proc destroy_dse_context with context_ptr
         Return 0
     End If
     Display "MIR verification passed"
 
     Note: Print statistics
     Display ""
-    print_dse_stats(context_ptr)
+    proc print_dse_stats with context_ptr
 
     Note: Cleanup
-    destroy_dse_context(context_ptr)
+    proc destroy_dse_context with context_ptr
 
     Display ""
     Display "============================================"
@@ -2577,19 +3582,47 @@ End Process
 
 Process called "run_dead_store_elimination_pass" that takes optimizer_context as Integer returns Integer:
     @Reasoning
-    **PIPELINE INTEGRATION ENTRY POINT**
+    PIPELINE INTEGRATION ENTRY POINT.
 
-    Runs DSE as part of mir_optimizer.runa pipeline.
-    Coordinates with other optimizations.
+    Runs DSE as part of the mir_optimizer.runa pipeline. Coordinates with
+    other optimizations by reading the cfg pointer from the optimizer
+    context at offset 0 and writing the count of eliminated instructions
+    into the shared deletion-counter at offset 40.
 
-    **USAGE (from mir_optimizer.runa):**
+    Differs from optimize_dead_store_elimination in three ways:
+    1. Does not own the cfg; obtains it from the pipeline context.
+    2. Skips the standalone MIR verifier (the pipeline driver invokes
+       a verification pass between optimizations).
+    3. Returns the total count of optimizations applied (eliminated +
+       forwarded + stack-eliminated) for the pipeline driver to aggregate.
+
+    USAGE (from mir_optimizer.runa):
     ```
     Note: After DCE and other optimizations
-    Let dse_result be run_dead_store_elimination_pass(context_ptr)
+    Let dse_result be proc run_dead_store_elimination_pass with context_ptr
     ```
 
-    Returns number of stores eliminated + forwarded.
+    Returns total optimization count.
     @End Reasoning
+
+    @Implementation
+    Process: "run_dead_store_elimination_pass"
+    Steps:
+        1. Reject null optimizer_context (return 0).
+        2. Print start message.
+        3. Read cfg from optimizer_context offset 0.
+        4. Create the DSE context (create_dse_context).
+        5. Bail with 0 if context creation failed.
+        6. Run run_dse_algorithm.
+        7. Read eliminated_count, forwarded_count, stack_eliminated_count
+           from the DSE context.
+        8. Compute total = eliminated + forwarded + stack_eliminated.
+        9. Read the pipeline's deleted-count from optimizer_context+40
+           and write back current_deleted + total (cumulative across
+           pipeline passes).
+        10. Destroy the DSE context.
+        11. Print the total and return it.
+    @End Implementation
 
     If optimizer_context is equal to 0:
         Return 0
@@ -2601,13 +3634,13 @@ Process called "run_dead_store_elimination_pass" that takes optimizer_context as
     Let cfg be proc memory_get_int64 from Layout with optimizer_context, 0
 
     Note: Create DSE context
-    Let dse_context be create_dse_context(cfg)
+    Let dse_context be proc create_dse_context with cfg
     If dse_context is equal to 0:
         Return 0
     End If
 
     Note: Run DSE
-    run_dse_algorithm(dse_context)
+    proc run_dse_algorithm with dse_context
 
     Note: Get totals
     Let eliminated_offset be proc offset_of_DSEContext_eliminated_count from Layout
@@ -2626,7 +3659,7 @@ Process called "run_dead_store_elimination_pass" that takes optimizer_context as
     proc memory_set_int64 from Layout with optimizer_context, 40, current_deleted plus total
 
     Note: Cleanup
-    destroy_dse_context(dse_context)
+    proc destroy_dse_context with dse_context
 
     Display "run_dead_store_elimination_pass: total optimizations = " joined with total
     Return total

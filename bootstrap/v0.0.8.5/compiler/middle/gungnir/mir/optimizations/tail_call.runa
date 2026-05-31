@@ -37,6 +37,7 @@ This file consists of the following functions/features/operation types:
 
 Note: ========== IMPORTS ==========
 Import "compiler/middle/gungnir/mir/mir.runa" as MIR
+Import "compiler/middle/gungnir/mir/mir_nodes.runa" as MIRNodes
 Import "compiler/middle/gungnir/mir/cfg.runa" as CFG
 Import "compiler/middle/gungnir/mir/ssa.runa" as SSA
 Import "compiler/middle/gungnir/mir/dominance.runa" as Dominance
@@ -101,6 +102,15 @@ Note: ============================================================
 Note: CONTEXT MANAGEMENT
 Note: ============================================================
 
+@Reasoning
+Construction is centralised so every downstream pass receives a context with predictable
+field layout and zeroed counters. The cfg pointer is captured at construction time because
+tail-call analysis is inherently scoped to a single CFG and we want every later helper to
+read it from one canonical slot. Caches (call-convention, instruction) are allocated up
+front so the hot loops in collect_tail_call_sites and check_calling_convention_compatibility
+can assume non-null dictionaries and avoid per-call null checks.
+@End Reasoning
+
 @Implementation
 Creates and initializes a TailCallContext structure for a given CFG.
 All counters start at zero, and caches are initialized as empty collections.
@@ -163,6 +173,15 @@ Process called "create_tail_call_context" that takes cfg_ptr as Integer returns 
     Return context
 End Process
 
+@Reasoning
+The context owns three transitive allocations (sites list, two dictionaries) plus an
+optional dominance tree, and each TailCallSite is itself a heap object. We free in the
+inverse order of construction so dangling references cannot occur even if a future
+extension caches cross-references between caches and site records. The destructor is
+defensive (early-returns on null and per-slot null checks) so it is safe to call from
+error-recovery paths in optimize_function_with_tail_call without partial-init risk.
+@End Reasoning
+
 @Implementation
 Destroys a TailCallContext and frees all associated memory.
 This includes freeing all tail call site structures, caches, and the context itself.
@@ -211,6 +230,15 @@ Process called "destroy_tail_call_context" that takes context_ptr as Integer ret
     Note: Free context structure
     proc deallocate from Layout with context_ptr
 End Process
+
+@Reasoning
+Stats output is the only feedback channel the pass exposes when running outside of a
+debugger, and the four counters reported here (tail recursion eliminations, sibling
+marks, total tail calls identified, blocks analysed) are precisely the four metrics that
+let a CI dashboard distinguish "pass disabled" from "pass ran but found nothing" from
+"pass ran and rewrote N sites". Keeping the format stable across versions matters for
+that downstream consumer.
+@End Reasoning
 
 @Implementation
 Prints statistics about tail call optimization transformations.
@@ -271,6 +299,24 @@ Algorithm:
 
 Returns 1 if in tail position, 0 otherwise.
 @End Implementation
+
+@Performance_Hints
+Call-shape detection is constant-time in the common in-block case — we peek at the next
+instruction — and at worst linear in successor count when the call sits at a block
+terminator. We deliberately do not walk arbitrary chains of single-successor blocks:
+that would push detection toward block-count work per call and the upstream MIR-builder
+already collapses trivial branch chains. Conservative single-hop lookahead therefore
+captures the realistic patterns while keeping the predicate cheap enough to run
+unconditionally on every CALL site in collect_tail_call_sites.
+@End Performance_Hints
+
+@Security_Scope
+A false positive here would let a non-tail call be rewritten as a jump, corrupting the
+caller's stack frame at runtime. We therefore default to 0 on every uncertain path
+(missing parent block, non-RETURN successor first instruction, mismatched return operand)
+rather than assuming benign shape. This conservative bias is intentional and must be
+preserved by any future refinement that adds new call-shape patterns.
+@End Security_Scope
 
 Process called "is_tail_position" that takes call_inst_ptr as Integer, context_ptr as Integer returns Integer:
     If call_inst_ptr is equal to 0 or context_ptr is equal to 0:
@@ -468,7 +514,7 @@ Process called "collect_tail_call_sites" that takes context_ptr as Integer retur
                         Note: Check if this is a CALL instruction
                         If opcode is equal to MIR.MIR_CALL:
                             Note: Check if call is in tail position
-                            Let in_tail_pos be is_tail_position(inst_ptr, context_ptr)
+                            Let in_tail_pos be proc is_tail_position with inst_ptr, context_ptr
 
                             If in_tail_pos is equal to 1:
                                 Note: Create TailCallSite structure
@@ -483,7 +529,7 @@ Process called "collect_tail_call_sites" that takes context_ptr as Integer retur
                                     proc memory_set_int64 from Layout with site_ptr, 8, block_ptr
 
                                     Note: Check if recursive
-                                    Let is_rec be is_recursive_call(inst_ptr, context_ptr)
+                                    Let is_rec be proc is_recursive_call with inst_ptr, context_ptr
                                     proc memory_set_int64 from Layout with site_ptr, 16, is_rec
 
                                     Note: Set callee_ptr
@@ -538,20 +584,20 @@ The transformation strategy:
 3. Replace tail recursive call with parameter updates + jump to loop header
 4. The original function entry jumps to loop header initially
 
-Example transformation:
+Example transformation (schematic, parameters n and acc):
   BEFORE:
-    func(n, acc):
-      if n == 0: return acc
-      return func(n-1, acc+n)
+    Process func taking n, acc:
+      If n is equal to 0 return acc
+      Return func with n minus 1, acc plus n
 
   AFTER:
-    func(n, acc):
+    Process func taking n, acc:
       loop_header:
-        n_phi = phi [n, entry], [n_new, recurse]
-        acc_phi = phi [acc, entry], [acc_new, recurse]
-        if n_phi == 0: return acc_phi
-        n_new = n_phi - 1
-        acc_new = acc_phi + n_phi
+        n_phi   := phi over [n, entry], [n_new, recurse]
+        acc_phi := phi over [acc, entry], [acc_new, recurse]
+        If n_phi is equal to 0 return acc_phi
+        n_new   := n_phi minus 1
+        acc_new := acc_phi plus n_phi
         jump loop_header
 
 This maintains correctness while using constant stack space.
@@ -562,16 +608,50 @@ Transforms a tail recursive function into an iterative loop.
 
 Algorithm:
 1. Create new loop header block with phi nodes for parameters
+   - Phi nodes are allocated via create_mir_phi_node so the extended
+     MIRPhi struct is fully initialized: result_value_id (offset 8),
+     incoming_pairs List (offset 16), incoming_count (offset 24),
+     result_type (offset 32), parent_block (offset 40).
+   - The entry-edge operand (predecessor = entry block, value = original
+     parameter) is appended via add_phi_incoming so the canonical pair
+     encoding (block_id then value_id in incoming_pairs, with the parallel
+     incoming_count bumped) is preserved.
 2. Redirect function entry to loop header
 3. For each tail recursive call:
    a. Extract argument values
-   b. Create parameter update instructions
+   b. Append a back-edge phi operand (predecessor = block containing the
+      tail call, value = corresponding argument) via add_phi_incoming.
+      Raw offset writes to MIRPhi are forbidden because offset 16 is a
+      live List* and offset 24 is the count maintained by the API.
    c. Replace CALL + RETURN with jump to loop header
 4. Update CFG edges
 5. Update SSA form (phi nodes and use-def chains)
 
 Returns 1 on success, 0 on failure.
 @End Implementation
+
+@Performance_Hints
+Stack-frame elision via loop-rewriting collapses a recursive activation tower into a
+single frame, so runtime cost drops from one prologue/epilogue pair per call depth to a
+single pair for the entire iteration. The rewrite itself runs linear in the sum of
+parameter count and recursive-site count, since each phi gets one entry-edge operand at
+construction and one recursive-edge operand per rewrite. We allocate scratch lists (temp_inst_list, phi_list) only as needed and reuse
+the same temporaries between the call-replacement and return-removal phases. SSA recomputation
+at the end is the dominant cost; we accept it because incremental phi maintenance across an
+arbitrary number of recursive sites is fragile compared to a single bulk rebuild.
+@End Performance_Hints
+
+@Security_Scope
+This pass mutates the CFG, instruction lists, and SSA form in place. The order of operations
+matters for correctness: phi nodes must exist in the loop header before recursive jumps are
+emitted (otherwise the back-edge references an undefined value), and the original RETURN must
+be removed before the CALL slot is repurposed (otherwise dead-code elimination cannot tell
+the rewritten flow from the unrewritten one). Every recursive site is gated by both
+can_optimize and transformation_applied so we cannot double-transform and cannot rewrite
+sites that an earlier compatibility step marked ineligible. Param count is read from the
+function structure once and reused, so an attacker cannot induce a mismatch by mutating
+the parameter list mid-pass.
+@End Security_Scope
 
 Process called "transform_tail_recursion_to_loop" that takes context_ptr as Integer returns Integer:
     If context_ptr is equal to 0:
@@ -636,6 +716,10 @@ Process called "transform_tail_recursion_to_loop" that takes context_ptr as Inte
     Note: Get next_value_id from function for phi nodes (offset 56 in MIRFunction)
     Let next_value_id be proc memory_get_int64 from Layout with current_func_ptr, 56
 
+    Note: Read entry block id up front; phi entry-edge operands are paired
+    Note: with this predecessor (offset 0 in MIRBasicBlock = block id).
+    Let entry_block_id_for_phi be proc memory_get_int64 from Layout with entry_block, 0
+
     Note: Create phi nodes for each parameter in loop header
     Let phi_list be proc create from List
     Let param_idx be 0
@@ -643,18 +727,27 @@ Process called "transform_tail_recursion_to_loop" that takes context_ptr as Inte
     While param_idx is less than param_count:
         Let param_value_id be proc get from List with parameters, param_idx
 
-        Note: Create phi node (MIR_PHI opcode = 20300)
-        Let phi_node be proc create_mir_node from MIR with 20300
+        Note: Allocate MIRPhi struct via the canonical constructor so the
+        Note: incoming_pairs List (offset 16) and incoming_count (offset 24)
+        Note: are wired up. Raw create_mir_node would yield only the base
+        Note: MIRNode and leave the phi-specific offsets uninitialized, which
+        Note: previously caused MIRPhi layout corruption when later writes
+        Note: targeted offsets 16 and 24 directly. result_type and parent_block
+        Note: are derived from the loop header context.
+        Let phi_node be proc create_mir_phi_node from MIRNodes with next_value_id, 0, loop_header_id
         If phi_node is equal to 0:
             Return 0
         End If
 
-        Note: Assign value ID for phi result and increment counter
-        proc memory_set_int64 from Layout with phi_node, 8, next_value_id
+        Note: Increment the value-id counter; the phi result was assigned
+        Note: next_value_id atomically inside create_mir_phi_node.
         Set next_value_id to next_value_id plus 1
 
-        Note: Set initial phi operand (from entry: use original parameter)
-        proc memory_set_int64 from Layout with phi_node, 16, param_value_id
+        Note: Set initial phi operand for the entry edge: the original
+        Note: parameter value flowing in from the function entry block.
+        Note: Routes through add_phi_incoming so incoming_pairs is appended
+        Note: with the (block, value) pair and incoming_count is bumped.
+        proc add_phi_incoming from MIRNodes with phi_node, entry_block_id_for_phi, param_value_id
 
         Note: Store phi node in list
         proc append from List with phi_list, phi_node
@@ -749,15 +842,23 @@ Process called "transform_tail_recursion_to_loop" that takes context_ptr as Inte
                     Set arg_idx to arg_idx plus 1
                 End While
 
-                Note: Update phi nodes with new incoming values from this recursive call
+                Note: Update phi nodes with new incoming values from this recursive call.
+                Note: The recursive-edge predecessor is the block containing the
+                Note: tail call (call_block_ptr); read its id from offset 0 of
+                Note: the MIRBasicBlock struct and pair it with each arg.
+                Let recursive_pred_block_id be proc memory_get_int64 from Layout with call_block_ptr, 0
                 Set param_idx to 0
                 While param_idx is less than param_count:
                     Set phi_node to proc get from List with phi_list, param_idx
                     Set arg_value to proc get from List with arg_values, param_idx
 
-                    Note: Add phi operand for recursive edge
-                    Note: Phi nodes track (value, predecessor_block) pairs
-                    proc memory_set_int64 from Layout with phi_node, 24, arg_value
+                    Note: Add phi operand for the recursive back-edge. Phi nodes
+                    Note: track (block_id, value_id) pairs in incoming_pairs and
+                    Note: a parallel incoming_count, both maintained by the
+                    Note: canonical add_phi_incoming API. Direct offset writes
+                    Note: would corrupt the MIRPhi layout (offset 16 is a List*,
+                    Note: offset 24 is the count).
+                    proc add_phi_incoming from MIRNodes with phi_node, recursive_pred_block_id, arg_value
 
                     Set param_idx to param_idx plus 1
                 End While
@@ -883,6 +984,17 @@ When these conditions are met, we can:
 This optimization saves stack space and eliminates the return overhead.
 @End Reasoning
 
+@Reasoning
+Sibling tail-call rewrites reuse the caller's stack frame and jump straight to the callee,
+so they are only sound when the two functions agree on how that frame is interpreted. Four
+properties matter: ABI (an external function may use a platform ABI we cannot synthesise),
+return-type slot (return registers must match), frame footprint (the callee must not need
+more locals than the caller provided), and unwinding (a tail jump skips the caller's
+landingpad chain, so caller and callee must agree on exception presence). We bail out the
+moment any of these diverges. The cache is keyed on callee identity because per-callsite
+recomputation would be wasted work for callees with many tail-call sites.
+@End Reasoning
+
 @Implementation
 Checks calling convention compatibility between caller and callee.
 
@@ -895,6 +1007,16 @@ Performs comprehensive compatibility analysis including:
 
 Returns 1 if compatible, 0 otherwise.
 @End Implementation
+
+@Security_Scope
+A false positive here is a silent ABI break: control transfers to the callee with a frame
+the callee will misread. Every check defaults to incompatible (return 0 + cache 0) on
+ambiguity, including null inputs and missing CFGs. The exception-handling scan is
+exhaustive across both CFGs precisely because a partial scan could miss an INVOKE in a
+seldom-reached block and let us strip its landingpad coverage. The cache stores 0 for
+incompatible decisions so a previously-rejected callee cannot be revisited and silently
+flipped to compatible.
+@End Security_Scope
 
 Process called "check_calling_convention_compatibility" that takes caller_ptr as Integer, callee_ptr as Integer, context_ptr as Integer returns Integer:
     If caller_ptr is equal to 0 or callee_ptr is equal to 0 or context_ptr is equal to 0:
@@ -1014,6 +1136,17 @@ Process called "check_calling_convention_compatibility" that takes caller_ptr as
     Return 1
 End Process
 
+@Reasoning
+Sibling tail calls (calls to a function other than the current one) cannot be lowered to
+a loop because the callee is opaque to us. The valuable optimisation in that case is
+stack-frame elision at the call boundary: the backend can deallocate the caller's frame,
+move arguments into the canonical ABI registers, and JMP to the callee. We perform only
+the marking step here; emitting the actual frame-shrinking sequence is the backend's job
+because it owns target-specific calling conventions. Marking is gated by both site-level
+flags (can_optimize, transformation_applied) and the global compatibility check, so a
+single ineligibility signal is enough to suppress the rewrite.
+@End Reasoning
+
 @Implementation
 Applies sibling tail call optimization to eligible call sites.
 
@@ -1063,7 +1196,7 @@ Process called "optimize_sibling_tail_calls" that takes context_ptr as Integer r
                     Let callee_ptr be proc memory_get_int64 from Layout with site_ptr, 24
 
                     Note: Check calling convention compatibility
-                    Let compatible be check_calling_convention_compatibility(current_func_ptr, callee_ptr, context_ptr)
+                    Let compatible be proc check_calling_convention_compatibility with current_func_ptr, callee_ptr, context_ptr
 
                     If compatible is equal to 1:
                         Note: Mark call as tail call
@@ -1092,6 +1225,16 @@ End Process
 Note: ============================================================
 Note: MAIN ENTRY POINTS
 Note: ============================================================
+
+@Reasoning
+The per-function driver enforces the canonical phase ordering: identification before
+transformation, recursion-to-loop before sibling marking. Identification is intentionally
+separated from rewriting so we have a complete worklist when deciding which sites to
+transform first. Recursion is handled before sibling marking because the loop rewrite can
+delete RETURN instructions that a sibling pass might otherwise observe and mis-classify.
+The driver guarantees context cleanup on every exit path so a partial optimisation cannot
+leak the sites list or its caches.
+@End Reasoning
 
 @Implementation
 Main entry point for tail call optimization on a single function.
@@ -1123,7 +1266,7 @@ Process called "optimize_function_with_tail_call" that takes function_ptr as Int
     End If
 
     Note: Create optimization context
-    Let context_ptr be create_tail_call_context(cfg_ptr)
+    Let context_ptr be proc create_tail_call_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "Failed to create tail call context"
         Return 0
@@ -1133,35 +1276,45 @@ Process called "optimize_function_with_tail_call" that takes function_ptr as Int
     proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
 
     Note: Collect all tail call sites
-    Let tail_call_count be collect_tail_call_sites(context_ptr)
+    Let tail_call_count be proc collect_tail_call_sites with context_ptr
     Display "Identified " joined with tail_call_count joined with " tail call sites"
 
     If tail_call_count is equal to 0:
         Display "No tail calls found, skipping optimization"
-        destroy_tail_call_context(context_ptr)
+        proc destroy_tail_call_context with context_ptr
         Return 1
     End If
 
     Note: Transform tail recursion to loops
-    Let recursion_success be transform_tail_recursion_to_loop(context_ptr)
+    Let recursion_success be proc transform_tail_recursion_to_loop with context_ptr
     If recursion_success is equal to 0:
         Display "Warning: Tail recursion transformation encountered issues"
     End If
 
     Note: Optimize sibling tail calls
-    Let sibling_count be optimize_sibling_tail_calls(context_ptr)
+    Let sibling_count be proc optimize_sibling_tail_calls with context_ptr
     Display "Marked " joined with sibling_count joined with " sibling tail calls"
 
     Note: Print statistics
-    print_tail_call_stats(context_ptr)
+    proc print_tail_call_stats with context_ptr
 
     Note: Clean up
-    destroy_tail_call_context(context_ptr)
+    proc destroy_tail_call_context with context_ptr
 
     Display "Tail call optimization complete"
 
     Return 1
 End Process
+
+@Reasoning
+The program-level driver applies the per-function pass across the MIR module while
+skipping external (declared but not defined) functions, which have no CFG to analyse
+and no body we are permitted to rewrite. Optimisation success is tallied per function
+so the pass-manager log can attribute regressions to specific units, not to "tail call
+optimisation" as a black box. The pass is intentionally non-fatal: a per-function
+failure increments the skip counter but does not abort, because tail-call optimisation
+is profitable but not load-bearing for correctness.
+@End Reasoning
 
 @Implementation
 Entry point for running tail call optimization pass on entire program.
@@ -1198,7 +1351,7 @@ Process called "run_tail_call_pass" that takes program_ptr as Integer returns In
             Let is_external be proc is_external_function from MIR with func_ptr
 
             If is_external is equal to 0:
-                Let success be optimize_function_with_tail_call(func_ptr)
+                Let success be proc optimize_function_with_tail_call with func_ptr
                 If success is equal to 1:
                     Set optimized_count to optimized_count plus 1
                 End If
@@ -1212,6 +1365,14 @@ Process called "run_tail_call_pass" that takes program_ptr as Integer returns In
 
     Return 1
 End Process
+
+@Reasoning
+Profitability gating is cheap because the only signal needed is "does this function
+contain a call?" — if it doesn't, neither identification nor transformation can do useful
+work and we save the cost of constructing a context. We tie enablement to -O1 because the
+transformation changes debuggability (the recursive frame chain becomes a single iterating
+frame) and -O0 should preserve the source-level call shape for step-debugging.
+@End Reasoning
 
 @Implementation
 Profitability check for tail call optimization.

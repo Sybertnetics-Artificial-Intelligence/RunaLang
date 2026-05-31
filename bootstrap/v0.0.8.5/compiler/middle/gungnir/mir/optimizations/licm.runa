@@ -136,16 +136,59 @@ Note: ==========================================================================
 
 Process called "create_licm_context" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Creates a new LICM context.
+    Constructs the LICM analysis context that ties together the CFG under
+    optimization with the dominance tree, SSA def/use information, and the
+    per-pass bookkeeping structures (loop list, invariant set, statistics
+    counters). Every downstream LICM stage reads its inputs and writes its
+    outputs through this single shared block, so the constructor is the
+    only place where ownership of those auxiliary tables is established.
 
-    **INITIALIZATION:**
-    - Allocates 96 bytes for context
-    - Initializes all dictionaries and sets
-    - Computes dominance information (required for loop detection)
-    - Creates empty loop list
+    Dominance must be computed up front because back-edge identification,
+    natural-loop body discovery, and the hoist-safety dominance check on
+    loop exits all require a ready dominance oracle. Computing it lazily
+    later would force every consumer to defensively trigger the analysis
+    and would prevent the constructor from validating its prerequisites
+    in one place.
 
-    Returns context pointer, or 0 on failure.
+    Returns the populated context pointer on success, or 0 if the CFG is
+    null or any allocation fails. On allocation failure the routine does
+    not attempt partial cleanup of any structures already created — the
+    teardown path in destroy_licm_context is the single deallocation
+    surface and is only safe to invoke against a fully constructed
+    context.
     @End Reasoning
+
+    @Implementation
+    Allocates the 96-byte context block via Layout.allocate and populates
+    it field-by-field using the canonical offsets documented on LICMContext:
+      0   cfg                  (argument)
+      8   loops                (List, fresh)
+      16  invariant_insts      (Set, fresh)
+      24  hoisted_count        (0)
+      32  loops_processed      (0)
+      40  preheaders_inserted  (0)
+      48  dominance_ptr        (compute_dominance_tree(cfg))
+      56  ssa_ptr              (get_ssa_info(cfg))
+      64  use_def_chains       (build_use_def_chains(cfg))
+      72  def_use_chains       (build_def_use_chains(cfg))
+      80  block_to_loop        (Dictionary, fresh)
+      88  iteration_count      (0)
+
+    Null CFG is rejected before allocation. Allocation failures from
+    Layout.allocate return 0 to the caller without leaking the partially
+    constructed context because no nested structures are created prior
+    to the allocation check.
+    @End Implementation
+
+    @Performance_Hints
+    Dominance computation is O(N * E * α(N)) using the Lengauer-Tarjan
+    algorithm. SSA def/use chain construction is O(I) in the number of
+    instructions. The context itself is a flat 96-byte block — no
+    indirection or cache misses beyond the dominance/SSA structures.
+    Callers that invoke LICM repeatedly on the same CFG should reuse the
+    dominance information rather than rebuilding it per pass; the pass
+    manager is responsible for that scheduling.
+    @End Performance_Hints
 
     If cfg_ptr is equal to 0:
         Display "create_licm_context: null CFG"
@@ -203,10 +246,43 @@ End Process
 
 Process called "destroy_licm_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Destroys LICM context and frees all allocated memory.
+    Releases every byte allocated by create_licm_context plus all
+    LoopInfo records and their owned body/exit/back-edge collections.
+    LICM context lifetime is bounded by a single optimize_function_with_licm
+    invocation, so the constructor and destructor are the only memory
+    handoff points; making the destructor responsible for every nested
+    structure keeps the call sites in optimize_function_with_licm
+    leak-free even when error paths short-circuit the pass.
 
-    Returns 1 on success, 0 on failure.
+    The destructor must walk loops_list and dispose of each LoopInfo's
+    Set/List children before destroying loops_list itself because the
+    outer List.destroy only releases the array of pointers, not the
+    objects they reference. The same constraint applies to invariant_insts
+    (a Set of instruction pointers, but the instructions themselves are
+    owned by MIR blocks and must not be freed) and block_to_loop (a
+    Dictionary whose values alias LoopInfo entries already disposed in
+    the loops_list walk, so the dictionary only releases its bucket
+    storage).
+
+    Returns 1 on success; returns 0 only when the context pointer is
+    null. The destructor never raises — all child destroyers are
+    null-tolerant.
     @End Reasoning
+
+    @Implementation
+    Performs a four-phase ordered teardown:
+      1. loops_list (offset 8): iterate every LoopInfo, free its
+         body_blocks Set (offset 16), exit_blocks Set (offset 24), and
+         back_edges List (offset 32), then deallocate the 64-byte
+         LoopInfo struct. After the walk, destroy loops_list.
+      2. invariant_insts (offset 16): destroy the Set. The pointed-to
+         instructions remain owned by MIR.
+      3. block_to_loop (offset 80): destroy the Dictionary. Values alias
+         LoopInfo entries already freed in phase 1.
+      4. Deallocate the 96-byte context block itself.
+    Dominance, SSA, and use/def chain structures are NOT freed here;
+    they are owned by the analysis cache and outlive a single LICM pass.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -305,13 +381,24 @@ Note: ==========================================================================
 
 Process called "is_back_edge" that takes source_id as Integer, target_id as Integer, dominance_ptr as Integer returns Integer:
     @Reasoning
-    Checks if edge (source → target) is a back edge.
+    Tests whether the directed CFG edge (source -> target) is a back
+    edge under the standard natural-loop definition: target must
+    dominate source. This is the foundational predicate the rest of
+    loop detection layers on top of — every natural loop in the CFG is
+    identified by exactly one back edge, and the loop's header is the
+    edge's target.
 
-    **BACK EDGE DEFINITION:**
-    Edge (B → H) is a back edge if H dominates B.
-
-    Returns 1 if back edge, 0 otherwise.
+    Returns 1 when the edge is a back edge, 0 otherwise. A null
+    dominance oracle is treated as "no back edges known" (returns 0)
+    rather than raising, since the loop detector tolerates an empty
+    back-edge set as a valid analysis result for a loop-free CFG.
     @End Reasoning
+
+    @Implementation
+    Delegates the dominance test to does_dominate on the precomputed
+    dominance tree. The check is O(log N) average using the dominator
+    tree's path-compressed ancestor query.
+    @End Implementation
 
     If dominance_ptr is equal to 0:
         Return 0
@@ -325,15 +412,38 @@ End Process
 
 Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
     @Reasoning
-    Finds all back edges in the CFG.
+    Enumerates every back edge present in the CFG by visiting all
+    (block, successor) edges and testing each one with is_back_edge.
+    Back-edge discovery is the entry point of natural-loop detection:
+    once back edges are known, each one generates exactly one
+    LoopInfo, with the back edge's target serving as the loop header
+    and its source as the seed for body discovery.
 
-    **ALGORITHM:**
-    For each edge (B → S) in CFG:
-        If S dominates B:
-            Add (B, S) to back_edges list
+    The result list owns its (source, target) pair allocations and the
+    caller is responsible for destroying it after extracting the edges
+    into LoopInfo records (detect_natural_loops handles this transfer).
 
-    Returns list of (source, target) pairs representing back edges.
+    Returns the populated List of edge-pair pointers on success, or 0
+    when the CFG or dominance argument is null. An empty list (length 0)
+    is a valid result meaning the CFG is reducible and loop-free.
     @End Reasoning
+
+    @Implementation
+    Iterates every block returned by get_all_blocks. For each block B,
+    iterates B's successors and applies is_back_edge(B, S, dominance).
+    A back edge produces a 16-byte heap pair (source_id at offset 0,
+    target_id at offset 8) appended to the result List. Diagnostic
+    Display traces each discovery so codegen problems remain visible
+    during bringup.
+    @End Implementation
+
+    @Performance_Hints
+    Cost is O(E) edge tests, each O(log N) via the dominance oracle, so
+    total O(E log N). For typical CFGs (E ~ 3*N) this is the dominant
+    cost of loop detection. The 16-byte pair allocation per back edge
+    is the only heap traffic — pair count is bounded by the number of
+    natural loops, which is at most N for a reducible CFG.
+    @End Performance_Hints
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -370,7 +480,7 @@ Process called "find_back_edges" that takes cfg_ptr as Integer, dominance_ptr as
                 Let succ_id be proc get_block_id from CFG with succ_ptr
 
                 Note: Check if this is a back edge
-                Let is_back be is_back_edge(block_id, succ_id, dominance_ptr)
+                Let is_back be proc is_back_edge with block_id, succ_id, dominance_ptr
 
                 If is_back is equal to 1:
                     Note: Create (source, target) pair (16 bytes)
@@ -398,19 +508,51 @@ End Process
 
 Process called "compute_loop_body" that takes header_id as Integer, back_edge_source as Integer, cfg_ptr as Integer, dominance_ptr as Integer returns Integer:
     @Reasoning
-    Computes the natural loop body for a back edge.
+    Computes the natural-loop body for back edge (back_edge_source -> header_id)
+    as the set of CFG blocks that can reach back_edge_source without
+    crossing header_id. This is the textbook natural-loop definition
+    and the only block set safe to treat as "inside the loop" for
+    every subsequent LICM stage (invariant detection, hoist safety,
+    preheader insertion). The header is included by definition; the
+    back-edge source is included as the worklist seed.
 
-    **NATURAL LOOP BODY:**
-    For back edge (B → H):
-    Loop body = {B} ∪ {nodes that can reach B without going through H}
+    The result Set owns string-encoded block IDs (one per body block).
+    String keys are required because the underlying Set is keyed by
+    String and not by Integer — encoding once on insertion avoids
+    re-encoding during the hot membership checks performed by
+    is_loop_invariant_operand and the preheader walk.
 
-    **ALGORITHM:**
-    1. Start with worklist = {B}
-    2. Add all predecessors of nodes in worklist that aren't H
-    3. Continue until worklist is empty
-
-    Returns Set of block IDs in loop body.
+    Returns the populated body Set on success, or 0 when the CFG
+    argument is null. The header_id is unconditionally included even
+    if the body would otherwise be empty (degenerate self-loop), so
+    every natural loop has at least one body block.
     @End Reasoning
+
+    @Implementation
+    Classic reverse-reachability worklist:
+      1. Seed body = {back_edge_source, header_id}.
+      2. worklist = [back_edge_source].
+      3. While worklist non-empty: pop current_id, fetch its block via
+         get_block_by_id, iterate predecessors. For each predecessor P
+         that is not header_id and not already in body, add P to body
+         and push it onto the worklist.
+    The header_id check at step 3 is what bounds the search — the loop
+    body terminates upward at the header because the header dominates
+    every body block by definition of "natural".
+
+    Block ID encoding to String is done once per insertion via
+    integer_to_string; the Set uses string equality for membership.
+    The worklist is destroyed before return; body_blocks is handed to
+    the caller.
+    @End Implementation
+
+    @Performance_Hints
+    O(|body|) Set inserts and O(|edges-into-body|) predecessor walks,
+    each predecessor walk being O(in-degree). Total: O(N + E) for a
+    typical loop body where N is body size. Integer-to-string
+    conversion is O(log block_id) per insertion; for CFGs with up to
+    ~10^6 blocks this is bounded by ~7 bytes per encoded key.
+    @End Performance_Hints
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -480,13 +622,39 @@ End Process
 
 Process called "compute_loop_exits" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Computes exit blocks for a loop.
+    Identifies every block that lies outside the loop but is the target
+    of an edge originating inside the loop. These are the loop's exits,
+    and their identification is load-bearing for hoist safety:
+    can_hoist_instruction must establish that the candidate instruction
+    dominates every loop exit, otherwise the hoist would change the
+    program's observable behaviour on paths that take the exit before
+    the original instruction would have executed.
 
-    **EXIT BLOCK:**
-    Block outside loop with edge from block inside loop.
+    The exit set is keyed by string-encoded block ID to match the
+    representation used for body_blocks, so cross-set lookups during
+    invariant analysis use the same key format throughout.
 
-    Returns Set of exit block IDs.
+    Returns the populated exit-block Set on success, or 0 if loop_info
+    or cfg is null. An empty exit set means the loop is infinite under
+    static analysis (no exits) and every invariant instruction in such
+    a loop is automatically exit-dominating.
     @End Reasoning
+
+    @Implementation
+    Iterates every block in loop_info.body_blocks. For each body block,
+    walks its successors; any successor not already in body_blocks is
+    an exit and is inserted (string-encoded) into the exit set.
+    Successor pointer retrieval uses get_block_by_id keyed by the
+    string-decoded body block id.
+    @End Implementation
+
+    @Performance_Hints
+    O(|body| + |edges-out-of-body|) — bounded by O(E) over the loop's
+    induced subgraph. The string encode/decode round-trip is the only
+    non-pointer cost; for tight inner loops this is the warmest path
+    in compute_loop_exits but remains negligible compared to dominance
+    queries elsewhere in the pass.
+    @End Performance_Hints
 
     If loop_info is equal to 0:
         Return 0
@@ -539,18 +707,50 @@ End Process
 
 Process called "detect_natural_loops" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Detects all natural loops in the CFG.
+    Top-level loop-detection driver. Materialises one LoopInfo per back
+    edge, populates each with its header, body, exit set, and back-edge
+    list, and registers every body block in block_to_loop so later
+    stages can answer "which loop contains this block?" in O(1).
 
-    **ALGORITHM:**
-    1. Find all back edges
-    2. For each back edge (B → H):
-       - Create LoopInfo with header H
-       - Compute loop body
-       - Compute exit blocks
-    3. Build nesting structure
+    The current implementation treats each back edge as a distinct
+    natural loop; merging back edges that share a header (multi-back-edge
+    irreducible patterns are not produced by structured frontends but
+    can arise after CFG simplification) is left to a later normalisation
+    pass — the per-edge representation here is correct because LICM
+    treats each LoopInfo independently and the union of their hoists
+    is equivalent to a merged-loop hoist.
 
-    Returns number of loops detected.
+    Returns the number of loops detected. Zero is a valid result for
+    loop-free functions and is handled by optimize_function_with_licm
+    as an early termination.
     @End Reasoning
+
+    @Implementation
+    Phases:
+      1. Resolve cfg, dominance, loops_list, block_to_loop from context.
+      2. find_back_edges -> back_edges list of (source, target) pairs.
+      3. For each pair:
+         a. Allocate a 64-byte LoopInfo and set header_id (offset 0),
+            preheader_id=0 (offset 8), body_blocks via compute_loop_body
+            (offset 16), exit_blocks via compute_loop_exits (offset 24),
+            back_edges list seeded with this pair (offset 32),
+            nesting_level=0/parent_loop=0/invariant_count=0
+            (offsets 40/48/56 — to be filled in later phases).
+         b. Append the LoopInfo to loops_list.
+         c. For every block id in body_blocks, set
+            block_to_loop[block_id] = loop_info.
+      4. Destroy back_edges (LoopInfo retains its own pair pointer in
+         the per-loop back_edges list).
+    Returns loops_list length.
+    @End Implementation
+
+    @Performance_Hints
+    Dominates by find_back_edges cost (O(E log N)) plus the per-loop
+    body computation (O(N + E) per loop). For nests of L loops with
+    average body size B the total is O(L*B + E log N), which is the
+    optimal complexity for natural-loop detection on a precomputed
+    dominance tree.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
@@ -568,7 +768,7 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
     Let block_to_loop be proc memory_get_int64 from Layout with context_ptr, 80
 
     Note: Find all back edges
-    Let back_edges be find_back_edges(cfg_ptr, dominance_ptr)
+    Let back_edges be proc find_back_edges with cfg_ptr, dominance_ptr
     If back_edges is equal to 0:
         Display "detect_natural_loops: no back edges found"
         Return 0
@@ -596,11 +796,11 @@ Process called "detect_natural_loops" that takes context_ptr as Integer returns 
         proc memory_set_int64 from Layout with loop_info, 8, 0
 
         Note: Compute loop body
-        Let body_blocks be compute_loop_body(target_id, source_id, cfg_ptr, dominance_ptr)
+        Let body_blocks be proc compute_loop_body with target_id, source_id, cfg_ptr, dominance_ptr
         proc memory_set_int64 from Layout with loop_info, 16, body_blocks
 
         Note: Compute exit blocks
-        Let exit_blocks be compute_loop_exits(loop_info, cfg_ptr)
+        Let exit_blocks be proc compute_loop_exits with loop_info, cfg_ptr
         proc memory_set_int64 from Layout with loop_info, 24, exit_blocks
 
         Note: Create back_edges list for this loop
@@ -647,14 +847,38 @@ Note: ==========================================================================
 
 Process called "needs_preheader" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Checks if loop needs a preheader.
+    Predicate that decides whether the loop requires a fresh preheader
+    block before hoisting can proceed. A preheader is the unique block
+    that flows into the loop header from outside the loop and serves
+    as the single landing pad for hoisted invariant instructions.
 
-    **NEEDS PREHEADER IF:**
-    - Loop header has multiple predecessors from outside loop
-    - OR loop header has instructions we want to hoist to
+    Conditions:
+      - If the header has multiple non-back-edge predecessors, the
+        loop has multiple external entry points; we cannot place
+        hoisted code on every such edge without code duplication, so
+        a synthetic preheader is required.
+      - Even with a single external predecessor, a dedicated preheader
+        is preferred so that hoists never alter the layout or
+        contents of the original predecessor block — preserving
+        debug locations and avoiding cross-pass interference with
+        other optimizations that may have settled the predecessor.
 
-    Returns 1 if needs preheader, 0 otherwise.
+    Because both branches return 1 under the current LICM policy, this
+    predicate currently always recommends preheader insertion when the
+    header has any predecessor at all. The branching structure is
+    retained as documentation of the analytical justification.
+
+    Returns 1 if a preheader should be created, 0 if loop_info or cfg
+    is null or the header has no predecessors at all (anomalous).
     @End Reasoning
+
+    @Implementation
+    Reads header_id from loop_info offset 0 and body_blocks from
+    offset 16. Resolves the header block via get_block_by_id, then
+    counts predecessors not in body_blocks (these are external entries).
+    Returns 1 in every well-formed case to enforce the
+    "always preheader for hoisting" policy described above.
+    @End Implementation
 
     If loop_info is equal to 0:
         Return 0
@@ -708,15 +932,60 @@ End Process
 
 Process called "insert_preheader" that takes loop_info as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Inserts a preheader block for the loop.
+    Materialises a preheader block for the loop and rewires every
+    external predecessor of the header to land in the preheader
+    instead. After this transformation:
+      - The preheader has exactly one successor: the loop header.
+      - The header has exactly two predecessor categories: the
+        preheader (from outside the loop) and back-edge sources
+        (from inside the loop).
+      - Every hoisted invariant instruction can be inserted at the
+        end of the preheader (before its terminating branch) and is
+        guaranteed to dominate every body block.
 
-    **PREHEADER:**
-    Single entry point to loop from outside.
-    All non-back-edge predecessors redirect to preheader.
-    Preheader has single successor: loop header.
+    Preheader insertion is the prerequisite for any subsequent hoist.
+    The single-landing-pad property is what allows can_hoist_instruction
+    to reason about exit dominance using the original instruction's
+    block — once hoisted, the instruction's new "block" is the
+    preheader, which by construction dominates the header and every
+    block dominated by the header (i.e. the loop body).
 
-    Returns preheader block ID, or 0 on failure.
+    Returns the new preheader block ID, or 0 if loop_info or cfg is
+    null, the header cannot be resolved, or block creation fails.
     @End Reasoning
+
+    @Implementation
+    1. Create a fresh basic block via create_basic_block; capture its
+       id and block pointer.
+    2. Materialise an unconditional branch instruction targeting the
+       header (create_branch_instruction) and append it to the
+       preheader so the preheader terminates with a single edge to
+       the header.
+    3. For every predecessor P of the header: if P is NOT in
+       body_blocks (i.e. P is an external entry, not a back edge),
+       call redirect_edge(P, header, preheader) to retarget P's
+       successor edge. Back-edge predecessors are deliberately left
+       pointing at the header.
+    4. Write the new preheader id into loop_info offset 8.
+    @End Implementation
+
+    @Performance_Hints
+    O(P) where P is the number of header predecessors. Edge redirection
+    is O(1) per edge through the CFG's adjacency representation.
+    Preheader insertion runs once per loop and is dwarfed by the
+    fixed-point invariant analysis later in the pass.
+    @End Performance_Hints
+
+    @Security_Scope
+    Preheader insertion mutates the CFG topology. It must run before
+    any concurrent reader of the CFG (e.g. another optimization pass
+    iterating predecessors) — the pass manager enforces single-writer
+    discipline by serialising LICM with respect to other CFG-mutating
+    passes. The preheader's terminating branch is the only instruction
+    materialised here; no user-visible control-flow change occurs
+    because the rewired predecessors still funnel into the header
+    through the preheader.
+    @End Security_Scope
 
     If loop_info is equal to 0:
         Return 0
@@ -786,10 +1055,25 @@ End Process
 
 Process called "insert_preheaders" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Inserts preheaders for all loops that need them.
+    Walks every detected loop and inserts a preheader where
+    needs_preheader recommends one. This is the second LICM stage,
+    after detect_natural_loops and before mark_invariant_instructions.
+    Running preheader insertion first means the invariant analysis
+    can treat the preheader as the canonical hoist target without
+    needing to re-check whether one exists.
 
-    Returns number of preheaders inserted.
+    Returns the number of preheaders successfully created. The
+    context's preheaders_inserted counter (offset 40) is updated to
+    match for statistics reporting.
     @End Reasoning
+
+    @Implementation
+    Reads cfg and loops_list from the context. For each LoopInfo:
+      - Calls needs_preheader to decide.
+      - On 1, calls insert_preheader; counts successful insertions
+        (return != 0).
+    Writes the running total into context offset 40 before returning.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -812,10 +1096,10 @@ Process called "insert_preheaders" that takes context_ptr as Integer returns Int
         Let loop_info be proc get from List with loops_list, i
 
         Note: Check if preheader needed
-        Let needs_ph be needs_preheader(loop_info, cfg_ptr)
+        Let needs_ph be proc needs_preheader with loop_info, cfg_ptr
 
         If needs_ph is equal to 1:
-            Let preheader_id be insert_preheader(loop_info, cfg_ptr)
+            Let preheader_id be proc insert_preheader with loop_info, cfg_ptr
             If preheader_id is not equal to 0:
                 Set preheaders_created to preheaders_created plus 1
             End If
@@ -839,15 +1123,50 @@ Note: ==========================================================================
 
 Process called "is_loop_invariant_operand" that takes operand_id as Integer, loop_info as Integer, invariant_set as Integer, ssa_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Checks if an operand is loop-invariant.
+    Per-operand classifier for the fixed-point invariant analysis. An
+    operand is loop-invariant if, on every iteration of the loop, it
+    has the same value. Three sources of invariance are recognised:
+      1. The operand is already in invariant_set — i.e. its defining
+         instruction has been classified invariant in a previous
+         iteration of the fixed-point loop.
+      2. The operand is an MIR constant node — constants are
+         invariant by construction.
+      3. The operand's defining instruction lives in a block outside
+         the loop body — such defs are unreachable for re-evaluation
+         from inside the loop and therefore stable across iterations.
 
-    **INVARIANT OPERAND:**
-    - Defined outside loop, OR
-    - Is itself a loop-invariant instruction, OR
-    - Is a constant value
+    This three-way classification is what makes the surrounding
+    fixed-point analysis monotone: once an instruction's operands are
+    classified invariant, the classification cannot regress in a later
+    iteration, so the worklist converges.
 
-    Returns 1 if invariant, 0 otherwise.
+    Returns 1 if invariant, 0 if not invariant or loop_info is null.
+    Null ssa_ptr disables case (3) but cases (1) and (2) still apply.
     @End Reasoning
+
+    @Implementation
+    Sequential check of the three cases in order of decreasing
+    cheapness:
+      Case 1: integer_to_string on operand_id, then Set.contains
+              against invariant_set.
+      Case 2: get_mir_value on operand_id from MIR; if non-null,
+              get_mir_node_type from MIR, then compare against
+              MIR.MIR_CONSTANT.
+      Case 3: get_defining_instruction on operand_id from SSA;
+              if non-null, get_instruction_block_id from MIR, then
+              string-encode and call Set.contains against body_blocks.
+              If the defining block is NOT in body_blocks, the
+              operand is classified invariant.
+    Falls through to Return 0 when none of the three apply.
+    @End Implementation
+
+    @Performance_Hints
+    Case 1 dominates in the steady state of the fixed-point loop
+    (most operands are already classified by mid-iteration). Cost is
+    O(1) Set lookup plus O(log operand_id) string encode. Case 3
+    requires an SSA lookup and a second Set lookup; this is the
+    warmest path during the first iteration but quickly becomes rare.
+    @End Performance_Hints
 
     If loop_info is equal to 0:
         Return 0
@@ -893,15 +1212,115 @@ End Process
 
 Process called "can_hoist_instruction" that takes inst_ptr as Integer, loop_info as Integer, dominance_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Checks if instruction can be safely hoisted out of loop.
+    The hoist-safety predicate. This is the single proof obligation
+    every LICM transformation must satisfy: hoisting must preserve
+    program semantics in every possible execution.
 
-    **SAFETY CONDITIONS:**
-    1. No side effects (no stores, calls, volatile ops)
-    2. Dominates all loop exits (or is exception-safe)
-    3. Defining block dominates all uses
+    LICM is only sound when the candidate instruction satisfies a
+    conjunction of three safety properties, each rejecting a distinct
+    class of unsoundness:
 
-    Returns 1 if safe to hoist, 0 otherwise.
+    PROPERTY 1 — NO OBSERVABLE SIDE EFFECTS
+    The instruction must be free of any effect a program could
+    distinguish if it occurred in a different control-flow context.
+    Hoisting from inside a loop to a preheader causes the instruction
+    to execute on paths that originally bypassed it (in particular
+    paths that would have exited the loop before the original
+    instruction ran). Effects that would become visible on such paths
+    are forbidden:
+      - MIR_STORE writes to memory the program may observe later;
+        hoisting can introduce spurious writes on early-exit paths
+        and (worse) reorder writes relative to other memory
+        operations. REJECT.
+      - MIR_CALL may have arbitrary effects (I/O, memory, throwing).
+        Hoisting may cause the call to execute when it would not
+        have, or to execute fewer times than the original program
+        would (which is itself observable for, e.g., counting side
+        effects). REJECT.
+      - MIR_LOAD is conservatively rejected even though it has no
+        write effect, because a load can trap (null deref, segfault,
+        unmapped page). The original program may have guarded the
+        load with a branch that decided not to enter the loop body
+        on the offending iteration; hoisting moves the load above
+        that guard and would synthesize a trap on paths that did not
+        originally exhibit one. A future enhancement may allow
+        provably-safe loads (e.g. loads of identified-non-aliasing
+        constants from unique-aliased base pointers known to be
+        non-null and in-bounds), but the safe default is REJECT.
+      - Implicit: divisions or other potentially-trapping ALU ops
+        require the same treatment; the current opcode whitelist
+        admits only side-effect-free, trap-free instructions, so they
+        fall through to the dominance check below.
+
+    PROPERTY 2 — DOMINATES ALL LOOP EXITS
+    The instruction must execute on every path that exits the loop.
+    Equivalently: the instruction's block must dominate every loop
+    exit block. If the instruction does NOT dominate an exit E, then
+    there is a path from the loop header to E that bypasses the
+    instruction. On that path the program would not have evaluated
+    the instruction; hoisting forces evaluation in the preheader,
+    which precedes every loop iteration including the one that takes
+    the bypass path. For a pure instruction this would still be
+    semantics-preserving (the value is computed but unused on the
+    bypass), but combined with Property 1 the strict dominance
+    requirement guards future relaxations and matches the textbook
+    LICM safety criterion. The check uses the precomputed dominance
+    oracle (does_dominate).
+
+    PROPERTY 3 — MAY-NOT-THROW
+    Combined with Property 1's rejection of MIR_CALL and MIR_LOAD,
+    Property 3 is satisfied by construction for the surviving opcode
+    set (arithmetic, logical, compare, move, constant). Any future
+    opcode added to the whitelist must be re-audited against this
+    property: hoisting an exception-throwing instruction would
+    materialise the exception in the preheader, before the loop
+    iteration that would have raised it would have executed,
+    violating happens-before with respect to any other instructions
+    in the iteration's prefix.
+
+    All three properties must hold simultaneously. The conjunction is
+    short-circuited: side-effect rejection returns 0 immediately so
+    the dominance walk is skipped for the common case of obviously
+    unsafe instructions.
+
+    Returns 1 if all three properties hold and the hoist is safe,
+    0 otherwise. Null inst_ptr or loop_info short-circuits to 0.
     @End Reasoning
+
+    @Implementation
+    Steps:
+      1. Read opcode via MIR.get_mir_node_opcode. Reject opcodes
+         MIR_STORE, MIR_CALL, MIR_LOAD (Property 1 + Property 3).
+      2. Read exit_blocks (offset 24) and enumerate its members via
+         Set.members. If dominance_ptr is non-null and there is at
+         least one exit, query does_dominate(dominance_ptr,
+         inst_block_id, exit_block_id) for each exit. Any failure
+         returns 0 (Property 2).
+      3. Reaching the end means all three properties hold; return 1.
+    inst_block_id is fetched once via get_instruction_block_id before
+    the loop to avoid repeated lookups inside the exit walk.
+    @End Implementation
+
+    @Performance_Hints
+    Per-call cost: one opcode read (O(1)), one block-id read (O(1)),
+    one dominance query per exit (O(log N) average). For tight loops
+    with a single exit (most natural loops) this is effectively a
+    constant-time predicate. The exit walk is the inner loop of the
+    fixed-point analysis when many candidates pass Property 1; the
+    Set.members allocation per call is the main optimisation target
+    if profiling identifies hotspot.
+    @End Performance_Hints
+
+    @Security_Scope
+    This predicate is the entire correctness boundary of the LICM
+    pass. Any future relaxation (e.g. admitting safe loads, admitting
+    speculatable calls) MUST update this predicate, not bypass it.
+    The opcode whitelist is intentionally conservative: false
+    negatives leave optimisation on the table but never produce
+    incorrect code. False positives would silently corrupt program
+    semantics on any non-trivial input. Every line of this routine is
+    therefore part of Runa's compiler trust boundary.
+    @End Security_Scope
 
     If inst_ptr is equal to 0:
         Return 0
@@ -954,23 +1373,64 @@ End Process
 
 Process called "mark_invariant_instructions" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Marks all loop-invariant instructions using fixed-point iteration.
+    Identifies the set of loop-invariant instructions using monotone
+    fixed-point iteration over the loop's body. An instruction is
+    classified invariant when every one of its operands is invariant
+    AND can_hoist_instruction accepts it as safe to move. The set is
+    seeded as empty and grows on each iteration; the analysis
+    terminates when an iteration produces no new classifications,
+    which is guaranteed to happen because the underlying lattice is
+    finite (the body has finitely many instructions) and the
+    classification function is monotone (an instruction once
+    classified invariant never reverts).
 
-    **FIXED-POINT ALGORITHM:**
-    ```
-    invariant = {}
-    changed = true
-    while changed:
-        changed = false
-        for each instruction I in loop:
-            if all operands of I are invariant:
-                if I not in invariant:
-                    invariant.add(I)
-                    changed = true
-    ```
+    Coupling invariance discovery to the hoist-safety check inside
+    the fixed-point body is deliberate: instructions that are
+    invariant in value but unsafe to hoist (e.g. loads, stores, calls)
+    are correctly excluded from the invariant set, so subsequent
+    transitive classification of dependent instructions does not
+    falsely propagate through them. This yields a smaller-but-correct
+    invariant set rather than a larger-but-overaggressive one.
 
-    Returns number of invariant instructions found.
+    A safety bound of 50 iterations is enforced to prevent worst-case
+    pathological CFGs from running unbounded. In practice convergence
+    occurs within a handful of iterations because the dependency
+    chain depth among invariant instructions is bounded by the
+    longest pure-arithmetic chain inside the loop, which is typically
+    very small.
+
+    Returns the number of invariant instructions found. The total
+    iteration count is folded into the context's iteration_count
+    counter (offset 88) for statistics reporting.
     @End Reasoning
+
+    @Implementation
+    Outer loop terminates when changed == 0 or iteration >= 50.
+    Inner walks:
+      - For each block id in body_blocks (string-decoded back to Int):
+        - For each instruction inst in the block:
+          - Skip if already in invariant_set.
+          - Read operands op1 (offset 16) and op2 (offset 24).
+          - Default each operand's invariance flag to 1; for a
+            non-null operand, override the flag with the result of
+            calling is_loop_invariant_operand on it.
+          - If both flags are 1, query can_hoist_instruction. On
+            accept, insert the instruction (string-encoded) into
+            invariant_set and set changed = 1.
+    After convergence, write the invariant set size into loop_info
+    offset 56 and accumulate the iteration count into context
+    offset 88.
+    @End Implementation
+
+    @Performance_Hints
+    O(K * |body| * inst-per-block) per iteration where K is the
+    number of iterations until convergence (typically 2-5). The
+    inner cost is dominated by is_loop_invariant_operand and
+    can_hoist_instruction, each O(log) per call. Set.contains for
+    inst_str is the warmest pure-bookkeeping cost. For loops with
+    >1000 instructions the integer_to_string traffic on the inner
+    inst_ptr -> inst_str path is the prime optimisation target.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
@@ -1029,16 +1489,16 @@ Process called "mark_invariant_instructions" that takes context_ptr as Integer, 
                             Let op2_invariant be 1
 
                             If op1 is not equal to 0:
-                                Set op1_invariant to is_loop_invariant_operand(op1, loop_info, invariant_set, ssa_ptr, cfg_ptr)
+                                Set op1_invariant to proc is_loop_invariant_operand with op1, loop_info, invariant_set, ssa_ptr, cfg_ptr
                             End If
 
                             If op2 is not equal to 0:
-                                Set op2_invariant to is_loop_invariant_operand(op2, loop_info, invariant_set, ssa_ptr, cfg_ptr)
+                                Set op2_invariant to proc is_loop_invariant_operand with op2, loop_info, invariant_set, ssa_ptr, cfg_ptr
                             End If
 
                             Note: If all operands invariant and safe to hoist
                             If op1_invariant is equal to 1 and op2_invariant is equal to 1:
-                                Let can_hoist be can_hoist_instruction(inst_ptr, loop_info, dominance_ptr, cfg_ptr)
+                                Let can_hoist be proc can_hoist_instruction with inst_ptr, loop_info, dominance_ptr, cfg_ptr
 
                                 If can_hoist is equal to 1:
                                     Note: Mark as invariant
@@ -1079,15 +1539,57 @@ Note: ==========================================================================
 
 Process called "hoist_instruction" that takes inst_ptr as Integer, loop_info as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Hoists an instruction to the loop preheader.
+    Executes the actual CFG mutation that relocates a single invariant
+    instruction from its original block (inside the loop body) to the
+    loop's preheader. By the time this routine runs the instruction
+    has already been certified by can_hoist_instruction, so no safety
+    re-validation is needed here; this routine's only responsibility
+    is the structural transplant.
 
-    **HOISTING:**
-    1. Remove instruction from current block
-    2. Insert at end of preheader (before branch)
-    3. Update SSA form (phi nodes if needed)
+    The hoisted instruction is appended to the preheader before the
+    preheader's terminating branch — placement at the end of the
+    preheader (rather than the beginning) preserves the relative
+    order of multiple hoisted instructions when they have
+    inter-dependencies, since the fixed-point analysis enumerated
+    them in dependency order.
 
-    Returns 1 on success, 0 on failure.
+    SSA form is preserved because the preheader strictly dominates
+    every block in the loop body (by construction of insert_preheader),
+    so every use of the hoisted instruction's defined value, which
+    must lie in the body to have been visible to the analysis, remains
+    dominated by the new definition site. No phi insertion or
+    renaming is required.
+
+    Returns 1 on success, 0 if any argument is null, the loop has no
+    preheader (insertion was skipped), or the preheader cannot be
+    resolved. A failure here is non-fatal for the pass: the
+    instruction remains in its original block and the program is
+    still correct, only unoptimised.
     @End Reasoning
+
+    @Implementation
+    1. Resolve preheader_id from loop_info offset 8. If zero, abort
+       with diagnostic (no preheader was inserted for this loop).
+    2. Resolve preheader_block via get_block_by_id; abort on failure.
+    3. Resolve original_block via get_instruction_block_id +
+       get_block_by_id. If found, call
+       remove_instruction_from_block; a non-zero failure is logged
+       but not fatal (the instruction will be appended to the
+       preheader regardless, which is benign because dead copies in
+       the original block are removed by subsequent DCE).
+    4. Append the instruction to the preheader via
+       add_instruction_to_block. The preheader's CFG implementation
+       inserts before the terminator branch.
+    @End Implementation
+
+    @Security_Scope
+    Hoisting is the irreversible mutation step. The safety predicate
+    can_hoist_instruction is the only guard. This routine MUST be
+    called only with instructions certified by that predicate;
+    invoking it on an arbitrary instruction would violate program
+    semantics. The single call site inside hoist_invariant_instructions
+    enforces this discipline.
+    @End Security_Scope
 
     If inst_ptr is equal to 0:
         Return 0
@@ -1137,10 +1639,32 @@ End Process
 
 Process called "hoist_invariant_instructions" that takes context_ptr as Integer, loop_info as Integer returns Integer:
     @Reasoning
-    Hoists all marked invariant instructions to preheader.
+    Iterates the context's invariant_set and relocates every member
+    instruction to the supplied loop's preheader via hoist_instruction.
+    This routine is the integration point between the analysis phase
+    (mark_invariant_instructions, which only mutates the bookkeeping
+    set) and the transformation phase (hoist_instruction, which
+    mutates the CFG).
 
-    Returns number of instructions hoisted.
+    The current implementation hoists the entire invariant_set into
+    one loop's preheader. When LICM processes multiple loops in a
+    function, the caller is responsible for clearing or re-seeding
+    invariant_set between loops; the current optimize_function_with_licm
+    pipeline relies on the convention that mark_invariant_instructions
+    is called immediately before hoist_invariant_instructions for each
+    loop in turn.
+
+    Returns the number of instructions successfully hoisted. The
+    return value contributes to the context's hoisted_count statistic.
     @End Reasoning
+
+    @Implementation
+    Reads invariant_set from context offset 16. Enumerates members via
+    Set.members, decodes each instruction pointer with
+    string_to_integer, and calls hoist_instruction. Counts successful
+    hoists (return == 1). Diagnostic Display lines bracket the loop
+    for codegen-bringup observability.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1166,7 +1690,7 @@ Process called "hoist_invariant_instructions" that takes context_ptr as Integer,
         Let inst_ptr be proc string_to_integer from String with inst_str
 
         Note: Hoist instruction
-        Let result be hoist_instruction(inst_ptr, loop_info, cfg_ptr)
+        Let result be proc hoist_instruction with inst_ptr, loop_info, cfg_ptr
         If result is equal to 1:
             Set hoisted to hoisted plus 1
         End If
@@ -1185,21 +1709,55 @@ Note: ==========================================================================
 
 Process called "optimize_function_with_licm" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    **MAIN LICM ENTRY POINT**
+    Top-level driver for the Loop-Invariant Code Motion optimization
+    pass on a single function CFG. The pipeline composes the six
+    LICM stages in their required order:
 
-    Runs complete LICM optimization on a function.
+      1. Construct the LICM context. This computes dominance, SSA
+         use/def chains, and allocates the bookkeeping structures.
+      2. Detect natural loops. Without any loops the pass terminates
+         successfully (no work to do).
+      3. Insert preheaders so every loop has a single landing pad for
+         hoisted instructions.
+      4. For each loop, run mark_invariant_instructions to find the
+         transitive closure of safe-to-hoist instructions, then
+         hoist_invariant_instructions to materialise the transform.
+         The two are tightly coupled: marking must finish before
+         hoisting because hoisting mutates the CFG and would
+         invalidate the analysis if interleaved.
+      5. Print statistics for telemetry consumers.
+      6. Destroy the context.
 
-    **ALGORITHM:**
-    1. Create LICM context
-    2. Detect natural loops
-    3. Insert preheaders
-    4. Mark invariant instructions (fixed-point)
-    5. Hoist invariant instructions
-    6. Print statistics
-    7. Destroy context
+    The pass is idempotent at the function level: re-running LICM on
+    a CFG that has no further invariant motion to perform produces
+    no transformations and identical output.
 
-    Returns 1 on success, 0 on failure.
+    Returns 1 on success (including the "no loops found" case), 0 on
+    context creation failure or null CFG.
     @End Reasoning
+
+    @Implementation
+    Stage 1: create_licm_context. On null return, abort with
+    diagnostic and propagate 0.
+    Stage 2: detect_natural_loops. On 0 return, destroy context and
+    return 1 (success with no work).
+    Stage 3: insert_preheaders.
+    Stage 4: iterate loops_list (offset 8); for each LoopInfo, call
+    mark_invariant_instructions and hoist_invariant_instructions,
+    accumulate hoisted count, increment loops_processed counter at
+    context offset 32.
+    Final: write total_hoisted into context offset 24, call
+    print_licm_stats, destroy context, return 1.
+    @End Implementation
+
+    @Performance_Hints
+    Per-function cost is dominated by stage 1 (dominance + SSA
+    construction) and the fixed-point analysis in stage 4. For
+    functions with no loops the early exit after stage 2 keeps the
+    cost at one dominance computation plus one CFG scan, which is
+    why the heuristic guard in should_run_licm matters for compile
+    time on loop-light input.
+    @End Performance_Hints
 
     If cfg_ptr is equal to 0:
         Display "optimize_function_with_licm: null CFG"
@@ -1214,7 +1772,7 @@ Process called "optimize_function_with_licm" that takes cfg_ptr as Integer retur
 
     Note: Step 1: Create context
     Display "Step 1: Creating LICM context..."
-    Let context_ptr be create_licm_context(cfg_ptr)
+    Let context_ptr be proc create_licm_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "optimize_function_with_licm: failed to create context"
         Return 0
@@ -1222,17 +1780,17 @@ Process called "optimize_function_with_licm" that takes cfg_ptr as Integer retur
 
     Note: Step 2: Detect natural loops
     Display "Step 2: Detecting natural loops..."
-    Let loop_count be detect_natural_loops(context_ptr)
+    Let loop_count be proc detect_natural_loops with context_ptr
 
     If loop_count is equal to 0:
         Display "optimize_function_with_licm: no loops found"
-        destroy_licm_context(context_ptr)
+        proc destroy_licm_context with context_ptr
         Return 1
     End If
 
     Note: Step 3: Insert preheaders
     Display "Step 3: Inserting preheaders..."
-    insert_preheaders(context_ptr)
+    proc insert_preheaders with context_ptr
 
     Note: Step 4: Process each loop
     Display "Step 4: Processing loops for invariant code motion..."
@@ -1248,10 +1806,10 @@ Process called "optimize_function_with_licm" that takes cfg_ptr as Integer retur
         Display "Processing loop with header " joined with header_id joined with "..."
 
         Note: Mark invariant instructions
-        mark_invariant_instructions(context_ptr, loop_info)
+        proc mark_invariant_instructions with context_ptr, loop_info
 
         Note: Hoist invariant instructions
-        Let hoisted be hoist_invariant_instructions(context_ptr, loop_info)
+        Let hoisted be proc hoist_invariant_instructions with context_ptr, loop_info
         Set total_hoisted to total_hoisted plus hoisted
 
         Note: Update loops processed counter
@@ -1266,10 +1824,10 @@ Process called "optimize_function_with_licm" that takes cfg_ptr as Integer retur
     proc memory_set_int64 from Layout with context_ptr, 24, total_hoisted
 
     Note: Step 5: Print statistics
-    print_licm_stats(context_ptr)
+    proc print_licm_stats with context_ptr
 
     Note: Step 6: Destroy context
-    destroy_licm_context(context_ptr)
+    proc destroy_licm_context with context_ptr
 
     Display ""
     Display "LOOP-INVARIANT CODE MOTION COMPLETE"
@@ -1285,20 +1843,32 @@ Process called "run_licm_pass" that takes cfg_ptr as Integer returns Integer:
     Returns 1 if CFG was modified, 0 if no changes.
     @End Reasoning
 
-    Return optimize_function_with_licm(cfg_ptr)
+    Return proc optimize_function_with_licm with cfg_ptr
 End Process
 
 Process called "should_run_licm" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Determines if LICM should be run.
+    Cheap pre-pass profitability guard. Returns 0 (skip LICM) when
+    the function is so small that the dominance-computation cost of
+    running LICM exceeds any plausible speedup from invariant motion.
+    A function with fewer than three basic blocks cannot contain a
+    non-trivial natural loop (a loop requires at minimum a header, a
+    body block, and a back-edge source — even a self-loop needs an
+    entry block to dominate it), so skipping such functions is sound
+    and avoids paying the dominance construction cost.
 
-    **PROFITABILITY:**
-    LICM is profitable if:
-    - Function contains loops (has back edges)
-    - Function is non-trivial (>= 3 blocks)
+    The actual back-edge presence check is performed inside
+    detect_natural_loops; this guard is purely a block-count
+    heuristic intended to keep compile-time overhead near zero on
+    loop-light input.
 
-    Returns 1 if should run, 0 otherwise.
+    Returns 1 when LICM should run, 0 to skip.
     @End Reasoning
+
+    @Implementation
+    Reads get_block_count from the CFG. Returns 0 immediately on
+    null CFG or block_count < 3. Otherwise returns 1.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Return 0

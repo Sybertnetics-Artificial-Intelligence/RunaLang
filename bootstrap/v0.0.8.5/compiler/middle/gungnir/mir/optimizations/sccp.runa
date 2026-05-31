@@ -145,24 +145,43 @@ Note: ==========================================================================
 
 Process called "create_sccp_context" that takes cfg as Integer returns Integer:
     @Reasoning
-    Creates and initializes SCCP context.
+    Allocates and initializes the SCCPContext that backs a single
+    Wegman-Zadeck analysis run. The context owns six collections (one
+    dictionary, two sets, two lists, one CFG reference) and four
+    counters, packed into a 96-byte layout described in the
+    SCCPContext type comment. Lifetime is one function-pass invocation;
+    `destroy_sccp_context` releases every child collection.
 
-    **INITIALIZATION:**
-    - Allocates 96-byte context structure
-    - Creates lattice value dictionary (SSA value_id → LatticeValue)
-    - Creates executable edges set
-    - Creates dual worklists (SSA values, CFG edges)
-    - Creates executable blocks set
-    - Initializes all counters to 0
-
-    Returns context pointer or 0 on failure.
+    Returns the context pointer on success, 0 on allocation failure or
+    NULL CFG input.
     @End Reasoning
 
+    @Implementation
+    Allocates a 96-byte structure via Layout.allocate, then for each
+    of the six collection slots (offsets 8/16/24/32/40 plus the cfg
+    pointer at offset 0) creates the appropriate Dictionary/Set/List
+    via the matching primitive create call and writes the pointer into
+    the structure with memory_set_int64. The four counters at
+    offsets 48/56/64/72 (constants_found, branches_folded,
+    instructions_eliminated, blocks_eliminated) plus the
+    interprocedural slots at 80/88 (module, call_graph) are explicitly
+    initialized to 0 so any later memory_get_int64 read is well-defined.
+    @End Implementation
+
     @Performance_Hints
-    Dictionary is used for lattice values to support sparse analysis.
-    Only values that are encountered are added to the dictionary,
-    avoiding O(n) initialization of all possible SSA values.
+    Dictionary is used for lattice values to support sparse analysis:
+    only SSA values actually visited during fixed-point iteration
+    appear in the dictionary, avoiding O(N) up-front initialization
+    over the full SSA value space.
     @End Performance_Hints
+
+    @Security_Scope
+    All allocations are checked for NULL via early-return on 0; partial
+    initialization that already happened is left to be cleaned up by
+    the caller (which has the context pointer 0 and therefore should
+    not call destroy_sccp_context on it). No untrusted input is
+    consumed here.
+    @End Security_Scope
 
     If cfg is equal to 0:
         Display "create_sccp_context: null CFG"
@@ -214,8 +233,30 @@ End Process
 
 Process called "destroy_sccp_context" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Destroys SCCP context and frees all memory.
+    Releases every collection owned by the SCCPContext and finally the
+    96-byte structure itself. Required to balance `create_sccp_context`;
+    failing to call it leaks the lattice dictionary, both worklists,
+    both reachability sets, and every LatticeValue stored in the
+    dictionary. Safe to call with context_ptr equal to 0.
     @End Reasoning
+
+    @Implementation
+    Iterates the lattice_values dictionary first because individual
+    LatticeValue allocations live inside it and must be freed one by
+    one via Layout.deallocate before the dictionary is destroyed.
+    Then destroys executable_edges, ssa_worklist, cfg_worklist, and
+    executable_blocks via the matching primitive destroy calls.
+    Finally deallocates the 96-byte context structure itself. Each
+    pointer is null-checked before being acted on so partially-
+    initialized contexts (impossible under correct usage but cheap to
+    guard against) do not crash.
+    @End Implementation
+
+    @Security_Scope
+    Defensive null-checks on every sub-pointer make this idempotent
+    against partial or repeated destruction. The function does not
+    expose any context state to its caller.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -277,8 +318,18 @@ End Process
 
 Process called "print_sccp_stats" that takes context_ptr as Integer returns Integer:
     @Reasoning
-    Prints SCCP optimization statistics.
+    Emits a four-line diagnostic summary of an SCCP run: number of
+    constants discovered, conditional branches that were folded to
+    unconditional jumps, instructions eliminated, and entire basic
+    blocks eliminated. Used by the optimization driver and during
+    interactive debugging of pass pipeline effectiveness.
     @End Reasoning
+
+    @Implementation
+    Reads the four counter fields (offsets 48, 56, 64, 72) from the
+    SCCPContext and emits them via Display calls, computing the total
+    by simple addition. No allocation; safe to call repeatedly.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -308,10 +359,21 @@ Note: ==========================================================================
 
 Process called "create_lattice_bottom" returns Integer:
     @Reasoning
-    Creates a BOTTOM lattice value (undefined/uninitialized).
+    Allocates a freshly initialized BOTTOM LatticeValue — the identity
+    element of the SCCP meet lattice, denoting "this SSA value has not
+    yet been observed by the analysis". Used as the initial state for
+    every previously-unseen SSA value and as the accumulator seed in
+    `evaluate_phi_node`.
 
-    Returns lattice value pointer.
+    Returns the LatticeValue pointer, 0 on allocation failure.
     @End Reasoning
+
+    @Implementation
+    Allocates 16 bytes, writes LATTICE_BOTTOM (0) into the state field
+    at offset 0 and 0 into the constant_value field at offset 8 to
+    avoid leaving uninitialized bytes that could confuse a future
+    memory_get_int64 read.
+    @End Implementation
 
     Let lattice_ptr be proc allocate from Layout with 16
     If lattice_ptr is equal to 0:
@@ -326,10 +388,21 @@ End Process
 
 Process called "create_lattice_constant" that takes value as Integer returns Integer:
     @Reasoning
-    Creates a CONSTANT lattice value with given value.
+    Allocates a CONSTANT(value) LatticeValue — the middle element of
+    the SCCP lattice, representing "this SSA value has been folded to
+    the literal `value` on every path observed so far". Produced by
+    constant-folding transfer functions in `evaluate_binary_op`,
+    `evaluate_comparison`, `evaluate_unary_op`, and by direct
+    MIR_CONST evaluation in `evaluate_instruction`.
 
-    Returns lattice value pointer.
+    Returns the LatticeValue pointer, 0 on allocation failure.
     @End Reasoning
+
+    @Implementation
+    Allocates 16 bytes, writes LATTICE_CONSTANT (1) into the state
+    field at offset 0 and the supplied `value` into the constant_value
+    field at offset 8.
+    @End Implementation
 
     Let lattice_ptr be proc allocate from Layout with 16
     If lattice_ptr is equal to 0:
@@ -344,10 +417,21 @@ End Process
 
 Process called "create_lattice_top" returns Integer:
     @Reasoning
-    Creates a TOP lattice value (overdefined).
+    Allocates a TOP LatticeValue — the absorbing element of the SCCP
+    meet lattice, denoting "this SSA value provably is not a single
+    compile-time constant". Produced whenever conservative analysis
+    cannot do better, e.g. memory loads, function calls, casts, or
+    arithmetic on disagreeing CONSTANT operands.
 
-    Returns lattice value pointer.
+    Returns the LatticeValue pointer, 0 on allocation failure.
     @End Reasoning
+
+    @Implementation
+    Allocates 16 bytes, writes LATTICE_TOP (2) into the state field
+    at offset 0 and 0 into the constant_value field at offset 8
+    (unused for TOP but explicitly cleared so the layout is fully
+    initialized).
+    @End Implementation
 
     Let lattice_ptr be proc allocate from Layout with 16
     If lattice_ptr is equal to 0:
@@ -362,28 +446,52 @@ End Process
 
 Process called "lattice_meet" that takes lattice1 as Integer, lattice2 as Integer returns Integer:
     @Reasoning
-    Computes the meet (join in upward lattice) of two lattice values.
+    Computes the meet operator (⊔) of the SCCP three-point lattice as
+    defined by Wegman and Zadeck (TOPLAS 1991). The lattice is:
 
-    **MEET RULES:**
-    ```
-    BOTTOM ⊔ x = x          (BOTTOM is identity)
-    x ⊔ BOTTOM = x
-    CONSTANT(v1) ⊔ CONSTANT(v2) = CONSTANT(v1) if v1=v2, else TOP
-    TOP ⊔ x = TOP           (TOP is absorbing)
-    x ⊔ TOP = TOP
-    ```
+        BOTTOM  -- unreached / undefined (initial state)
+           |
+        CONSTANT(v)  -- value is the literal v
+           |
+          TOP  -- over-defined (varies across executions / unknown)
+
+    **MEET RULES (commutative, idempotent, associative):**
+        BOTTOM ⊔ x        = x                (BOTTOM is the identity)
+        TOP ⊔ x           = TOP              (TOP is the absorbing element)
+        CONSTANT(v) ⊔ CONSTANT(v)  = CONSTANT(v)
+        CONSTANT(v1) ⊔ CONSTANT(v2) = TOP    when v1 ≠ v2
 
     **MONOTONICITY:**
-    Result is always > or equal to both inputs in lattice ordering.
+    The meet only moves elements DOWN the lattice (BOTTOM → CONSTANT → TOP)
+    or leaves them unchanged. Combined with the finite three-element height,
+    this guarantees the worklist algorithm in `run_sccp_analysis` reaches a
+    fixed point in O(N × 2) lattice transitions where N is the SSA-value count.
 
-    Returns new lattice value (caller must free).
+    Returns a freshly allocated LatticeValue (caller frees via deallocate).
+    Returns a TOP value on either NULL input (safe over-approximation).
     @End Reasoning
 
+    @Implementation
+    Reads the `state` byte (offset 0) of each operand to dispatch:
+      1. If either input pointer is 0, return TOP (defensive fallback so
+         missing values never accidentally fold into a CONSTANT).
+      2. If either state is LATTICE_TOP, return TOP (absorbing rule).
+      3. If either state is LATTICE_BOTTOM, return a copy of the other
+         operand (identity rule). When the other side is CONSTANT we
+         read its value field (offset 8) and reconstruct CONSTANT(v).
+         When both sides are BOTTOM the result is BOTTOM.
+      4. Both sides are CONSTANT: compare the value fields. Equal → return
+         CONSTANT(v); unequal → return TOP.
+    Each branch allocates a NEW 16-byte LatticeValue rather than mutating
+    its operands, preserving the immutability the worklist depends on for
+    delta-detection in `update_lattice_value`.
+    @End Implementation
+
     If lattice1 is equal to 0:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
     If lattice2 is equal to 0:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Let state1 be proc memory_get_int64 from Layout with lattice1, 0
@@ -391,27 +499,27 @@ Process called "lattice_meet" that takes lattice1 as Integer, lattice2 as Intege
 
     Note: If either is TOP, result is TOP
     If state1 is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
     If state2 is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: If either is BOTTOM, result is the other
     If state1 is equal to LATTICE_BOTTOM:
         If state2 is equal to LATTICE_BOTTOM:
-            Return create_lattice_bottom()
+            Return proc create_lattice_bottom
         End If
         If state2 is equal to LATTICE_CONSTANT:
             Let value2 be proc memory_get_int64 from Layout with lattice2, 8
-            Return create_lattice_constant(value2)
+            Return proc create_lattice_constant with value2
         End If
     End If
 
     If state2 is equal to LATTICE_BOTTOM:
         If state1 is equal to LATTICE_CONSTANT:
             Let value1 be proc memory_get_int64 from Layout with lattice1, 8
-            Return create_lattice_constant(value1)
+            Return proc create_lattice_constant with value1
         End If
     End If
 
@@ -420,16 +528,24 @@ Process called "lattice_meet" that takes lattice1 as Integer, lattice2 as Intege
     Set value2 to proc memory_get_int64 from Layout with lattice2, 8
 
     If value1 is equal to value2:
-        Return create_lattice_constant(value1)
+        Return proc create_lattice_constant with value1
     Otherwise:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 End Process
 
 Process called "is_lattice_bottom" that takes lattice as Integer returns Integer:
     @Reasoning
-    Returns 1 if lattice value is BOTTOM, 0 otherwise.
+    State-predicate convenience accessor: returns 1 when the
+    LatticeValue's state byte is LATTICE_BOTTOM, 0 otherwise. NULL
+    pointers are treated as not-BOTTOM so callers receive a
+    conservative answer when given a missing value.
     @End Reasoning
+
+    @Implementation
+    Null-checks the pointer, then reads the state field at offset 0
+    via memory_get_int64 and compares against LATTICE_BOTTOM.
+    @End Implementation
 
     If lattice is equal to 0:
         Return 0
@@ -445,8 +561,16 @@ End Process
 
 Process called "is_lattice_constant" that takes lattice as Integer returns Integer:
     @Reasoning
-    Returns 1 if lattice value is CONSTANT, 0 otherwise.
+    State-predicate convenience accessor: returns 1 when the
+    LatticeValue's state byte is LATTICE_CONSTANT, 0 otherwise. Used
+    by transformation passes to decide whether a value is foldable.
+    Treats NULL as not-CONSTANT.
     @End Reasoning
+
+    @Implementation
+    Null-checks the pointer, reads state at offset 0 via
+    memory_get_int64, and compares against LATTICE_CONSTANT.
+    @End Implementation
 
     If lattice is equal to 0:
         Return 0
@@ -462,8 +586,16 @@ End Process
 
 Process called "is_lattice_top" that takes lattice as Integer returns Integer:
     @Reasoning
-    Returns 1 if lattice value is TOP, 0 otherwise.
+    State-predicate convenience accessor: returns 1 when the
+    LatticeValue's state byte is LATTICE_TOP, 0 otherwise. Used by
+    callers that need to short-circuit further folding work as soon
+    as overdefined-ness has been reached. Treats NULL as not-TOP.
     @End Reasoning
+
+    @Implementation
+    Null-checks the pointer, reads state at offset 0 via
+    memory_get_int64, and compares against LATTICE_TOP.
+    @End Implementation
 
     If lattice is equal to 0:
         Return 0
@@ -479,9 +611,18 @@ End Process
 
 Process called "get_lattice_constant_value" that takes lattice as Integer returns Integer:
     @Reasoning
-    Returns the constant value if lattice is CONSTANT.
-    Returns 0 if not constant (caller should check is_lattice_constant first).
+    Extracts the folded constant value from a CONSTANT LatticeValue.
+    Returns 0 when the state is not LATTICE_CONSTANT or when the
+    pointer is NULL — callers must therefore precede this call with
+    `is_lattice_constant` if they need to distinguish "value is the
+    literal 0" from "value is not constant".
     @End Reasoning
+
+    @Implementation
+    Null-checks the pointer, reads the state at offset 0, and only
+    when state equals LATTICE_CONSTANT returns the constant_value
+    field at offset 8. All other cases return 0 as a sentinel.
+    @End Implementation
 
     If lattice is equal to 0:
         Return 0
@@ -498,14 +639,29 @@ End Process
 
 Process called "get_or_create_lattice_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
     @Reasoning
-    Gets existing lattice value for SSA value_id, or creates BOTTOM if none exists.
+    Looks up the LatticeValue mapped to a given SSA value-id in the
+    sparse lattice dictionary, lazily creating BOTTOM on first
+    reference. This is the central read API for every transfer
+    function in the file. The "sparse" property of SCCP relies on
+    this lazy creation: only SSA values actually visited during
+    fixed-point iteration ever occupy dictionary slots, keeping the
+    working set proportional to live use-def chain reach rather than
+    the whole function.
 
-    **SPARSE ANALYSIS:**
-    Values start as BOTTOM (undefined) only when first encountered.
-    This avoids initializing all possible SSA values upfront.
-
-    Returns lattice value pointer (never returns 0).
+    Returns the LatticeValue pointer (never returns 0 under correct
+    Dictionary primitive behaviour).
     @End Reasoning
+
+    @Implementation
+    Reads the lattice_values dictionary pointer from the SCCPContext
+    at offset 8, then stringifies value_id (Dictionary keys are
+    strings in the bootstrap primitives) and probes via
+    Dictionary.contains. On a hit, returns the stored pointer
+    directly. On a miss, allocates a fresh BOTTOM LatticeValue,
+    installs it under the key, and returns it. The created value is
+    OWNED by the dictionary — `update_lattice_value` is responsible
+    for freeing and replacing it on state transitions.
+    @End Implementation
 
     Let lattice_values be proc memory_get_int64 from Layout with context_ptr, 8
 
@@ -521,7 +677,7 @@ Process called "get_or_create_lattice_value" that takes context_ptr as Integer, 
     End If
 
     Note: Create new BOTTOM value
-    Set lattice_val to create_lattice_bottom()
+    Set lattice_val to proc create_lattice_bottom
     proc set from Dictionary with lattice_values, key_str, lattice_val
 
     Return lattice_val
@@ -529,13 +685,40 @@ End Process
 
 Process called "update_lattice_value" that takes context_ptr as Integer, value_id as Integer, new_lattice as Integer returns Integer:
     @Reasoning
-    Updates lattice value for SSA value_id with new_lattice.
+    Atomically applies a proposed lattice transition for one SSA value
+    and signals whether the value actually moved. This is the delta-
+    detection primitive that gates SSA-worklist propagation: only
+    genuine lattice transitions trigger re-visiting of user
+    instructions. Without this guard the fixed-point iteration could
+    bounce between equal states forever.
 
-    Returns 1 if value changed (needs repropagation), 0 if unchanged.
+    **MONOTONICITY GUARANTEE:**
+    The SCCP lattice is finite-height (3) and the meet operator is
+    monotone, so the only legal transitions are:
+        BOTTOM   → CONSTANT(v)   → TOP
+        BOTTOM   → TOP                  (skipping CONSTANT)
+        CONSTANT → TOP                  (when meeting disagreeing constants)
+    Each SSA value therefore moves at most twice, which is the
+    termination argument for `run_sccp_analysis`.
 
-    **MONOTONICITY CHECK:**
-    Only updates if new_lattice is lower in lattice (more defined).
+    **CHANGE-DETECTION SEMANTICS:**
+      - Same state AND same constant value      ⇒ no change (returns 0)
+      - Different state OR different constant   ⇒ change (returns 1)
+
+    The caller (visit_instruction / visit_phi_node) uses the return
+    value to decide whether to enqueue users on the SSA worklist.
     @End Reasoning
+
+    @Implementation
+    Looks up (or creates BOTTOM for) the existing LatticeValue, then
+    compares state-words at offset 0. When both states are
+    LATTICE_CONSTANT we additionally compare the value field at
+    offset 8. On any genuine change we deallocate the old LatticeValue
+    and allocate a fresh 16-byte LatticeValue that is a clone of
+    `new_lattice` — the dictionary owns its entries and `new_lattice`
+    itself may be deallocated by the caller after this call returns.
+    The dictionary is then re-set under the stringified value_id key.
+    @End Implementation
 
     If new_lattice is equal to 0:
         Return 0
@@ -545,7 +728,7 @@ Process called "update_lattice_value" that takes context_ptr as Integer, value_i
     Let key_str be proc integer_to_string from String with value_id
 
     Note: Get current lattice value
-    Let current_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    Let current_lattice be proc get_or_create_lattice_value with context_ptr, value_id
 
     Let current_state be proc memory_get_int64 from Layout with current_lattice, 0
     Let new_state be proc memory_get_int64 from Layout with new_lattice, 0
@@ -584,28 +767,54 @@ Note: ==========================================================================
 
 Process called "evaluate_instruction" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
     @Reasoning
-    Evaluates a MIR instruction and returns its result lattice value.
+    Computes the SCCP lattice element produced by a single MIR
+    instruction given the current lattice values of its operands. This
+    is the abstract-interpretation transfer function in Wegman-Zadeck
+    notation: ⟦inst⟧(σ) where σ maps each SSA value to its current
+    lattice element.
 
-    **LATTICE SEMANTICS:**
-    - Operates on lattice values (BOTTOM, CONSTANT(v), TOP)
-    - If any operand is TOP → result is TOP (overdefined)
-    - If any operand is BOTTOM → result is BOTTOM (undefined)
-    - If all operands are CONSTANT → compute constant result
+    **GENERAL LATTICE SEMANTICS (applied per-opcode):**
+      - any operand at TOP    ⇒ result is TOP (information loss propagates)
+      - any operand at BOTTOM ⇒ result is BOTTOM (instruction not yet
+        usefully reachable — re-evaluation will lower it later)
+      - all operands at CONSTANT ⇒ compute the concrete result and
+        return CONSTANT(folded_value)
 
-    **INSTRUCTION TYPES:**
-    Dispatches to specialized evaluators based on opcode.
+    **OPCODE DISPATCH:**
+      - MIR_CONST     : reads the literal value and returns CONSTANT(v)
+      - Arithmetic    : delegates to `evaluate_binary_op`
+      - Comparisons   : delegates to `evaluate_comparison`
+      - Bitwise/shift : delegates to `evaluate_binary_op`
+      - Unary         : delegates to `evaluate_unary_op`
+      - Cast/extend   : delegates to `evaluate_cast`
+      - φ-node        : delegates to `evaluate_phi_node`
+      - Memory ops, calls, intrinsics: returns TOP (conservative)
 
-    Returns lattice value for instruction result (0 if no result/error).
+    Returns a newly allocated LatticeValue; TOP for NULL input or any
+    opcode not yet modelled as foldable.
     @End Reasoning
 
+    @Implementation
+    Reads the opcode via the MIR accessor `get_mir_node_opcode`, then
+    a Match dispatches on the opcode constant to the appropriate
+    specialized evaluator. The Match form compiles to a jump table for
+    O(1) dispatch which matters because this is called once per
+    instruction per worklist visit. All un-modelled opcodes fall through
+    to the default arm and return TOP — this keeps the analysis sound
+    even when new opcodes are added without an evaluator.
+    @End Implementation
+
     @Performance_Hints
-    This is a hot path in SCCP minus called for every instruction during analysis.
-    Match statement provides O(1) opcode dispatch via compiler-generated jump table,
-    replacing O(n) sequential comparisons.
+    This is the SCCP transfer function inner loop; it is invoked once
+    per instruction visit on the SSA/CFG worklists. The Match statement
+    compiles to a dense opcode jump table for O(1) dispatch rather than
+    O(n) sequential `If opcode is equal to ...` comparisons. Returning
+    TOP for non-foldable opcodes is intentionally cheap — no allocation
+    of operand lookups happens in those arms.
     @End Performance_Hints
 
     If inst_ptr is equal to 0:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
@@ -616,67 +825,88 @@ Process called "evaluate_instruction" that takes context_ptr as Integer, inst_pt
             Note: Constants always evaluate to their constant value
             Let const_node be inst_ptr
             Let const_val be proc memory_get_int64 from Layout with const_node, 16
-            Return create_lattice_constant(const_val)
+            Return proc create_lattice_constant with const_val
 
         When MIR_ADD or MIR_SUB or MIR_MUL or MIR_DIV or MIR_MOD:
             Note: Binary arithmetic operations
-            Return evaluate_binary_op(context_ptr, inst_ptr, opcode)
+            Return proc evaluate_binary_op with context_ptr, inst_ptr, opcode
 
         When MIR_AND or MIR_OR or MIR_XOR or MIR_SHL or MIR_SHR or MIR_SAR:
             Note: Bitwise operations
-            Return evaluate_binary_op(context_ptr, inst_ptr, opcode)
+            Return proc evaluate_binary_op with context_ptr, inst_ptr, opcode
 
         When MIR_EQ or MIR_NE or MIR_LT or MIR_LE or MIR_GT or MIR_GE:
             Note: Comparison operations
-            Return evaluate_comparison(context_ptr, inst_ptr, opcode)
+            Return proc evaluate_comparison with context_ptr, inst_ptr, opcode
 
         When MIR_NEG or MIR_NOT:
             Note: Unary operations
-            Return evaluate_unary_op(context_ptr, inst_ptr, opcode)
+            Return proc evaluate_unary_op with context_ptr, inst_ptr, opcode
 
         When MIR_CAST or MIR_BITCAST or MIR_TRUNC or MIR_EXTEND or MIR_ZEXT:
             Note: Type casts
-            Return evaluate_cast(context_ptr, inst_ptr)
+            Return proc evaluate_cast with context_ptr, inst_ptr
 
         When MIR_PHI:
             Note: PHI nodes
-            Return evaluate_phi_node(context_ptr, inst_ptr)
+            Return proc evaluate_phi_node with context_ptr, inst_ptr
 
         When MIR_LOAD or MIR_LOAD_FIELD or MIR_ALLOCA or MIR_ADDRESS_OF or MIR_DEREF:
             Note: Memory operations - conservative (TOP)
-            Return create_lattice_top()
+            Return proc create_lattice_top
 
         When MIR_CALL or MIR_CALL_INDIRECT or MIR_INVOKE:
             Note: Function calls - conservative (TOP)
-            Return create_lattice_top()
+            Return proc create_lattice_top
 
         Otherwise:
             Note: All other instructions - conservative (TOP)
-            Return create_lattice_top()
+            Return proc create_lattice_top
     End Match
 End Process
 
 Process called "evaluate_phi_node" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
     @Reasoning
-    Evaluates a PHI node by computing the meet of all incoming values
-    from executable predecessors.
+    Computes the SCCP lattice element for the result of an SSA φ-function
+    by meeting the incoming values from EXECUTABLE predecessor edges only.
+    The conditional reachability filter is what distinguishes SCCP from
+    plain Wegman-Zadeck CCP: an incoming value flowing through a branch
+    that has been proven false does not poison the φ-result.
 
-    **PHI SEMANTICS:**
-    - Only consider incoming values from executable edges
-    - Compute meet of all executable incoming values
-    - If no executable predecessors → BOTTOM (unreachable)
-    - If single executable predecessor → that value's lattice
-    - If multiple with same constant → CONSTANT
-    - If multiple with different constants → TOP
+    **PHI LATTICE RULES:**
+      - No executable incoming edges yet ⇒ BOTTOM (block not reached).
+      - Exactly one executable predecessor ⇒ that predecessor's lattice
+        value (meet with BOTTOM identity).
+      - Multiple executable predecessors carrying the same CONSTANT(v)
+        ⇒ CONSTANT(v) (all paths agree).
+      - Multiple executable predecessors with disagreeing constants, or
+        any executable predecessor at TOP ⇒ TOP.
 
-    **FLOW-SENSITIVE ANALYSIS:**
-    Critical for SCCP - only executable paths contribute to PHI result.
+    **FLOW SENSITIVITY:**
+    Edge executability is computed lazily by `mark_edge_executable` as
+    branches resolve. Re-evaluating a φ when a previously-non-executable
+    edge becomes executable is the mechanism by which constant
+    propagation crosses control-flow merges in SCCP.
 
-    Returns lattice value for PHI result.
+    Returns a newly allocated LatticeValue (caller frees).
+    Returns BOTTOM on a NULL phi pointer.
     @End Reasoning
 
+    @Implementation
+    Reads the φ-node's parent block (offset 40), its incoming-pair list
+    (offset 16) and the incoming count (offset 24). Each pair stores
+    (predecessor_block_id, value_id) at offsets 0 and 8. The result
+    accumulator starts at BOTTOM (the meet identity). For each incoming
+    pair we synthesize the edge-key "pred_id->parent_id" and consult the
+    executable_edges set; only when the edge is in that set do we look
+    up the incoming value's lattice element and meet it into the
+    accumulator. The previous accumulator is deallocated each step to
+    avoid leaking the intermediate LatticeValue allocations that
+    `lattice_meet` produces.
+    @End Implementation
+
     If phi_ptr is equal to 0:
-        Return create_lattice_bottom()
+        Return proc create_lattice_bottom
     End If
 
     Let executable_edges be proc memory_get_int64 from Layout with context_ptr, 16
@@ -687,7 +917,7 @@ Process called "evaluate_phi_node" that takes context_ptr as Integer, phi_ptr as
     Let incoming_count be proc memory_get_int64 from Layout with phi_ptr, 24
 
     Note: Start with BOTTOM (no incoming values seen yet)
-    Let result_lattice be create_lattice_bottom()
+    Let result_lattice be proc create_lattice_bottom
 
     Let i be 0
     While i is less than incoming_count:
@@ -708,10 +938,10 @@ Process called "evaluate_phi_node" that takes context_ptr as Integer, phi_ptr as
 
         If is_executable is equal to 1:
             Note: Get lattice value for incoming value
-            Let incoming_lattice be get_or_create_lattice_value(context_ptr, value_id)
+            Let incoming_lattice be proc get_or_create_lattice_value with context_ptr, value_id
 
             Note: Meet with current result
-            Let new_result be lattice_meet(result_lattice, incoming_lattice)
+            Let new_result be proc lattice_meet with result_lattice, incoming_lattice
 
             Note: Free old result and update
             proc deallocate from Layout with result_lattice
@@ -726,21 +956,34 @@ End Process
 
 Process called "evaluate_binary_op" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
     @Reasoning
-    Evaluates binary operations with lattice semantics.
+    Lattice transfer function for two-operand arithmetic and bitwise
+    MIR instructions. Implements ⟦inst⟧(σ) where ⊕ ∈ {+, -, *, /, %,
+    &, |, ^, <<, >>, >>>}. The full lattice semantics are:
+        TOP ⊕ x         = TOP
+        x ⊕ TOP         = TOP
+        BOTTOM ⊕ x      = BOTTOM   (defer — operand not yet refined)
+        x ⊕ BOTTOM      = BOTTOM
+        CONST(a) ⊕ CONST(b) = CONST(a ⊕ b) when the operation is total
+                              for these operands (e.g. division by zero
+                              poisons the result to TOP for safety).
 
-    **LATTICE RULES:**
-    - TOP ⊕ x = TOP (overdefined propagates)
-    - BOTTOM ⊕ x = BOTTOM (undefined propagates)
-    - CONSTANT(v1) ⊕ CONSTANT(v2) = CONSTANT(v1 ⊕ v2) (constant folding)
-
-    **OPERATIONS:**
-    Supports: ADD, SUB, MUL, DIV, MOD, AND, OR, XOR, SHL, SHR, SAR
-
-    Returns lattice value for operation result.
+    Returns a freshly allocated LatticeValue.
     @End Reasoning
 
+    @Implementation
+    Reads the MIRBinaryOp operand-ids from offsets 16 and 24 of the
+    instruction, looks up each operand's LatticeValue via
+    `get_or_create_lattice_value`, then short-circuits to TOP on any
+    TOP operand and to BOTTOM on any BOTTOM operand. When both
+    operands are CONSTANT we read each value field at offset 8 and
+    dispatch on the opcode constant to compute the folded result.
+    Division and modulo guard against a zero divisor by returning TOP
+    rather than performing the undefined operation. Unknown opcodes
+    fall through to TOP to keep the analysis sound.
+    @End Implementation
+
     If inst_ptr is equal to 0:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: MIRBinaryOp structure - get operands
@@ -748,26 +991,26 @@ Process called "evaluate_binary_op" that takes context_ptr as Integer, inst_ptr 
     Let right_operand_id be proc memory_get_int64 from Layout with inst_ptr, 24 Note: Offset 24: right_operand
 
     Note: Get lattice values for operands
-    Let left_lattice be get_or_create_lattice_value(context_ptr, left_operand_id)
-    Let right_lattice be get_or_create_lattice_value(context_ptr, right_operand_id)
+    Let left_lattice be proc get_or_create_lattice_value with context_ptr, left_operand_id
+    Let right_lattice be proc get_or_create_lattice_value with context_ptr, right_operand_id
 
     Let left_state be proc memory_get_int64 from Layout with left_lattice, 0
     Let right_state be proc memory_get_int64 from Layout with right_lattice, 0
 
     Note: If either operand is TOP, result is TOP
     If left_state is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
     If right_state is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: If either operand is BOTTOM, result is BOTTOM
     If left_state is equal to LATTICE_BOTTOM:
-        Return create_lattice_bottom()
+        Return proc create_lattice_bottom
     End If
     If right_state is equal to LATTICE_BOTTOM:
-        Return create_lattice_bottom()
+        Return proc create_lattice_bottom
     End If
 
     Note: Both operands are CONSTANT - perform constant folding
@@ -779,79 +1022,90 @@ Process called "evaluate_binary_op" that takes context_ptr as Integer, inst_ptr 
     Note: Arithmetic operations
     If opcode is equal to MIR.MIR_ADD:
         Set result_val to left_val plus right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_SUB:
         Set result_val to left_val minus right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_MUL:
         Set result_val to left_val multiplied by right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_DIV:
         If right_val is equal to 0:
-            Return create_lattice_top()  Note: Division by zero
+            Return proc create_lattice_top  Note: Division by zero
         End If
         Set result_val to left_val divided by right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_MOD:
         If right_val is equal to 0:
-            Return create_lattice_top()  Note: modulo by zero
+            Return proc create_lattice_top  Note: modulo by zero
         End If
         Set result_val to left_val modulo by right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     Note: Bitwise operations
     If opcode is equal to MIR.MIR_AND:
         Set result_val to proc bitwise_and from Layout with left_val, right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_OR:
         Set result_val to proc bitwise_or from Layout with left_val, right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_XOR:
         Set result_val to proc bitwise_xor from Layout with left_val, right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_SHL:
         Set result_val to proc bitwise_shl from Layout with left_val, right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_SHR:
         Set result_val to proc bitwise_shr from Layout with left_val, right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
     If opcode is equal to MIR.MIR_SAR:
         Set result_val to proc bitwise_sar from Layout with left_val, right_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     Note: Unknown binary operation
-    Return create_lattice_top()
+    Return proc create_lattice_top
 End Process
 
 Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
     @Reasoning
-    Evaluates comparison operations with lattice semantics.
+    Lattice transfer function for the six relational MIR opcodes (EQ,
+    NE, LT, LE, GT, GE). Production of a CONSTANT result here is what
+    feeds `process_branch_instruction` the boolean it needs to fold a
+    conditional jump into an unconditional one — relational folding
+    is therefore the hot spot for branch elimination effectiveness.
 
-    **COMPARISON SEMANTICS:**
-    - Result is boolean (0 or 1)
-    - TOP ≈ x = TOP (can't compare overdefined)
-    - BOTTOM ≈ x = BOTTOM (can't compare undefined)
-    - CONSTANT(v1) ≈ CONSTANT(v2) = CONSTANT(boolean result)
+        TOP ≈ x         = TOP
+        BOTTOM ≈ x      = BOTTOM
+        CONST(a) ≈ CONST(b) = CONST(1) when the relation holds,
+                              CONST(0) otherwise.
 
-    **COMPARISONS:**
-    Supports: EQ, NE, LT, LE, GT, GE
-
-    Returns lattice value for comparison result (CONSTANT 0 or 1, or TOP/BOTTOM).
+    Returns a freshly allocated LatticeValue.
     @End Reasoning
 
+    @Implementation
+    Reads operand value-ids from offsets 16 and 24 of the
+    MIRBinaryOp, looks up each lattice via
+    `get_or_create_lattice_value`, and short-circuits to TOP or
+    BOTTOM exactly as `evaluate_binary_op` does. When both operands
+    are CONSTANT it reads each value, dispatches on the relational
+    opcode (MIR_EQ ... MIR_GE), and assigns 1 or 0 to result_val.
+    Returns CONSTANT(result_val) via `create_lattice_constant`.
+    Unknown opcodes fall through to TOP for soundness.
+    @End Implementation
+
     If inst_ptr is equal to 0:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: MIRBinaryOp structure - get operands
@@ -859,26 +1113,26 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
     Let right_operand_id be proc memory_get_int64 from Layout with inst_ptr, 24 Note: Offset 24: right_operand
 
     Note: Get lattice values for operands
-    Let left_lattice be get_or_create_lattice_value(context_ptr, left_operand_id)
-    Let right_lattice be get_or_create_lattice_value(context_ptr, right_operand_id)
+    Let left_lattice be proc get_or_create_lattice_value with context_ptr, left_operand_id
+    Let right_lattice be proc get_or_create_lattice_value with context_ptr, right_operand_id
 
     Let left_state be proc memory_get_int64 from Layout with left_lattice, 0
     Let right_state be proc memory_get_int64 from Layout with right_lattice, 0
 
     Note: If either operand is TOP, result is TOP
     If left_state is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
     If right_state is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: If either operand is BOTTOM, result is BOTTOM
     If left_state is equal to LATTICE_BOTTOM:
-        Return create_lattice_bottom()
+        Return proc create_lattice_bottom
     End If
     If right_state is equal to LATTICE_BOTTOM:
-        Return create_lattice_bottom()
+        Return proc create_lattice_bottom
     End If
 
     Note: Both operands are CONSTANT - perform constant comparison
@@ -893,7 +1147,7 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
         Otherwise:
             Set result_val to 0
         End If
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     If opcode is equal to MIR.MIR_NE:
@@ -902,7 +1156,7 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
         Otherwise:
             Set result_val to 0
         End If
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     If opcode is equal to MIR.MIR_LT:
@@ -911,7 +1165,7 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
         Otherwise:
             Set result_val to 0
         End If
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     If opcode is equal to MIR.MIR_LE:
@@ -924,7 +1178,7 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
                 Set result_val to 0
             End If
         End If
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     If opcode is equal to MIR.MIR_GT:
@@ -933,7 +1187,7 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
         Otherwise:
             Set result_val to 0
         End If
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     If opcode is equal to MIR.MIR_GE:
@@ -946,48 +1200,53 @@ Process called "evaluate_comparison" that takes context_ptr as Integer, inst_ptr
                 Set result_val to 0
             End If
         End If
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     Note: Unknown comparison operation
-    Return create_lattice_top()
+    Return proc create_lattice_top
 End Process
 
 Process called "evaluate_unary_op" that takes context_ptr as Integer, inst_ptr as Integer, opcode as Integer returns Integer:
     @Reasoning
-    Evaluates unary operations with lattice semantics.
+    Lattice transfer function for one-operand MIR instructions (NEG
+    arithmetic negation, NOT bitwise complement). Lattice rules:
+        ⊖TOP        = TOP
+        ⊖BOTTOM     = BOTTOM
+        ⊖CONST(v)   = CONST(⊖v)
 
-    **UNARY LATTICE RULES:**
-    - ⊖TOP = TOP (overdefined remains overdefined)
-    - ⊖BOTTOM = BOTTOM (undefined remains undefined)
-    - ⊖CONSTANT(v) = CONSTANT(⊖v) (constant folding)
-
-    **OPERATIONS:**
-    Supports: NEG (negation), NOT (bitwise NOT)
-
-    Returns lattice value for operation result.
+    Returns a freshly allocated LatticeValue.
     @End Reasoning
 
+    @Implementation
+    Reads the MIRUnaryOp operand-id from offset 16, looks up its
+    LatticeValue, and short-circuits to TOP/BOTTOM if the operand
+    state is anything but CONSTANT. For CONSTANT operands the value
+    is read from offset 8 and the unary operation applied — NEG via
+    Runa's negation operator, NOT via the Layout.bitwise_not
+    primitive. Unknown opcodes fall through to TOP.
+    @End Implementation
+
     If inst_ptr is equal to 0:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: MIRUnaryOp structure - get operand
     Let operand_id be proc memory_get_int64 from Layout with inst_ptr, 16 Note: Offset 16: operand
 
     Note: Get lattice value for operand
-    Let operand_lattice be get_or_create_lattice_value(context_ptr, operand_id)
+    Let operand_lattice be proc get_or_create_lattice_value with context_ptr, operand_id
 
     Let operand_state be proc memory_get_int64 from Layout with operand_lattice, 0
 
     Note: If operand is TOP, result is TOP
     If operand_state is equal to LATTICE_TOP:
-        Return create_lattice_top()
+        Return proc create_lattice_top
     End If
 
     Note: If operand is BOTTOM, result is BOTTOM
     If operand_state is equal to LATTICE_BOTTOM:
-        Return create_lattice_bottom()
+        Return proc create_lattice_bottom
     End If
 
     Note: Operand is CONSTANT - perform constant folding
@@ -997,38 +1256,45 @@ Process called "evaluate_unary_op" that takes context_ptr as Integer, inst_ptr a
 
     If opcode is equal to MIR.MIR_NEG:
         Set result_val to -operand_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     If opcode is equal to MIR.MIR_NOT:
         Set result_val to proc bitwise_not from Layout with operand_val
-        Return create_lattice_constant(result_val)
+        Return proc create_lattice_constant with result_val
     End If
 
     Note: Unknown unary operation
-    Return create_lattice_top()
+    Return proc create_lattice_top
 End Process
 
 Process called "evaluate_cast" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
     @Reasoning
-    Evaluates type cast operations with lattice semantics.
+    Lattice transfer function for the MIR cast family (BITCAST, TRUNC,
+    EXTEND, ZEXT, SEXT, generic CAST). A precise treatment would
+    fold each cast against its source-and-destination type widths,
+    sign-extending or truncating CONST(v) values accordingly. The
+    current implementation is intentionally conservative — it always
+    returns TOP — because cast types are not yet threaded through to
+    this transfer function. Soundness is preserved (TOP is the
+    correct over-approximation); precision can be tightened later
+    without altering callers.
 
-    **CAST SEMANTICS:**
-    For constant propagation, most casts preserve constant values
-    (with appropriate transformations like truncation or extension).
-
-    **CONSERVATIVE ANALYSIS:**
-    Currently returns TOP for all casts to be safe.
-    Could be enhanced to propagate constants through casts with
-    proper type size and sign handling.
-
-    Returns lattice value (currently always TOP).
+    Returns a freshly allocated TOP LatticeValue.
     @End Reasoning
+
+    @Implementation
+    Single-line implementation that returns a new TOP LatticeValue
+    via `create_lattice_top`. No operand inspection is required while
+    the analysis is conservative; the function signature is kept
+    stable so future precise-cast support can replace the body
+    without touching callers.
+    @End Implementation
 
     Note: Conservative - casts could propagate constants with proper type handling
     Note: Future enhancement: track constant through casts with type information
 
-    Return create_lattice_top()
+    Return proc create_lattice_top
 End Process
 
 Note: ============================================================================
@@ -1037,20 +1303,38 @@ Note: ==========================================================================
 
 Process called "initialize_sccp_worklist" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Initializes SCCP worklist with entry block and marks entry edge executable.
+    Seeds the worklists with the entry-block reachability fact that
+    SCCP's fixed-point iteration starts from. Without this seed both
+    worklists are empty and `run_sccp_analysis` would exit
+    immediately, mistaking "nothing to do" for "fixed point reached".
 
-    **INITIALIZATION:**
-    1. Mark entry block as executable
-    2. Mark entry edge (START → entry_block) as executable
-    3. Add entry block to CFG worklist
-    4. Initialize function arguments to TOP (conservative)
+    **SEEDING STEPS:**
+      1. Mark the function's entry block as executable in the
+         executable_blocks set.
+      2. Mark the virtual entry edge "START→entry_block" as
+         executable so φ-nodes in the entry block (legal in some IRs)
+         do not under-meet to BOTTOM.
+      3. Push the entry block id onto the CFG worklist for processing.
 
-    **ENTRY POINT:**
-    SCCP analysis starts from the entry block and propagates along
-    executable control flow paths.
+    Function arguments are NOT eagerly initialized here — they
+    naturally settle to TOP on first reference via
+    `get_or_create_lattice_value` once their PARAM instructions are
+    visited, except when interprocedural analysis seeds them from
+    call sites (see `initialize_function_arguments`).
 
-    Returns 1 on success, 0 on failure.
+    Returns 1 on success, 0 on NULL context, NULL CFG, or missing
+    entry block.
     @End Reasoning
+
+    @Implementation
+    Calls CFG.get_entry_block to obtain the entry-block id; bails out
+    on 0 (no entry). Then reads the executable_blocks set pointer
+    (offset 40), stringifies the entry id, and Set.add's it. Builds
+    the virtual entry-edge key "START->entry_id" and Set.add's it
+    into executable_edges (offset 16). Finally appends the entry id
+    to the cfg_worklist list (offset 32) so it gets picked up by
+    `process_cfg_worklist`.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1087,16 +1371,45 @@ End Process
 
 Process called "mark_edge_executable" that takes context_ptr as Integer, from_block_id as Integer, to_block_id as Integer returns Integer:
     @Reasoning
-    Marks a CFG edge as executable and adds target block to worklist if newly reachable.
+    Marks a CFG edge as executable (i.e. control can flow along it given
+    the constants discovered so far) and propagates the reachability to
+    its target block. This is the SCCP-specific extension to Wegman-
+    Zadeck CCP: instead of treating all CFG edges as always-executable,
+    SCCP only treats an edge as executable when the branch condition
+    feeding it has been proven NOT to be CONSTANT(false_value).
 
-    **EDGE EXECUTABLE:**
-    When an edge becomes executable:
-    1. Add edge to executable_edges set
-    2. If target block is newly executable, mark it and add all its instructions to SSA worklist
-    3. Add target block to CFG worklist for processing
+    **THE EDGE EXECUTABILITY MONOTONICITY INVARIANT:**
+    Once an edge is marked executable it stays executable — the set
+    grows monotonically just like the lattice element set. This
+    monotonicity is what gives the analysis its O(E) bound on
+    edge-flagging work across the entire fixed-point iteration.
 
-    Returns 1 if edge was newly marked (changed), 0 if already executable.
+    **WHEN A NEW EDGE BECOMES EXECUTABLE:**
+      1. The edge is recorded in `executable_edges` under the canonical
+         key "from_id->to_id".
+      2. If the target block was previously unreached, it is added to
+         `executable_blocks` and pushed onto the CFG worklist so that
+         its instructions get visited.
+      3. If the target was already executable, only the edge changes;
+         φ-nodes in the target will be re-evaluated when their value
+         users are pulled off the SSA worklist (they re-read edge
+         executability via `evaluate_phi_node`).
+
+    Returns 1 when the edge was newly marked (state changed), 0 when it
+    was already executable (no propagation needed).
     @End Reasoning
+
+    @Implementation
+    Forms the canonical edge key by stringifying both block IDs joined
+    with "->". A Set.contains probe against `executable_edges` answers
+    whether this edge has been seen. If it has, we return 0 immediately
+    so the caller knows no propagation is needed. Otherwise we add the
+    edge to the set, then probe `executable_blocks` for the target. If
+    the target is new we add it to the executable-block set and append
+    its id to the CFG worklist (offset 32 of the SCCPContext). The
+    return value distinguishes new-edge from already-known for callers
+    that aggregate change counts.
+    @End Implementation
 
     Let executable_edges be proc memory_get_int64 from Layout with context_ptr, 16
     Let executable_blocks be proc memory_get_int64 from Layout with context_ptr, 40
@@ -1136,19 +1449,32 @@ End Process
 
 Process called "visit_instruction" that takes context_ptr as Integer, inst_ptr as Integer returns Integer:
     @Reasoning
-    Visits an instruction and updates its result lattice value.
+    Wraps the transfer-function call (`evaluate_instruction`) with the
+    delta-detection + worklist-propagation machinery that drives the
+    SSA worklist. This is one of the two visit primitives drained by
+    `process_cfg_worklist`; the other is `visit_phi_node`.
 
-    **INSTRUCTION VISIT:**
-    1. Evaluate instruction using current lattice values
-    2. Get result value ID
-    3. Update lattice value for result
-    4. If changed, add all users of result to SSA worklist
+    **SEQUENCE:**
+      1. Read the result SSA value-id from the MIR node.
+      2. Evaluate the transfer function under the current lattice.
+      3. Apply `update_lattice_value` and observe its change-bit.
+      4. If the lattice element actually moved, enqueue the result
+         value-id on the SSA worklist so all USERS of this value get
+         re-visited in turn.
 
-    **PROPAGATION:**
-    Changes propagate through use-def chains via SSA worklist.
-
-    Returns 1 if lattice value changed, 0 otherwise.
+    Returns 1 when the lattice element changed (and therefore
+    propagation was triggered), 0 otherwise — including the case of
+    an instruction with no SSA result (stores, branches, returns).
     @End Reasoning
+
+    @Implementation
+    Calls MIR.get_mir_node_value_id; returns 0 immediately when this
+    is zero (instruction produces no SSA value). Otherwise calls
+    `evaluate_instruction` to obtain a new LatticeValue, hands it to
+    `update_lattice_value` (which clones and stores it), deallocates
+    the now-redundant transfer-function output, and on a non-zero
+    change appends the result value-id to ssa_worklist (offset 24).
+    @End Implementation
 
     If inst_ptr is equal to 0:
         Return 0
@@ -1161,10 +1487,10 @@ Process called "visit_instruction" that takes context_ptr as Integer, inst_ptr a
     End If
 
     Note: Evaluate instruction
-    Let new_lattice be evaluate_instruction(context_ptr, inst_ptr)
+    Let new_lattice be proc evaluate_instruction with context_ptr, inst_ptr
 
     Note: Update lattice value
-    Let changed be update_lattice_value(context_ptr, result_value_id, new_lattice)
+    Let changed be proc update_lattice_value with context_ptr, result_value_id, new_lattice
 
     Note: Free lattice
     proc deallocate from Layout with new_lattice
@@ -1182,14 +1508,24 @@ End Process
 
 Process called "visit_phi_node" that takes context_ptr as Integer, phi_ptr as Integer returns Integer:
     @Reasoning
-    Visits a PHI node and updates its result lattice value.
+    Wraps the φ-node transfer function (`evaluate_phi_node`) with the
+    delta-detection + propagation machinery, analogous to
+    `visit_instruction` but specialised for φ semantics. φ-nodes are
+    treated separately because their transfer function depends not
+    only on operand lattice values but also on which incoming edges
+    are currently executable, so they must be re-visited whenever a
+    NEW edge becomes executable even if no operand lattice changed.
 
-    **PHI VISIT:**
-    PHI nodes are special - they merge values from multiple predecessors.
-    Only executable incoming edges contribute to the PHI result.
-
-    Returns 1 if lattice value changed, 0 otherwise.
+    Returns 1 when the lattice element changed, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Reads the φ-result value-id from offset 8 of the MIRPhi node,
+    invokes `evaluate_phi_node` to compute the new lattice element,
+    feeds it into `update_lattice_value`, then deallocates the
+    intermediate transfer-function output. On change, appends the
+    result value-id to ssa_worklist so users re-visit.
+    @End Implementation
 
     If phi_ptr is equal to 0:
         Return 0
@@ -1199,10 +1535,10 @@ Process called "visit_phi_node" that takes context_ptr as Integer, phi_ptr as In
     Let result_value_id be proc memory_get_int64 from Layout with phi_ptr, 8 Note: Offset 8: result_value_id
 
     Note: Evaluate PHI node
-    Let new_lattice be evaluate_phi_node(context_ptr, phi_ptr)
+    Let new_lattice be proc evaluate_phi_node with context_ptr, phi_ptr
 
     Note: Update lattice value
-    Let changed be update_lattice_value(context_ptr, result_value_id, new_lattice)
+    Let changed be proc update_lattice_value with context_ptr, result_value_id, new_lattice
 
     Note: Free lattice
     proc deallocate from Layout with new_lattice
@@ -1220,20 +1556,42 @@ End Process
 
 Process called "process_ssa_worklist" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Processes SSA value worklist until empty.
+    Drains the SSA-value worklist by re-visiting every USER instruction
+    of each popped value-id. This is the data-flow half of the dual
+    worklist: it propagates lattice transitions along def-use chains.
+    Combined with `process_cfg_worklist` it implements one full pass
+    of the Wegman-Zadeck fixed-point iteration.
 
-    **SSA WORKLIST PROCESSING:**
-    1. Pop value from SSA worklist
-    2. Find all instructions that use this value
-    3. Re-evaluate those instructions with updated lattice
-    4. If their results change, add to worklist
+    **TERMINATION GUARANTEE:**
+    Each SSA value can transition only along the chain
+    BOTTOM → CONSTANT → TOP (two transitions maximum), and only a
+    real transition re-enqueues the value, so the cumulative work
+    across the whole analysis is bounded by O(uses × 2).
 
-    **TERMINATION:**
-    Lattice values are monotonic (only move down: BOTTOM → CONSTANT → TOP).
-    Each value can change at most twice, guaranteeing termination.
-
-    Returns number of values processed.
+    Returns the number of value-ids popped.
     @End Reasoning
+
+    @Implementation
+    While ssa_worklist is non-empty, pops a value-id and scans every
+    block of the function looking for instructions that reference it.
+    For each candidate instruction the opcode is read and matched
+    against the families that take SSA operands: binary ops,
+    comparisons, φ-nodes, stores, returns, conditional branches.
+    Operand fields are read at their canonical offsets and compared
+    against the popped value-id; on a hit the corresponding visit
+    routine is invoked so the user instruction's lattice element is
+    refreshed and, if it changes, its OWN result-id is enqueued.
+    @End Implementation
+
+    @Performance_Hints
+    The current implementation performs an O(blocks × instructions)
+    sweep per popped value to locate users. In long-running pipelines
+    this is the dominant cost; a future optimisation is to maintain
+    an explicit use-list per SSA value so user enumeration becomes
+    O(uses). The opcode-family pre-filter keeps the constant factor
+    low because non-data-flow instructions never enter the deeper
+    operand-equality checks.
+    @End Performance_Hints
 
     Let ssa_worklist be proc memory_get_int64 from Layout with context_ptr, 24
     Let processed_count be 0
@@ -1323,15 +1681,15 @@ Process called "process_ssa_worklist" that takes context_ptr as Integer, cfg_ptr
 
                         Note: Re-evaluate instruction based on type
                         If opcode is equal to 20010 or opcode is equal to 20011 or opcode is equal to 20012 or opcode is equal to 20013 or opcode is equal to 20014:
-                            visit_binary_operation(context_ptr, cfg_ptr, inst)
+                            proc visit_binary_operation with context_ptr, cfg_ptr, inst
                         End If
 
                         If opcode is equal to 20015:  Note: MIR_CMP
-                            visit_comparison(context_ptr, cfg_ptr, inst)
+                            proc visit_comparison with context_ptr, cfg_ptr, inst
                         End If
 
                         If opcode is equal to 20023:  Note: MIR_PHI
-                            visit_phi_node(context_ptr, cfg_ptr, inst)
+                            proc visit_phi_node with context_ptr, cfg_ptr, inst
                         End If
                     End If
                 End If
@@ -1350,21 +1708,44 @@ End Process
 
 Process called "process_cfg_worklist" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Processes CFG edge worklist until empty.
+    Drains the CFG-block worklist, visiting every instruction of each
+    popped reachable block and then dispatching its terminator to the
+    appropriate edge-flagging routine. This is the control-flow half
+    of the dual worklist: it propagates reachability along executable
+    CFG edges. Re-visiting unreachable blocks is suppressed by an
+    explicit `executable_blocks` membership check.
 
-    **CFG WORKLIST PROCESSING:**
-    1. Pop block from CFG worklist
-    2. Visit all instructions in block
-    3. Evaluate block terminator (branch/jump)
-    4. Mark successor edges executable based on terminator evaluation
-    5. If new edges marked, add successor blocks to worklist
+    **PER-BLOCK SEQUENCE:**
+      1. Pop a block id; verify it is still in executable_blocks.
+      2. Walk the instruction list in IR order, calling
+         `visit_phi_node` for MIR_PHI and `visit_instruction` for
+         everything else, so the per-instruction transfer functions
+         contribute to the SSA worklist.
+      3. Inspect the terminator opcode:
+           MIR_JUMP   → mark the single target executable.
+           MIR_BRANCH → delegate to `process_branch_instruction` which
+                         uses the condition's lattice value to decide
+                         which of the two edges to mark.
+           MIR_SWITCH → delegate to `process_switch_instruction`
+                         which uses the switch-value's lattice to
+                         select one case edge or fall back to default.
+           MIR_RETURN → no successor edges.
 
-    **FLOW-SENSITIVE ANALYSIS:**
-    Only visits blocks reachable through executable edges.
-    This enables dead code detection and branch folding.
-
-    Returns number of blocks processed.
+    Returns the number of blocks visited (including
+    already-unreachable pops that are skipped).
     @End Reasoning
+
+    @Implementation
+    Loop drives until cfg_worklist.length is zero. Each iteration
+    pops via List.pop, stringifies the id, and checks
+    executable_blocks via Set.contains; non-executable blocks are
+    counted-and-skipped (defensive — they should not normally appear
+    on the worklist). For executable blocks the block pointer is
+    fetched via CFG.get_block, its instruction list via
+    CFG.get_block_instructions, and each instruction is visited in
+    order. The terminator is then fetched via
+    CFG.get_block_terminator and dispatched on its opcode.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1413,9 +1794,9 @@ Process called "process_cfg_worklist" that takes context_ptr as Integer, cfg_ptr
                 Note: Check if this is a PHI node
                 Let opcode be proc get_mir_node_opcode from MIR with inst_ptr
                 If opcode is equal to MIR.MIR_PHI:
-                    visit_phi_node(context_ptr, inst_ptr)
+                    proc visit_phi_node with context_ptr, inst_ptr
                 Otherwise:
-                    visit_instruction(context_ptr, inst_ptr)
+                    proc visit_instruction with context_ptr, inst_ptr
                 End If
 
                 Set i to i plus 1
@@ -1430,12 +1811,12 @@ Process called "process_cfg_worklist" that takes context_ptr as Integer, cfg_ptr
             Note: Unconditional jump - mark edge executable
             If term_opcode is equal to MIR.MIR_JUMP:
                 Let target_block_id be proc memory_get_int64 from Layout with terminator, 8 Note: MIRJump: target_block_id
-                mark_edge_executable(context_ptr, block_id, target_block_id)
+                proc mark_edge_executable with context_ptr, block_id, target_block_id
             End If
 
             Note: Conditional branch - evaluate condition
             If term_opcode is equal to MIR.MIR_BRANCH:
-                process_branch_instruction(context_ptr, block_id, terminator)
+                proc process_branch_instruction with context_ptr, block_id, terminator
             End If
 
             Note: Return - no successors
@@ -1445,7 +1826,7 @@ Process called "process_cfg_worklist" that takes context_ptr as Integer, cfg_ptr
 
             Note: Switch - evaluate switch value
             If term_opcode is equal to MIR.MIR_SWITCH:
-                process_switch_instruction(context_ptr, block_id, terminator)
+                proc process_switch_instruction with context_ptr, block_id, terminator
             End If
         End If
 
@@ -1457,27 +1838,61 @@ End Process
 
 Process called "run_sccp_analysis" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Runs the complete SCCP analysis to fixed point.
+    Drives the Wegman-Zadeck Sparse Conditional Constant Propagation
+    algorithm (TOPLAS 13(2), 1991) to a fixed point. The "sparse" in SCCP
+    means we propagate along def-use chains of SSA values rather than
+    revisiting every instruction on every iteration; the "conditional"
+    means an edge is only treated as executable when the condition
+    guarding it is reachable AND not provably false. The combined effect
+    is strictly more powerful than running classical constant propagation
+    followed by dead-code elimination.
 
-    **WEGMAN-ZADECK ALGORITHM:**
-    1. Initialize worklists with entry block
-    2. Iterate until both worklists empty:
-       a. Process CFG worklist (mark executable edges, visit blocks)
-       b. Process SSA worklist (propagate lattice values)
-    3. Converge to fixed point (all lattice values stable)
+    **THE TWO WORKLISTS:**
+      - CFG worklist (blocks newly reached by an executable edge)
+      - SSA worklist (SSA values whose lattice element just dropped)
 
-    **FIXED-POINT ITERATION:**
-    Monotonic lattice ensures termination.
-    Each SSA value transitions at most: BOTTOM → CONSTANT → TOP
+    **MAIN LOOP:**
+      1. Initialize: mark entry block reachable; push a virtual START→entry
+         edge onto the executable-edge set; enqueue the entry block on the
+         CFG worklist.
+      2. While EITHER worklist is non-empty:
+           a. Drain the CFG worklist: for each popped block, visit all
+              instructions (including φ-nodes) and process the terminator
+              to enqueue successor edges via `mark_edge_executable`.
+           b. Drain the SSA worklist: for each popped value-id, re-visit
+              every user instruction so the new lattice value propagates
+              along data-flow edges.
+      3. Termination: both worklists drain → no more lattice transitions
+         possible → fixed point reached → return success.
 
-    Returns 1 on success, 0 on failure.
+    **TERMINATION GUARANTEE:**
+    Each SSA value can transition at most twice (BOTTOM → CONSTANT → TOP),
+    and each CFG edge is marked executable at most once, so the algorithm
+    is O((V + E) × k) for k = 2 lattice height.
+
+    Returns 1 on success, 0 on failure (NULL context/CFG or runaway loop).
     @End Reasoning
 
+    @Implementation
+    Calls `initialize_sccp_worklist` to seed entry-block reachability,
+    then enters the main fixed-point loop. Each iteration reads the
+    current length of both worklists; if both are zero we have reached
+    the fixed point and exit successfully. Otherwise we drain CFG first
+    (because new control flow may discover new SSA values to enqueue)
+    and SSA second. A `max_iterations` guard of 10000 catches the
+    pathological case of a logic bug elsewhere creating non-monotonic
+    transitions; under correct invariants this guard never trips on
+    real input.
+    @End Implementation
+
     @Performance_Hints
-    The dual worklist approach (SSA plus CFG) is critical for performance.
-    minus CFG worklist handles control flow (which blocks are reachable)
-    minus SSA worklist handles data flow (which values are constant)
-    This separation allows efficient fixed-point convergence.
+    The dual worklist approach (SSA worklist and CFG worklist) is critical
+    for performance:
+    - CFG worklist handles control flow (which blocks are reachable)
+    - SSA worklist handles data flow (which values are constant)
+    This separation allows efficient fixed-point convergence: instead of
+    re-evaluating the whole function at each iteration, only the affected
+    instructions and edges are re-examined.
     @End Performance_Hints
 
     If context_ptr is equal to 0:
@@ -1492,7 +1907,7 @@ Process called "run_sccp_analysis" that takes context_ptr as Integer, cfg_ptr as
     Display "============================================"
 
     Note: Initialize worklists
-    Let init_result be initialize_sccp_worklist(context_ptr, cfg_ptr)
+    Let init_result be proc initialize_sccp_worklist with context_ptr, cfg_ptr
     If init_result is equal to 0:
         Display "run_sccp_analysis: initialization failed"
         Return 0
@@ -1521,12 +1936,12 @@ Process called "run_sccp_analysis" that takes context_ptr as Integer, cfg_ptr as
 
         Note: Process CFG worklist first (control flow)
         If cfg_len is greater than 0:
-            process_cfg_worklist(context_ptr, cfg_ptr)
+            proc process_cfg_worklist with context_ptr, cfg_ptr
         End If
 
         Note: Process SSA worklist (data flow)
         If ssa_len is greater than 0:
-            process_ssa_worklist(context_ptr, cfg_ptr)
+            proc process_ssa_worklist with context_ptr, cfg_ptr
         End If
 
         Set iteration_count to iteration_count plus 1
@@ -1542,22 +1957,46 @@ Note: ==========================================================================
 
 Process called "process_branch_instruction" that takes context_ptr as Integer, block_id as Integer, branch_ptr as Integer returns Integer:
     @Reasoning
-    Processes conditional branch instruction and marks edges executable.
+    Implements the CONDITIONAL part of Sparse Conditional Constant
+    Propagation. When a basic block ends in `MIR_BRANCH cond, T, F` we
+    consult the lattice element of `cond` to decide which successor
+    edges become executable. This is the mechanism by which SCCP
+    discovers blocks that are statically unreachable along all but
+    one path of a conditional, even when classical CCP would conclude
+    that both paths might execute.
 
-    **BRANCH EVALUATION:**
-    1. Get condition value lattice
-    2. If condition is CONSTANT:
-       - If true (1) → mark true edge executable only
-       - If false (0) → mark false edge executable only
-       - Increment branches_folded counter
-    3. If condition is TOP or BOTTOM → mark both edges executable (conservative)
+    **CASE ANALYSIS ON THE CONDITION LATTICE ELEMENT:**
+      - BOTTOM ⇒ block has not yet been usefully reached on this
+        worklist iteration; no edges are marked yet. The branch will
+        be re-evaluated after the condition's lattice descends.
+      - CONSTANT(0) ⇒ false branch only: mark only `F` executable,
+        increment `branches_folded` (the optimizer counter that drives
+        downstream cleanup), and leave `T` quiescent so the unreached
+        block can be eliminated later by `eliminate_unreachable_block`.
+      - CONSTANT(1) ⇒ true branch only: mirror of the above.
+      - TOP ⇒ condition varies at run time. Mark BOTH `T` and `F`
+        executable (the safe, conservative over-approximation).
 
-    **BRANCH FOLDING:**
-    When condition is constant, only one successor is reachable.
-    This enables dead code elimination of unreachable branch.
+    Note that "CONSTANT(v) for v ∉ {0,1}" cannot legally arise from a
+    well-typed boolean condition; if it did, this implementation treats
+    the non-1 case as false (matches C semantics) for forward
+    compatibility with integer-conditioned branches.
 
-    Returns 1 on success.
+    Returns 1 on success, 0 on a NULL branch pointer.
     @End Reasoning
+
+    @Implementation
+    Reads the three MIRBranch fields: condition value-id at offset 8,
+    true target at offset 16, false target at offset 24. Looks up the
+    condition's lattice via `get_or_create_lattice_value`. If state is
+    LATTICE_CONSTANT we read the value at offset 8 and dispatch on it,
+    calling `mark_edge_executable` exactly once and bumping the
+    branches_folded counter (offset 56 of the SCCPContext). Otherwise
+    we mark both edges via two calls to `mark_edge_executable`. The
+    branch instruction itself is NOT rewritten here — the rewrite to
+    JUMP happens later in `simplify_branch` during the transformation
+    pass, which keeps analysis and transformation strictly separated.
+    @End Implementation
 
     If branch_ptr is equal to 0:
         Return 0
@@ -1569,7 +2008,7 @@ Process called "process_branch_instruction" that takes context_ptr as Integer, b
     Let false_block_id be proc memory_get_int64 from Layout with branch_ptr, 24 Note: Offset 24: false_block_id
 
     Note: Get condition lattice value
-    Let condition_lattice be get_or_create_lattice_value(context_ptr, condition_value_id)
+    Let condition_lattice be proc get_or_create_lattice_value with context_ptr, condition_value_id
     Let condition_state be proc memory_get_int64 from Layout with condition_lattice, 0
 
     Note: If condition is CONSTANT, fold branch
@@ -1578,7 +2017,7 @@ Process called "process_branch_instruction" that takes context_ptr as Integer, b
 
         If condition_val is equal to 1:
             Note: Condition is true - only true edge executable
-            mark_edge_executable(context_ptr, block_id, true_block_id)
+            proc mark_edge_executable with context_ptr, block_id, true_block_id
 
             Note: Increment branches_folded counter
             Let branches_folded be proc memory_get_int64 from Layout with context_ptr, 56
@@ -1588,7 +2027,7 @@ Process called "process_branch_instruction" that takes context_ptr as Integer, b
             Display "process_branch_instruction: folded branch to true (block " joined with true_block_id joined with ")"
         Otherwise:
             Note: Condition is false - only false edge executable
-            mark_edge_executable(context_ptr, block_id, false_block_id)
+            proc mark_edge_executable with context_ptr, block_id, false_block_id
 
             Note: Increment branches_folded counter
             Set branches_folded to proc memory_get_int64 from Layout with context_ptr, 56
@@ -1602,8 +2041,8 @@ Process called "process_branch_instruction" that takes context_ptr as Integer, b
     End If
 
     Note: Condition is not constant - mark both edges executable
-    mark_edge_executable(context_ptr, block_id, true_block_id)
-    mark_edge_executable(context_ptr, block_id, false_block_id)
+    proc mark_edge_executable with context_ptr, block_id, true_block_id
+    proc mark_edge_executable with context_ptr, block_id, false_block_id
 
     Display "process_branch_instruction: both edges executable (condition not constant)"
 
@@ -1612,22 +2051,29 @@ End Process
 
 Process called "process_switch_instruction" that takes context_ptr as Integer, block_id as Integer, switch_ptr as Integer returns Integer:
     @Reasoning
-    Processes switch instruction and marks edges executable.
+    Multi-way analogue of `process_branch_instruction` for SCCP. When
+    the switch discriminator's lattice is CONSTANT(v) only the case
+    edge whose case-value equals v (or the default edge when no case
+    matches) becomes executable; all other case edges remain
+    quiescent so the corresponding blocks can later be eliminated.
+    When the discriminator is TOP, every case edge plus the default
+    edge is marked executable (conservative over-approximation).
 
-    **SWITCH EVALUATION:**
-    1. Get switch value lattice
-    2. If switch value is CONSTANT:
-       - Find matching case edge
-       - Mark only that edge executable
-       - Increment branches_folded counter
-    3. If switch value is TOP or BOTTOM → mark all case edges + default executable
-
-    **SWITCH FOLDING:**
-    When switch value is constant, only one case is reachable.
-    This enables dead code elimination of unreachable cases.
-
-    Returns 1 on success.
+    Returns 1 on success, 0 on NULL switch pointer.
     @End Reasoning
+
+    @Implementation
+    Reads the switch value-id at offset 8, the cases list at offset
+    16, the case_count at offset 24, and the default block id at
+    offset 32. Looks up the discriminator's LatticeValue. On a
+    LATTICE_CONSTANT state it scans the cases list comparing each
+    case_value (offset 0 of each case-pair) against the constant; on
+    a match it marks that case's edge executable, increments
+    branches_folded, and returns 1. If no case matches it marks the
+    default edge (when present). On a TOP/BOTTOM discriminator it
+    falls through to a second loop that marks every case edge plus
+    the default — preserving soundness when the value is not known.
+    @End Implementation
 
     If switch_ptr is equal to 0:
         Return 0
@@ -1640,7 +2086,7 @@ Process called "process_switch_instruction" that takes context_ptr as Integer, b
     Let default_block_id be proc memory_get_int64 from Layout with switch_ptr, 32 Note: Offset 32: default_block_id
 
     Note: Get switch value lattice
-    Let value_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    Let value_lattice be proc get_or_create_lattice_value with context_ptr, value_id
     Let value_state be proc memory_get_int64 from Layout with value_lattice, 0
 
     Note: If switch value is CONSTANT, fold switch
@@ -1658,7 +2104,7 @@ Process called "process_switch_instruction" that takes context_ptr as Integer, b
 
             If case_val is equal to switch_val:
                 Note: Found matching case
-                mark_edge_executable(context_ptr, block_id, case_block_id)
+                proc mark_edge_executable with context_ptr, block_id, case_block_id
                 Set found_case to 1
 
                 Note: Increment branches_folded counter
@@ -1677,7 +2123,7 @@ Process called "process_switch_instruction" that takes context_ptr as Integer, b
         Note: No matching case - use default
         If found_case is equal to 0:
             If default_block_id is not equal to 0:
-                mark_edge_executable(context_ptr, block_id, default_block_id)
+                proc mark_edge_executable with context_ptr, block_id, default_block_id
 
                 Note: Increment branches_folded counter
                 Set branches_folded to proc memory_get_int64 from Layout with context_ptr, 56
@@ -1696,13 +2142,13 @@ Process called "process_switch_instruction" that takes context_ptr as Integer, b
     While i is less than case_count:
         Set case_pair to proc get from List with cases, i
         Set case_block_id to proc memory_get_int64 from Layout with case_pair, 8
-        mark_edge_executable(context_ptr, block_id, case_block_id)
+        proc mark_edge_executable with context_ptr, block_id, case_block_id
         Set i to i plus 1
     End While
 
     Note: Also mark default edge
     If default_block_id is not equal to 0:
-        mark_edge_executable(context_ptr, block_id, default_block_id)
+        proc mark_edge_executable with context_ptr, block_id, default_block_id
     End If
 
     Display "process_switch_instruction: all edges executable (value not constant)"
@@ -1712,14 +2158,21 @@ End Process
 
 Process called "is_block_unreachable" that takes context_ptr as Integer, block_id as Integer returns Integer:
     @Reasoning
-    Checks if a block is unreachable (not in executable_blocks set).
+    Predicate that returns 1 when a block was NEVER added to the
+    executable_blocks set during the SCCP fixed-point iteration,
+    meaning every CFG edge leading to it has been proven unreachable.
+    Such blocks are dead code: any instruction inside them cannot
+    execute, and any φ operand they contribute is statically dropped
+    from successor blocks during transformation.
 
-    **UNREACHABLE BLOCKS:**
-    Blocks not reachable through any executable path from entry block.
-    These blocks can be eliminated during code transformation.
-
-    Returns 1 if block is unreachable, 0 if reachable.
+    Returns 1 if the block is unreachable, 0 if it is reachable.
     @End Reasoning
+
+    @Implementation
+    Reads the executable_blocks set pointer at offset 40 of the
+    SCCPContext, stringifies block_id, and Set.contains-probes the
+    set. Inverts the result so "not contained" maps to "unreachable".
+    @End Implementation
 
     Let executable_blocks be proc memory_get_int64 from Layout with context_ptr, 40
     Let block_id_str be proc integer_to_string from String with block_id
@@ -1735,14 +2188,24 @@ End Process
 
 Process called "collect_unreachable_blocks" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Collects all unreachable blocks in the CFG.
+    Materialises the set difference (all CFG blocks) − (executable
+    blocks) as an ordered List of block IDs. Called by
+    `transform_cfg_with_sccp_results` to drive bulk dead-block
+    elimination after fixed-point convergence.
 
-    **DEAD CODE DETECTION:**
-    After SCCP analysis, any block not in executable_blocks is unreachable.
-    Returns a List of unreachable block IDs.
-
-    Returns List pointer (caller must free), or 0 on error.
+    Returns a freshly allocated List of block IDs (caller frees via
+    List.destroy), or 0 on allocation/argument failure.
     @End Reasoning
+
+    @Implementation
+    Creates an empty List for the result, then iterates over
+    CFG.get_all_blocks comparing each block's id against
+    `is_block_unreachable`. Hits are List.append-ed to the result
+    list. Finally updates the blocks_eliminated counter (offset 72)
+    with the result length so downstream stats reporting reflects
+    the count even before actual elimination runs. Frees the
+    intermediate all-blocks list on early-error paths.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1771,7 +2234,7 @@ Process called "collect_unreachable_blocks" that takes context_ptr as Integer, c
         Let block_id be proc get_block_id from CFG with block_ptr
 
         Note: Check if block is unreachable
-        Let is_unreach be is_block_unreachable(context_ptr, block_id)
+        Let is_unreach be proc is_block_unreachable with context_ptr, block_id
         If is_unreach is equal to 1:
             proc append from List with unreachable_blocks, block_id
         End If
@@ -1790,16 +2253,22 @@ End Process
 
 Process called "is_value_constant" that takes context_ptr as Integer, value_id as Integer returns Integer:
     @Reasoning
-    Checks if an SSA value is constant after SCCP analysis.
-
-    **CONSTANT CHECK:**
-    Returns 1 if value's lattice is CONSTANT, 0 otherwise.
-
-    Used to identify which values can be replaced with constants
-    during code transformation.
+    Public predicate consumed by transformation passes: answers
+    "did SCCP prove this SSA value to be a single compile-time
+    constant?" by looking up its LatticeValue and inspecting the
+    state field. A BOTTOM (never reached) or TOP (varies) result
+    returns 0; only CONSTANT returns 1.
     @End Reasoning
 
-    Let value_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    @Implementation
+    Calls `get_or_create_lattice_value` to obtain the value's
+    LatticeValue (creating BOTTOM if it has never been seen, which
+    will return 0 here — the safe answer for values outside any
+    executable region), then reads the state field at offset 0 and
+    compares against LATTICE_CONSTANT.
+    @End Implementation
+
+    Let value_lattice be proc get_or_create_lattice_value with context_ptr, value_id
     Let state be proc memory_get_int64 from Layout with value_lattice, 0
 
     If state is equal to LATTICE_CONSTANT:
@@ -1811,14 +2280,20 @@ End Process
 
 Process called "get_constant_value" that takes context_ptr as Integer, value_id as Integer returns Integer:
     @Reasoning
-    Gets the constant value for an SSA value (if constant).
-
-    **CONSTANT RETRIEVAL:**
-    Returns the constant value if lattice is CONSTANT.
-    Returns 0 if not constant (caller should check is_value_constant first).
+    Companion to `is_value_constant`: extracts the actual folded
+    literal value of an SSA value the analysis proved constant.
+    Returns 0 when the value is not CONSTANT — callers that need to
+    distinguish the literal 0 from "not constant" must guard with
+    `is_value_constant` first.
     @End Reasoning
 
-    Let value_lattice be get_or_create_lattice_value(context_ptr, value_id)
+    @Implementation
+    Calls `get_or_create_lattice_value`, reads the state at offset 0,
+    and only when the state equals LATTICE_CONSTANT reads and
+    returns the constant_value field at offset 8.
+    @End Implementation
+
+    Let value_lattice be proc get_or_create_lattice_value with context_ptr, value_id
     Let state be proc memory_get_int64 from Layout with value_lattice, 0
 
     If state is not equal to LATTICE_CONSTANT:
@@ -1835,22 +2310,22 @@ Note: ==========================================================================
 
 Process called "set_interprocedural_context" that takes context_ptr as Integer, module_ptr as Integer, call_graph_ptr as Integer returns Integer:
     @Reasoning
-    Sets module and call graph for interprocedural analysis.
+    Configures the SCCPContext with the module and call-graph pointers
+    needed for interprocedural extensions to the basic intra-
+    procedural Wegman-Zadeck algorithm. With these set, future
+    refinements (function summaries, argument lattice meet across
+    call sites, pure-function constant folding) can read them from
+    the context without changing any caller-facing API.
 
-    **INTERPROCEDURAL SETUP:**
-    Enables SCCP to propagate constants across function boundaries.
-    - module_ptr: Module containing all functions
-    - call_graph_ptr: Call graph for function relationships
-
-    **LIMITATIONS:**
-    Current implementation is conservative for function calls.
-    Full interprocedural SCCP requires:
-    - Function summaries
-    - Context-sensitive analysis
-    - Iterative refinement across call boundaries
-
-    Returns 1 on success.
+    Returns 1 on success, 0 on NULL context.
     @End Reasoning
+
+    @Implementation
+    Stores module_ptr at offset 80 and call_graph_ptr at offset 88 of
+    the SCCPContext via memory_set_int64. No validation of the
+    pointer contents is performed; the caller has already validated
+    them at module-build time.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1866,52 +2341,60 @@ End Process
 
 Process called "evaluate_function_call" that takes context_ptr as Integer, call_ptr as Integer returns Integer:
     @Reasoning
-    Evaluates function call instruction (conservative).
+    Lattice transfer function for MIR_CALL / MIR_CALL_INDIRECT /
+    MIR_INVOKE. The conservative answer is TOP for every call,
+    because without interprocedural information we cannot bound the
+    return value. The signature is held stable so future passes can
+    refine this transfer once function summaries, purity analysis,
+    and constant-argument propagation are in place.
 
-    **CALL EVALUATION:**
-    Currently returns TOP for all function calls (conservative).
-
-    **FUTURE ENHANCEMENT:**
-    Could implement:
-    - Constant argument propagation into callee
-    - Return value analysis based on function summary
-    - Pure function detection (no side effects)
-    - Builtin function constant folding
-
-    Returns lattice value for call result (currently always TOP).
+    Returns a freshly allocated TOP LatticeValue.
     @End Reasoning
 
-    @Performance_Hints
-    This is a key area for future optimization.
-    Many standard library functions are pure and could be
-    constant-folded when all arguments are constant.
+    @Implementation
+    Single-line implementation returning a new TOP LatticeValue via
+    `create_lattice_top`. No operand or callee inspection is
+    performed while the analysis is conservative.
+    @End Implementation
 
-    Examples:
-    minus abs(constant) → constant
-    minus min(c1, c2) → constant
-    minus String operations on constant strings
+    @Performance_Hints
+    This is a key area for future optimisation. Many standard library
+    functions are pure and could be constant-folded when all
+    arguments are constant — e.g. abs of a constant operand yields a
+    constant; min of two constant operands yields a constant; string
+    operations over constant strings yield constants. Plugging a
+    purity attribute into MIR_CALL and a small intrinsic table here
+    would let SCCP fold a substantial class of library calls.
     @End Performance_Hints
 
     Note: Conservative - all calls return TOP
     Note: Future: analyze pure functions with constant arguments
 
-    Return create_lattice_top()
+    Return proc create_lattice_top
 End Process
 
 Process called "initialize_function_arguments" that takes context_ptr as Integer, function_ptr as Integer returns Integer:
     @Reasoning
-    Initializes function argument values to TOP (conservative).
+    Pre-populates the lattice dictionary with TOP entries for every
+    PARAM instruction in the entry block. Required when running SCCP
+    intra-procedurally without an interprocedural seed — otherwise
+    parameters would default to BOTTOM and every transfer function
+    that touches them would yield BOTTOM, suppressing all folding.
+    TOP is the correct over-approximation: arguments could be any
+    value, so the analysis must assume nothing.
 
-    **ARGUMENT INITIALIZATION:**
-    Function arguments are initially unknown (could be any value).
-    We conservatively initialize them to TOP.
-
-    **INTERPROCEDURAL REFINEMENT:**
-    With full interprocedural analysis, arguments could be initialized
-    based on constant values at call sites.
-
-    Returns 1 on success.
+    Returns the number of arguments initialized.
     @End Reasoning
+
+    @Implementation
+    Reads the CFG pointer at offset 0 of the SCCPContext, fetches
+    the entry block (block 0), and iterates its instruction list.
+    For each MIR_PARAM opcode (20024) it pulls the value-id via
+    MIR.get_mir_node_value_id, allocates a TOP LatticeValue, and
+    inserts it into the lattice_values dictionary under the
+    stringified value-id key. Returns the running count of installed
+    arguments — useful for diagnostic logging.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1954,7 +2437,7 @@ Process called "initialize_function_arguments" that takes context_ptr as Integer
                 Let param_str be proc integer_to_string from String with param_value_id
 
                 Note: Create TOP lattice value
-                Let top_value be create_lattice_top()
+                Let top_value be proc create_lattice_top
                 proc set from Dictionary with lattice_values, param_str, top_value
 
                 Set args_initialized to args_initialized plus 1
@@ -1977,19 +2460,34 @@ Note: ==========================================================================
 
 Process called "replace_value_with_constant" that takes context_ptr as Integer, cfg_ptr as Integer, value_id as Integer returns Integer:
     @Reasoning
-    Replaces all uses of an SSA value with a constant.
+    Materialises an SCCP analysis result into the IR by rewriting
+    every USE of a value the analysis proved constant to instead
+    reference a fresh MIR_CONST instruction holding the folded
+    literal. This is the IR mutation that gives SCCP its visible
+    effect — without it the lattice information would never reach
+    downstream passes. Only invoked for values that
+    `is_value_constant` confirms; non-constant values are silently
+    skipped (return 0).
 
-    **CONSTANT REPLACEMENT:**
-    1. Check if value is constant
-    2. Create MIR_CONST instruction with constant value
-    3. Replace all uses of value_id with the constant instruction
-
-    **PROPAGATION:**
-    This is the key transformation that replaces computed values
-    with their constant results.
-
-    Returns number of uses replaced.
+    Returns the number of operand sites rewritten.
     @End Reasoning
+
+    @Implementation
+    After a fast `is_value_constant` guard and fetch of the
+    constant_value via `get_constant_value`, scans every block of
+    the CFG. For each instruction it inspects the opcode and reads
+    the operand fields appropriate to that opcode family (binary
+    ops at offsets 16/24, comparisons same, φ-operands via the
+    MIRNodes API, stores at 16/24, returns at 8, branches at 8).
+    On every match the rewrite path creates a new MIR_CONST node via
+    MIR.create_const_node, captures its result value-id, points the
+    user operand at that new id, and inserts the MIR_CONST node
+    before the user instruction (or at the start of the predecessor
+    block for φ-operands so the value dominates the merge). The
+    constants_found counter at offset 48 of the SCCPContext is
+    incremented by the number of sites rewritten so the final stats
+    report reflects optimisation effectiveness.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1999,13 +2497,13 @@ Process called "replace_value_with_constant" that takes context_ptr as Integer, 
     End If
 
     Note: Check if value is constant
-    Let is_const be is_value_constant(context_ptr, value_id)
+    Let is_const be proc is_value_constant with context_ptr, value_id
     If is_const is equal to 0:
         Return 0  Note: Not constant
     End If
 
     Note: Get constant value
-    Let const_val be get_constant_value(context_ptr, value_id)
+    Let const_val be proc get_constant_value with context_ptr, value_id
 
     Note: Complete implementation: scan all blocks for uses of value_id
     Let uses_replaced be 0
@@ -2143,20 +2641,31 @@ End Process
 
 Process called "simplify_branch" that takes context_ptr as Integer, cfg_ptr as Integer, block_ptr as Integer, branch_ptr as Integer returns Integer:
     @Reasoning
-    Simplifies conditional branch with constant condition.
+    IR transformation that consumes the conditional-reachability
+    information SCCP discovered: when a branch's condition was proven
+    CONSTANT(0) or CONSTANT(1), this proc rewrites the MIR_BRANCH
+    instruction in place into an MIR_JUMP to the surviving target
+    and triggers elimination of the unreachable target block. Branch
+    folding is the most user-visible optimisation that SCCP enables
+    beyond plain constant propagation.
 
-    **BRANCH SIMPLIFICATION:**
-    1. Check if condition is constant
-    2. If true → replace branch with unconditional jump to true block
-    3. If false → replace branch with unconditional jump to false block
-    4. Mark unreachable branch for elimination
-
-    **CFG SIMPLIFICATION:**
-    Reduces control flow graph complexity by eliminating conditional branches
-    with known outcomes.
-
-    Returns 1 if , 0 otherwise.
+    Returns 1 when the branch was folded, 0 when the condition was
+    not constant (the branch is left untouched).
     @End Reasoning
+
+    @Implementation
+    Reads the condition value-id at offset 8 of the MIRBranch, guards
+    with `is_value_constant`, and on success extracts the literal via
+    `get_constant_value`. Reads the two target block ids at offsets
+    16 and 24. The rewrite path is in-place: writes opcode 20006
+    (MIR_JUMP) over offset 0 of the same MIR node, writes the
+    surviving target block id at offset 8 (the MIRJump target field),
+    and clears offsets 16 and 24 so any later visitor sees a
+    well-formed MIR_JUMP. The losing target is handed to
+    `eliminate_unreachable_block` which removes its instructions and
+    successor edges. The branches_folded counter at offset 56 is
+    incremented to reflect the transformation in pass statistics.
+    @End Implementation
 
     If branch_ptr is equal to 0:
         Return 0
@@ -2166,13 +2675,13 @@ Process called "simplify_branch" that takes context_ptr as Integer, cfg_ptr as I
     Let condition_value_id be proc memory_get_int64 from Layout with branch_ptr, 8
 
     Note: Check if condition is constant
-    Let is_const be is_value_constant(context_ptr, condition_value_id)
+    Let is_const be proc is_value_constant with context_ptr, condition_value_id
     If is_const is equal to 0:
         Return 0  Note: Condition not constant
     End If
 
     Note: Get constant value
-    Let condition_val be get_constant_value(context_ptr, condition_value_id)
+    Let condition_val be proc get_constant_value with context_ptr, condition_value_id
 
     Note: Get target blocks
     Let true_block_id be proc memory_get_int64 from Layout with branch_ptr, 16
@@ -2194,7 +2703,7 @@ Process called "simplify_branch" that takes context_ptr as Integer, cfg_ptr as I
         proc memory_set_int64 from Layout with branch_ptr, 24, 0
 
         Note: Mark false block as unreachable
-        eliminate_unreachable_block(cfg_ptr, false_block_id)
+        proc eliminate_unreachable_block with cfg_ptr, false_block_id
 
         Display "simplify_branch: replaced BRANCH with JUMP to block " joined with true_block_id
     Otherwise:
@@ -2211,7 +2720,7 @@ Process called "simplify_branch" that takes context_ptr as Integer, cfg_ptr as I
         proc memory_set_int64 from Layout with branch_ptr, 24, 0
 
         Note: Mark true block as unreachable
-        eliminate_unreachable_block(cfg_ptr, true_block_id)
+        proc eliminate_unreachable_block with cfg_ptr, true_block_id
 
         Display "simplify_branch: replaced BRANCH with JUMP to block " joined with false_block_id
     End If
@@ -2226,18 +2735,30 @@ End Process
 
 Process called "eliminate_unreachable_block" that takes cfg_ptr as Integer, block_id as Integer returns Integer:
     @Reasoning
-    Eliminates an unreachable basic block from CFG.
+    Removes a basic block that SCCP has proven unreachable. Doing so
+    requires more than just deleting the block — every φ-node in a
+    SUCCESSOR block carries an incoming operand for this predecessor
+    and must have that operand removed to preserve well-formed SSA.
+    The block's own instructions are freed individually because they
+    may hold IR memory not otherwise reachable from the CFG once the
+    block disappears.
 
-    **BLOCK ELIMINATION:**
-    1. Remove block from CFG
-    2. Remove all PHI node references to this block
-    3. Free all instructions in block
-
-    **CFG CLEANUP:**
-    Removes dead code that cannot be reached through any executable path.
-
-    Returns 1 on success.
+    Returns 1 on success, 0 on NULL CFG or missing block.
     @End Reasoning
+
+    @Implementation
+    Step 1 — collects the block's successor ids via
+    CFG.get_block_successors. Step 2 — for each successor, walks its
+    instruction list, identifies MIR_PHI nodes (opcode 20023), and
+    calls MIRNodes.remove_phi_operand_for_block to strip the incoming
+    operand tied to the dying block. Step 3 — iterates the block's
+    own instruction list calling MIR.free_mir_node on each entry,
+    then List.clear on the list itself to release the storage. Step
+    4 — marks the block unreachable in CFG metadata via
+    CFG.mark_block_unreachable. Step 5 — drops incoming edges via
+    CFG.remove_block_edges so predecessor terminator targets no
+    longer point at the dead block.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -2308,19 +2829,35 @@ End Process
 
 Process called "transform_cfg_with_sccp_results" that takes context_ptr as Integer, cfg_ptr as Integer returns Integer:
     @Reasoning
-    Transforms CFG by applying all SCCP optimizations.
-
-    **TRANSFORMATION STEPS:**
-    1. Replace constant values throughout CFG
-    2. Simplify branches with constant conditions
-    3. Eliminate unreachable blocks
-    4. Update CFG structure
-
-    **COMPLETE OPTIMIZATION:**
-    Applies all optimizations discovered during SCCP analysis.
+    Drives the IR-mutation phase that consumes the lattice and
+    reachability facts SCCP discovered. Strictly separated from the
+    analysis phase so that the analysis itself remains a pure
+    fixed-point computation that can be reasoned about independently.
+    The three sub-transformations are ordered carefully:
+      1. Constant materialisation (replace_value_with_constant) FIRST,
+         because branch simplification consumes the result of a
+         comparison that may itself depend on freshly-materialised
+         constants.
+      2. Branch folding (simplify_branch) SECOND, because folding
+         branches creates the unreachable blocks the next step
+         removes.
+      3. Unreachable-block elimination LAST, because earlier steps
+         depend on a fully-connected CFG to find users.
 
     Returns 1 on success.
     @End Reasoning
+
+    @Implementation
+    Step 1 reads the lattice_values dictionary and the list of keys,
+    parsing each key back to an Integer and calling
+    `replace_value_with_constant` per value-id. Step 2 walks every
+    block, fetches its terminator instruction, and if the opcode is
+    20007 (MIR_BRANCH) hands it to `simplify_branch`. Step 3 calls
+    `collect_unreachable_blocks` to obtain a List of dead block ids
+    and invokes `eliminate_unreachable_block` for each, then frees
+    the list. All intermediate collections are explicitly freed so
+    transformation leaves no allocation behind.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -2347,7 +2884,7 @@ Process called "transform_cfg_with_sccp_results" that takes context_ptr as Integ
         Let value_id be proc string_to_integer from String with key_str
 
         Note: Try to replace this value with constant
-        replace_value_with_constant(context_ptr, cfg_ptr, value_id)
+        proc replace_value_with_constant with context_ptr, cfg_ptr, value_id
 
         Set i to i plus 1
     End While
@@ -2373,7 +2910,7 @@ Process called "transform_cfg_with_sccp_results" that takes context_ptr as Integ
             Note: Check if it's a BRANCH instruction
             If opcode is equal to 20007:  Note: MIR_BRANCH
                 Note: Try to simplify this branch
-                simplify_branch(context_ptr, cfg_ptr, block, last_inst)
+                proc simplify_branch with context_ptr, cfg_ptr, block, last_inst
             End If
         End If
 
@@ -2382,14 +2919,14 @@ Process called "transform_cfg_with_sccp_results" that takes context_ptr as Integ
 
     Note: Step 3: Eliminate unreachable blocks
     Display "Step 3: Eliminating unreachable blocks..."
-    Let unreachable_blocks be collect_unreachable_blocks(context_ptr, cfg_ptr)
+    Let unreachable_blocks be proc collect_unreachable_blocks with context_ptr, cfg_ptr
     If unreachable_blocks is not equal to 0:
         Let unreachable_count be proc length from List with unreachable_blocks
         Let k be 0
 
         While k is less than unreachable_count:
             Let block_id be proc get from List with unreachable_blocks, k
-            eliminate_unreachable_block(cfg_ptr, block_id)
+            proc eliminate_unreachable_block with cfg_ptr, block_id
             Set k to k plus 1
         End While
 
@@ -2405,16 +2942,21 @@ End Process
 
 Process called "verify_sccp_transformation" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Verifies CFG is valid after SCCP transformation.
+    Post-transformation sanity check that hands the CFG to the
+    central MIR verifier and surfaces any structural defect the
+    transformation may have introduced (orphan φ operands, stale
+    successor lists, dangling instructions). Cheap to run and a
+    valuable guard against subtle SCCP bugs that would otherwise
+    only manifest in later optimisation passes.
 
-    **VERIFICATION:**
-    - All blocks have valid predecessors/successors
-    - PHI nodes have correct incoming edges
-    - SSA form preserved
-    - No dangling references
-
-    Returns 1 if valid, 0 if invalid.
+    Returns 1 if the CFG passes verification, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Defensive null-check on cfg_ptr, then delegates to
+    Verifier.verify_cfg. The boolean result is returned directly so
+    callers can either log or hard-fail on verification failure.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -2440,33 +2982,41 @@ Note: ==========================================================================
 
 Process called "optimize_function_with_sccp" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Main entry point for SCCP optimization on a single function.
+    Per-function driver that owns the full SCCP lifecycle: context
+    construction, fixed-point analysis, IR transformation,
+    verification, statistics, and context teardown. The single
+    point of entry the MIR optimisation pipeline schedules.
 
-    **COMPLETE SCCP PIPELINE:**
-    1. Create SCCP context
-    2. Run SCCP analysis to fixed point
-    3. Transform CFG with results
-    4. Verify transformation
-    5. Print statistics
-    6. Destroy context
-
-    **ONE-STOP OPTIMIZATION:**
-    This is the primary function called by the MIR optimization pipeline.
-
-    Returns 1 on success, 0 on failure.
+    Returns 1 when the pass succeeded (transformation may still have
+    performed zero rewrites — that is a valid outcome), 0 when any
+    step failed.
     @End Reasoning
 
+    @Implementation
+    Six-step sequence: (1) `create_sccp_context` allocates the
+    context; (2) `run_sccp_analysis` iterates worklists to a fixed
+    point; (3) `transform_cfg_with_sccp_results` materialises the
+    discovered constants, folds branches, and removes dead blocks;
+    (4) `verify_sccp_transformation` runs the MIR verifier and logs
+    a warning (not a hard failure) on rejection; (5)
+    `print_sccp_stats` emits the counter summary; (6)
+    `destroy_sccp_context` releases the context and every collection
+    it owns. Each error path explicitly calls destroy_sccp_context
+    before returning so the analysis context is never leaked on
+    failure.
+    @End Implementation
+
     @Performance_Hints
-    SCCP is typically run early in the optimization pipeline,
-    after SSA construction but before other optimizations.
+    SCCP is typically scheduled early in the optimisation pipeline,
+    after SSA construction but before downstream passes:
 
-    **PIPELINE POSITION:**
-    CFG construction → SSA construction → **SCCP** → DCE → other opts
+      CFG construction → SSA construction → **SCCP** → DCE → other opts
 
-    SCCP enables many follow-up optimizations by:
-    minus Exposing constants for folding
-    minus Simplifying control flow
-    minus Eliminating dead branches
+    Running it early maximises the work downstream passes can avoid:
+    - Constants exposed here feed into algebraic simplification
+    - Folded branches expose new dead-code-elimination opportunities
+    - Eliminated blocks shrink the CFG before more expensive
+      analyses (dominance, alias) compute their fixed points.
     @End Performance_Hints
 
     If cfg_ptr is equal to 0:
@@ -2481,39 +3031,39 @@ Process called "optimize_function_with_sccp" that takes cfg_ptr as Integer retur
     Display ""
 
     Note: Step 1: Create SCCP context
-    Let context_ptr be create_sccp_context(cfg_ptr)
+    Let context_ptr be proc create_sccp_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "optimize_function_with_sccp: failed to create context"
         Return 0
     End If
 
     Note: Step 2: Run SCCP analysis
-    Let analysis_result be run_sccp_analysis(context_ptr, cfg_ptr)
+    Let analysis_result be proc run_sccp_analysis with context_ptr, cfg_ptr
     If analysis_result is equal to 0:
         Display "optimize_function_with_sccp: analysis failed"
-        destroy_sccp_context(context_ptr)
+        proc destroy_sccp_context with context_ptr
         Return 0
     End If
 
     Note: Step 3: Transform CFG with results
-    Let transform_result be transform_cfg_with_sccp_results(context_ptr, cfg_ptr)
+    Let transform_result be proc transform_cfg_with_sccp_results with context_ptr, cfg_ptr
     If transform_result is equal to 0:
         Display "optimize_function_with_sccp: transformation failed"
-        destroy_sccp_context(context_ptr)
+        proc destroy_sccp_context with context_ptr
         Return 0
     End If
 
     Note: Step 4: Verify transformation
-    Let verify_result be verify_sccp_transformation(cfg_ptr)
+    Let verify_result be proc verify_sccp_transformation with cfg_ptr
     If verify_result is equal to 0:
         Display "optimize_function_with_sccp: WARNING - verification failed"
     End If
 
     Note: Step 5: Print statistics
-    print_sccp_stats(context_ptr)
+    proc print_sccp_stats with context_ptr
 
     Note: Step 6: Destroy context
-    destroy_sccp_context(context_ptr)
+    proc destroy_sccp_context with context_ptr
 
     Display ""
     Display "SCCP OPTIMIZATION COMPLETE"
@@ -2524,20 +3074,25 @@ End Process
 
 Process called "optimize_module_with_sccp" that takes module_ptr as Integer returns Integer:
     @Reasoning
-    Runs SCCP optimization on all functions in a module.
+    Module-level driver that applies the per-function SCCP pipeline
+    to every function in the MIRProgram. Each function is optimised
+    in isolation (intra-procedural mode); interprocedural propagation
+    is a future enhancement that would compose function summaries
+    across call graph edges.
 
-    **MODULE-WIDE OPTIMIZATION:**
-    1. Iterate through all functions in module
-    2. Run SCCP on each function's CFG
-    3. Aggregate statistics across module
-
-    **INTERPROCEDURAL POTENTIAL:**
-    Future enhancement could perform interprocedural SCCP
-    across entire module for better constant propagation
-    across function boundaries.
-
-    Returns number of functions optimized.
+    Returns the number of functions for which the per-function pass
+    reported success.
     @End Reasoning
+
+    @Implementation
+    Reads the functions list and function_count from the MIRProgram
+    layout (offsets 0 and 8). Defends against an empty module by
+    early-returning 0. Iterates the list, fetches each MIRFunction
+    pointer via List.get, reads its CFG pointer at offset 0, and
+    invokes `optimize_function_with_sccp`. Increments
+    functions_optimized on every reported success and emits per-
+    function diagnostic Display lines for traceability.
+    @End Implementation
 
     If module_ptr is equal to 0:
         Display "optimize_module_with_sccp: null module"
@@ -2584,7 +3139,7 @@ Process called "optimize_module_with_sccp" that takes module_ptr as Integer retu
                 Display "optimize_module_with_sccp: optimizing function " joined with i
 
                 Note: Run SCCP on this function's CFG
-                Let result be optimize_function_with_sccp(cfg_ptr)
+                Let result be proc optimize_function_with_sccp with cfg_ptr
 
                 If result is equal to 1:
                     Set functions_optimized to functions_optimized plus 1
@@ -2611,34 +3166,40 @@ End Process
 
 Process called "run_sccp_pass" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Convenience wrapper for running SCCP as an optimization pass.
+    Thin pass-orchestrator adapter: takes the CFG-only signature
+    expected by the standard optimisation pass interface and
+    delegates to `optimize_function_with_sccp`. Exists so the
+    optimiser registry can refer to a single entry point without
+    binding to the richer internal API.
 
-    **OPTIMIZATION PASS INTERFACE:**
-    Simple entry point that matches the standard optimization pass signature.
-    Takes CFG, runs SCCP, returns success/failure.
-
-    Returns 1 if CFG was modified, 0 if no changes.
+    Returns 1 if the underlying pass succeeded.
     @End Reasoning
 
-    Return optimize_function_with_sccp(cfg_ptr)
+    @Implementation
+    Single Return statement delegating to
+    `optimize_function_with_sccp with cfg_ptr`.
+    @End Implementation
+
+    Return proc optimize_function_with_sccp with cfg_ptr
 End Process
 
 Process called "should_run_sccp" that takes cfg_ptr as Integer returns Integer:
     @Reasoning
-    Determines if SCCP optimization should be run on this CFG.
+    Heuristic that lets the pass scheduler skip SCCP on functions
+    where it cannot possibly help: a function with fewer than two
+    basic blocks has no conditional control flow to fold and no
+    cross-block φ-merges to refine, so analysis cost would be pure
+    waste. For all other functions the predicate returns 1 — SCCP
+    is cheap enough that running it speculatively is the right
+    default until a sharper cost model exists.
 
-    **PROFITABILITY ANALYSIS:**
-    SCCP is profitable when:
-    - CFG has constants that can be propagated
-    - CFG has conditional branches
-    - Function is not trivial (> 1 basic block)
-
-    **HEURISTICS:**
-    Currently always returns 1 (always run SCCP).
-    Could be enhanced with cost model.
-
-    Returns 1 if SCCP should run, 0 otherwise.
+    Returns 1 when SCCP should run, 0 to skip.
     @End Reasoning
+
+    @Implementation
+    Defensive null-check on cfg_ptr, then reads CFG.get_block_count.
+    Returns 0 when the count is below 2, otherwise 1.
+    @End Implementation
 
     If cfg_ptr is equal to 0:
         Return 0
@@ -2659,20 +3220,34 @@ End Process
 
 Process called "get_sccp_pass_name" returns Integer:
     @Reasoning
-    Returns the name of this optimization pass for logging/debugging.
+    Identification string consumed by the pass scheduler and by
+    diagnostic logging. Kept short ("SCCP") so it fits cleanly in
+    structured pass-pipeline output.
 
-    Returns pointer to pass name string.
+    Returns pointer to the static string "SCCP".
     @End Reasoning
+
+    @Implementation
+    Returns the string literal "SCCP" directly.
+    @End Implementation
 
     Return "SCCP"
 End Process
 
 Process called "get_sccp_pass_description" returns Integer:
     @Reasoning
-    Returns a description of what this optimization pass does.
+    Human-readable one-line description used by `--help`-style pass
+    listings and by the pass scheduler when emitting per-pass
+    diagnostics. Includes the algorithm name so readers can locate
+    the original paper.
 
-    Returns pointer to description string.
+    Returns pointer to a static description string.
     @End Reasoning
+
+    @Implementation
+    Returns the string literal
+    "Sparse Conditional Constant Propagation - Wegman-Zadeck Algorithm".
+    @End Implementation
 
     Return "Sparse Conditional Constant Propagation - Wegman-Zadeck Algorithm"
 End Process

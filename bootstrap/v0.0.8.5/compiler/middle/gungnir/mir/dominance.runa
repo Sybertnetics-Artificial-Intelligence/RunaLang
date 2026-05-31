@@ -277,9 +277,20 @@ Process called "compute_reverse_postorder" that takes postorder as Integer retur
     - Except for back edges (loop backedges)
     - Enables fast convergence of iterative algorithms (typically 2-3 iterations)
 
-    Implementation: Simply reverse the postorder list.
     Time complexity: O(n) where n = number of blocks
     @End Reasoning
+
+    @Implementation
+    Allocates a fresh List (TIER 3 owned heap) and walks the input postorder
+    from index n-1 down to 0, appending each block ID to the new list. The
+    input postorder list is not consumed; the caller retains ownership.
+
+    Backward index iteration is used rather than two-pointer swap because the
+    underlying List supports O(1) append and O(1) get, but no in-place reverse
+    primitive. The single-pass O(n) traversal matches the asymptotic optimum
+    and produces a list whose memory layout is contiguous in the forward
+    direction — the order required for the Cooper-Harvey-Kennedy main loop.
+    @End Implementation
 
     Let postorder_len be proc length from List with postorder
     Let rpo be proc create from List
@@ -301,11 +312,30 @@ Process called "create_block_to_rpo_index_map" that takes rpo as Integer returns
 
     This enables O(1) lookup of RPO position, needed for:
     - Finding first processed predecessor in Cooper algorithm
-    - Determining if an edge is a back edge (target RPO < or equal to source RPO)
+    - Determining if an edge is a back edge (target RPO <= source RPO)
 
     Representation: List where index = block_id, value = RPO index
     For sparse block IDs, we use -1 to indicate "not in RPO"
     @End Reasoning
+
+    @Implementation
+    Two-pass construction over the RPO list:
+
+    Pass 1 - sizing: scan the RPO list to find the maximum block_id. This
+    determines the size of the dense direct-indexed map (max_block_id + 1
+    slots). A direct-indexed List is chosen over a hash map because MIR block
+    IDs are dense small integers (allocated sequentially by the CFG builder),
+    making array indexing strictly faster than hashing and cache-friendlier
+    than tree-based lookup.
+
+    Pass 2 - population: initialize all slots to -1 ("not in RPO"), then walk
+    the RPO list and assign map[block_id] = rpo_index for each visited block.
+    The sentinel -1 lets callers distinguish unreachable blocks (which never
+    appear in RPO) from reachable ones with index 0.
+
+    Total time complexity: O(V) where V = block count.
+    Space complexity: O(max_block_id) — at most one int64 slot per ID.
+    @End Implementation
 
     Let rpo_len be proc length from List with rpo
 
@@ -357,6 +387,27 @@ Process called "find_common_dominator" that takes block1_id as Integer, block2_i
 
     Time complexity: O(depth of dom tree) = O(n) worst case
     @End Reasoning
+
+    @Implementation
+    Implements Cooper-Harvey-Kennedy's "intersect" as a two-finger walk up
+    the partial dominator tree built so far. The invariant maintained by RPO
+    ordering is: if a block has been visited in the outer fixpoint loop, its
+    idom is already correct relative to all back-edge-free ancestors.
+
+    On each iteration we compare rpo_index_map[finger1] and rpo_index_map[finger2].
+    The finger with the higher RPO index lies deeper in RPO — i.e., further from
+    entry — so we replace it with its current idom (one step toward entry).
+    Continuing this until the fingers coincide produces the lowest common
+    ancestor in the in-progress dominator tree.
+
+    Early-exit guard: if either finger's idom is -1 ("undefined" in the partial
+    map), the chain is incomplete on that side and we return the other finger.
+    This is the correct fallback during the first iteration of the outer
+    Cooper loop, when not every predecessor's idom is yet assigned.
+
+    Time complexity: O(d) where d is the depth of the (partial) dominator
+    tree. Average d ~ O(log V) on structured code, O(V) worst case.
+    @End Implementation
 
     Let finger1 be block1_id
     Let finger2 be block2_id
@@ -446,22 +497,22 @@ Process called "compute_dominance_tree" that takes cfg_ptr as Integer returns In
     @End Implementation
 
     Note: Create DominanceInfo structure
-    Let info_ptr be create_dominance_info(cfg_ptr)
+    Let info_ptr be proc create_dominance_info with cfg_ptr
     Let entry_id be proc memory_get_int64 from Layout with info_ptr, 8
 
     Note: Step 1: Compute postorder and reverse postorder
-    Let postorder be compute_postorder_traversal(cfg_ptr, entry_id)
+    Let postorder be proc compute_postorder_traversal with cfg_ptr, entry_id
     Let postorder_count be proc length from List with postorder
     proc memory_set_int64 from Layout with info_ptr, 56, postorder
     proc memory_set_int64 from Layout with info_ptr, 64, postorder_count
 
-    Let rpo be compute_reverse_postorder(postorder)
+    Let rpo be proc compute_reverse_postorder with postorder
     Let rpo_count be proc length from List with rpo
     proc memory_set_int64 from Layout with info_ptr, 72, rpo
     proc memory_set_int64 from Layout with info_ptr, 80, rpo_count
 
     Note: Create block_id -> RPO index map
-    Let rpo_index_map be create_block_to_rpo_index_map(rpo)
+    Let rpo_index_map be proc create_block_to_rpo_index_map with rpo
     proc memory_set_int64 from Layout with info_ptr, 88, rpo_index_map
 
     Note: Step 2: Initialize idom map
@@ -552,7 +603,7 @@ Process called "compute_dominance_tree" that takes cfg_ptr as Integer returns In
                 Note: Skip if same as new_idom or not processed
                 If pred_id is not equal to new_idom and pred_idom is not equal to -1:
                     Note: Intersect: find common dominator
-                    Set new_idom to find_common_dominator(pred_id, new_idom, idom_map, rpo_index_map)
+                    Set new_idom to proc find_common_dominator with pred_id, new_idom, idom_map, rpo_index_map
                 End If
 
                 Set pred_idx to pred_idx plus 1
@@ -668,7 +719,7 @@ Process called "get_immediate_dominator" that takes info_ptr as Integer, block_i
     Returns the immediate dominator of a given block.
 
     The immediate dominator (idom) of block B is the unique block that:
-    1. Strictly dominates B (dominates B and idom ≠ B)
+    1. Strictly dominates B (dominates B and idom != B)
     2. Does not strictly dominate any other strict dominator of B
 
     In other words, idom is B's parent in the dominance tree.
@@ -678,6 +729,30 @@ Process called "get_immediate_dominator" that takes info_ptr as Integer, block_i
     Time complexity: O(n) to search dominance tree
     Can be optimized with block_id -> node_ptr map if needed.
     @End Reasoning
+
+    @Implementation
+    Linear scan over the dom_tree list looking for the DominanceTreeNode
+    whose block_id field (offset 0) matches the query. When found, return
+    the idom field at offset 8.
+
+    Linear search is acceptable because:
+    1. The dom_tree is built once per CFG analysis and queried millions of
+       times during downstream passes — but query patterns tend to be
+       hot-cached at the cache line level for sequential block IDs.
+    2. The tree has at most V entries where V is small (typical MIR
+       function < 100 blocks).
+    3. Adding a separate block_id -> node_ptr index map would double the
+       memory footprint of DominanceInfo for marginal benefit on real code.
+
+    For very large functions a future optimization could materialize a
+    direct-indexed lookup table, gated on V exceeding a threshold (e.g.
+    1024 blocks). For now the linear walk avoids the complexity.
+
+    Null-safety: returns -1 if info_ptr is 0, if dom_tree pointer is 0,
+    or if the block is not present in the tree (unreachable from entry).
+    The -1 sentinel matches the "undefined" marker used during Cooper's
+    fixpoint, so callers can chain queries without special-casing.
+    @End Implementation
 
     Note: Null check
     If info_ptr is equal to 0:
@@ -729,6 +804,28 @@ Process called "dominates" that takes info_ptr as Integer, dominator_id as Integ
     Returns: 1 if dominates, 0 otherwise
     @End Reasoning
 
+    @Implementation
+    Implements the standard dominance query via upward chain traversal. The
+    reflexive case (A dominates itself) is handled by an early-out before
+    entering the loop, so the main loop body only handles strict ancestry.
+
+    Loop invariant: at the top of each iteration, current_id is some block
+    that lies on the dominator chain from block_id toward entry. We fetch
+    its idom; if the idom equals dominator_id we have proven dominance;
+    if the idom equals current_id we have hit the entry sentinel and dominance
+    is false; otherwise we step up and continue.
+
+    Bounded iteration: max_iterations is set to 1000 as a defensive guard
+    against a malformed dominance tree (which should never occur if
+    validate_dominance_tree has been run). A correctly constructed dominator
+    tree on a CFG with V blocks has chain depth <= V, so 1000 covers any
+    function the compiler is expected to handle in practice.
+
+    Calling proc get_immediate_dominator each iteration is O(V) (linear scan
+    of the tree), giving worst-case O(V^2) for this query. Hot callers
+    should batch-query via get_dominated_blocks or cache the chain.
+    @End Implementation
+
     Note: Null check
     If info_ptr is equal to 0:
         Return 0
@@ -747,7 +844,7 @@ Process called "dominates" that takes info_ptr as Integer, dominator_id as Integ
     Let iteration be 0
     While iteration is less than max_iterations:
         Note: Get immediate dominator of current block
-        Let idom_id be get_immediate_dominator(info_ptr, current_id)
+        Let idom_id be proc get_immediate_dominator with info_ptr, current_id
 
         If idom_id is equal to -1:
             Note: No dominator, reached root or invalid block
@@ -779,7 +876,7 @@ Process called "strictly_dominates" that takes info_ptr as Integer, dominator_id
 
     Block A strictly dominates block B if:
     1. A dominates B
-    2. A ≠ B
+    2. A != B
 
     This is used in many compiler algorithms that need to distinguish
     between a block dominating itself vs. dominating others.
@@ -789,13 +886,27 @@ Process called "strictly_dominates" that takes info_ptr as Integer, dominator_id
     Returns: 1 if strictly dominates, 0 otherwise
     @End Reasoning
 
-    Note: Strict dominance requires A ≠ B
+    @Implementation
+    Two-step decision: first reject the reflexive case (A == B implies not
+    strict), then delegate to proc dominates for the actual ancestor walk.
+    This composition keeps the strict / non-strict distinction at the
+    type boundary rather than duplicating chain-traversal logic.
+
+    Used pervasively in SSA verification (def must strictly dominate every
+    non-phi use), in loop-invariant code motion (hoist target must strictly
+    dominate the loop header), and in dead-code elimination's reachability
+    analysis. The reflexive guard is correctness-critical: a block trivially
+    dominates itself, so without this check loop bodies would falsely
+    "strictly dominate" their own headers and break LICM safety.
+    @End Implementation
+
+    Note: Strict dominance requires A != B
     If dominator_id is equal to block_id:
         Return 0
     End If
 
     Note: Otherwise, same as regular dominance
-    Return dominates(info_ptr, dominator_id, block_id)
+    Return proc dominates with info_ptr, dominator_id, block_id
 End Process
 
 Process called "get_dominated_blocks" that takes info_ptr as Integer, block_id as Integer returns Integer:
@@ -814,6 +925,34 @@ Process called "get_dominated_blocks" that takes info_ptr as Integer, block_id a
 
     Returns: List of block IDs (TIER 3), or empty list if block not found
     @End Reasoning
+
+    @Implementation
+    Iterative DFS using an explicit stack list (TIER 3) to avoid recursion
+    depth issues on deeply nested dominator trees. The dominator tree is
+    materialized as a flat array of DominanceTreeNode structs where each
+    node stores its children as a list of block IDs (not pointers), so we
+    must perform a node-pointer lookup for each child to push it onto the
+    DFS stack.
+
+    Algorithm walkthrough:
+    1. Append block_id itself to the result (reflexive dominance).
+    2. Linear-scan dom_tree to find the root node for block_id. If not found,
+       return the result list containing only block_id.
+    3. Push the root onto the work stack.
+    4. Loop until stack empty: pop a node, iterate its children list, append
+       each child's block_id to result, then linear-scan dom_tree again to
+       find that child's node pointer and push it.
+
+    The stack pop is simulated by rebuilding a new List minus the last
+    element — a consequence of the current List type lacking an O(1) pop
+    primitive. This is O(stack_depth) per pop, giving overall O(d * out)
+    where d = max depth and out = output size. Acceptable for typical MIR
+    block counts.
+
+    The intermediate stack list is destroyed at the end to free TIER 3
+    memory. The result list is returned to the caller, which assumes
+    ownership.
+    @End Implementation
 
     Note: Create result list
     Let result be proc create from List
@@ -1023,7 +1162,7 @@ Process called "compute_dominance_frontiers" that takes info_ptr as Integer retu
 
                 Note: Walk up dominator tree from predecessor
                 Let runner be pred_id
-                Let block_idom be get_immediate_dominator(info_ptr, block_id)
+                Let block_idom be proc get_immediate_dominator with info_ptr, block_id
                 Let max_iterations be 1000  Note: Safety limit
 
                 Let iteration be 0
@@ -1037,7 +1176,7 @@ Process called "compute_dominance_frontiers" that takes info_ptr as Integer retu
                     End If
 
                     Note: Move up to runner's immediate dominator
-                    Let runner_idom be get_immediate_dominator(info_ptr, runner)
+                    Let runner_idom be proc get_immediate_dominator with info_ptr, runner
 
                     Note: Stop if we've reached the root or an invalid state
                     If runner_idom is equal to -1 or runner_idom is equal to runner:
@@ -1101,6 +1240,24 @@ Process called "get_dominance_frontier" that takes info_ptr as Integer, block_id
 
     Returns: List of block IDs in the frontier (TIER 3), or empty list if not found
     @End Reasoning
+
+    @Implementation
+    Linear scan over the frontier_sets list looking for the
+    DominanceFrontierSet whose block_id field (offset 0) matches the query;
+    on match, return the frontier_blocks list pointer at offset 8.
+
+    The returned list is a borrowed reference into the DominanceInfo —
+    the caller must NOT destroy it. Lifetime is tied to info_ptr; destroying
+    the DominanceInfo (via proc destroy_dominance_info) invalidates every
+    frontier list returned by this function.
+
+    For not-found / null cases we synthesize a fresh empty list. The caller
+    therefore receives a list pointer in both cases but only the synthesized
+    one is safe to destroy. Hot SSA-construction paths that issue many
+    queries should check pred_count of the source block and skip the query
+    entirely when the frontier is provably empty (single-predecessor blocks
+    cannot contribute new frontier entries).
+    @End Implementation
 
     Note: Null check
     If info_ptr is equal to 0:
@@ -1334,14 +1491,14 @@ Process called "compute_post_dominance_tree" that takes cfg_ptr as Integer retur
     proc memory_set_int64 from Layout with post_info_ptr, 56, 0 Note: block_to_rpo_index
 
     Note: Step 1: Compute reverse CFG postorder and RPO
-    Let postorder be compute_reverse_cfg_postorder(cfg_ptr, exit_block_id)
-    Let rpo be compute_reverse_postorder(postorder)
+    Let postorder be proc compute_reverse_cfg_postorder with cfg_ptr, exit_block_id
+    Let rpo be proc compute_reverse_postorder with postorder
     Let rpo_count be proc length from List with rpo
     proc memory_set_int64 from Layout with post_info_ptr, 40, rpo
     proc memory_set_int64 from Layout with post_info_ptr, 48, rpo_count
 
     Note: Create block_id -> RPO index map
-    Let rpo_index_map be create_block_to_rpo_index_map(rpo)
+    Let rpo_index_map be proc create_block_to_rpo_index_map with rpo
     proc memory_set_int64 from Layout with post_info_ptr, 56, rpo_index_map
 
     Note: Step 2: Initialize post-idom map
@@ -1431,7 +1588,7 @@ Process called "compute_post_dominance_tree" that takes cfg_ptr as Integer retur
                 Note: Skip if same as new_post_idom or not processed
                 If succ_id is not equal to new_post_idom and succ_post_idom is not equal to -1:
                     Note: Intersect: find common post-dominator
-                    Set new_post_idom to find_common_dominator(succ_id, new_post_idom, post_idom_map, rpo_index_map)
+                    Set new_post_idom to proc find_common_dominator with succ_id, new_post_idom, post_idom_map, rpo_index_map
                 End If
 
                 Set succ_idx to succ_idx plus 1
@@ -1535,6 +1692,21 @@ Process called "get_post_dominator" that takes post_info_ptr as Integer, block_i
     Time complexity: O(n) to search post-dom tree
     @End Reasoning
 
+    @Implementation
+    Mirror of proc get_immediate_dominator but reading from PostDominanceInfo
+    instead of DominanceInfo. The post-dom tree shares the same node layout
+    (DominanceTreeNode reused for both directions): block_id at offset 0,
+    post-idom at offset 8. Only the tree's root differs — it is the exit
+    block rather than entry.
+
+    Linear scan over post_dom_tree. -1 is returned for null post_info_ptr,
+    null post_dom_tree pointer, or unreachable blocks (blocks with no path
+    to exit). The unreachable case is significant: irreducible CFGs with
+    infinite loops have no exit path, and downstream control-dependence
+    analysis must treat -1 as "control depends on the program never
+    terminating" rather than a default block ID.
+    @End Implementation
+
     Note: Null check
     If post_info_ptr is equal to 0:
         Return -1
@@ -1578,6 +1750,23 @@ Process called "post_dominates" that takes post_info_ptr as Integer, post_dom_id
     Returns: 1 if post-dominates, 0 otherwise
     @End Reasoning
 
+    @Implementation
+    Structural mirror of proc dominates: reflexive early-out, then bounded
+    upward walk of the post-dominator chain via proc get_post_dominator.
+    The exit block is its own post-idom (analogous to entry being its own
+    idom in forward dominance), so reaching post_idom_id == current_id
+    means we hit the root of the post-dom tree without finding the queried
+    ancestor — answer false.
+
+    Used by dead-store elimination (a store is dead if every use is
+    post-dominated by another store of the same location to the same value)
+    and by control-dependence analysis (B is control-dependent on A iff A
+    has a successor that post-dominates B and another that does not).
+
+    Bounded by max_iterations = 1000 as a defense against malformed
+    post-dom trees; a correctly built tree on V blocks has chain depth <= V.
+    @End Implementation
+
     Note: Null check
     If post_info_ptr is equal to 0:
         Return 0
@@ -1596,7 +1785,7 @@ Process called "post_dominates" that takes post_info_ptr as Integer, post_dom_id
     Let iteration be 0
     While iteration is less than max_iterations:
         Note: Get immediate post-dominator of current block
-        Let post_idom_id be get_post_dominator(post_info_ptr, current_id)
+        Let post_idom_id be proc get_post_dominator with post_info_ptr, current_id
 
         If post_idom_id is equal to -1:
             Note: No post-dominator, reached root or invalid block
@@ -1676,7 +1865,7 @@ Process called "validate_dominance_tree" that takes info_ptr as Integer returns 
     End If
 
     Note: Check 1: Entry block has idom = entry
-    Let entry_idom be get_immediate_dominator(info_ptr, entry_id)
+    Let entry_idom be proc get_immediate_dominator with info_ptr, entry_id
     If entry_idom is not equal to entry_id:
         Display "ERROR: validate_dominance_tree: entry block idom incorrect"
         Return 0
@@ -1716,7 +1905,7 @@ Process called "validate_dominance_tree" that takes info_ptr as Integer returns 
         Let max_visits be node_count plus 1
 
         While visited_count is less than max_visits:
-            Let current_idom be get_immediate_dominator(info_ptr, current)
+            Let current_idom be proc get_immediate_dominator with info_ptr, current
 
             If current_idom is equal to -1:
                 Display "ERROR: validate_dominance_tree: invalid idom in chain"
@@ -1758,7 +1947,7 @@ Process called "validate_dominance_tree" that takes info_ptr as Integer returns 
         Let j be 0
         While j is less than child_count:
             Let child_id be proc get from List with children_list, j
-            Let child_idom be get_immediate_dominator(info_ptr, child_id)
+            Let child_idom be proc get_immediate_dominator with info_ptr, child_id
 
             If child_idom is not equal to block_id:
                 Display "ERROR: validate_dominance_tree: parent-child relationship inconsistent"
@@ -1787,6 +1976,30 @@ Process called "print_dominance_tree" that takes info_ptr as Integer returns Int
     Useful for debugging dominance analysis and understanding
     control flow structure.
     @End Reasoning
+
+    @Implementation
+    Linear walk of the dom_tree list; for each DominanceTreeNode emits a
+    multi-line record to Display:
+    - "Block N:" header
+    - "  idom = M" or "  idom = ENTRY (self)" when the entry block is its
+      own idom
+    - "  children = [c1, c2, ...]" comma-separated child block IDs
+    - "  DF = {f1, f2, ...}" or "  DF = {}" obtained via
+      proc get_dominance_frontier
+
+    Output ordering follows the dom_tree list order, which mirrors the
+    block_count traversal in proc compute_dominance_tree (CFG block-allocation
+    order, not RPO). This is intentional: a debugger comparing dominance
+    output against block_id sequence does not have to mentally re-order.
+
+    The "continuing" keyword on Display calls suppresses the trailing newline
+    so list contents render on a single line. ASCII-only output — no Unicode
+    box-drawing — to remain portable across terminal encodings and log
+    aggregation pipelines.
+
+    Returns 1 on success, 0 if info_ptr is null. Always emits a header and
+    footer band of "=" characters for visual segmentation in long logs.
+    @End Implementation
 
     Note: Null check
     If info_ptr is equal to 0:
@@ -1850,7 +2063,7 @@ Process called "print_dominance_tree" that takes info_ptr as Integer returns Int
         Display "]"
 
         Note: Print dominance frontier if available
-        Let frontier_blocks be get_dominance_frontier(info_ptr, block_id)
+        Let frontier_blocks be proc get_dominance_frontier with info_ptr, block_id
         Let frontier_count be proc length from List with frontier_blocks
         If frontier_count is greater than 0:
             Display "  DF = {" continuing
@@ -1899,6 +2112,24 @@ Process called "invalidate_dominance_info" that takes cfg_ptr as Integer returns
     Time complexity: O(1)
     @End Reasoning
 
+    @Implementation
+    Single-call delegation to proc set_cfg_dominance_computed from CFG with
+    flag value 0. This clears the cache-valid bit on the CFG side so that the
+    next consumer pipeline stage (SSA construction, loop analysis, etc.) will
+    re-run proc compute_dominance_tree before issuing dominance queries.
+
+    Lifetime contract: this function does NOT free the existing DominanceInfo
+    structure. That responsibility belongs to proc destroy_dominance_info,
+    which is the symmetric counterpart to proc create_dominance_info. Splitting
+    invalidation from destruction lets transformation passes batch CFG edits:
+    invalidate once at the start, perform N mutations, then re-compute once at
+    the end — without paying the allocation cost N times.
+
+    The mutator that invokes this function owns the responsibility of either
+    destroying the stale DominanceInfo or re-using its allocated buffer when
+    re-running the analysis. Returns 1 on success, 0 if cfg_ptr is null.
+    @End Implementation
+
     Note: Null check
     If cfg_ptr is equal to 0:
         Return 0
@@ -1928,6 +2159,37 @@ Process called "destroy_dominance_info" that takes info_ptr as Integer returns I
 
     Time complexity: O(n) where n = number of blocks
     @End Reasoning
+
+    @Implementation
+    Bottom-up deallocation that mirrors the construction order in
+    proc compute_dominance_tree and proc compute_dominance_frontiers. Each
+    nested allocation must be freed before its container, otherwise child
+    pointers would dangle inside an unreachable parent.
+
+    Step-by-step:
+    1. Load every list pointer + count from the DominanceInfo header so we
+       have the full inventory before we start freeing anything.
+    2. For each DominanceTreeNode in dom_tree: destroy the children list
+       (TIER 3 owned), then deallocate the 40-byte node struct via
+       proc deallocate from Layout. Finally destroy the dom_tree list itself.
+    3. For each DominanceFrontierSet in frontiers: destroy the
+       frontier_blocks list, then deallocate the 24-byte frontier-set struct.
+       Then destroy the frontiers list itself.
+    4. Destroy postorder, reverse_postorder, and block_to_rpo_index lists.
+    5. Deallocate the 96-byte DominanceInfo struct itself.
+
+    Every list pointer is null-checked before destroy because partially-
+    constructed DominanceInfo objects (e.g., from a CFG that failed analysis
+    before frontier computation) may have null slots. The deallocate calls
+    require exact byte-sizes that must match the corresponding allocate
+    calls; these sizes are encoded as literal constants in both the
+    constructor and this destructor — keeping them in sync is part of the
+    invariant for the Layout-based memory model.
+
+    Total work is O(V) blocks * (O(1) per node) plus the list destruction
+    cost, giving O(V + sum(frontier_size)) which is dominated by frontier
+    size in the worst case.
+    @End Implementation
 
     Note: Null check
     If info_ptr is equal to 0:

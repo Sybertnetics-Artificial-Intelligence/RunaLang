@@ -285,8 +285,24 @@ Process called "get_binary_expression_operator" takes expr as Integer returns In
     Note: Get operator from binary expression
 
     @Reasoning:
-    Direct field access for operator retrieval.
+    The operator field identifies which binary operation this node represents
+    (add, subtract, multiply, divide, logical-and, comparison, etc.). Downstream
+    passes (type checker, MIR lowering, codegen) dispatch on this value to
+    select the correct semantic rule or instruction. We expose it via a
+    dedicated accessor so the field offset never leaks into call sites.
     @End Reasoning
+
+    @Implementation:
+    HIRBinaryExpression layout: [base(0), operator(8), left(16), right(24),
+    result_type(32)]. The operator constant lives at byte offset 8 and is read
+    as an int64. A null-pointer guard returns 0 (interpreted as INVALID_OP by
+    callers) to keep this accessor safe in error-recovery paths.
+    @End Implementation
+
+    @Performance_Hints:
+    Single int64 load on the binary-expression hot path. Inlined by the backend
+    when the call site is in a tight visitor loop.
+    @End Performance_Hints
 
     If expr is equal to 0:
         Return 0
@@ -300,8 +316,24 @@ Process called "get_binary_expression_left" takes expr as Integer returns Intege
     Note: Get left operand from binary expression
 
     @Reasoning:
-    Direct field access for left operand retrieval.
+    The left operand is the first sub-expression of a binary operation; in
+    short-circuit operators it is evaluated unconditionally, and in arithmetic
+    operations it determines the result type when no implicit promotion is
+    needed. Callers (type unifier, constant folder, codegen) must traverse it
+    before the right operand to preserve Runa's left-to-right evaluation order.
     @End Reasoning
+
+    @Implementation:
+    HIRBinaryExpression layout puts the left operand pointer at byte offset 16.
+    Read as int64 (HIR node pointer). Returns 0 when expr itself is null so
+    the accessor is safe to call during partial-AST error recovery.
+    @End Implementation
+
+    @Performance_Hints:
+    Single int64 load. Frequently called in pairs with get_binary_expression_right
+    during tree walks; both fields share a cache line in the HIRBinaryExpression
+    layout, making sequential access cache-friendly.
+    @End Performance_Hints
 
     If expr is equal to 0:
         Return 0
@@ -315,8 +347,24 @@ Process called "get_binary_expression_right" takes expr as Integer returns Integ
     Note: Get right operand from binary expression
 
     @Reasoning:
-    Direct field access for right operand retrieval.
+    The right operand is the second sub-expression of a binary operation. For
+    short-circuit operators (logical AND, logical OR) it may be evaluated
+    conditionally, so codegen must emit the branch sequence before lowering
+    the right child. For commutative arithmetic operators the right operand
+    is interchangeable with the left for re-association optimizations, but
+    the canonical HIR preserves source order until MIR canonicalization.
     @End Reasoning
+
+    @Implementation:
+    HIRBinaryExpression layout puts the right operand pointer at byte offset 24.
+    Read as int64 (HIR node pointer). Returns 0 when expr itself is null.
+    @End Implementation
+
+    @Performance_Hints:
+    Single int64 load. Combined with get_binary_expression_left this is the
+    core child-iteration path; both reads compile to two MOV instructions on
+    x86-64 from adjacent offsets.
+    @End Performance_Hints
 
     If expr is equal to 0:
         Return 0
@@ -396,8 +444,18 @@ Process called "get_call_expression_callee" takes call as Integer returns Intege
     Note: Get callee from call expression
 
     @Reasoning:
-    Direct field access for callee node retrieval.
+    The callee node holds the unresolved or partially-resolved expression that
+    names the function being invoked (identifier reference, qualified path,
+    method-bound member access, etc.). Semantic analysis reads this to perform
+    symbol resolution and overload selection before populating resolved_function.
+    Codegen reads it only when the indirect-call path is taken.
     @End Reasoning
+
+    @Implementation:
+    HIRCallExpression layout: [base(0), callee(8), arguments(16),
+    argument_count(24), resolved_function(32), return_type(40),
+    is_method_call(48)]. The callee pointer lives at byte offset 8.
+    @End Implementation
 
     If call is equal to 0:
         Return 0
@@ -411,8 +469,18 @@ Process called "get_call_expression_arguments" takes call as Integer returns Int
     Note: Get arguments list from call expression
 
     @Reasoning:
-    Direct field access for arguments list pointer.
+    Returns the pointer to the List of argument HIR nodes. The list is
+    positional and follows source order; named arguments have already been
+    re-ordered to positional form by the parser. Callers iterate this list
+    to type-check each argument against the parameter type, to lower
+    arguments to MIR values, or to compute escape-analysis side effects.
     @End Reasoning
+
+    @Implementation:
+    HIRCallExpression layout: arguments list pointer at byte offset 16. The
+    list is a heap-allocated List[Integer] of HIR node pointers; null when no
+    arguments are present.
+    @End Implementation
 
     If call is equal to 0:
         Return 0
@@ -426,8 +494,18 @@ Process called "get_call_expression_argument_count" takes call as Integer return
     Note: Get argument count from call expression
 
     @Reasoning:
-    Direct field access for argument count.
+    Cached count of the arguments list. Storing this alongside the list
+    pointer avoids walking the linked-list-style List structure during
+    arity checking, which happens on every call site. Arity validation is
+    the first semantic check applied to a call, so this accessor sits on
+    a hot path.
     @End Reasoning
+
+    @Implementation:
+    HIRCallExpression layout: argument_count at byte offset 24, stored as
+    int64. Maintained by parser when constructing the node; never edited
+    after HIR is sealed.
+    @End Implementation
 
     If call is equal to 0:
         Return 0
@@ -441,9 +519,18 @@ Process called "set_call_expression_method_flag" takes call as Integer, is_metho
     Note: Set method call flag
 
     @Reasoning:
-    Mark call as method call for proper code generation (method calls may
-    require different calling conventions or implicit self parameter).
+    Method calls differ from free-function calls in two ways: they bind an
+    implicit self/receiver as the first argument, and method-resolution rules
+    consider the receiver type when picking the target. Semantic analysis
+    flips this flag during member-call lowering so codegen knows to emit the
+    receiver slot ahead of the explicit arguments.
     @End Reasoning
+
+    @Implementation:
+    HIRCallExpression layout: is_method_call boolean at byte offset 48,
+    stored as int64 (0=false, 1=true). Returns 1 on success, 0 if call
+    pointer is null.
+    @End Implementation
 
     If call is equal to 0:
         Return 0
@@ -492,8 +579,19 @@ Process called "get_member_expression_object" takes member_expr as Integer retur
     Note: Get object from member expression
 
     @Reasoning:
-    Direct field access for object node retrieval.
+    The object sub-expression evaluates to the aggregate value whose field
+    or method we are accessing. For chained access (a.b.c) this points to
+    the inner HIRMemberExpression, forming a left-leaning chain that the
+    type checker walks bottom-up to resolve each member against the parent
+    type. Codegen materialises this expression's value before issuing the
+    field-offset load.
     @End Reasoning
+
+    @Implementation:
+    HIRMemberExpression layout: [base(0), object(8), member_name(16),
+    member_index(24), member_type(32), is_method(40)]. The object pointer
+    is at byte offset 8 and read as int64.
+    @End Implementation
 
     If member_expr is equal to 0:
         Return 0
@@ -507,9 +605,26 @@ Process called "get_member_expression_member_index" takes member_expr as Integer
     Note: Get member field index
 
     @Reasoning:
-    Field index enables direct offset calculation for efficient field access
-    code generation (offset = field_index × 8 bytes).
+    Once semantic analysis has resolved a member name to a concrete field,
+    we cache the field's zero-based ordinal in the declaring type. Codegen
+    uses this index to compute the byte offset (currently field_index times
+    8 on 64-bit targets, but the lowering layer is free to substitute the
+    real layout once packed structs or alignment rules are honored) without
+    re-doing the string-based lookup. A value of -1 indicates the index has
+    not yet been resolved.
     @End Reasoning
+
+    @Implementation:
+    HIRMemberExpression layout: member_index at byte offset 24 stored as
+    int64. Returned as a signed integer so callers can distinguish the
+    sentinel -1 (unresolved) from a valid zero-based index.
+    @End Implementation
+
+    @Performance_Hints:
+    Hot path during field-load lowering. Single int64 load on a node already
+    in cache from the parent walker; the resulting index feeds directly into
+    the offset calculation used by the LIR emitter.
+    @End Performance_Hints
 
     If member_expr is equal to 0:
         Return 0
@@ -590,9 +705,28 @@ Process called "add_lambda_capture" takes lambda_expr as Integer, captured_symbo
     Note: Add captured variable to lambda closure
 
     @Reasoning:
-    During closure analysis, we identify free variables that must be captured.
-    Each capture is tracked for closure environment construction.
+    During closure analysis we walk the lambda body and record every free
+    variable that resolves to an enclosing-scope symbol. Each such symbol
+    must become a field in the closure environment record so the runtime
+    representation of the lambda can carry the captured state alongside the
+    code pointer. Adding captures incrementally allows the analyzer to
+    process body statements in order without first counting captures.
     @End Reasoning
+
+    @Implementation:
+    HIRLambdaExpression layout: captures list pointer at byte offset 40,
+    capture_count at byte offset 48. On first invocation the list is
+    lazily allocated via List.create; subsequent invocations append the
+    captured_symbol pointer. The capture_count int64 is incremented after
+    each successful append to keep the cached count consistent with the
+    list length.
+    @End Implementation
+
+    @Performance_Hints:
+    Called once per free-variable reference during closure analysis. The
+    cached capture_count is read later by codegen O(1) instead of walking
+    the list.
+    @End Performance_Hints
 
     If lambda_expr is equal to 0:
         Return 0
@@ -626,8 +760,18 @@ Process called "get_lambda_captures" takes lambda_expr as Integer returns Intege
     Note: Get list of captured variables
 
     @Reasoning:
-    Direct field access for captures list retrieval.
+    Returns the List[Integer] of captured symbol pointers in capture order.
+    The MIR closure-lowering pass walks this list to emit the environment
+    struct layout, and the codegen back end emits a load-capture sequence
+    in the same order. Order stability is therefore part of the contract.
+    A null result means the lambda has no free variables (a pure function).
     @End Reasoning
+
+    @Implementation:
+    HIRLambdaExpression layout: captures list pointer at byte offset 40,
+    read as int64. The list is lazily created by add_lambda_capture, so a
+    lambda with no captures returns 0 here rather than an empty list.
+    @End Implementation
 
     If lambda_expr is equal to 0:
         Return 0
@@ -673,8 +817,18 @@ Process called "get_function_pointer_name" takes func_ptr as Integer returns Int
     Note: Get function name from function pointer
 
     @Reasoning:
-    Direct field access for function name retrieval.
+    Returns the source-text identifier as parsed from the $name literal.
+    Even after resolution this is preserved for diagnostic messages
+    ("cannot take pointer to undefined function 'foo'") and for symbol-table
+    cross-referencing during incremental compilation. Resolution failure
+    leaves resolved_function null while keeping function_name populated.
     @End Reasoning
+
+    @Implementation:
+    HIRFunctionPointer layout: [base(0), function_name(8), resolved_function(16),
+    function_type(24)]. The name pointer at byte offset 8 references an
+    interned, NUL-terminated string in the symbol-pool arena.
+    @End Implementation
 
     If func_ptr is equal to 0:
         Return 0
@@ -688,8 +842,18 @@ Process called "get_function_pointer_resolved_function" takes func_ptr as Intege
     Note: Get resolved function symbol from function pointer
 
     @Reasoning:
-    Direct field access for resolved function symbol.
+    Returns the symbol-table pointer to the concrete function that the
+    $name literal resolves to. The MIR lowering pass uses this to emit a
+    direct address-of-function relocation; if the field is still null,
+    semantic analysis emits an unresolved-symbol diagnostic and the call
+    chain refuses to lower further.
     @End Reasoning
+
+    @Implementation:
+    HIRFunctionPointer layout: resolved_function pointer at byte offset 16,
+    read as int64. Populated by the resolver pass; remains 0 until the
+    pass runs.
+    @End Implementation
 
     If func_ptr is equal to 0:
         Return 0
@@ -703,8 +867,18 @@ Process called "get_function_pointer_type" takes func_ptr as Integer returns Int
     Note: Get function type from function pointer
 
     @Reasoning:
-    Direct field access for function type signature.
+    Returns the HIRTypeInfo describing the function's full signature
+    (parameter types, return type, calling convention bits). Indirect calls
+    on this pointer must produce an HIRIndirectCall whose argument list is
+    type-compatible with this signature, and type-inference uses it when
+    a function-pointer literal flows into a polymorphic context.
     @End Reasoning
+
+    @Implementation:
+    HIRFunctionPointer layout: function_type pointer at byte offset 24,
+    read as int64. The type record is shared with the resolved symbol's
+    type entry, so this is a cheap pointer copy, not a clone.
+    @End Implementation
 
     If func_ptr is equal to 0:
         Return 0
@@ -752,8 +926,19 @@ Process called "get_indirect_call_function_value" takes indirect_call as Integer
     Note: Get function value expression from indirect call
 
     @Reasoning:
-    Direct field access for function value expression.
+    Returns the sub-expression that produces the function pointer at runtime.
+    Unlike a direct HIRCallExpression whose callee is statically resolved,
+    here the pointer is computed (loaded from a variable, returned from
+    another call, taken via $name). The lowering pass evaluates this
+    expression, validates its type as a function type, then emits a CALL
+    through register.
     @End Reasoning
+
+    @Implementation:
+    HIRIndirectCall layout: [base(0), function_value(8), arguments(16),
+    argument_count(24), return_type(32)]. function_value pointer at byte
+    offset 8.
+    @End Implementation
 
     If indirect_call is equal to 0:
         Return 0
@@ -767,8 +952,18 @@ Process called "get_indirect_call_arguments" takes indirect_call as Integer retu
     Note: Get arguments list from indirect call
 
     @Reasoning:
-    Direct field access for arguments list pointer.
+    Returns the positional argument list for an indirect call. Same
+    invariants as get_call_expression_arguments: list preserves source
+    order and named arguments have already been re-ordered. The lowering
+    pass walks this list after evaluating function_value so that argument
+    setup respects Runa's left-to-right evaluation order even when the
+    receiver is itself a complex expression.
     @End Reasoning
+
+    @Implementation:
+    HIRIndirectCall layout: arguments list pointer at byte offset 16,
+    read as int64. List[Integer] of HIR node pointers.
+    @End Implementation
 
     If indirect_call is equal to 0:
         Return 0
@@ -782,8 +977,16 @@ Process called "get_indirect_call_argument_count" takes indirect_call as Integer
     Note: Get argument count from indirect call
 
     @Reasoning:
-    Direct field access for argument count.
+    Cached length of the indirect call's argument list. Used to validate
+    arity against the function-pointer's declared signature without walking
+    the list. Arity mismatches at an indirect call site are the most common
+    type error for higher-order code, so we keep the check O(1).
     @End Reasoning
+
+    @Implementation:
+    HIRIndirectCall layout: argument_count at byte offset 24, stored as
+    int64. Set by the parser and treated as read-only thereafter.
+    @End Implementation
 
     If indirect_call is equal to 0:
         Return 0
@@ -797,8 +1000,19 @@ Process called "get_indirect_call_return_type" takes indirect_call as Integer re
     Note: Get return type from indirect call
 
     @Reasoning:
-    Direct field access for return type.
+    Returns the HIRTypeInfo for the call's result. Although this can be
+    re-derived from function_value's function type, caching it here lets
+    the type checker propagate the result type to enclosing expressions in
+    a single lookup, and lets codegen pick the right return-value register
+    class (integer vs floating-point vs aggregate) without re-traversing
+    the function signature.
     @End Reasoning
+
+    @Implementation:
+    HIRIndirectCall layout: return_type pointer at byte offset 32, read
+    as int64. Populated during semantic analysis once function_value's
+    type is known; remains 0 until then.
+    @End Implementation
 
     If indirect_call is equal to 0:
         Return 0
@@ -877,9 +1091,25 @@ Process called "add_match_arm" takes match_stmt as Integer, when_clause as Integ
     Note: Add when clause (match arm) to match statement
 
     @Reasoning:
-    Match arms are added incrementally during HIR construction. Each arm
-    must be validated for type consistency and pattern coverage.
+    Match arms are appended in source order so that exhaustiveness checking
+    and fall-through analysis can reason about precedence (earlier arms
+    shadow later ones for overlapping patterns). The arm-count field is
+    kept in sync to avoid O(n) list-length probes during exhaustiveness
+    proofs over very wide enums.
     @End Reasoning
+
+    @Implementation:
+    HIRMatchStatement layout: arms list pointer at byte offset 24,
+    arm_count at byte offset 32. The list is lazily allocated on the
+    first add via List.create, then each subsequent call appends the
+    HIRWhenClause pointer and increments arm_count. Returns 1 on success,
+    0 on null match_stmt, null when_clause, or list append failure.
+    @End Implementation
+
+    @Performance_Hints:
+    Called once per source-level When clause during HIR construction;
+    not on any analysis hot path.
+    @End Performance_Hints
 
     If match_stmt is equal to 0:
         Return 0
@@ -917,9 +1147,26 @@ Process called "set_match_exhaustive" takes match_stmt as Integer, is_exhaustive
     Note: Mark match statement as exhaustive
 
     @Reasoning:
-    After exhaustiveness analysis, we mark the match statement to indicate
-    all possible patterns are covered (no missing cases).
+    Exhaustive matches are guaranteed to dispatch to exactly one arm at
+    runtime, which lets codegen drop the trailing "unmatched pattern"
+    abort and lets the type system treat the match as a total expression
+    in expression position. Non-exhaustive matches must still be lowered
+    with a fall-through abort path. The exhaustiveness checker sets this
+    bit only after proving total coverage over the matched type.
     @End Reasoning
+
+    @Implementation:
+    HIRMatchStatement layout: is_exhaustive boolean at byte offset 40,
+    stored as int64 (0=non-exhaustive, 1=exhaustive). Returns 1 on
+    success, 0 if match_stmt is null.
+    @End Implementation
+
+    @Security_Scope:
+    Setting is_exhaustive to a wrong value would silently disable the
+    runtime safety net (the unmatched-pattern abort). Only the
+    exhaustiveness checker should call this; treat it as analysis-only,
+    never user-controllable.
+    @End Security_Scope
 
     If match_stmt is equal to 0:
         Return 0
@@ -974,9 +1221,26 @@ Process called "set_process_visibility" takes process_def as Integer, is_public 
     Note: Set process visibility (public/private)
 
     @Reasoning:
-    Visibility affects symbol resolution and code generation. Public processes
-    are exported in module interface, private processes are internal.
+    Visibility controls two things: (1) whether the symbol appears in the
+    module's exported interface and is therefore callable from importers,
+    and (2) whether the linker is asked to emit a globl directive for the
+    symbol. Private processes get static-local emission and may be
+    inlined or dead-code-eliminated across the whole module without
+    breaking ABI guarantees.
     @End Reasoning
+
+    @Implementation:
+    HIRProcessDefinition layout: is_public boolean at byte offset 56,
+    stored as int64 (0=private, 1=public). Returns 1 on success, 0 if
+    process_def is null.
+    @End Implementation
+
+    @Security_Scope:
+    Mis-marking a private helper as public widens the module's attack
+    surface by exporting symbols that bypass intended encapsulation.
+    The parser only sets is_public when the source explicitly declares
+    public visibility; analysis passes must never silently flip this bit.
+    @End Security_Scope
 
     If process_def is equal to 0:
         Return 0
@@ -990,9 +1254,22 @@ Process called "set_process_generic" takes process_def as Integer, generic_param
     Note: Mark process as generic with type parameters
 
     @Reasoning:
-    Generic processes require monomorphization during code generation. We
-    track generic parameters for instantiation and constraint checking.
+    A generic process is not eligible for direct codegen; instead the
+    backend stamps out a monomorphic instance per unique type argument
+    combination it encounters. Recording the generic parameter list and
+    count up front lets the monomorphizer iterate parameters by index and
+    lets the type checker validate constraint clauses against the
+    parameter symbols without re-parsing them.
     @End Reasoning
+
+    @Implementation:
+    HIRProcessDefinition layout: is_generic at byte offset 72 (set to 1),
+    generic_params list pointer at byte offset 80, generic_count at byte
+    offset 88. All three fields are written atomically from the caller's
+    perspective (single-threaded HIR construction); the function is a
+    fused setter rather than three independent ones to keep the invariant
+    "is_generic implies generic_params is non-null" inside a single call.
+    @End Implementation
 
     If process_def is equal to 0:
         Return 0
@@ -1050,9 +1327,21 @@ Process called "add_type_field" takes type_def as Integer, field_symbol as Integ
     Note: Add field to type definition
 
     @Reasoning:
-    Fields are added incrementally during type construction. Each field
-    has type information and offset for memory layout calculation.
+    Fields are appended in declaration order, and that order is contract:
+    it determines the offsets the layout pass will assign, the order
+    constructor literals must follow, and the indices that
+    HIRMemberExpression.member_index refers to. Two definitions with the
+    same fields in different orders are therefore distinct types from the
+    layout's point of view.
     @End Reasoning
+
+    @Implementation:
+    HIRTypeDefinition layout: fields list pointer at byte offset 32,
+    field_count at byte offset 40. The list is lazily created on the
+    first call. Both null type_def and null field_symbol short-circuit
+    to a 0 return so partial AST under error recovery cannot corrupt
+    the type's field roster.
+    @End Implementation
 
     If type_def is equal to 0:
         Return 0
@@ -1125,9 +1414,19 @@ Process called "add_pattern_binding" takes pattern as Integer, binding_symbol as
     Note: Add variable binding to pattern
 
     @Reasoning:
-    Patterns introduce new variables in match arm scope. Each binding
-    extracts a value from the matched expression and binds it to a variable.
+    Each binding represents a name introduced by a pattern (for example the
+    "value" in `When Some as value:`). Binding order matches the source-text
+    order of the binders, which is the order codegen uses when materialising
+    binding slots into the arm's frame. Maintaining the symbol pointer here
+    rather than re-resolving by name keeps the arm body's name lookups O(1).
     @End Reasoning
+
+    @Implementation:
+    HIRPattern layout: bindings list pointer at byte offset 16, binding_count
+    at byte offset 24. List is lazily allocated on first append; subsequent
+    calls append the symbol pointer and increment binding_count. Returns 1
+    on success, 0 on null pattern, null binding_symbol, or append failure.
+    @End Implementation
 
     If pattern is equal to 0:
         Return 0
@@ -1165,9 +1464,20 @@ Process called "add_pattern_subpattern" takes pattern as Integer, subpattern as 
     Note: Add subpattern to complex pattern
 
     @Reasoning:
-    Complex patterns (tuple, record, variant patterns) contain nested subpatterns.
-    Each subpattern matches part of the structure and may have its own bindings.
+    Composite patterns (tuple, record, variant-with-payload, list patterns)
+    are represented as a parent HIRPattern plus an ordered list of child
+    HIRPattern nodes. The order mirrors the structural position being
+    matched (tuple element index, record-field order, variant payload
+    slot) so the exhaustiveness and reachability passes can walk parent
+    and child structures in lock-step. Each child carries its own
+    bindings list, so nested destructuring composes cleanly.
     @End Reasoning
+
+    @Implementation:
+    HIRPattern layout: subpatterns list pointer at byte offset 32,
+    subpattern_count at byte offset 40. List is lazily allocated. Returns
+    1 on success, 0 on null pattern, null subpattern, or append failure.
+    @End Implementation
 
     If pattern is equal to 0:
         Return 0
@@ -1205,6 +1515,25 @@ End Process
 Process called "create_hir_set_statement" takes base_node as Integer, target as Integer, value as Integer, target_symbol as Integer returns Integer:
     Note: Create HIR assignment/set statement
 
+    @Reasoning:
+    Set statements perform mutation of an existing binding (variable, field,
+    indexed slot). They differ from Let statements in that they do not
+    introduce a new symbol; instead they require the borrow checker to
+    confirm that the target is mutable and that no live shared borrow
+    exists. Storing the resolved target_symbol alongside the target
+    expression lets later passes avoid re-walking the LHS tree to find
+    the canonical owner.
+    @End Reasoning
+
+    @Implementation:
+    HIRSetStatement: 4 fields x 8 bytes = 32 bytes.
+    Layout: [base_node(0), target(8), value(16), target_symbol(24)].
+    base_node points to the shared HIRNode header (source location, parent
+    pointer); target is the LHS expression HIR node; value is the RHS
+    expression HIR node; target_symbol caches the resolved symbol for
+    direct-write codegen.
+    @End Implementation
+
     Let stmt_size be 32
     Let stmt be proc allocate from Layout with stmt_size
 
@@ -1223,6 +1552,23 @@ End Process
 Process called "create_hir_if_statement" takes base_node as Integer, condition as Integer, then_block as Integer, else_block as Integer returns Integer:
     Note: Create HIR if statement
 
+    @Reasoning:
+    If statements drive control flow with a boolean condition and up to two
+    branches; the else_block is optional and represented by 0 when absent.
+    Keeping then and else as full HIR nodes (rather than statement lists)
+    lets nested ifs and other compound statements participate uniformly in
+    CFG construction, dead-code elimination, and branch-probability
+    annotation later in the pipeline.
+    @End Reasoning
+
+    @Implementation:
+    HIRIfStatement: 4 fields x 8 bytes = 32 bytes.
+    Layout: [base_node(0), condition(8), then_block(16), else_block(24)].
+    All four fields are int64 pointers. else_block is 0 when the source
+    has no Otherwise branch; downstream passes must check for 0 before
+    dereferencing.
+    @End Implementation
+
     Let stmt_size be 32
     Let stmt be proc allocate from Layout with stmt_size
 
@@ -1240,6 +1586,23 @@ End Process
 
 Process called "create_hir_while_statement" takes base_node as Integer, condition as Integer, body as Integer, loop_scope as Integer returns Integer:
     Note: Create HIR while statement
+
+    @Reasoning:
+    While statements implement test-at-top loops. The condition is re-evaluated
+    before each iteration; the body executes zero or more times. A dedicated
+    loop_scope record (separate from any block scope inside the body) anchors
+    Break/Continue targets and gives the optimizer a precise place to hang
+    loop-invariant metadata. Lifting Break/Continue resolution into loop_scope
+    keeps the HIR free of unresolved jump targets.
+    @End Reasoning
+
+    @Implementation:
+    HIRWhileStatement: 4 fields x 8 bytes = 32 bytes.
+    Layout: [base_node(0), condition(8), body(16), loop_scope(24)].
+    All fields are int64 pointers; none are optional. loop_scope is
+    allocated by the parser even for loops without explicit Break/Continue
+    so downstream passes can rely on its presence.
+    @End Implementation
 
     Let stmt_size be 32
     Let stmt be proc allocate from Layout with stmt_size
@@ -1289,6 +1652,27 @@ End Process
 
 Process called "create_hir_when_clause" takes base_node as Integer, pattern as Integer, guard as Integer, body as Integer returns Integer:
     Note: Create HIR when clause (match arm)
+
+    @Reasoning:
+    A When clause pairs a pattern with the code that runs when the pattern
+    matches. The optional guard expression refines selection: if the
+    pattern shape matches but the guard evaluates to false, the arm is
+    skipped and matching continues with the next arm. Exhaustiveness
+    checking conservatively treats any guarded arm as non-total over its
+    pattern shape because the guard's value is not statically known.
+    Storing guard as 0 when absent lets the exhaustiveness pass distinguish
+    guarded and unguarded arms in O(1).
+    @End Reasoning
+
+    @Implementation:
+    HIRWhenClause: 4 fields x 8 bytes = 32 bytes. Note that bindings and
+    binding_count fields of the broader HIRWhenClause type are populated
+    separately by the pattern-binding pass; this constructor initialises
+    only the core slots actually allocated at parse time.
+    Layout: [base_node(0), pattern(8), guard(16), body(24)].
+    pattern points to the HIRPattern, guard is 0 when the source has no
+    guard expression, body holds the arm's compound statement.
+    @End Implementation
 
     Let clause_size be 32
     Let clause be proc allocate from Layout with clause_size

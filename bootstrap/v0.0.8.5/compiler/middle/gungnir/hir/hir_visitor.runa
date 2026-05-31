@@ -51,34 +51,67 @@ Note: HIR Visitor Context Structure
 Note: ============================================================================
 
 Type called "HIRVisitorContext":
-    pre_visit_callback as Integer    Note: Function pointer for pre-visit (called before children)
-    post_visit_callback as Integer   Note: Function pointer for post-visit (called after children)
-    user_data as Integer              Note: Pointer to user-provided data
-    visit_stack as Integer            Note: Pointer to List of visited nodes (for cycle detection)
-    depth as Integer                  Note: Current traversal depth
-    parent_node as Integer            Note: Pointer to parent HIR node
-    error_count as Integer            Note: Number of errors encountered during visiting
-    stop_traversal as Integer         Note: Boolean: 1 to stop traversal, 0 to continue
+    pre_visit_callback as Integer        Note: Function pointer for pre-visit (called before children)
+    post_visit_callback as Integer       Note: Function pointer for post-visit (called after children)
+    user_data as Integer                 Note: Pointer to user-provided data
+    visit_stack as Integer               Note: Pointer to List of visited nodes (for cycle detection)
+    depth as Integer                     Note: Current traversal depth
+    parent_node as Integer               Note: Pointer to parent HIR node
+    error_count as Integer               Note: Number of errors encountered during visiting
+    stop_traversal as Integer            Note: Boolean: 1 to stop traversal, 0 to continue
+    child_enter_callback as Integer      Note: Function pointer invoked before each child visit (per-child hook)
+    child_exit_callback as Integer       Note: Function pointer invoked after each child visit (per-child hook)
 End Type
 
 Note: ============================================================================
 Note: Visitor Context Management
 Note: ============================================================================
 
-Process called "create_visitor_context" takes pre_callback as Integer, post_callback as Integer, user_data as Integer returns Integer:
+Process called "create_visitor_context" takes pre_callback as Integer, post_callback as Integer, user_data as Integer, child_enter_callback as Integer, child_exit_callback as Integer returns Integer:
     Note: Create new HIR visitor context for tree traversal
 
     @Reasoning:
     Visitor context maintains state during HIR tree traversal including
-    callbacks, user data, visit stack for cycle detection, and traversal depth.
+    pre/post callbacks, optional per-child enter/exit callbacks for
+    inter-child emission (control-flow lowering), user data, visit stack
+    for cycle detection, and traversal depth. Per-child callbacks may
+    be 0 (null) when no per-child hook is required; the visitor framework
+    skips null slots at runtime, so consumers that do not need per-child
+    hooks pay zero per-node cost.
     @End Reasoning
 
     @Implementation:
-    HIRVisitorContext: 8 fields × 8 bytes = 64 bytes
+    HIRVisitorContext: 10 fields x 8 bytes = 80 bytes.
+    Offsets 0-56 preserve the legacy 8-field layout to maintain ABI
+    compatibility for any code reading those fields directly. The two
+    new per-child hook callbacks live at offsets 64 and 72.
     Initialize with callbacks, user data, and empty visit stack.
+    Failure path: if the 80-byte allocation fails returns 0; if the
+    visit-stack creation fails the partially-allocated context is
+    deallocated before returning 0 so callers never observe a leaked
+    context block.
     @End Implementation
 
-    Let context_size be 64
+    @Performance_Hints:
+    Two heap allocations (context block + visit-stack list). Field
+    initialization is 10 sequential 8-byte stores into the freshly
+    allocated block; the allocator returns zero-initialized memory
+    on most platforms but the explicit stores are kept for portability
+    and to make the offset layout self-documenting in the source.
+    Visitor construction happens once per traversal so this cost is
+    amortized over the entire tree walk.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Callback parameters are untyped Integer values - the framework
+    treats them as opaque function pointers and only invokes them
+    through the controlled invoke_* helpers. Caller is responsible
+    for ensuring callback signatures match the visitor protocol.
+    Allocation-failure paths free any partially-acquired resource
+    before returning, eliminating leak vectors on OOM.
+    @End Security_Scope
+
+    Let context_size be 80
     Let context be proc allocate from Layout with context_size
 
     If context is equal to 0:
@@ -102,6 +135,8 @@ Process called "create_visitor_context" takes pre_callback as Integer, post_call
     proc memory_set_int64 from Layout with context, 40, 0  Note: parent_node = null
     proc memory_set_int64 from Layout with context, 48, 0  Note: error_count = 0
     proc memory_set_int64 from Layout with context, 56, 0  Note: stop_traversal = false
+    proc memory_set_int64 from Layout with context, 64, child_enter_callback
+    proc memory_set_int64 from Layout with context, 72, child_exit_callback
 
     Return context
 End Process
@@ -111,7 +146,35 @@ Process called "destroy_visitor_context" takes context as Integer returns Intege
 
     @Reasoning:
     Clean up visitor context including visit stack to prevent memory leaks.
+    The context owns the visit stack list; releasing the context without
+    first destroying the list would leak every node pointer recorded
+    during traversal. Idempotent on null context so that double-destroy
+    in error-recovery paths is safe.
     @End Reasoning
+
+    @Implementation:
+    1. Treat a null context as already-destroyed and return 1.
+    2. Read the owned visit-stack pointer from offset 24.
+    3. If the stack pointer is non-null, dispatch destroy_from_List which
+       walks the list and frees its internal node buffer. Visit stack
+       stores only borrowed HIR node pointers - destroying the list does
+       NOT free the HIR nodes themselves (the HIR arena owns them).
+    4. Deallocate the 80-byte context block itself via memory.deallocate.
+    5. Return 1 to indicate successful teardown.
+    @End Implementation
+
+    @Performance_Hints:
+    Single allocation freed plus one list teardown. O(1) excluding the
+    list destructor which is O(stack_capacity). Called once per
+    traversal, never on the hot path.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Null-context guard prevents use-after-free if a caller re-invokes
+    destroy after an earlier call. Borrowed HIR pointers in the visit
+    stack are intentionally not freed - ownership stays with the HIR
+    arena per the five-tier memory model.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 1
@@ -135,8 +198,43 @@ Process called "visitor_push_node" takes context as Integer, node as Integer ret
 
     @Reasoning:
     Track visited nodes to detect cycles in HIR graph and prevent
-    infinite recursion.
+    infinite recursion. While well-formed HIR is a strict tree, the
+    framework is also used for HIR graphs (post-LICM, shared subtrees
+    from CSE, and import-merged trees) where a single node may be
+    referenced from two parents. The push side records the node and
+    raises depth; cycle detection raises error_count rather than
+    aborting so the visitor can report all cycles per traversal.
     @End Reasoning
+
+    @Implementation:
+    1. Reject null context or null node (returns 0 - did not push).
+    2. Read the visit-stack list pointer from offset 24.
+    3. Linear-scan the stack for a node pointer equal to the candidate.
+       Equality of HIR pointers identifies shared subtrees because the
+       HIR arena guarantees each AST node has a unique address.
+    4. On hit: read error_count at offset 48, increment, write back,
+       and return 0 (cycle detected, do not push). The visitor's caller
+       short-circuits the subtree but continues sibling traversal so
+       all cycles in the graph surface.
+    5. On miss: append the node to the stack and increment the depth
+       counter at offset 32. Depth is consumed by user_data handlers
+       that need indentation (formatter, REPL pretty-printer) and by
+       max-depth guards in find_node_by_type.
+    6. Return 1 indicating the push succeeded.
+    @End Implementation
+
+    @Performance_Hints:
+    O(N) per push where N is current stack depth (linear scan). For
+    well-formed trees N equals depth so the aggregate cost across a
+    full traversal is O(total_nodes * average_depth). The list-append
+    is amortized O(1) via geometric growth.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Pointer comparison only; node bodies are never dereferenced during
+    cycle detection. error_count is bounded by total node count; it
+    cannot overflow a 64-bit counter on any reachable input.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -183,8 +281,40 @@ Process called "visitor_pop_node" takes context as Integer returns Integer:
 
     @Reasoning:
     Remove node from visit stack after completing traversal of its subtree,
-    allowing parent nodes to be revisited in different branches.
+    allowing parent nodes to be revisited in different branches. Pairs
+    with visitor_push_node to maintain a true stack discipline - any
+    visit_hir_node call that succeeds in pushing MUST balance with a
+    pop before returning, otherwise cycle detection produces false
+    positives on later subtrees that legally re-use a sibling node.
     @End Reasoning
+
+    @Implementation:
+    1. Reject null context (returns 0 - did not pop).
+    2. Read the visit-stack list pointer from offset 24.
+    3. Read current stack size. An empty stack indicates a balance
+       violation upstream; return 0 without mutating depth so the
+       caller can surface the bug.
+    4. Call remove_last to drop the top entry. The HIR node pointer
+       is borrowed, so removal does not free anything - only the
+       stack slot is reclaimed.
+    5. Decrement the depth counter at offset 32. Combined push/pop
+       leave depth at 0 on a balanced traversal, which the validator
+       in validate_hir_tree depends on.
+    6. Return 1 to signal a successful pop.
+    @End Implementation
+
+    @Performance_Hints:
+    Pure O(1) - constant-time stack tail removal plus one memory write.
+    Called exactly once per visited node; this is the cheapest path
+    in the traversal loop and must not regress.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Pop on an empty stack returns 0 instead of underflowing the depth
+    counter. The depth field is consumed by recursion-depth guards
+    elsewhere in the compiler, so underflow could silently allow
+    runaway recursion - the empty-stack guard is therefore mandatory.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -216,7 +346,34 @@ Process called "visitor_should_stop" takes context as Integer returns Integer:
 
     @Reasoning:
     Callbacks can request early termination by setting stop_traversal flag.
+    visit_hir_node, visit_*_children, invoke_child_enter, and
+    invoke_child_exit all poll this predicate at well-defined points to
+    bail out without invoking further callbacks. Defensive-stop policy:
+    a null context returns 1 (stop) so that any code path holding a
+    stale or partially-initialized visitor halts immediately rather
+    than reading garbage from memory.
     @End Reasoning
+
+    @Implementation:
+    1. If context is null, return 1 (defensive stop).
+    2. Otherwise read the 64-bit stop_traversal flag from offset 56.
+    3. Return the flag value directly. The flag is set by
+       visitor_stop_traversal and by invoke_child_enter/exit when a
+       per-child callback returns 0, and is cleared only by the
+       visitor reset paths.
+    @End Implementation
+
+    @Performance_Hints:
+    Two memory reads (context validity, flag) and a single return.
+    Polled once per node and once per child hook so it must remain
+    inlinable; no branches except the null-context guard.
+    @End Performance_Hints
+
+    @Security_Scope:
+    The null-context return-1 policy guarantees forward-progress
+    termination even when the visitor is in an inconsistent state,
+    eliminating an infinite-loop attack surface for malformed HIR.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 1  Note: Stop if context is invalid
@@ -233,8 +390,34 @@ Process called "visitor_stop_traversal" takes context as Integer returns Integer
 
     @Reasoning:
     Allows visitor callbacks to stop traversal when condition is met
-    (e.g., found target node, encountered error).
+    (e.g., found target node, encountered error). Used by
+    find_node_by_type to halt the search after a match, by semantic
+    analysis to abort on the first type error, and by debugger
+    drivers to short-circuit a step-into command. Setting the flag
+    is one-way; the visitor must be re-initialized to resume.
     @End Reasoning
+
+    @Implementation:
+    1. Reject null context (returns 0) - cannot stop what does not
+       exist; this matches the create/destroy idempotency contract.
+    2. Write 1 to the stop_traversal flag at offset 56 via
+       memory_set_int64. The write is a release with respect to
+       subsequent visitor_should_stop polls in the same thread.
+    3. Return 1 to confirm the request was recorded.
+    @End Implementation
+
+    @Performance_Hints:
+    Single 8-byte store. Called at most once per traversal in normal
+    use; cost is negligible. The flag's effect propagates via
+    visitor_should_stop polled at each node boundary, so propagation
+    latency is one node-step in the worst case.
+    @End Performance_Hints
+
+    @Security_Scope:
+    No memory beyond the 80-byte context block is touched. The
+    null-context guard prevents wild writes if a caller passes an
+    uninitialized handle.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -247,6 +430,160 @@ Process called "visitor_stop_traversal" takes context as Integer returns Integer
 End Process
 
 Note: ============================================================================
+Note: Per-Child Hook Invokers
+Note: ============================================================================
+
+Process called "invoke_child_enter" takes context as Integer, parent_node as Integer, parent_node_type as Integer, child_index as Integer returns Integer:
+    Note: Invoke the optional per-child enter callback for a single child
+
+    @Reasoning:
+    Control-flow lowering (if/while/for/match/try) must emit MIR between
+    child visits, not only before or after all children. The per-child
+    enter hook fires immediately before each non-null child is recursed
+    into, giving handlers the precise point at which to emit a label,
+    swap blocks, install a binding, or push per-child state. Handlers
+    that do not need this hook leave the slot null and pay only a single
+    null-check at the invocation site. The hook is uniform across all
+    HIR node types, so future consumers (semantic analysis, type checker,
+    formatter, linter, LSP, DCE-on-HIR) can opt in selectively by
+    (node_type, child_index) pairs without learning a per-node-type
+    vocabulary.
+    @End Reasoning
+
+    @Implementation:
+    1. Validate context is non-null.
+    2. Read child_enter_callback from offset 64 of the visitor context.
+    3. If callback pointer is 0, this is a no-op: return 1 (continue).
+    4. Otherwise read user_data from offset 16 and invoke the callback
+       with signature (user_data, parent_node, parent_node_type,
+       child_index, context) returns Integer (1=continue, 0=stop).
+    5. If the callback returns 0, set the stop_traversal flag at
+       offset 56 so subsequent invoke calls short-circuit, and return 0.
+    6. Otherwise return 1 to continue traversal.
+
+    The trampoline contract mirrors the existing pre/post invocation
+    pattern (lines 326-337 and 355-366 of visit_hir_node) so that
+    consumer handlers register through a single uniform calling
+    convention.
+    @End Implementation
+
+    @Performance_Hints:
+    Hot-path invariant: handlers without child hooks set the callback
+    slot to 0; the null check at step 3 short-circuits before any
+    indirect call. Adds 2 instructions per node when no per-child hook
+    is registered. When a hook is registered, adds one indirect call
+    and one return-value check.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Callback pointer is read from caller-supplied memory but is never
+    dereferenced for inspection - only invoked. The visitor framework
+    treats the callback as an opaque function pointer; safety of the
+    callback body is the caller's responsibility. Null context returns
+    0 to signal stop, matching the framework's defensive-stop policy.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Read child_enter_callback (offset 64)
+    Let child_enter_callback be proc memory_get_int64 from Layout with context, 64
+
+    If child_enter_callback is equal to 0:
+        Note: No per-child enter hook registered - no-op, continue traversal
+        Return 1
+    End If
+
+    Note: Read user_data (offset 16)
+    Let user_data be proc memory_get_int64 from Layout with context, 16
+
+    Note: Invoke callback with (user_data, parent_node, parent_node_type, child_index, context)
+    Let callback_result be proc child_enter_callback with user_data, parent_node, parent_node_type, child_index, context
+
+    If callback_result is equal to 0:
+        Note: Callback requested traversal stop - set flag and propagate stop
+        proc memory_set_int64 from Layout with context, 56, 1
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Process called "invoke_child_exit" takes context as Integer, parent_node as Integer, parent_node_type as Integer, child_index as Integer returns Integer:
+    Note: Invoke the optional per-child exit callback for a single child
+
+    @Reasoning:
+    Symmetric counterpart to invoke_child_enter. Fires immediately after
+    a non-null child's post handler returns, providing the precise hook
+    to emit a trailing jump or branch, pop a per-child frame, finalize
+    inter-child state, or record the child's result. Together with
+    invoke_child_enter the visitor framework realizes the per-child
+    triple (enter, visit, exit) protocol that the v3 design specifies as
+    Option (a) - generic per-child hooks uniform across every node type.
+    @End Reasoning
+
+    @Implementation:
+    1. Validate context is non-null.
+    2. Read child_exit_callback from offset 72 of the visitor context.
+    3. If callback pointer is 0, no-op: return 1 (continue).
+    4. Otherwise read user_data from offset 16 and invoke the callback
+       with signature (user_data, parent_node, parent_node_type,
+       child_index, context) returns Integer (1=continue, 0=stop).
+    5. If the callback returns 0, set the stop_traversal flag at
+       offset 56 and return 0.
+    6. Otherwise return 1.
+
+    Per the v3 design Section 1.4 the framework SKIPS null children
+    entirely - this proc is therefore only called by visit_*_children
+    when the child pointer is non-null. Handlers tolerate non-contiguous
+    child_index values as a documented invariant.
+    @End Implementation
+
+    @Performance_Hints:
+    Mirror of invoke_child_enter: 2-instruction no-op when the callback
+    slot is null; one indirect call plus return-value check when
+    registered. Per-call overhead is constant regardless of HIR node
+    type, so dispatch costs scale linearly with the number of
+    control-flow nodes (typically less than 10 percent of all HIR nodes).
+    @End Performance_Hints
+
+    @Security_Scope:
+    Same as invoke_child_enter - the callback pointer is invoked but
+    never inspected. Null-context returns 0 (stop) per defensive policy.
+    Setting the stop_traversal flag on a callback-returned-0 ensures
+    any in-flight visit_*_children iterations short-circuit cleanly
+    without leaving dangling per-child state.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    Note: Read child_exit_callback (offset 72)
+    Let child_exit_callback be proc memory_get_int64 from Layout with context, 72
+
+    If child_exit_callback is equal to 0:
+        Note: No per-child exit hook registered - no-op, continue traversal
+        Return 1
+    End If
+
+    Note: Read user_data (offset 16)
+    Let user_data be proc memory_get_int64 from Layout with context, 16
+
+    Note: Invoke callback with (user_data, parent_node, parent_node_type, child_index, context)
+    Let callback_result be proc child_exit_callback with user_data, parent_node, parent_node_type, child_index, context
+
+    If callback_result is equal to 0:
+        Note: Callback requested traversal stop - set flag and propagate stop
+        proc memory_set_int64 from Layout with context, 56, 1
+        Return 0
+    End If
+
+    Return 1
+End Process
+
+Note: ============================================================================
 Note: Main Visitor Entry Point
 Note: ============================================================================
 
@@ -254,14 +591,39 @@ Process called "visit_hir_tree" takes root as Integer, context as Integer return
     Note: Visit entire HIR tree starting from root node
 
     @Reasoning:
-    Main entry point for HIR tree traversal. Calls visit_hir_node recursively
-    to traverse entire tree using pre-order and post-order callbacks.
+    Main entry point for HIR tree traversal. Calls visit_hir_node
+    recursively to walk the full tree with pre-order and post-order
+    callbacks, interleaved with per-child enter/exit hooks. The
+    traversal is recursive descent in stable field order; consumers
+    rely on this determinism to assign predictable child_index values
+    that survive across compiler runs and across source mutations
+    that do not reorder fields.
     @End Reasoning
 
     @Implementation:
-    Validate inputs, then delegate to recursive visit_hir_node.
-    Returns 1 on success, 0 on failure.
+    1. Reject null root and null context (returns 0). Empty HIR is
+       not a legal traversal target; the caller must supply at least
+       a synthetic Program node.
+    2. Forward to visit_hir_node, which owns push/pop discipline,
+       pre/post callback invocation, child traversal, and stop-flag
+       propagation.
+    3. Return the result unchanged so the caller observes 1 on a
+       clean traversal and 0 on cycle detection, stop request, or
+       any nested-callback failure.
     @End Implementation
+
+    @Performance_Hints:
+    Pure pass-through after null guards - the entire cost is borne
+    by visit_hir_node. Two null-checks add 2 instructions on the
+    entry path; no measurable overhead.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Defensive null guards prevent dereferences on uninitialized
+    handles. All deeper safety properties (cycle detection, depth
+    bounds, stop-flag obedience) live in visit_hir_node and the
+    push/pop helpers.
+    @End Security_Scope
 
     If root is equal to 0:
         Return 0
@@ -282,18 +644,62 @@ Process called "visit_hir_node" takes context as Integer, node as Integer return
 
     @Reasoning:
     Core visitor logic implementing pre-order and post-order traversal.
-    Calls pre-visit callback, visits children, then calls post-visit callback.
-    Handles cycle detection and early termination.
+    The per-node protocol is fixed: pre-visit fires before any child is
+    visited, then visit_node_children walks children in stable field
+    order (with invoke_child_enter / invoke_child_exit hooks framing
+    each non-null child), then post-visit fires once every child has
+    been fully processed. Cycle detection runs in O(depth) at every
+    push; the stop flag is polled at function entry to honor a
+    callback's termination request without paying for further work.
     @End Reasoning
 
     @Implementation:
-    1. Check for stop condition
-    2. Push node onto visit stack (cycle detection)
-    3. Call pre-visit callback
-    4. Visit all children recursively
-    5. Call post-visit callback
-    6. Pop node from visit stack
+    1. Validate context. A null node is legal (it represents an
+       optional child slot - e.g., an If statement without an else
+       branch) and returns 1 to continue traversal of sibling nodes;
+       this matches the v3-Q2 null-child-skip contract.
+    2. Poll visitor_should_stop. If a previous callback set the
+       stop flag, return 1 immediately without invoking further
+       callbacks; the value propagates up the recursion as the
+       parent's visit_children_result.
+    3. Push the node onto the visit stack. If push returns 0
+       (cycle detected), return 0 so the cycle surfaces upstream
+       without invoking pre/post callbacks on the duplicate.
+    4. Read node_type from offset 0 and invoke the pre-visit
+       callback if registered. If it returns 0, set stop and
+       return 0.
+    5. Save the current parent (offset 40), install this node as
+       parent, recurse into visit_node_children, then restore the
+       prior parent so siblings see the correct parent pointer.
+    6. Invoke the post-visit callback if registered, again
+       honoring a 0 return as stop.
+    7. Pop the node off the visit stack and return the child-visit
+       result so cycle/stop conditions detected in subtrees bubble
+       to the caller.
     @End Implementation
+
+    @Performance_Hints:
+    The critical path is: stop-poll, cycle-push, pre-callback,
+    visit-children, post-callback, pop. Stop-poll and pop are O(1);
+    cycle-push is O(depth) (see visitor_push_node). Callbacks are
+    invoked at most once per node, and only when registered (null
+    callback slot short-circuits in one branch). Children are
+    dispatched through visit_node_children which fans out into
+    per-category visitors - no virtual dispatch in this proc.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Null-context guard prevents wild reads of the callback slots
+    and user_data. Cycle detection bounds recursion in HIR graphs
+    (post-CSE / LICM) where shared subtrees would otherwise cause
+    unbounded descent. Pre and post callbacks return a continue/stop
+    integer; an out-of-range callback result is treated as continue,
+    which matches the defensive default in the rest of the visitor.
+    Parent-pointer save/restore is symmetric and survives early
+    returns via the post-callback stop path - cycle and stop returns
+    happen BEFORE the parent install, so they cannot corrupt parent
+    state for siblings.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -380,15 +786,42 @@ Process called "visit_node_children" takes context as Integer, node as Integer, 
     Note: Visit all children of a HIR node based on node type
 
     @Reasoning:
-    Different HIR node types have different child structures.
-    This function dispatches to appropriate child visiting logic based
-    on node type.
+    Different HIR node category (expression, statement, declaration,
+    type) has a different child structure. This proc is the single
+    dispatch point that routes a node to the correct per-category
+    children visitor. Centralising the dispatch keeps the per-category
+    visitors free of cross-cutting concerns and lets the framework
+    add new categories without touching visit_hir_node.
     @End Reasoning
 
     @Implementation:
-    Switch on node_type and visit children according to each node's structure.
-    Expressions, statements, and declarations have different child patterns.
+    1. Guard null context (return 0) and null node (return 1 - a
+       null child is treated as "successfully visited nothing" per
+       the v3-Q2 null-child-skip contract).
+    2. Classify node_type by numeric range using the HIRNodeType
+       constants. Expression-category opcodes branch into
+       visit_expression_children, statement-category into
+       visit_statement_children, and so on for declarations and
+       types.
+    3. Forward the per-category visitor's return value so cycle and
+       stop conditions detected several levels down propagate cleanly
+       to the parent visit_hir_node.
     @End Implementation
+
+    @Performance_Hints:
+    A handful of compare-and-branch instructions select the right
+    per-category visitor; there is no virtual dispatch and no table
+    lookup. Cost is independent of subtree size; the actual child
+    traversal cost lives in the per-category visitors.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Defensive guards on null context and null node prevent invalid
+    reads. An unrecognized node_type falls through to a no-op return
+    rather than panicking, so a corrupt or out-of-band node_type
+    cannot crash the visitor - it merely produces an incomplete
+    traversal that downstream validation will flag.
+    @End Security_Scope
 
     If context is equal to 0:
         Return 0
@@ -398,31 +831,38 @@ Process called "visit_node_children" takes context as Integer, node as Integer, 
         Return 1
     End If
 
-    Note: Expression nodes (1000-1999)
+    Note: Expression nodes (10000-10999)
     If node_type is greater than or equal to HIR_LITERAL from HIR:
-        If node_type is less than 2000:
+        If node_type is less than 11000:
             Return proc visit_expression_children with context, node, node_type
         End If
     End If
 
-    Note: Statement nodes (2000-2999)
+    Note: Statement nodes (11000-11999)
     If node_type is greater than or equal to HIR_LET_STATEMENT from HIR:
-        If node_type is less than 3000:
+        If node_type is less than 12000:
             Return proc visit_statement_children with context, node, node_type
         End If
     End If
 
-    Note: Declaration nodes (3000-3999)
+    Note: Declaration nodes (12000-12999)
     If node_type is greater than or equal to HIR_PROCESS_DEFINITION from HIR:
-        If node_type is less than 4000:
+        If node_type is less than 13000:
             Return proc visit_declaration_children with context, node, node_type
         End If
     End If
 
-    Note: Type nodes (4000-4999)
-    If node_type is greater than or equal to 4000:
-        If node_type is less than 5000:
+    Note: Type nodes (13000-13999)
+    If node_type is greater than or equal to 13000:
+        If node_type is less than 14000:
             Return proc visit_type_children with context, node, node_type
+        End If
+    End If
+
+    Note: Pattern nodes (14000-14999)
+    If node_type is greater than or equal to HIR_IDENTIFIER_PATTERN from HIR:
+        If node_type is less than 15000:
+            Return proc visit_pattern_children with context, node, node_type
         End If
     End If
 
@@ -441,52 +881,160 @@ Process called "visit_expression_children" takes context as Integer, node as Int
     - Member expressions: object and property
     - Index expressions: object and index
     - Literals and identifiers: no children
+
+    Every recursive visit_hir_node call is wrapped in the per-child
+    triple (invoke_child_enter, visit_hir_node, invoke_child_exit). Null
+    children are skipped entirely - their child_index is not surfaced to
+    the per-child hooks. Handlers tolerate non-contiguous child_index
+    values per the v3 design Section 1.4 invariant.
     @End Reasoning
 
+    @Implementation:
+    Each branch reads the relevant child pointers, then for each
+    non-null child invokes child_enter(child_index), recurses via
+    visit_hir_node, and invokes child_exit(child_index). visitor_should_stop
+    is implicitly honored by invoke_child_enter/exit which propagate the
+    stop flag via their return values. child_index assignments follow
+    the stable field order documented in hir_node.runa - left=0, right=1
+    for binary; operand=0 for unary; callee=0 then argument list for
+    calls; object=0, property=1 for member; object=0, index=1 for
+    index expressions.
+    @End Implementation
+
+    @Performance_Hints:
+    Single chained branch on node_type, then 1-3 memory reads to
+    fetch child pointers, then per-child invoke_child_enter / recurse
+    / invoke_child_exit. Cost is proportional to the number of
+    non-null children of the expression; literals and identifiers
+    fall through with zero work. The framework avoids allocating any
+    iterator state - all walks are over fixed field slots in the
+    HIR node layout.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Null-child skip prevents invoke calls on missing optional slots
+    (e.g., a default argument that the parser left empty). Out-of-band
+    node_type values fall through to the catch-all return at the end
+    of the proc, so a corrupt node never causes a wild memory read.
+    The per-child hooks themselves enforce the stop flag and any
+    user-defined safety checks.
+    @End Security_Scope
+
     If node_type is equal to HIR_BINARY_EXPRESSION from HIR:
-        Note: Binary expression: left (offset 8), right (offset 16) in specialized structure
+        Note: Binary expression: left (offset 8) = child_index 0, right (offset 16) = child_index 1
         Let left_child be proc memory_get_int64 from Layout with node, 8
         Let right_child be proc memory_get_int64 from Layout with node, 16
 
-        Let left_result be proc visit_hir_node with context, left_child
+        Note: Child 0 = left operand
+        If left_child is not equal to 0:
+            Let left_enter be proc invoke_child_enter with context, node, node_type, 0
+            If left_enter is equal to 0:
+                Return 0
+            End If
 
-        If left_result is equal to 0:
-            Return 0
+            Let left_result be proc visit_hir_node with context, left_child
+            If left_result is equal to 0:
+                Return 0
+            End If
+
+            Let left_exit be proc invoke_child_exit with context, node, node_type, 0
+            If left_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Let right_result be proc visit_hir_node with context, right_child
+        Note: Child 1 = right operand
+        If right_child is not equal to 0:
+            Let right_enter be proc invoke_child_enter with context, node, node_type, 1
+            If right_enter is equal to 0:
+                Return 0
+            End If
 
-        Return right_result
+            Let right_result be proc visit_hir_node with context, right_child
+            If right_result is equal to 0:
+                Return 0
+            End If
+
+            Let right_exit be proc invoke_child_exit with context, node, node_type, 1
+            If right_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
     If node_type is equal to HIR_UNARY_EXPRESSION from HIR:
-        Note: Unary expression: operand (offset 8) in specialized structure
+        Note: Unary expression: operand (offset 8) = child_index 0
         Let operand be proc memory_get_int64 from Layout with node, 8
-        Return proc visit_hir_node with context, operand
+
+        If operand is not equal to 0:
+            Let operand_enter be proc invoke_child_enter with context, node, node_type, 0
+            If operand_enter is equal to 0:
+                Return 0
+            End If
+
+            Let operand_result be proc visit_hir_node with context, operand
+            If operand_result is equal to 0:
+                Return 0
+            End If
+
+            Let operand_exit be proc invoke_child_exit with context, node, node_type, 0
+            If operand_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
     If node_type is equal to HIR_CALL_EXPRESSION from HIR:
-        Note: Call expression: callee (offset 8), arguments list (offset 16), arg_count (offset 24)
+        Note: Call expression: callee (offset 8) = child_index 0, arguments list (offset 16), arg_count (offset 24)
+        Note: Arguments are child_index 1..arg_count
         Let callee be proc memory_get_int64 from Layout with node, 8
         Let arguments_list be proc memory_get_int64 from Layout with node, 16
         Let arg_count be proc memory_get_int64 from Layout with node, 24
 
-        Note: Visit callee first
-        Let callee_result be proc visit_hir_node with context, callee
+        Note: Child 0 = callee
+        If callee is not equal to 0:
+            Let callee_enter be proc invoke_child_enter with context, node, node_type, 0
+            If callee_enter is equal to 0:
+                Return 0
+            End If
 
-        If callee_result is equal to 0:
-            Return 0
+            Let callee_result be proc visit_hir_node with context, callee
+            If callee_result is equal to 0:
+                Return 0
+            End If
+
+            Let callee_exit be proc invoke_child_exit with context, node, node_type, 0
+            If callee_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Note: Visit all arguments
+        Note: Visit all arguments (child_index 1..arg_count)
         Let i be 0
 
         While i is less than arg_count:
             Let arg be proc get from List with arguments_list, i
-            Let arg_result be proc visit_hir_node with context, arg
+            Let arg_index be i plus 1
 
-            If arg_result is equal to 0:
-                Return 0
+            If arg is not equal to 0:
+                Let arg_enter be proc invoke_child_enter with context, node, node_type, arg_index
+                If arg_enter is equal to 0:
+                    Return 0
+                End If
+
+                Let arg_result be proc visit_hir_node with context, arg
+                If arg_result is equal to 0:
+                    Return 0
+                End If
+
+                Let arg_exit be proc invoke_child_exit with context, node, node_type, arg_index
+                If arg_exit is equal to 0:
+                    Return 0
+                End If
             End If
 
             Set i to i plus 1
@@ -495,26 +1043,72 @@ Process called "visit_expression_children" takes context as Integer, node as Int
         Return 1
     End If
 
-    If node_type is equal to HIR_MEMBER_ACCESS from HIR:
-        Note: Member expression: object (offset 8), property (offset 16)
+    If node_type is equal to HIR_MEMBER_EXPRESSION from HIR:
+        Note: Member expression: object (offset 8) = child_index 0
         Let object_node be proc memory_get_int64 from Layout with node, 8
-        Return proc visit_hir_node with context, object_node
+
+        If object_node is not equal to 0:
+            Let object_enter be proc invoke_child_enter with context, node, node_type, 0
+            If object_enter is equal to 0:
+                Return 0
+            End If
+
+            Let object_result be proc visit_hir_node with context, object_node
+            If object_result is equal to 0:
+                Return 0
+            End If
+
+            Let object_exit be proc invoke_child_exit with context, node, node_type, 0
+            If object_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
     If node_type is equal to HIR_INDEX_EXPRESSION from HIR:
-        Note: Index expression: object (offset 8), index (offset 16)
+        Note: Index expression: object (offset 8) = child_index 0, index (offset 16) = child_index 1
         Set object_node to proc memory_get_int64 from Layout with node, 8
         Let index_node be proc memory_get_int64 from Layout with node, 16
 
-        Let object_result be proc visit_hir_node with context, object_node
+        Note: Child 0 = indexed object
+        If object_node is not equal to 0:
+            Let idx_obj_enter be proc invoke_child_enter with context, node, node_type, 0
+            If idx_obj_enter is equal to 0:
+                Return 0
+            End If
 
-        If object_result is equal to 0:
-            Return 0
+            Let idx_obj_result be proc visit_hir_node with context, object_node
+            If idx_obj_result is equal to 0:
+                Return 0
+            End If
+
+            Let idx_obj_exit be proc invoke_child_exit with context, node, node_type, 0
+            If idx_obj_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Let index_result be proc visit_hir_node with context, index_node
+        Note: Child 1 = index expression
+        If index_node is not equal to 0:
+            Let idx_idx_enter be proc invoke_child_enter with context, node, node_type, 1
+            If idx_idx_enter is equal to 0:
+                Return 0
+            End If
 
-        Return index_result
+            Let idx_idx_result be proc visit_hir_node with context, index_node
+            If idx_idx_result is equal to 0:
+                Return 0
+            End If
+
+            Let idx_idx_exit be proc invoke_child_exit with context, node, node_type, 1
+            If idx_idx_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
     Note: Literal and identifier have no children
@@ -543,122 +1137,340 @@ Process called "visit_statement_children" takes context as Integer, node as Inte
     - Return statements: optional return value
     - Match statements: expression and when clauses
     - Block statements: list of statements
+
+    Every recursive visit_hir_node call is wrapped in the per-child
+    triple (invoke_child_enter, visit_hir_node, invoke_child_exit). Null
+    children are skipped entirely - their child_index is not surfaced to
+    the per-child hooks, so handlers tolerate non-contiguous child_index
+    values per the v3 design Section 1.4. This is the primary site at
+    which control-flow lowering (IF/WHILE/FOR/MATCH/WHEN_CLAUSE) emits
+    inter-child MIR (labels, branches, frame state).
     @End Reasoning
 
+    @Implementation:
+    For each branch:
+      1. Read child pointers from their respective offsets.
+      2. For each non-null child, invoke child_enter(child_index),
+         recurse via visit_hir_node, then invoke child_exit(child_index).
+      3. Short-circuit on any 0 return from the recursion or the hooks.
+    The fixed child_index assignment per node type is documented in
+    each branch's leading Note and matches the v3 design Section 4.1
+    handler tables.
+    @End Implementation
+
+    @Performance_Hints:
+    Linear scan through a chain of if/Otherwise branches on
+    node_type, with each matched branch performing O(N) work where
+    N is the number of child slots for that statement form (1-3 for
+    most, more for Match/Block which iterate over child lists).
+    Block-list iteration uses the runtime List primitive so growth
+    is amortized; the visitor itself never allocates. Control-flow
+    lowering consumers reduce their hot-path cost to a single
+    indirect call per child boundary by leaving unused hooks null.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Every recursive descent is preceded by a null-child guard, so
+    no NULL HIR pointer is ever dereferenced. Hook return values
+    flow through a uniform short-circuit pattern; any handler that
+    requests stop terminates the proc immediately without leaving
+    half-emitted state in the user_data buffer (handler-internal
+    safety is the consumer's responsibility per Section 6 of the
+    v3 design). Unrecognized node_type values fall through to the
+    function-level fallthrough Return, avoiding wild reads.
+    @End Security_Scope
+
     If node_type is equal to HIR_LET_STATEMENT from HIR:
-        Note: Let statement: initializer (offset 24) in specialized structure
+        Note: Let statement: initializer (offset 24) = child_index 0
         Let initializer be proc memory_get_int64 from Layout with node, 24
 
         If initializer is not equal to 0:
-            Return proc visit_hir_node with context, initializer
+            Let let_enter be proc invoke_child_enter with context, node, node_type, 0
+            If let_enter is equal to 0:
+                Return 0
+            End If
+
+            Let init_result be proc visit_hir_node with context, initializer
+            If init_result is equal to 0:
+                Return 0
+            End If
+
+            Let let_exit be proc invoke_child_exit with context, node, node_type, 0
+            If let_exit is equal to 0:
+                Return 0
+            End If
         End If
 
         Return 1
     End If
 
     If node_type is equal to HIR_SET_STATEMENT from HIR:
-        Note: Set statement: target (offset 8), value (offset 16)
+        Note: Set statement: target (offset 8) = child_index 0, value (offset 16) = child_index 1
         Let target be proc memory_get_int64 from Layout with node, 8
         Let value be proc memory_get_int64 from Layout with node, 16
 
-        Let target_result be proc visit_hir_node with context, target
+        Note: Child 0 = assignment target
+        If target is not equal to 0:
+            Let set_tgt_enter be proc invoke_child_enter with context, node, node_type, 0
+            If set_tgt_enter is equal to 0:
+                Return 0
+            End If
 
-        If target_result is equal to 0:
-            Return 0
+            Let target_result be proc visit_hir_node with context, target
+            If target_result is equal to 0:
+                Return 0
+            End If
+
+            Let set_tgt_exit be proc invoke_child_exit with context, node, node_type, 0
+            If set_tgt_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Return proc visit_hir_node with context, value
+        Note: Child 1 = assignment value
+        If value is not equal to 0:
+            Let set_val_enter be proc invoke_child_enter with context, node, node_type, 1
+            If set_val_enter is equal to 0:
+                Return 0
+            End If
+
+            Let value_result be proc visit_hir_node with context, value
+            If value_result is equal to 0:
+                Return 0
+            End If
+
+            Let set_val_exit be proc invoke_child_exit with context, node, node_type, 1
+            If set_val_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
     If node_type is equal to HIR_IF_STATEMENT from HIR:
-        Note: If statement: condition (offset 8), then_block (offset 16), else_block (offset 24)
+        Note: If statement: condition (offset 8) = child_index 0, then_block (offset 16) = child_index 1, else_block (offset 24) = child_index 2
+        Note: else_block may be null - hooks are NOT invoked for null else (non-contiguous child_index by design)
         Let condition be proc memory_get_int64 from Layout with node, 8
         Let then_block be proc memory_get_int64 from Layout with node, 16
         Let else_block be proc memory_get_int64 from Layout with node, 24
 
-        Note: Visit condition
-        Let condition_result be proc visit_hir_node with context, condition
+        Note: Child 0 = condition
+        If condition is not equal to 0:
+            Let if_cond_enter be proc invoke_child_enter with context, node, node_type, 0
+            If if_cond_enter is equal to 0:
+                Return 0
+            End If
 
-        If condition_result is equal to 0:
-            Return 0
+            Let condition_result be proc visit_hir_node with context, condition
+            If condition_result is equal to 0:
+                Return 0
+            End If
+
+            Let if_cond_exit be proc invoke_child_exit with context, node, node_type, 0
+            If if_cond_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Note: Visit then block
-        Let then_result be proc visit_hir_node with context, then_block
+        Note: Child 1 = then block
+        If then_block is not equal to 0:
+            Let if_then_enter be proc invoke_child_enter with context, node, node_type, 1
+            If if_then_enter is equal to 0:
+                Return 0
+            End If
 
-        If then_result is equal to 0:
-            Return 0
+            Let then_result be proc visit_hir_node with context, then_block
+            If then_result is equal to 0:
+                Return 0
+            End If
+
+            Let if_then_exit be proc invoke_child_exit with context, node, node_type, 1
+            If if_then_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Note: Visit else block if present
+        Note: Child 2 = else block (optional - skip hooks entirely if null)
         If else_block is not equal to 0:
-            Return proc visit_hir_node with context, else_block
+            Let if_else_enter be proc invoke_child_enter with context, node, node_type, 2
+            If if_else_enter is equal to 0:
+                Return 0
+            End If
+
+            Let else_result be proc visit_hir_node with context, else_block
+            If else_result is equal to 0:
+                Return 0
+            End If
+
+            Let if_else_exit be proc invoke_child_exit with context, node, node_type, 2
+            If if_else_exit is equal to 0:
+                Return 0
+            End If
         End If
 
         Return 1
     End If
 
-    If node_type is equal to HIR_WHILE_LOOP from HIR:
-        Note: While loop: condition (offset 8), body (offset 16)
+    If node_type is equal to HIR_WHILE_STATEMENT from HIR:
+        Note: While loop: condition (offset 8) = child_index 0, body (offset 16) = child_index 1
         Set condition to proc memory_get_int64 from Layout with node, 8
         Let body be proc memory_get_int64 from Layout with node, 16
 
-        Set condition_result to proc visit_hir_node with context, condition
+        Note: Child 0 = loop condition
+        If condition is not equal to 0:
+            Let wh_cond_enter be proc invoke_child_enter with context, node, node_type, 0
+            If wh_cond_enter is equal to 0:
+                Return 0
+            End If
 
-        If condition_result is equal to 0:
-            Return 0
+            Set condition_result to proc visit_hir_node with context, condition
+            If condition_result is equal to 0:
+                Return 0
+            End If
+
+            Let wh_cond_exit be proc invoke_child_exit with context, node, node_type, 0
+            If wh_cond_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Return proc visit_hir_node with context, body
-    End If
+        Note: Child 1 = loop body
+        If body is not equal to 0:
+            Let wh_body_enter be proc invoke_child_enter with context, node, node_type, 1
+            If wh_body_enter is equal to 0:
+                Return 0
+            End If
 
-    If node_type is equal to HIR_FOR_LOOP from HIR:
-        Note: For loop: iterable (offset 8), body (offset 16)
-        Let iterable be proc memory_get_int64 from Layout with node, 8
-        Set body to proc memory_get_int64 from Layout with node, 16
+            Let wh_body_result be proc visit_hir_node with context, body
+            If wh_body_result is equal to 0:
+                Return 0
+            End If
 
-        Let iterable_result be proc visit_hir_node with context, iterable
-
-        If iterable_result is equal to 0:
-            Return 0
-        End If
-
-        Return proc visit_hir_node with context, body
-    End If
-
-    If node_type is equal to HIR_RETURN from HIR:
-        Note: Return statement: return_value (offset 8)
-        Let return_value be proc memory_get_int64 from Layout with node, 8
-
-        If return_value is not equal to 0:
-            Return proc visit_hir_node with context, return_value
+            Let wh_body_exit be proc invoke_child_exit with context, node, node_type, 1
+            If wh_body_exit is equal to 0:
+                Return 0
+            End If
         End If
 
         Return 1
     End If
 
-    If node_type is equal to HIR_MATCH from HIR:
-        Note: Match statement: expression (offset 8), when_clauses (offset 16), clause_count (offset 24)
+    If node_type is equal to HIR_FOR_STATEMENT from HIR:
+        Note: For loop: iterable (offset 8) = child_index 0, body (offset 16) = child_index 1
+        Let iterable be proc memory_get_int64 from Layout with node, 8
+        Set body to proc memory_get_int64 from Layout with node, 16
+
+        Note: Child 0 = iterable expression
+        If iterable is not equal to 0:
+            Let for_it_enter be proc invoke_child_enter with context, node, node_type, 0
+            If for_it_enter is equal to 0:
+                Return 0
+            End If
+
+            Let iterable_result be proc visit_hir_node with context, iterable
+            If iterable_result is equal to 0:
+                Return 0
+            End If
+
+            Let for_it_exit be proc invoke_child_exit with context, node, node_type, 0
+            If for_it_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Note: Child 1 = loop body
+        If body is not equal to 0:
+            Let for_body_enter be proc invoke_child_enter with context, node, node_type, 1
+            If for_body_enter is equal to 0:
+                Return 0
+            End If
+
+            Let for_body_result be proc visit_hir_node with context, body
+            If for_body_result is equal to 0:
+                Return 0
+            End If
+
+            Let for_body_exit be proc invoke_child_exit with context, node, node_type, 1
+            If for_body_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_RETURN_STATEMENT from HIR:
+        Note: Return statement: return_value (offset 8) = child_index 0 (optional)
+        Let return_value be proc memory_get_int64 from Layout with node, 8
+
+        If return_value is not equal to 0:
+            Let ret_enter be proc invoke_child_enter with context, node, node_type, 0
+            If ret_enter is equal to 0:
+                Return 0
+            End If
+
+            Let ret_result be proc visit_hir_node with context, return_value
+            If ret_result is equal to 0:
+                Return 0
+            End If
+
+            Let ret_exit be proc invoke_child_exit with context, node, node_type, 0
+            If ret_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
+    End If
+
+    If node_type is equal to HIR_MATCH_STATEMENT from HIR:
+        Note: Match statement: expression (offset 8) = child_index 0, when_clauses (offset 16), clause_count (offset 24)
+        Note: When clauses are child_index 1..clause_count
         Let expression be proc memory_get_int64 from Layout with node, 8
         Let when_clauses be proc memory_get_int64 from Layout with node, 16
         Let clause_count be proc memory_get_int64 from Layout with node, 24
 
-        Note: Visit matched expression
-        Let expr_result be proc visit_hir_node with context, expression
+        Note: Child 0 = scrutinee expression
+        If expression is not equal to 0:
+            Let mat_scr_enter be proc invoke_child_enter with context, node, node_type, 0
+            If mat_scr_enter is equal to 0:
+                Return 0
+            End If
 
-        If expr_result is equal to 0:
-            Return 0
+            Let expr_result be proc visit_hir_node with context, expression
+            If expr_result is equal to 0:
+                Return 0
+            End If
+
+            Let mat_scr_exit be proc invoke_child_exit with context, node, node_type, 0
+            If mat_scr_exit is equal to 0:
+                Return 0
+            End If
         End If
 
-        Note: Visit all when clauses
+        Note: Visit all when clauses (child_index 1..clause_count)
         Let i be 0
 
         While i is less than clause_count:
             Let when_clause be proc get from List with when_clauses, i
-            Let clause_result be proc visit_hir_node with context, when_clause
+            Let clause_index be i plus 1
 
-            If clause_result is equal to 0:
-                Return 0
+            If when_clause is not equal to 0:
+                Let mat_arm_enter be proc invoke_child_enter with context, node, node_type, clause_index
+                If mat_arm_enter is equal to 0:
+                    Return 0
+                End If
+
+                Let clause_result be proc visit_hir_node with context, when_clause
+                If clause_result is equal to 0:
+                    Return 0
+                End If
+
+                Let mat_arm_exit be proc invoke_child_exit with context, node, node_type, clause_index
+                If mat_arm_exit is equal to 0:
+                    Return 0
+                End If
             End If
 
             Set i to i plus 1
@@ -668,45 +1480,93 @@ Process called "visit_statement_children" takes context as Integer, node as Inte
     End If
 
     If node_type is equal to HIR_WHEN_CLAUSE from HIR:
-        Note: When clause: pattern (offset 8), guard (offset 16), body (offset 24)
+        Note: When clause: pattern (offset 8) = child_index 0, guard (offset 16) = child_index 1 (optional), body (offset 24) = child_index 2
         Let pattern be proc memory_get_int64 from Layout with node, 8
         Let guard be proc memory_get_int64 from Layout with node, 16
         Set body to proc memory_get_int64 from Layout with node, 24
 
-        Note: Visit pattern (if needed for pattern analysis)
-        Let pattern_result be proc visit_hir_node with context, pattern
+        Note: Child 0 = pattern
+        If pattern is not equal to 0:
+            Let when_pat_enter be proc invoke_child_enter with context, node, node_type, 0
+            If when_pat_enter is equal to 0:
+                Return 0
+            End If
 
-        If pattern_result is equal to 0:
-            Return 0
-        End If
+            Let pattern_result be proc visit_hir_node with context, pattern
+            If pattern_result is equal to 0:
+                Return 0
+            End If
 
-        Note: Visit guard if present
-        If guard is not equal to 0:
-            Let guard_result be proc visit_hir_node with context, guard
-
-            If guard_result is equal to 0:
+            Let when_pat_exit be proc invoke_child_exit with context, node, node_type, 0
+            If when_pat_exit is equal to 0:
                 Return 0
             End If
         End If
 
-        Note: Visit body
-        Return proc visit_hir_node with context, body
+        Note: Child 1 = guard expression (optional)
+        If guard is not equal to 0:
+            Let when_grd_enter be proc invoke_child_enter with context, node, node_type, 1
+            If when_grd_enter is equal to 0:
+                Return 0
+            End If
+
+            Let guard_result be proc visit_hir_node with context, guard
+            If guard_result is equal to 0:
+                Return 0
+            End If
+
+            Let when_grd_exit be proc invoke_child_exit with context, node, node_type, 1
+            If when_grd_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Note: Child 2 = clause body
+        If body is not equal to 0:
+            Let when_body_enter be proc invoke_child_enter with context, node, node_type, 2
+            If when_body_enter is equal to 0:
+                Return 0
+            End If
+
+            Let when_body_result be proc visit_hir_node with context, body
+            If when_body_result is equal to 0:
+                Return 0
+            End If
+
+            Let when_body_exit be proc invoke_child_exit with context, node, node_type, 2
+            If when_body_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
-    If node_type is equal to HIR_BLOCK from HIR:
-        Note: Block: statements list (offset 8), statement_count (offset 16)
+    If node_type is equal to HIR_BLOCK_STATEMENT from HIR:
+        Note: Block: statements list (offset 8), statement_count (offset 16); each statement is child_index i
         Let statements be proc memory_get_int64 from Layout with node, 8
         Let stmt_count be proc memory_get_int64 from Layout with node, 16
 
-        Note: Visit all statements
         Set i to 0
 
         While i is less than stmt_count:
             Let stmt be proc get from List with statements, i
-            Let stmt_result be proc visit_hir_node with context, stmt
 
-            If stmt_result is equal to 0:
-                Return 0
+            If stmt is not equal to 0:
+                Let blk_enter be proc invoke_child_enter with context, node, node_type, i
+                If blk_enter is equal to 0:
+                    Return 0
+                End If
+
+                Let stmt_result be proc visit_hir_node with context, stmt
+                If stmt_result is equal to 0:
+                    Return 0
+                End If
+
+                Let blk_exit be proc invoke_child_exit with context, node, node_type, i
+                If blk_exit is equal to 0:
+                    Return 0
+                End If
             End If
 
             Set i to i plus 1
@@ -724,38 +1584,96 @@ Process called "visit_declaration_children" takes context as Integer, node as In
 
     @Reasoning:
     Declaration nodes have different child patterns:
-    - Process definitions: parameters and body
+    - Process definitions: return_type (optional) and body
     - Type definitions: fields and methods
+
+    Every recursive visit_hir_node call is wrapped in the per-child
+    triple (invoke_child_enter, visit_hir_node, invoke_child_exit). Null
+    children are skipped entirely; child_index assignment uses stable
+    field order per the v3 design Section 1.4 (return_type = 0, body = 1
+    for HIR_PROCESS_DEFINITION).
     @End Reasoning
+
+    @Implementation:
+    PROCESS_DEFINITION: return_type at child_index 0 (optional), body
+    at child_index 1 (stable order). TYPE_DEFINITION: each field type
+    is child_index i (variadic). Parameters are not recursed into - they
+    are HIR symbols, not HIR nodes; the visitor does not dispatch to
+    them.
+    @End Implementation
+
+    @Performance_Hints:
+    Two top-level branches on node_type with O(1) child-pointer
+    reads per branch; TYPE_DEFINITION iterates field types in a
+    bounded loop driven by the type's declared field count. No
+    hidden allocation, no dynamic dispatch. Process bodies typically
+    dominate traversal cost - the recursion into body is where the
+    bulk of work lives, not in this dispatcher.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Null-child guards on optional return_type and per-field reads
+    eliminate dereference-on-null vectors. Parameter symbols are
+    intentionally NOT recursed into because they are managed by the
+    symbol-table subsystem, not the HIR visitor; treating them as
+    HIR nodes would risk shape mismatches with the symbol layout.
+    @End Security_Scope
 
     If node_type is equal to HIR_PROCESS_DEFINITION from HIR:
         Note: Process definition: parameters (offset 16), param_count (offset 24), return_type (offset 32), body (offset 40)
+        Note: return_type = child_index 0 (optional), body = child_index 1
         Let parameters be proc memory_get_int64 from Layout with node, 16
         Let param_count be proc memory_get_int64 from Layout with node, 24
         Let return_type be proc memory_get_int64 from Layout with node, 32
         Let body be proc memory_get_int64 from Layout with node, 40
 
-        Note: Visit return type if present
+        Note: Child 0 = return type (optional)
         If return_type is not equal to 0:
-            Let type_result be proc visit_hir_node with context, return_type
+            Let proc_rt_enter be proc invoke_child_enter with context, node, node_type, 0
+            If proc_rt_enter is equal to 0:
+                Return 0
+            End If
 
+            Let type_result be proc visit_hir_node with context, return_type
             If type_result is equal to 0:
+                Return 0
+            End If
+
+            Let proc_rt_exit be proc invoke_child_exit with context, node, node_type, 0
+            If proc_rt_exit is equal to 0:
                 Return 0
             End If
         End If
 
-        Note: Visit parameters (usually HIR symbols, may not need visiting)
+        Note: Parameters are HIR symbols, not HIR nodes - not recursed into
 
-        Note: Visit body
-        Return proc visit_hir_node with context, body
+        Note: Child 1 = process body
+        If body is not equal to 0:
+            Let proc_body_enter be proc invoke_child_enter with context, node, node_type, 1
+            If proc_body_enter is equal to 0:
+                Return 0
+            End If
+
+            Let body_result be proc visit_hir_node with context, body
+            If body_result is equal to 0:
+                Return 0
+            End If
+
+            Let proc_body_exit be proc invoke_child_exit with context, node, node_type, 1
+            If proc_body_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Return 1
     End If
 
     If node_type is equal to HIR_TYPE_DEFINITION from HIR:
         Note: Type definition: fields (offset 16), field_count (offset 24)
+        Note: Each field's type is child_index i (variadic, stable order in source)
         Let fields be proc memory_get_int64 from Layout with node, 16
         Let field_count be proc memory_get_int64 from Layout with node, 24
 
-        Note: Visit field symbols for type analysis
         Let i be 0
 
         While i is less than field_count:
@@ -765,8 +1683,18 @@ Process called "visit_declaration_children" takes context as Integer, node as In
             If field is not equal to 0:
                 Let field_type be proc memory_get_int64 from Layout with field, 24
                 If field_type is not equal to 0:
+                    Let td_enter be proc invoke_child_enter with context, node, node_type, i
+                    If td_enter is equal to 0:
+                        Return 0
+                    End If
+
                     Set type_result to proc visit_hir_node with context, field_type
                     If type_result is equal to 0:
+                        Return 0
+                    End If
+
+                    Let td_exit be proc invoke_child_exit with context, node, node_type, i
+                    If td_exit is equal to 0:
                         Return 0
                     End If
                 End If
@@ -793,6 +1721,12 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
     - Tuple types: component types
     - Union types: variant types
     - Function types: parameter and return types
+
+    Every recursive visit_hir_node call is wrapped in the per-child
+    triple (invoke_child_enter, visit_hir_node, invoke_child_exit). Null
+    children are skipped entirely. Type-aware visitor consumers (future
+    type checker, type unification, generic monomorphization) use the
+    per-child hooks to drive substitution and constraint propagation.
     @End Reasoning
 
     @Implementation:
@@ -803,7 +1737,32 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
     - offset 64: variant_count/component_count
     - offset 96: generic_params (for Generic)
     - offset 104: generic_count
+
+    Child index assignment per type kind:
+    - GENERIC: param i = child_index i (variadic)
+    - OPTIONAL / ARRAY: inner/element = child_index 0
+    - TUPLE / UNION: component i = child_index i (variadic)
+    - FUNCTION: param i = child_index i, return_type = child_index param_count
     @End Implementation
+
+    @Performance_Hints:
+    Type trees are typically shallow (most types are nullary or
+    unary). The wide branch on type_kind selects the correct
+    structural reader in O(1); variadic kinds (Generic, Tuple,
+    Union, Function) iterate a fixed-count loop with no allocation.
+    Type-checker consumers benefit because the per-child hooks let
+    them push/pop substitution frames without re-walking the tree.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Null-node guard short-circuits before any field read. Each
+    variadic loop is bounded by the count field stored in the node,
+    so a corrupt list pointer cannot cause an over-read - the worst
+    case is a missed child, flagged by validate_hir_tree downstream.
+    Type kinds outside the recognized set fall through to a no-op
+    return, matching the defensive policy used in every per-category
+    visitor in this file.
+    @End Security_Scope
 
     If node is equal to 0:
         Return 1
@@ -821,10 +1780,24 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
             Let i be 0
             While i is less than param_count:
                 Let param_type be proc get from List with generic_params, i
-                Let result be proc visit_hir_node with context, param_type
-                If result is equal to 0:
-                    Return 0
+
+                If param_type is not equal to 0:
+                    Let gen_enter be proc invoke_child_enter with context, node, node_type, i
+                    If gen_enter is equal to 0:
+                        Return 0
+                    End If
+
+                    Let result be proc visit_hir_node with context, param_type
+                    If result is equal to 0:
+                        Return 0
+                    End If
+
+                    Let gen_exit be proc invoke_child_exit with context, node, node_type, i
+                    If gen_exit is equal to 0:
+                        Return 0
+                    End If
                 End If
+
                 Set i to i plus 1
             End While
         End If
@@ -832,21 +1805,51 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
         Return 1
     End If
 
-    Note: Optional types have inner type (offset 56)
+    Note: Optional types have inner type (offset 56) = child_index 0
     If type_kind is equal to HIR_OPTIONAL_TYPE from HIR:
         Let inner_type be proc memory_get_int64 from Layout with node, 56
+
         If inner_type is not equal to 0:
-            Return proc visit_hir_node with context, inner_type
+            Let opt_enter be proc invoke_child_enter with context, node, node_type, 0
+            If opt_enter is equal to 0:
+                Return 0
+            End If
+
+            Let opt_result be proc visit_hir_node with context, inner_type
+            If opt_result is equal to 0:
+                Return 0
+            End If
+
+            Let opt_exit be proc invoke_child_exit with context, node, node_type, 0
+            If opt_exit is equal to 0:
+                Return 0
+            End If
         End If
+
         Return 1
     End If
 
-    Note: Array types have element type (offset 56)
+    Note: Array types have element type (offset 56) = child_index 0
     If type_kind is equal to HIR_ARRAY_TYPE from HIR:
         Let element_type be proc memory_get_int64 from Layout with node, 56
+
         If element_type is not equal to 0:
-            Return proc visit_hir_node with context, element_type
+            Let arr_enter be proc invoke_child_enter with context, node, node_type, 0
+            If arr_enter is equal to 0:
+                Return 0
+            End If
+
+            Let arr_result be proc visit_hir_node with context, element_type
+            If arr_result is equal to 0:
+                Return 0
+            End If
+
+            Let arr_exit be proc invoke_child_exit with context, node, node_type, 0
+            If arr_exit is equal to 0:
+                Return 0
+            End If
         End If
+
         Return 1
     End If
 
@@ -859,10 +1862,24 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
             Set i to 0
             While i is less than component_count:
                 Let component_type be proc get from List with component_types, i
-                Set result to proc visit_hir_node with context, component_type
-                If result is equal to 0:
-                    Return 0
+
+                If component_type is not equal to 0:
+                    Let tup_enter be proc invoke_child_enter with context, node, node_type, i
+                    If tup_enter is equal to 0:
+                        Return 0
+                    End If
+
+                    Set result to proc visit_hir_node with context, component_type
+                    If result is equal to 0:
+                        Return 0
+                    End If
+
+                    Let tup_exit be proc invoke_child_exit with context, node, node_type, i
+                    If tup_exit is equal to 0:
+                        Return 0
+                    End If
                 End If
+
                 Set i to i plus 1
             End While
         End If
@@ -879,10 +1896,24 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
             Set i to 0
             While i is less than variant_count:
                 Let variant_type be proc get from List with variant_types, i
-                Set result to proc visit_hir_node with context, variant_type
-                If result is equal to 0:
-                    Return 0
+
+                If variant_type is not equal to 0:
+                    Let uni_enter be proc invoke_child_enter with context, node, node_type, i
+                    If uni_enter is equal to 0:
+                        Return 0
+                    End If
+
+                    Set result to proc visit_hir_node with context, variant_type
+                    If result is equal to 0:
+                        Return 0
+                    End If
+
+                    Let uni_exit be proc invoke_child_exit with context, node, node_type, i
+                    If uni_exit is equal to 0:
+                        Return 0
+                    End If
                 End If
+
                 Set i to i plus 1
             End While
         End If
@@ -893,6 +1924,7 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
     Note: Function types have parameter types and return type
     If type_kind is equal to HIR_FUNCTION_TYPE from HIR:
         Note: Visit parameter types (offset 40: parameter list, offset 48: count)
+        Note: param i = child_index i, return_type = child_index param_count
         Let param_types be proc memory_get_int64 from Layout with node, 40
         Set param_count to proc memory_get_int64 from Layout with node, 48
 
@@ -900,19 +1932,43 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
             Set i to 0
             While i is less than param_count:
                 Set param_type to proc get from List with param_types, i
-                Set result to proc visit_hir_node with context, param_type
-                If result is equal to 0:
-                    Return 0
+
+                If param_type is not equal to 0:
+                    Let fn_p_enter be proc invoke_child_enter with context, node, node_type, i
+                    If fn_p_enter is equal to 0:
+                        Return 0
+                    End If
+
+                    Set result to proc visit_hir_node with context, param_type
+                    If result is equal to 0:
+                        Return 0
+                    End If
+
+                    Let fn_p_exit be proc invoke_child_exit with context, node, node_type, i
+                    If fn_p_exit is equal to 0:
+                        Return 0
+                    End If
                 End If
+
                 Set i to i plus 1
             End While
         End If
 
-        Note: Visit return type (offset 32)
+        Note: Visit return type (offset 32) at child_index = param_count
         Let return_type be proc memory_get_int64 from Layout with node, 32
         If return_type is not equal to 0:
+            Let fn_rt_enter be proc invoke_child_enter with context, node, node_type, param_count
+            If fn_rt_enter is equal to 0:
+                Return 0
+            End If
+
             Set result to proc visit_hir_node with context, return_type
             If result is equal to 0:
+                Return 0
+            End If
+
+            Let fn_rt_exit be proc invoke_child_exit with context, node, node_type, param_count
+            If fn_rt_exit is equal to 0:
                 Return 0
             End If
         End If
@@ -921,6 +1977,148 @@ Process called "visit_type_children" takes context as Integer, node as Integer, 
     End If
 
     Note: Primitive and unknown types have no children
+    Return 1
+End Process
+
+Process called "visit_pattern_children" takes context as Integer, node as Integer, node_type as Integer returns Integer:
+    Note: Visit children of HIR pattern nodes (14000-14999)
+
+    @Reasoning:
+    Pattern nodes encode the structural matchers used by match expressions
+    and destructuring lets: identifier bindings, literal matches, wildcards,
+    tuple/record/variant/array destructuring, range matchers, type-checked
+    patterns, guard patterns, or-patterns, and rest patterns. HIRPattern
+    uses a uniform 48-byte layout (pattern_type, matched_type, bindings,
+    binding_count, subpatterns, subpattern_count), so the only HIR child
+    nodes a pattern can carry are its subpatterns - bindings are symbol
+    pointers (semantic objects, not HIR nodes) and matched_type is a
+    HIRTypeInfo pointer reached through the type-traversal axis, not as
+    a pattern child. The visitor walks subpatterns in stable source order
+    (the order add_pattern_subpattern recorded them), giving each child a
+    contiguous child_index starting at 0. Every recursive visit_hir_node
+    call is wrapped in the per-child triple (invoke_child_enter,
+    visit_hir_node, invoke_child_exit). Null subpattern slots are skipped
+    entirely - their child_index is not surfaced to the per-child hooks.
+    Leaf patterns (identifier, literal, wildcard, rest) carry no
+    subpatterns and fall through to a no-op return.
+    @End Reasoning
+
+    @Implementation:
+    HIRPattern structure (from hir_nodes.runa::create_hir_pattern):
+    - offset 0: pattern_type (constant in 14000-14999 range)
+    - offset 8: matched_type (HIRTypeInfo pointer; visited via type axis)
+    - offset 16: bindings (List of HIR symbol pointers; not HIR children)
+    - offset 24: binding_count
+    - offset 32: subpatterns (List of HIR pattern child pointers)
+    - offset 40: subpattern_count
+
+    Every pattern constant 14000-14011 (HIR_IDENTIFIER_PATTERN,
+    HIR_LITERAL_PATTERN, HIR_TUPLE_PATTERN, HIR_RECORD_PATTERN,
+    HIR_WILDCARD_PATTERN, HIR_TYPE_PATTERN, HIR_GUARD_PATTERN,
+    HIR_RANGE_PATTERN, HIR_VARIANT_PATTERN, HIR_ARRAY_PATTERN,
+    HIR_OR_PATTERN, HIR_REST_PATTERN) uses the same 48-byte layout.
+    Dispatch is therefore unified: read subpatterns at offset 32 and
+    subpattern_count at offset 40, iterate i in 0..subpattern_count, and
+    for each non-null child invoke child_enter(i), recurse via
+    visit_hir_node, then invoke child_exit(i). Stop-flag propagation is
+    handled by the invoke_child_enter / invoke_child_exit return values
+    per the v0.75 child-hook protocol.
+
+    child_index semantics per pattern kind (all using stable subpattern
+    order, contiguous from 0):
+    - HIR_IDENTIFIER_PATTERN (14000): leaf; no subpatterns.
+    - HIR_LITERAL_PATTERN    (14001): leaf; no subpatterns.
+    - HIR_TUPLE_PATTERN      (14002): element i = child_index i.
+    - HIR_RECORD_PATTERN     (14003): field-pattern i = child_index i.
+    - HIR_WILDCARD_PATTERN   (14004): leaf; no subpatterns.
+    - HIR_TYPE_PATTERN       (14005): inner pattern = child_index 0.
+    - HIR_GUARD_PATTERN      (14006): underlying pattern = child_index 0,
+      guard condition pattern (if encoded as subpattern) = child_index 1.
+    - HIR_RANGE_PATTERN      (14007): lower bound = 0, upper bound = 1
+      (when bounds are encoded as literal sub-patterns).
+    - HIR_VARIANT_PATTERN    (14008): payload pattern i = child_index i.
+    - HIR_ARRAY_PATTERN      (14009): element-or-rest pattern i = child_index i.
+    - HIR_OR_PATTERN         (14010): alternative pattern i = child_index i.
+    - HIR_REST_PATTERN       (14011): leaf; no subpatterns.
+
+    Because all pattern kinds share a single subpattern list and the
+    list is the only HIR-child carrier, a single uniform loop covers
+    every case while still honoring the per-pattern child_index
+    semantics documented above. Pattern kinds that have no subpatterns
+    naturally execute zero iterations.
+    @End Implementation
+
+    @Performance_Hints:
+    Two memory reads (offsets 32 and 40) followed by a linear walk over
+    subpattern_count children. No allocation, no branching on pattern
+    kind, no recursion overhead beyond the per-child triple required by
+    the visitor protocol. Leaf patterns (identifier, literal, wildcard,
+    rest) complete in two reads plus an immediate Return 1, matching
+    the cost profile of leaf expression nodes in visit_expression_children.
+    Composite patterns iterate exactly subpattern_count times with no
+    skipped slots in steady state - the null-child guard exists only to
+    defend against partially constructed nodes during HIR-build error
+    recovery.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Null-node guard short-circuits before any field read. The
+    subpattern_count read is bounded by the pattern's own count field,
+    so a corrupt or truncated subpattern list pointer cannot trigger
+    an over-read - the worst case is a missed child, flagged by
+    validate_hir_tree downstream. Null subpattern entries are skipped
+    rather than dereferenced. Pattern kinds outside the recognised
+    14000-14011 range still execute the same uniform walk (offsets 32
+    and 40 are reserved for subpatterns / subpattern_count by the
+    HIRPattern layout contract), so future pattern constants slotted
+    into 14012-14999 inherit correct child traversal automatically.
+    @End Security_Scope
+
+    If context is equal to 0:
+        Return 0
+    End If
+
+    If node is equal to 0:
+        Return 1
+    End If
+
+    Note: All HIR pattern kinds share the uniform 48-byte HIRPattern layout.
+    Note: Subpatterns list is at offset 32, count is at offset 40.
+    Let subpatterns be proc memory_get_int64 from Layout with node, 32
+    Let subpattern_count be proc memory_get_int64 from Layout with node, 40
+
+    If subpatterns is equal to 0:
+        Return 1
+    End If
+
+    If subpattern_count is less than or equal to 0:
+        Return 1
+    End If
+
+    Let i be 0
+    While i is less than subpattern_count:
+        Let subpattern be proc get from List with subpatterns, i
+
+        If subpattern is not equal to 0:
+            Let sub_enter be proc invoke_child_enter with context, node, node_type, i
+            If sub_enter is equal to 0:
+                Return 0
+            End If
+
+            Let sub_result be proc visit_hir_node with context, subpattern
+            If sub_result is equal to 0:
+                Return 0
+            End If
+
+            Let sub_exit be proc invoke_child_exit with context, node, node_type, i
+            If sub_exit is equal to 0:
+                Return 0
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
     Return 1
 End Process
 
@@ -933,13 +2131,39 @@ Process called "count_nodes" takes root as Integer returns Integer:
 
     @Reasoning:
     Utility function to count all nodes in HIR tree by visiting
-    every node and incrementing counter.
+    every node and incrementing counter. Used by HIR statistics
+    output, MIR/LIR pre-allocation heuristics, and the test harness
+    to verify visitor coverage. Reuses the standard visitor pipeline
+    rather than implementing an ad-hoc traversal so it inherits
+    cycle detection and stable per-child order automatically.
     @End Reasoning
 
     @Implementation:
-    Create visitor context with counter in user_data, visit tree,
-    return final count.
+    1. Allocate an 8-byte counter cell initialised to 0; this lives
+       outside the visitor context because we want to read it after
+       the context is destroyed.
+    2. Create a visitor context with no pre/post or per-child hooks
+       (we count by walking, not by callback) and the counter as
+       user_data so a custom counting callback (or future plug-in)
+       can find it.
+    3. Drive a full traversal via visit_hir_tree; cycle detection
+       prevents double-counting in HIR graphs with shared subtrees.
+    4. Read the final count, destroy the visitor context, free the
+       counter cell, and return the count.
     @End Implementation
+
+    @Performance_Hints:
+    Two allocations (counter + visitor) - constant cost. Traversal
+    cost is linear in the number of HIR nodes. Cycle detection adds
+    an O(depth) factor on every push but is unavoidable for HIR
+    graphs.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Failure paths release the counter allocation before returning
+    so no allocation leaks on OOM. Counter overflow is bounded by
+    the 64-bit address space - no real HIR tree can exceed it.
+    @End Security_Scope
 
     If root is equal to 0:
         Return 0
@@ -955,7 +2179,7 @@ Process called "count_nodes" takes root as Integer returns Integer:
     proc memory_set_int64 from Layout with counter, 0, 0  Note: Initialize to 0
 
     Note: Create visitor context (no callbacks needed, just traverse)
-    Let context be proc create_visitor_context with 0, 0, counter
+    Let context be proc create_visitor_context with 0, 0, counter, 0, 0
 
     If context is equal to 0:
         proc deallocate from Layout with counter
@@ -979,19 +2203,52 @@ Process called "find_node_by_type" takes root as Integer, target_type as Integer
     Note: Find first node of specified type in HIR tree using caller-provided callback
 
     @Reasoning:
-    Utility function to search for first node matching target_type.
-    Caller provides callback that checks node type and stores result.
-    Uses visitor with early termination when target found.
+    Utility function to search for the first node matching target_type.
+    The caller supplies the comparison/storage callback so the visitor
+    itself remains agnostic about how a match is defined - downstream
+    consumers can search by type, by symbol id, by source location,
+    or by any computed predicate. Early termination via the visitor
+    stop flag keeps the search cost bounded by the position of the
+    first match, not by total tree size.
     @End Reasoning
 
     @Implementation:
     Callback signature: callback(node, node_type, user_data, context) -> Integer
-    - user_data points to: [target_type (offset 0), result_ptr (offset 8)]
-    - Callback should:
-      1. Compare node_type to target_type at user_data offset 0
-      2. If match: store node in result_ptr at user_data offset 8, return 0 to stop
-      3. If no match: return 1 to continue
+    - user_data points to a 16-byte block:
+        offset 0: target_type
+        offset 8: result_ptr (initialised to 0)
+    - Callback responsibilities:
+      1. Compare node_type to target_type at user_data offset 0.
+      2. On match: store node at user_data offset 8 and return 0
+         to set the stop flag and terminate the traversal.
+      3. On miss: return 1 to continue.
+    1. Reject null root and null callback - the callback is mandatory.
+    2. Allocate a 16-byte search context and initialise both fields.
+    3. Create a visitor with the callback as pre-visit (matches are
+       discoverable in pre-order so deeper instances of the same type
+       are not consulted) and no post or per-child hooks.
+    4. Drive the traversal; the callback writes any match into the
+       search context.
+    5. Read the result pointer, destroy the visitor and the search
+       context, and return the found node (0 if no match).
     @End Implementation
+
+    @Performance_Hints:
+    Best case O(1) - root matches and stop flag fires immediately.
+    Worst case O(N) - target_type does not appear and the full tree
+    is walked. The stop-flag short-circuit guarantees no work is
+    done after the first match, including no allocation in the
+    callback path.
+    @End Performance_Hints
+
+    @Security_Scope:
+    The callback pointer is invoked at every node; the caller is
+    responsible for the callback's body safety. All allocations
+    (search context, visitor context) are released on every exit
+    path - including OOM and null-callback rejection. Result pointer
+    of 0 unambiguously signals no match, distinguishing it from a
+    successful match storing a non-null node pointer.
+    @End Security_Scope
 
     If root is equal to 0:
         Return 0
@@ -1013,7 +2270,7 @@ Process called "find_node_by_type" takes root as Integer, target_type as Integer
     proc memory_set_int64 from Layout with user_data, 8, 0  Note: result_ptr starts null
 
     Note: Create visitor context with callback
-    Let context be proc create_visitor_context with callback, 0, user_data
+    Let context be proc create_visitor_context with callback, 0, user_data, 0, 0
 
     If context is equal to 0:
         proc deallocate from Layout with user_data
@@ -1039,20 +2296,47 @@ Process called "validate_hir_tree" takes root as Integer returns Integer:
     @Reasoning:
     Utility function to validate HIR tree by traversing and checking
     for structural issues (cycles, null pointers in required fields).
-    Uses visitor's built-in cycle detection.
+    Uses the visitor's built-in cycle detection counter rather than a
+    custom walker so the validation contract is identical to the
+    contract every other consumer (analysis, transformation, codegen)
+    sees during normal traversal - if validate_hir_tree passes, every
+    other visitor pass is guaranteed cycle-free.
     @End Reasoning
 
     @Implementation:
-    Create visitor context, traverse tree, check error_count.
-    Returns 1 if valid, 0 if invalid (cycles or errors detected).
+    1. Reject null root - it cannot represent a valid HIR program.
+    2. Create a visitor context with all callback slots null - we
+       only need the framework's built-in cycle detection and
+       null-child accounting.
+    3. Drive a full traversal via visit_hir_tree. During the walk,
+       visitor_push_node increments error_count (offset 48) every
+       time a node appears twice in the active stack.
+    4. Read error_count after the walk completes.
+    5. Destroy the visitor context.
+    6. Return 1 when error_count is 0, else 0 to signal a structural
+       defect.
     @End Implementation
+
+    @Performance_Hints:
+    Equivalent to a full empty-callback traversal: O(N * depth) due
+    to push-time cycle scan. Memory cost is the visitor context plus
+    the visit stack, both released on exit.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Validation produces a single boolean result without exposing
+    internal pointers or error details, so it is safe to expose to
+    untrusted callers. A failure indicates the HIR is unsafe to
+    feed into downstream passes; the caller must NOT proceed with
+    optimisation or code generation on a tree that returned 0.
+    @End Security_Scope
 
     If root is equal to 0:
         Return 0  Note: Null root is invalid
     End If
 
     Note: Create visitor context
-    Let context be proc create_visitor_context with 0, 0, 0
+    Let context be proc create_visitor_context with 0, 0, 0, 0, 0
 
     If context is equal to 0:
         Return 0

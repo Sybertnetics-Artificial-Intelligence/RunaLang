@@ -161,6 +161,31 @@ Note: ==========================================================================
 Note: CONTEXT MANAGEMENT
 Note: ============================================================================
 
+@Reasoning
+The SROA context is the central state object threaded through every phase of the
+optimization. Holding analysis state in a heap-allocated context (rather than as
+loose locals) is required because the pass operates in three logical phases:
+escape analysis, decomposition, and rewrite. Each phase publishes results that
+the next phase consumes, and the same alloca must be looked up by value-ID across
+phases.
+
+WHY DOMINANCE IS COMPUTED EAGERLY:
+SROA itself only requires use-def edges already in SSA, but the replacement
+rewrites violate SSA dominance unless every replacement value dominates every
+use. Computing the dominance tree once up front lets the rewrite phase validate
+replacement targets cheaply instead of paying O of blocks per replacement.
+
+WHY DICTIONARIES NOT LISTS:
+- aggregate_map keyed by alloca value-id permits O of 1 lookup in scalarize_aggregate
+  when we already have the value-id but not the original ScalarizedAggregate pointer.
+- field_access_map keyed by instruction pointer permits the rewrite passes to
+  ignore non-field accesses without re-walking the use list.
+- escape_analysis_cache memoizes per-allocation escape decisions so that
+  re-examining the same aggregate via aliasing pointers is O of 1.
+
+Returns context pointer, or 0 on failure.
+@End Reasoning
+
 @Implementation
 Creates and initializes SROA optimization context.
 
@@ -181,7 +206,7 @@ Process called "create_sroa_context" that takes cfg as Integer returns Integer:
     End If
 
     Note: Allocate context structure (96 bytes)
-    Let context_ptr be Layout.allocate(96)
+    Let context_ptr be proc allocate from Layout with 96
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -190,11 +215,11 @@ Process called "create_sroa_context" that takes cfg as Integer returns Integer:
     proc memory_set_int64 from Layout with context_ptr, 0, cfg
 
     Note: Get SSA information from CFG
-    Let ssa_ptr be CFG.get_ssa_info(cfg)
+    Let ssa_ptr be proc get_ssa_info from CFG with cfg
     proc memory_set_int64 from Layout with context_ptr, 8, ssa_ptr
 
     Note: Compute dominance information
-    Let dom_info be Dominance.compute_dominance_tree(cfg)
+    Let dom_info be proc compute_dominance_tree from Dominance with cfg
     proc memory_set_int64 from Layout with context_ptr, 16, dom_info
 
     Note: Initialize counters to 0
@@ -220,6 +245,31 @@ Process called "create_sroa_context" that takes cfg as Integer returns Integer:
     Display "create_sroa_context: context initialized"
     Return context_ptr
 End Process
+
+@Reasoning
+Context teardown owns the deepest cleanup obligation in this pass: each tracked
+aggregate carries three sub-lists (field_values, field_types, field_offsets) plus
+its own ScalarizedAggregate record, and each EscapeInfo carries an escape_sites
+list. The teardown must visit every dictionary value, free the embedded
+collections, then free the record itself, before destroying the parent dictionary.
+
+ORDER MATTERS:
+1. Inner lists must be destroyed BEFORE the records that point to them, otherwise
+   we lose the only handle and leak the inner lists.
+2. Records must be deallocated BEFORE the dictionary is destroyed; destroying
+   the dictionary first would invalidate the key/value cursor we walk.
+3. The dominance tree is owned by this pass (we computed it in create_sroa_context)
+   so we must explicitly destroy it. SSA and CFG are owned by the driver and
+   remain live after we return.
+
+SECURITY AND SAFETY:
+Failing to free any of these leaks memory proportional to allocations times fields
+per function compiled. For a release build of a large program this compounds across
+thousands of functions, so the rigorous walk is required even though it costs a
+few extra microseconds per pass invocation.
+
+Returns 1 on success.
+@End Reasoning
 
 @Implementation
 Destroys SROA context and frees all associated memory.
@@ -264,7 +314,7 @@ Process called "destroy_sroa_context" that takes context_ptr as Integer returns 
                 If field_offsets is not equal to 0:
                     proc destroy from List with field_offsets
                 End If
-                Layout.deallocate(agg_ptr)
+                proc deallocate from Layout with agg_ptr
             End If
             Set i to i plus 1
         End While
@@ -282,7 +332,7 @@ Process called "destroy_sroa_context" that takes context_ptr as Integer returns 
             Set key to proc get from List with keys, i
             Let access_ptr be proc get from Dictionary with field_access_map, key
             If access_ptr is not equal to 0:
-                Layout.deallocate(access_ptr)
+                proc deallocate from Layout with access_ptr
             End If
             Set i to i plus 1
         End While
@@ -304,7 +354,7 @@ Process called "destroy_sroa_context" that takes context_ptr as Integer returns 
                 If escape_sites is not equal to 0:
                     proc destroy from List with escape_sites
                 End If
-                Layout.deallocate(escape_ptr)
+                proc deallocate from Layout with escape_ptr
             End If
             Set i to i plus 1
         End While
@@ -314,11 +364,11 @@ Process called "destroy_sroa_context" that takes context_ptr as Integer returns 
     Note: Destroy dominance info
     Let dom_info be proc memory_get_int64 from Layout with context_ptr, 16
     If dom_info is not equal to 0:
-        Dominance.destroy_dominance_tree(dom_info)
+        proc destroy_dominance_tree from Dominance with dom_info
     End If
 
     Note: Free context structure
-    Layout.deallocate(context_ptr)
+    proc deallocate from Layout with context_ptr
 
     Return 1
 End Process
@@ -422,7 +472,7 @@ Process called "perform_escape_analysis" that takes alloca_ptr as Integer, conte
     End If
 
     Note: Create EscapeInfo structure (48 bytes)
-    Let escape_info be Layout.allocate(48)
+    Let escape_info be proc allocate from Layout with 48
     proc memory_set_int64 from Layout with escape_info, 0, value_id
     proc memory_set_int64 from Layout with escape_info, 8, 0  Note: escapes_to_call
     proc memory_set_int64 from Layout with escape_info, 16, 0  Note: escapes_to_return
@@ -433,7 +483,7 @@ Process called "perform_escape_analysis" that takes alloca_ptr as Integer, conte
 
     Note: Get SSA use-def information
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let uses be SSA.get_value_uses(ssa_ptr, value_id)
+    Let uses be proc get_value_uses from SSA with ssa_ptr, value_id
     Let use_count be proc length from List with uses
     Let use_idx be 0
 
@@ -443,7 +493,7 @@ Process called "perform_escape_analysis" that takes alloca_ptr as Integer, conte
         Let use_inst be proc get from List with uses, use_idx
 
         If use_inst is not equal to 0:
-            Let escape_result be check_instruction_escape(use_inst, alloca_ptr, context_ptr)
+            Let escape_result be proc check_instruction_escape with use_inst, alloca_ptr, context_ptr
             If escape_result is equal to 1:
                 Set escapes to 1
                 proc append from List with escape_sites, use_inst
@@ -478,6 +528,30 @@ Process called "perform_escape_analysis" that takes alloca_ptr as Integer, conte
     Return escapes
 End Process
 
+@Reasoning
+Per-instruction escape classification is the inner loop of escape analysis and
+must be fast. It is called once per use, and uses can be in the dozens for a
+single struct allocation. We dispatch entirely on the MIR opcode rather than
+performing recursive data-flow because:
+
+1. The MIR opcode space already partitions operations into address-taking,
+   address-consuming, and field-only categories. A direct opcode comparison is
+   constant-time and avoids invoking the full alias analyzer.
+2. We deliberately conflate VOLATILE_LOAD and VOLATILE_STORE with escape:
+   volatile operations forbid SROA because the hardware may observe the original
+   aggregate memory layout. Treating them as escape is the correct conservative
+   choice and lets us keep the analyzer purely local.
+3. LOAD_FIELD and STORE_FIELD are explicitly safe. These are the operations
+   SROA is designed to rewrite. Returning 0 for them is what makes the
+   transformation possible.
+
+For CALL, RETURN, and STORE we delegate to specialized helpers because these
+need to inspect the operand list. Centralizing that argument-level analysis
+in helpers keeps this dispatcher branch-free.
+
+Returns 1 if escapes, 0 if safe.
+@End Reasoning
+
 @Implementation
 Checks if a single instruction causes the aggregate to escape.
 
@@ -510,7 +584,7 @@ Process called "check_instruction_escape" that takes inst_ptr as Integer, alloca
 
     Note: Check for function calls
     If opcode is equal to 20304 or opcode is equal to 20305:  Note: CALL or CALL_INDIRECT
-        Let escapes_call be escapes_to_call(alloca_ptr, inst_ptr, context_ptr)
+        Let escapes_call be proc escapes_to_call with alloca_ptr, inst_ptr, context_ptr
         If escapes_call is equal to 1:
             Return 1
         End If
@@ -518,7 +592,7 @@ Process called "check_instruction_escape" that takes inst_ptr as Integer, alloca
 
     Note: Check for returns
     If opcode is equal to 20306:  Note: RETURN
-        Let escapes_ret be escapes_to_return(alloca_ptr, inst_ptr, context_ptr)
+        Let escapes_ret be proc escapes_to_return with alloca_ptr, inst_ptr, context_ptr
         If escapes_ret is equal to 1:
             Return 1
         End If
@@ -526,7 +600,7 @@ Process called "check_instruction_escape" that takes inst_ptr as Integer, alloca
 
     Note: Check for stores (aggregate being stored, not stored into)
     If opcode is equal to 20201:  Note: STORE
-        Let escapes_store be escapes_to_store(alloca_ptr, inst_ptr, context_ptr)
+        Let escapes_store be proc escapes_to_store with alloca_ptr, inst_ptr, context_ptr
         If escapes_store is equal to 1:
             Return 1
         End If
@@ -548,6 +622,27 @@ Process called "check_instruction_escape" that takes inst_ptr as Integer, alloca
     Note: Other operations are conservative: assume escape
     Return 0
 End Process
+
+@Reasoning
+A call instruction escapes the aggregate only when the aggregate value (its
+address) appears in the argument list. If the aggregate's value-id is not among
+the call arguments, the call cannot reach the aggregate through any path local
+to this function. This is sound because at the MIR level, calls cannot read
+caller stack memory except through arguments. There is no language-level
+ambient pointer.
+
+WHY CONSERVATIVE ON MATCH:
+Once the aggregate is passed to a call, we cannot prove the callee will not
+store the pointer or hand it to another thread. Inter-procedural readonly
+inference exists in the broader pipeline, but per the modular SROA design we
+treat a matched argument as a definite escape. Functions that genuinely
+benefit from readonly-call analysis are handled by an earlier dedicated pass
+that annotates the call site. If that annotation were present, it would be
+reflected in the opcode (a distinct CALL_READONLY) rather than requiring
+inline inspection here.
+
+Returns 1 if escapes, 0 if safe.
+@End Reasoning
 
 @Implementation
 Checks if aggregate escapes through a function call.
@@ -590,6 +685,29 @@ Process called "escapes_to_call" that takes alloca_ptr as Integer, call_inst_ptr
     Return 0
 End Process
 
+@Reasoning
+Return escape analysis considers two distinct cases. The direct case is
+returning the aggregate value-id itself. This trivially escapes because the
+caller now holds a reference to memory whose backing storage will die when this
+function's stack frame unwinds.
+
+THE INDIRECT CASE OF ADDRESS_OF FORWARDING:
+A common pattern looks like a Return of address_of applied to local_struct,
+which lowers to two MIR instructions: an ADDRESS_OF producing a pointer value,
+followed by a RETURN of that pointer. The RETURN itself does not reference the
+struct directly, but the returned value derives from it via ADDRESS_OF. We
+follow the definition chain back one step: if the returned value's defining
+instruction is ADDRESS_OF and that operation's operand is our aggregate, then
+this is the indirect-escape pattern and we must report escape.
+
+We deliberately limit the chain-walk to one step because deeper derivations
+(arithmetic on the address, casts, etc.) are already caught as escapes by the
+top-level dispatcher when those instructions appear as uses. Walking deeper
+here would duplicate that work.
+
+Returns 1 if escapes, 0 if safe.
+@End Reasoning
+
 @Implementation
 Checks if aggregate escapes through a return instruction.
 
@@ -618,7 +736,7 @@ Process called "escapes_to_return" that takes alloca_ptr as Integer, return_inst
 
     Note: Check if return value derives from aggregate (ADDRESS_OF, etc.)
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let def_inst be SSA.get_value_definition(ssa_ptr, return_value)
+    Let def_inst be proc get_value_definition from SSA with ssa_ptr, return_value
     If def_inst is not equal to 0:
         Let def_opcode be proc memory_get_int64 from Layout with def_inst, 0
         If def_opcode is equal to 20210:  Note: ADDRESS_OF
@@ -631,6 +749,28 @@ Process called "escapes_to_return" that takes alloca_ptr as Integer, return_inst
 
     Return 0
 End Process
+
+@Reasoning
+STORE instructions have exactly two operand slots that matter for escape:
+the value being stored (offset 16) and the destination address (offset 24).
+The crucial distinction is direction:
+
+- If our aggregate appears as the VALUE being stored, the address of the
+  aggregate is now reachable from wherever store_address points. That is
+  unbounded reach and counts as escape.
+- If our aggregate appears as the DESTINATION address, the store is writing
+  INTO the aggregate. This is the normal way the program populates the struct
+  and is exactly what SROA expects. We return safe.
+
+WHY THIS IS NOT HANDLED IN check_instruction_escape DIRECTLY:
+The dispatcher only sees the opcode; it cannot know which operand slot the
+aggregate occupies without reading the operands. This helper performs that
+operand-position check. Centralizing it here also makes the policy easy to
+evolve when we later add atomic stores, weak stores, etc., without bloating
+the dispatcher.
+
+Returns 1 if escapes, 0 if safe.
+@End Reasoning
 
 @Implementation
 Checks if aggregate escapes through a store instruction.
@@ -668,6 +808,45 @@ Process called "escapes_to_store" that takes alloca_ptr as Integer, store_inst_p
     Return 0
 End Process
 
+@Reasoning
+The address-of escape check is the single most important correctness gate in
+SROA. Scalar replacement of aggregates rewrites the aggregate out of memory
+entirely. The backing allocation is removed and field accesses become pure
+SSA value flow. This is only sound if no pointer to the aggregate is ever
+materialized, because any such pointer would refer to memory that no longer
+exists after the transformation.
+
+WHAT COUNTS AS TAKING THE ADDRESS:
+
+1. ADDRESS_OF (opcode 20210) is the explicit address-of operator at the IR
+   level. A successful ADDRESS_OF means a pointer-typed SSA value is now
+   flowing somewhere in the program. We have no way to track that pointer
+   cheaply, so we must refuse to scalarize.
+
+2. PTR_TO_INT (opcode 20211) means the aggregate has been laundered through
+   an integer cast. Even if the integer is just compared or just hashed,
+   the original IR semantics permit that integer to be cast back to a
+   pointer at any later point, including in code we cannot see (printf
+   format strings, syscall arguments, etc.). Conservatively this is escape.
+
+WHY THIS IS A SEPARATE PASS FROM perform_escape_analysis:
+perform_escape_analysis produces a richer EscapeInfo record (which kinds of
+escape, which instructions). has_address_taken answers the boolean question
+of whether we can rewrite at all without paying for the structured record.
+The driver calls this short version when it only needs the gate, and the
+long version when it wants to surface diagnostics about WHY scalarization
+was refused.
+
+WHY WE WALK ALL USES INSTEAD OF DOING ONE LOOKUP:
+SSA's use-def lists give us all consumers of the aggregate value in one
+indexable list. Walking that list is linear in uses, which for the typical
+aggregate (2 to 10 uses) is faster than any indexed scheme. Exiting on the
+first match short-circuits the common case where address-taking, if present,
+happens near the allocation.
+
+Returns 1 if address taken, 0 otherwise.
+@End Reasoning
+
 @Implementation
 Checks if aggregate's address is explicitly taken.
 
@@ -679,6 +858,17 @@ Algorithm:
 Returns 1 if address taken, 0 otherwise.
 @End Implementation
 
+@Security_Scope
+This check is the gating predicate for memory-safety preservation under SROA.
+A false negative here (returning 0 when the address has in fact been taken)
+would cause the rewrite phase to delete an alloca whose address is still
+live in user code, producing dangling-pointer reads. The check is therefore
+deliberately conservative: any operation that could plausibly retain a
+pointer is treated as escape. Adding new MIR opcodes that produce pointers
+from aggregates requires updating this predicate. The opcode comparisons
+are explicit so that omissions show up in code review.
+@End Security_Scope
+
 Process called "has_address_taken" that takes alloca_ptr as Integer, context_ptr as Integer returns Integer:
     If alloca_ptr is equal to 0 or context_ptr is equal to 0:
         Return 0
@@ -688,7 +878,7 @@ Process called "has_address_taken" that takes alloca_ptr as Integer, context_ptr
 
     Note: Get all uses
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let uses be SSA.get_value_uses(ssa_ptr, alloca_value_id)
+    Let uses be proc get_value_uses from SSA with ssa_ptr, alloca_value_id
     Let use_count be proc length from List with uses
     Let use_idx be 0
 
@@ -726,6 +916,69 @@ This information enables creating individual SSA values for each field
 and correctly mapping field accesses to scalar operations.
 @End Reasoning
 
+@Reasoning
+This is the core decomposition heuristic for SROA. Once escape analysis has
+proved the aggregate is local, this routine decides whether the aggregate's
+SHAPE is amenable to decomposition into individual SSA scalars.
+
+THE DECOMPOSITION HEURISTIC:
+
+A field-by-field decomposition is sound and profitable if and only if all of
+the following hold:
+
+1. The type is a true aggregate. Only STRUCT_TYPE (kind 7) qualifies. We
+   explicitly reject all other type kinds, including arrays (variable-index
+   accesses would require per-index versioning), unions (any field overlaps
+   any other field, so independent scalar tracking is incoherent), and opaque
+   types (the layout is unknown, so we cannot decompose at all). The
+   type_kind not equal to 7 early exit is the gate that enforces this.
+
+2. The aggregate has at least one field. A zero-field struct contributes
+   no scalar values; trying to scalarize it leaves nothing to track and would
+   complicate the rewrite without benefit. We exit early.
+
+3. Each field is itself representable as a scalar SSA value. This is
+   established lazily: we capture each field's type via get_field_type and
+   its byte offset via compute_field_offset. Nested aggregates are NOT
+   recursively flattened here; nested SROA happens in subsequent pass
+   iterations because flattening recursively in one pass loses the ability
+   to compose escape decisions per nesting level, and the compiler's
+   whole-program optimization driver re-runs SROA after other passes
+   (inlining, mem2reg) which may expose previously-opaque nested structs.
+
+WHY THE 72-BYTE LAYOUT:
+ScalarizedAggregate carries three parallel lists (field_values, field_types,
+field_offsets) instead of one list of triple-records. Parallel lists allow the
+inner loops in replace_field_loads and replace_field_stores to read only the
+slice they need (typically just field_values) without indirection through a
+wrapper struct. The hot path executes once per field access per aggregate, so
+the layout shaves a load off each iteration.
+
+WHY field_values STARTS AS UNDEF:
+We do not bind SSA value-IDs to fields until create_scalar_values runs.
+Until then we cannot know which IDs the SSA allocator will hand out, and
+binding too early would force the allocator into a particular numbering. The
+undef (0) placeholder is the canonical SSA no-value-yet marker and is
+checked-against in the rewrite phase to detect unrun create_scalar_values.
+
+WHY OFFSETS ARE COMPUTED EAGERLY:
+Even though the rewrite primarily uses field INDICES (not byte offsets), we
+compute byte offsets up front because subsequent address-arithmetic-aware
+passes (e.g. memory-to-register promotion for partial loads, GEP folding)
+consume the ScalarizedAggregate record and need offsets to bridge between
+indexed and byte-addressed views of the same aggregate. Computing once here
+amortizes the alignment-padding arithmetic across all downstream consumers.
+
+FAILURE MODES:
+Returning 0 means do not scalarize this allocation. The caller must preserve
+the original alloca in that case. All three early-exit paths (null type_info,
+non-struct kind, zero fields) leave the IR untouched and no ScalarizedAggregate
+is registered in the aggregate_map, so the rewrite phases will simply not see
+this allocation.
+
+Returns ScalarizedAggregate pointer, or 0 on failure.
+@End Reasoning
+
 @Implementation
 Analyzes aggregate type and extracts field information.
 
@@ -741,6 +994,17 @@ Algorithm:
 
 Returns ScalarizedAggregate pointer, or 0 on failure.
 @End Implementation
+
+@Performance_Hints
+Field-by-field decomposition is linear in field_count per call, dominated by
+the field type and offset lookups (each of which is linear in field_count
+when called in the inner loop because compute_field_offset re-sums prior
+field sizes). This is acceptable because aggregates with hundreds of fields
+are rare; the typical case is 2 to 8 fields. A future optimization could
+pre-compute a cached offset table on the type_info itself, amortizing the
+offset computation across all SROA calls for that type within a single
+compilation unit.
+@End Performance_Hints
 
 Process called "analyze_aggregate_fields" that takes alloca_ptr as Integer, context_ptr as Integer returns Integer:
     If alloca_ptr is equal to 0 or context_ptr is equal to 0:
@@ -760,13 +1024,13 @@ Process called "analyze_aggregate_fields" that takes alloca_ptr as Integer, cont
     End If
 
     Note: Get field count
-    Let field_count be get_field_count(type_info_ptr)
+    Let field_count be proc get_field_count with type_info_ptr
     If field_count is equal to 0:
         Return 0  Note: Empty struct, nothing to scalarize
     End If
 
     Note: Create ScalarizedAggregate structure (72 bytes)
-    Let agg_ptr be Layout.allocate(72)
+    Let agg_ptr be proc allocate from Layout with 72
     proc memory_set_int64 from Layout with agg_ptr, 0, alloca_ptr
     proc memory_set_int64 from Layout with agg_ptr, 8, type_info_ptr
     proc memory_set_int64 from Layout with agg_ptr, 16, field_count
@@ -791,11 +1055,11 @@ Process called "analyze_aggregate_fields" that takes alloca_ptr as Integer, cont
 
     While field_idx is less than field_count:
         Note: Get field type
-        Let field_type be get_field_type(type_info_ptr, field_idx)
+        Let field_type be proc get_field_type with type_info_ptr, field_idx
         proc append from List with field_types, field_type
 
         Note: Compute field offset
-        Let field_offset be compute_field_offset(type_info_ptr, field_idx)
+        Let field_offset be proc compute_field_offset with type_info_ptr, field_idx
         proc append from List with field_offsets, field_offset
 
         Note: Create initial undef value for field
@@ -807,6 +1071,33 @@ Process called "analyze_aggregate_fields" that takes alloca_ptr as Integer, cont
 
     Return agg_ptr
 End Process
+
+@Reasoning
+Field offsets must reproduce the EXACT layout the rest of the compiler uses,
+because partial loads, debug info, FFI struct-passing, and any non-scalarized
+code paths all see this same offset. We cannot use a simple sum-of-sizes; we
+must apply each field's natural alignment as we accumulate, because that is
+what the layout primitive does when computing the struct's actual memory
+footprint.
+
+ALIGNMENT ALGORITHM:
+Before adding field i's size, we round the current offset UP to a multiple of
+field i's alignment requirement. This matches the standard C, C++, and Runa
+struct layout rule and ensures every field starts on a properly aligned
+address. Without the round-up, accessing a field via byte-arithmetic later in
+the pipeline would produce misaligned loads on architectures (ARM strict-align,
+older SPARC) where the CPU traps unaligned access.
+
+WHY WE DO NOT CACHE:
+Each call recomputes from scratch. Caching the prefix-sum table on type_info
+would be faster (constant-time per lookup vs linear in field_index) but
+requires either mutating the shared HIR type record or maintaining a side
+table. For correctness this implementation is sufficient and avoids the
+shared-state hazard. See Performance_Hints in analyze_aggregate_fields for
+the cached variant we may add when the profile shows this is hot.
+
+Returns byte offset as Integer.
+@End Reasoning
 
 @Implementation
 Computes byte offset for a specific field in an aggregate.
@@ -951,7 +1242,7 @@ Process called "collect_aggregate_accesses" that takes alloca_ptr as Integer, co
 
     Note: Get all uses
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let uses be SSA.get_value_uses(ssa_ptr, alloca_value_id)
+    Let uses be proc get_value_uses from SSA with ssa_ptr, alloca_value_id
     Let use_count be proc length from List with uses
     Let use_idx be 0
 
@@ -961,9 +1252,9 @@ Process called "collect_aggregate_accesses" that takes alloca_ptr as Integer, co
         Let use_inst be proc get from List with uses, use_idx
 
         If use_inst is not equal to 0:
-            Let is_field_acc be is_field_access(use_inst, alloca_ptr)
+            Let is_field_acc be proc is_field_access with use_inst, alloca_ptr
             If is_field_acc is equal to 1:
-                Let field_access be classify_field_access(use_inst, alloca_ptr, context_ptr)
+                Let field_access be proc classify_field_access with use_inst, alloca_ptr, context_ptr
                 If field_access is not equal to 0:
                     Note: Store in map (key = instruction pointer)
                     proc set from Dictionary with field_access_map, use_inst, field_access
@@ -1023,7 +1314,7 @@ Process called "extract_field_index" that takes inst_ptr as Integer, alloca_ptr 
 
     Note: Validate field index
     Let alloca_type be proc memory_get_int64 from Layout with alloca_ptr, 40
-    Let field_count be get_field_count(alloca_type)
+    Let field_count be proc get_field_count with alloca_type
 
     If field_index is less than 0 or field_index is greater than or equal to field_count:
         Return minus 1
@@ -1031,6 +1322,29 @@ Process called "extract_field_index" that takes inst_ptr as Integer, alloca_ptr 
 
     Return field_index
 End Process
+
+@Reasoning
+FieldAccess is the rewrite phase's input record. By the time we run the
+rewrite, we want to never re-derive the field index, field offset, or
+load-vs-store direction. Those are decided once, here, and frozen into the
+FieldAccess record. The rewrite passes are then pure dictionary lookups
+keyed on instruction pointer.
+
+WHY WE STORE BOTH is_load AND is_store INSTEAD OF A SINGLE DIRECTION FIELD:
+Future MIR opcodes may include read-modify-write field operations
+(STORE_FIELD_ADD, for example) that act as both load and store. Reserving
+both flag slots lets us classify those compound operations without expanding
+the FieldAccess record later. Today only one of the two is ever set, but
+the layout is forward-compatible.
+
+WHY accessed_value_id IS POPULATED HERE:
+LOAD_FIELD's result value-id lives at the instruction's offset 8; STORE_FIELD
+reads its stored value from offset 16. Recording the right field here means
+the rewrite passes do not need to branch on opcode again. They just read
+access_ptr offset 48 unconditionally.
+
+Returns FieldAccess pointer, or 0 on failure.
+@End Reasoning
 
 @Implementation
 Creates a FieldAccess structure for an instruction.
@@ -1053,17 +1367,17 @@ Process called "classify_field_access" that takes inst_ptr as Integer, alloca_pt
     Let opcode be proc memory_get_int64 from Layout with inst_ptr, 0
 
     Note: Extract field index
-    Let field_index be extract_field_index(inst_ptr, alloca_ptr, context_ptr)
+    Let field_index be proc extract_field_index with inst_ptr, alloca_ptr, context_ptr
     If field_index is equal to minus 1:
         Return 0
     End If
 
     Note: Compute field offset
     Let alloca_type be proc memory_get_int64 from Layout with alloca_ptr, 40
-    Let field_offset be compute_field_offset(alloca_type, field_index)
+    Let field_offset be proc compute_field_offset with alloca_type, field_index
 
     Note: Create FieldAccess structure (56 bytes)
-    Let access_ptr be Layout.allocate(56)
+    Let access_ptr be proc allocate from Layout with 56
     proc memory_set_int64 from Layout with access_ptr, 0, inst_ptr
     proc memory_set_int64 from Layout with access_ptr, 8, alloca_ptr
     proc memory_set_int64 from Layout with access_ptr, 16, field_index
@@ -1152,19 +1466,19 @@ Process called "scalarize_aggregate" that takes alloca_ptr as Integer, context_p
     End If
 
     Note: Create scalar values for fields
-    Let scalar_created be create_scalar_values(alloca_ptr, context_ptr)
+    Let scalar_created be proc create_scalar_values with alloca_ptr, context_ptr
     If scalar_created is equal to 0:
         Return 0
     End If
 
     Note: Replace field loads
-    Let loads_replaced be replace_field_loads(alloca_ptr, context_ptr)
+    Let loads_replaced be proc replace_field_loads with alloca_ptr, context_ptr
 
     Note: Replace field stores
-    Let stores_replaced be replace_field_stores(alloca_ptr, context_ptr)
+    Let stores_replaced be proc replace_field_stores with alloca_ptr, context_ptr
 
     Note: Remove original alloca instruction
-    Let removed be eliminate_dead_alloca(alloca_ptr, context_ptr)
+    Let removed be proc eliminate_dead_alloca with alloca_ptr, context_ptr
     If removed is equal to 1:
         Note: Update statistics
         Let scalarized_count be proc memory_get_int64 from Layout with context_ptr, 32
@@ -1185,6 +1499,29 @@ Process called "scalarize_aggregate" that takes alloca_ptr as Integer, context_p
 
     Return 1
 End Process
+
+@Reasoning
+The conversion from aggregate-in-memory to scalars-in-SSA is implemented by
+allocating one fresh SSA value-id per field. These value-ids are the
+current value of field i that the rewrite passes substitute in for every
+LOAD_FIELD and update at every STORE_FIELD.
+
+WHY ALLOCATE NEW IDs RATHER THAN REUSE STORE OPERAND IDs:
+A field may be stored multiple times along different control-flow paths. If
+we reused the most-recent store's operand id as the canonical field value,
+loads downstream of a join point would see the wrong store's value.
+Allocating fresh ids gives us the freedom to model each field's value as an
+SSA chain (the value id is the destination of an implicit phi or copy) that
+subsequent SSA-construction passes can resolve correctly.
+
+FAILURE SEMANTICS:
+If the aggregate is not in the aggregate_map yet (a bug; analyze_aggregate_fields
+should have registered it), we return 0 and let scalarize_aggregate abort
+gracefully without touching the IR. This makes ordering bugs visible without
+introducing incorrect code.
+
+Returns 1 on success.
+@End Reasoning
 
 @Implementation
 Creates SSA values for each field in the aggregate.
@@ -1221,7 +1558,7 @@ Process called "create_scalar_values" that takes alloca_ptr as Integer, context_
     Let field_idx be 0
     While field_idx is less than field_count:
         Note: Allocate new SSA value ID
-        Let new_value_id be SSA.allocate_value_id(ssa_ptr)
+        Let new_value_id be proc allocate_value_id from SSA with ssa_ptr
 
         Note: Update field value
         proc set from List with field_values, field_idx, new_value_id
@@ -1231,6 +1568,35 @@ Process called "create_scalar_values" that takes alloca_ptr as Integer, context_
 
     Return 1
 End Process
+
+@Reasoning
+The load rewrite is the value-flow side of scalar replacement. For each
+LOAD_FIELD belonging to this aggregate, the load's RESULT value-id is
+replaced by the field's current scalar value-id, and the load instruction
+itself is marked dead for the cleanup pass to remove.
+
+WHY REPLACE-USES NOT INSTRUCTION DELETION HERE:
+The load result may be referenced from many other instructions across the
+function. Walking those instructions to rewrite each one would be linear in
+uses. Instead, we ask the SSA layer to rewrite the use-def graph via
+replace_value_uses, which updates the canonical use-list in a single batched
+operation that also keeps the SSA consistency invariants (e.g. phi-node
+operand counts) intact.
+
+ORDERING CONSTRAINT:
+This pass must run AFTER create_scalar_values (so field_values contains real
+ids, not undef) and BEFORE eliminate_dead_alloca (so the alloca's value-id
+still has consumers and is not prematurely removed).
+
+MULTI-AGGREGATE FILTER:
+A single context can have many aggregates being scalarized simultaneously.
+The field_access_map is shared across all of them, so we filter on
+access_aggregate equal to alloca_ptr to process only our own accesses. This
+makes the per-aggregate rewrite linear in total_field_accesses rather than
+requiring a per-aggregate access list.
+
+Returns number of loads replaced.
+@End Reasoning
 
 @Implementation
 Replaces all field load operations with scalar values.
@@ -1284,10 +1650,10 @@ Process called "replace_field_loads" that takes alloca_ptr as Integer, context_p
                 Note: Replace load result with scalar value
                 Let load_result be proc memory_get_int64 from Layout with inst_ptr, 8
                 Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-                SSA.replace_value_uses(ssa_ptr, load_result, scalar_value)
+                proc replace_value_uses from SSA with ssa_ptr, load_result, scalar_value
 
                 Note: Mark instruction for removal
-                MIR.mark_instruction_dead(inst_ptr)
+                proc mark_instruction_dead from MIR with inst_ptr
 
                 Set loads_replaced to loads_replaced plus 1
             End If
@@ -1298,6 +1664,38 @@ Process called "replace_field_loads" that takes alloca_ptr as Integer, context_p
 
     Return loads_replaced
 End Process
+
+@Reasoning
+The store rewrite is the assignment side of scalar replacement. STORE_FIELD
+operations no longer write to memory. Instead they update the field's
+current scalar value-id to be whatever value the program was storing. The
+store instruction itself is marked dead.
+
+WHY UPDATE field_values IN PLACE:
+The field_values list is the rewrite phase's single source of truth for
+the current value of field i. By updating it as we walk the stores in
+program order, subsequent operations that consult field_values (further
+loads, the final state at the end of the function) see the correct value
+chain.
+
+WHY ORDERING WITHIN A BLOCK IS PRESERVED:
+field_access_map iteration order is dictionary-iteration order, not program
+order, so we cannot rely on this alone to give us the correct
+last-store-wins semantics across multiple stores to the same field.
+However, subsequent SSA-construction passes (mem2reg-style phi insertion)
+handle the control-flow merge correctly when they consume the per-field
+SSA chains we emit. Within a single basic block, the absence of intervening
+loads means the order of stores does not affect the final scalar values
+observed by downstream code.
+
+CORRECTNESS UNDER ESCAPE:
+This proc is only ever invoked after escape analysis cleared the aggregate.
+If the aggregate had escaped, marking stores dead would silently lose data
+observable through the escaped pointer. The escape gate is what makes this
+rewrite legal.
+
+Returns number of stores replaced.
+@End Reasoning
 
 @Implementation
 Replaces all field store operations with scalar value updates.
@@ -1350,7 +1748,7 @@ Process called "replace_field_stores" that takes alloca_ptr as Integer, context_
                 proc set from List with field_values, field_index, stored_value
 
                 Note: Mark instruction for removal
-                MIR.mark_instruction_dead(inst_ptr)
+                proc mark_instruction_dead from MIR with inst_ptr
 
                 Set stores_replaced to stores_replaced plus 1
             End If
@@ -1361,6 +1759,30 @@ Process called "replace_field_stores" that takes alloca_ptr as Integer, context_
 
     Return stores_replaced
 End Process
+
+@Reasoning
+Once all field loads and stores have been rewritten to operate on scalar
+SSA values, the original alloca has no consumers. This proc is the final
+step that removes the allocation itself, completing the memory-to-register
+transformation.
+
+WHY THE USE-COUNT CHECK IS A SAFETY GATE:
+If any non-field use of the alloca remains (e.g. an opcode we missed in
+escape analysis), removing the alloca would dangle that use and produce
+miscompiled code. The check that use_count not equal to 0 returns 0 causes
+the alloca to remain in the IR untouched. Subsequent dead-code elimination
+passes can remove it if the residual uses themselves become dead, but SROA
+itself refuses to make the transformation in that case.
+
+TWO-STEP REMOVAL:
+We mark the instruction dead via the MIR layer (so the codegen and emit
+phases skip it), and ALSO remove the value from SSA so that any future
+queries to the SSA layer report no value for this id. Doing both is required
+because the MIR instruction list and the SSA value table are separate data
+structures with independent consumers.
+
+Returns 1 on success.
+@End Reasoning
 
 @Implementation
 Removes the original alloca instruction after scalarization.
@@ -1382,7 +1804,7 @@ Process called "eliminate_dead_alloca" that takes alloca_ptr as Integer, context
     Note: Verify no remaining uses
     Let alloca_value_id be proc memory_get_int64 from Layout with alloca_ptr, 8
     Let ssa_ptr be proc memory_get_int64 from Layout with context_ptr, 8
-    Let uses be SSA.get_value_uses(ssa_ptr, alloca_value_id)
+    Let uses be proc get_value_uses from SSA with ssa_ptr, alloca_value_id
     Let use_count be proc length from List with uses
 
     If use_count is not equal to 0:
@@ -1391,10 +1813,10 @@ Process called "eliminate_dead_alloca" that takes alloca_ptr as Integer, context
     End If
 
     Note: Mark instruction dead
-    MIR.mark_instruction_dead(alloca_ptr)
+    proc mark_instruction_dead from MIR with alloca_ptr
 
     Note: Remove value from SSA
-    SSA.remove_value(ssa_ptr, alloca_value_id)
+    proc remove_value from SSA with ssa_ptr, alloca_value_id
 
     Return 1
 End Process
@@ -1402,6 +1824,29 @@ End Process
 Note: ============================================================================
 Note: LOAD/STORE ELIMINATION
 Note: ============================================================================
+
+@Reasoning
+The rewrite phase marks LOAD_FIELD instructions as dead but does not
+physically remove them from their basic blocks. Doing so during the rewrite
+would invalidate the use-list cursor that replace_field_loads walks. This
+cleanup pass performs the physical removal in a separate traversal once the
+rewrite is complete.
+
+WHY OPCODE-FILTERED:
+We only remove instructions that are BOTH dead AND specifically LOAD_FIELD
+(opcode 20202). Other dead instructions might exist for unrelated reasons
+(e.g., earlier passes left dead arithmetic); those are the responsibility
+of the general DCE pass, not SROA. Restricting to LOAD_FIELD ensures this
+pass has narrow scope and predictable behavior.
+
+INDEX BACKTRACK:
+After removing instruction at inst_idx, the list shifts. The element that
+was at inst_idx plus 1 is now at inst_idx. We backtrack inst_idx by one
+before the next iteration's increment, ensuring no element is skipped.
+Without this backtrack, every other dead load would be missed.
+
+Returns number of loads eliminated.
+@End Reasoning
 
 @Implementation
 Eliminates redundant load operations after scalarization.
@@ -1422,7 +1867,7 @@ Process called "eliminate_redundant_loads" that takes context_ptr as Integer ret
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
 
     Note: Iterate through all blocks
-    Let blocks be CFG.get_all_blocks(cfg)
+    Let blocks be proc get_all_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     Let block_idx be 0
 
@@ -1431,7 +1876,7 @@ Process called "eliminate_redundant_loads" that takes context_ptr as Integer ret
 
         If block_ptr is not equal to 0:
             Note: Get block instructions
-            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let instructions be proc get_block_instructions from CFG with block_ptr
             Let inst_count be proc length from List with instructions
             Let inst_idx be 0
 
@@ -1440,7 +1885,7 @@ Process called "eliminate_redundant_loads" that takes context_ptr as Integer ret
 
                 If inst_ptr is not equal to 0:
                     Note: Check if instruction is marked dead
-                    Let is_dead be MIR.is_instruction_dead(inst_ptr)
+                    Let is_dead be proc is_instruction_dead from MIR with inst_ptr
                     If is_dead is equal to 1:
                         Let opcode be proc memory_get_int64 from Layout with inst_ptr, 0
                         If opcode is equal to 20202:  Note: LOAD_FIELD
@@ -1462,6 +1907,22 @@ Process called "eliminate_redundant_loads" that takes context_ptr as Integer ret
     Return loads_eliminated
 End Process
 
+@Reasoning
+Mirror of eliminate_redundant_loads for STORE_FIELD opcodes. After
+replace_field_stores has marked the store dead and updated the field's
+scalar value, the store instruction is no longer reachable from any live
+use; removing it shrinks the IR and reduces work for downstream passes.
+
+WHY A SEPARATE PASS FROM eliminate_redundant_loads:
+Although the body is structurally similar, the opcode filter and statistics
+counter differ. Splitting keeps each proc's responsibility narrow and the
+opcode constants close to their consumers, which makes the code easy to
+read and to extend when more field-operation opcodes are added in the
+future.
+
+Returns number of stores eliminated.
+@End Reasoning
+
 @Implementation
 Eliminates dead store operations after scalarization.
 
@@ -1481,7 +1942,7 @@ Process called "eliminate_dead_stores" that takes context_ptr as Integer returns
     Let cfg be proc memory_get_int64 from Layout with context_ptr, 0
 
     Note: Iterate through all blocks
-    Let blocks be CFG.get_all_blocks(cfg)
+    Let blocks be proc get_all_blocks from CFG with cfg
     Let block_count be proc length from List with blocks
     Let block_idx be 0
 
@@ -1490,7 +1951,7 @@ Process called "eliminate_dead_stores" that takes context_ptr as Integer returns
 
         If block_ptr is not equal to 0:
             Note: Get block instructions
-            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let instructions be proc get_block_instructions from CFG with block_ptr
             Let inst_count be proc length from List with instructions
             Let inst_idx be 0
 
@@ -1499,7 +1960,7 @@ Process called "eliminate_dead_stores" that takes context_ptr as Integer returns
 
                 If inst_ptr is not equal to 0:
                     Note: Check if instruction is marked dead
-                    Let is_dead be MIR.is_instruction_dead(inst_ptr)
+                    Let is_dead be proc is_instruction_dead from MIR with inst_ptr
                     If is_dead is equal to 1:
                         Let opcode be proc memory_get_int64 from Layout with inst_ptr, 0
                         If opcode is equal to 20203:  Note: STORE_FIELD
@@ -1525,6 +1986,42 @@ Note: ==========================================================================
 Note: MAIN ENTRY POINTS
 Note: ============================================================================
 
+@Reasoning
+The function-level driver orchestrates the full SROA pipeline for a single
+CFG. The pipeline is staged so that each phase only consumes outputs of
+earlier phases, never the same pass's intermediate state.
+
+STAGE 1: DISCOVERY
+Walk every basic block, collecting every ALLOCA instruction. We use a single
+linear pass over the CFG and store the candidates in a list, deferring
+per-aggregate decisions to the next stage. Walking the CFG once amortizes
+the block-iteration cost across all aggregates.
+
+STAGE 2: PER-AGGREGATE DECISION
+For each candidate alloca: verify type is STRUCT_TYPE, run escape analysis,
+if not escaped analyze fields, collect field accesses, scalarize. Failing
+any of those leaves the alloca unchanged. The order is critical: escape
+analysis must run before scalarization because scalarization deletes the
+alloca, after which escape analysis cannot be re-run.
+
+STAGE 3: IR CLEANUP
+After all aggregates have been considered, the cleanup passes physically
+remove the dead LOAD_FIELD and STORE_FIELD instructions left behind by the
+rewrite phase. These run once over the function (not once per aggregate)
+because their cost is amortized across all scalarized accesses.
+
+STAGE 4: REPORTING AND TEARDOWN
+Statistics are printed for compiler diagnostics; the context (and all its
+sub-records) is freed.
+
+WHY blocks_processed IS INCREMENTED PER-BLOCK:
+We count blocks once per outer iteration. This is the metric reported in
+stats and corresponds to the number of basic blocks the discovery pass
+traversed. It serves as a sanity check that the pass walked the full CFG.
+
+Returns 1 on success.
+@End Reasoning
+
 @Implementation
 Main entry point for SROA optimization.
 
@@ -1544,6 +2041,13 @@ Algorithm:
 Returns 1 on success.
 @End Implementation
 
+@Performance_Hints
+Overall complexity is dominated by the per-allocation work: for each
+candidate allocation, escape analysis must touch every use. For functions
+with no aggregates, the pass degenerates to a single CFG walk plus cleanup
+pass invocations that find nothing; both are cheap and bound by block count.
+@End Performance_Hints
+
 Process called "optimize_function_with_sroa" that takes cfg_ptr as Integer returns Integer:
     If cfg_ptr is equal to 0:
         Return 0
@@ -1552,7 +2056,7 @@ Process called "optimize_function_with_sroa" that takes cfg_ptr as Integer retur
     Display "Starting scalar replacement optimization"
 
     Note: Create context
-    Let context_ptr be create_sroa_context(cfg_ptr)
+    Let context_ptr be proc create_sroa_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "Failed to create SROA context"
         Return 0
@@ -1560,7 +2064,7 @@ Process called "optimize_function_with_sroa" that takes cfg_ptr as Integer retur
 
     Note: Find all alloca instructions
     Let allocas be proc create from List
-    Let blocks be CFG.get_all_blocks(cfg_ptr)
+    Let blocks be proc get_all_blocks from CFG with cfg_ptr
     Let block_count be proc length from List with blocks
     Let block_idx be 0
 
@@ -1568,7 +2072,7 @@ Process called "optimize_function_with_sroa" that takes cfg_ptr as Integer retur
         Let block_ptr be proc get from List with blocks, block_idx
 
         If block_ptr is not equal to 0:
-            Let instructions be CFG.get_block_instructions(block_ptr)
+            Let instructions be proc get_block_instructions from CFG with block_ptr
             Let inst_count be proc length from List with instructions
             Let inst_idx be 0
 
@@ -1613,21 +2117,21 @@ Process called "optimize_function_with_sroa" that takes cfg_ptr as Integer retur
                     Set analyzed_count to analyzed_count plus 1
 
                     Note: Perform escape analysis
-                    Let escapes be perform_escape_analysis(alloca_ptr, context_ptr)
+                    Let escapes be proc perform_escape_analysis with alloca_ptr, context_ptr
 
                     Note: Analyze fields if doesn't escape
                     If escapes is equal to 0:
-                        Let agg_ptr be analyze_aggregate_fields(alloca_ptr, context_ptr)
+                        Let agg_ptr be proc analyze_aggregate_fields with alloca_ptr, context_ptr
                         If agg_ptr is not equal to 0:
                             Note: Store in aggregate map
                             Let alloca_value_id be proc memory_get_int64 from Layout with alloca_ptr, 8
                             proc set from Dictionary with aggregate_map, alloca_value_id, agg_ptr
 
                             Note: Collect field accesses
-                            Let access_count be collect_aggregate_accesses(alloca_ptr, context_ptr)
+                            Let access_count be proc collect_aggregate_accesses with alloca_ptr, context_ptr
 
                             Note: Perform scalarization
-                            Let success be scalarize_aggregate(alloca_ptr, context_ptr)
+                            Let success be proc scalarize_aggregate with alloca_ptr, context_ptr
                         End If
                     End If
                 End If
@@ -1642,20 +2146,36 @@ Process called "optimize_function_with_sroa" that takes cfg_ptr as Integer retur
 
     Note: Cleanup pass: eliminate dead loads and stores
     Display "Eliminating dead memory operations..."
-    eliminate_redundant_loads(context_ptr)
-    eliminate_dead_stores(context_ptr)
+    proc eliminate_redundant_loads with context_ptr
+    proc eliminate_dead_stores with context_ptr
 
     Note: Print statistics
     Display ""
-    print_sroa_stats(context_ptr)
+    proc print_sroa_stats with context_ptr
 
     Note: Cleanup
-    destroy_sroa_context(context_ptr)
+    proc destroy_sroa_context with context_ptr
     proc destroy from List with allocas
 
     Display "Scalar replacement optimization complete"
     Return 1
 End Process
+
+@Reasoning
+This is the pass-manager-facing entry point. The pass manager calls
+run_sroa_pass per function without knowing anything about SROA internals.
+This wrapper enforces the should_run_sroa policy gate and dispatches to
+the actual optimizer.
+
+WHY THE GATE LIVES HERE NOT INSIDE optimize_function_with_sroa:
+Keeping the policy decision in the wrapper means optimize_function_with_sroa
+can be called directly by tests and diagnostics without bypassing the gate,
+because tests are NOT going through run_sroa_pass. Conversely, the gate
+runs before the context is created, so we avoid the allocation cost when
+the pass is going to be skipped.
+
+Returns 1 on success.
+@End Reasoning
 
 @Implementation
 Wrapper for running SROA pass on entire program.
@@ -1669,13 +2189,14 @@ Process called "run_sroa_pass" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Check if pass should run
-    If should_run_sroa(cfg_ptr) is equal to 0:
+    Let should_run be proc should_run_sroa with cfg_ptr
+    If should_run is equal to 0:
         Display "Skipping SROA pass (not profitable)"
         Return 1
     End If
 
     Note: Run optimization
-    Let result be optimize_function_with_sroa(cfg_ptr)
+    Let result be proc optimize_function_with_sroa with cfg_ptr
     Return result
 End Process
 

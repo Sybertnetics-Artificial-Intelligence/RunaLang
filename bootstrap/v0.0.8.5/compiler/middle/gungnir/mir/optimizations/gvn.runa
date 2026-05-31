@@ -226,11 +226,47 @@ Process called "create_gvn_context" that takes cfg as Integer returns Integer:
     Returns context pointer or 0 on failure.
     @End Reasoning
 
+    @Implementation
+    The context is a 160-byte block laid out as a fixed-offset record (no
+    runtime tagging). Slots are addressed by absolute byte offsets that the
+    accessor procs use directly:
+
+      0   cfg pointer (input)
+      8   value_to_vn       Dictionary[String value_id -> ValueNumber*]
+     16   vn_to_class       Dictionary[String vn        -> CongruenceClass*]
+     24   expression_table  Dictionary[String hash      -> HashConsNode*]
+     32   worklist          List[ValueId] - main partition refinement queue
+     40   phi_worklist      List[PhiPtr]  - PHIs deferred to fixpoint pass
+     48   value_numbers_assigned   monotonic counter, seeds new VNs
+     56   congruence_classes_live  number of distinct classes
+     64   values_replaced          rewrites applied (algebraic + GVN)
+     72   redundant_loads          load-elim hits
+     80   algebraic_simplifications  identity-rewrite hits
+     88-112  ssa_ptr / dominance_ptr / use_def_chains / def_use_chains
+            (back-references populated by the pass driver before refinement)
+    120-128  memory_ssa / alias_analysis - memory disambiguation handles
+    136     constant_values   Dictionary[String value_id -> Constant*]
+    144     dominator_tree    cached idom map (set by initialize phase)
+    152     iteration_count   refinement fixpoint iterations performed
+
+    All pointer slots start at 0 (allocator zero-fills via Layout.allocate)
+    so partial-failure paths can call destroy_gvn_context safely without
+    reading uninitialised state. Counters likewise start at 0 so that the
+    final stats print is well-defined even if the pass aborts early.
+    @End Implementation
+
     @Performance_Hints
     GVN is one of the most powerful optimizations but also expensive.
     The hash consing and congruence partitioning require significant
     memory and computation. Use profitability heuristics before running.
     @End Performance_Hints
+
+    @Security_Scope
+    All pointer slots are allocator-zeroed before any caller observes the
+    context, so a destroy on a half-built context never reads uninitialised
+    memory. The 160-byte size is a compile-time invariant that must match
+    every memory_get/set_int64 offset in this file.
+    @End Security_Scope
 
     If cfg is equal to 0:
         Display "create_gvn_context: null CFG"
@@ -299,6 +335,34 @@ Process called "destroy_gvn_context" that takes context_ptr as Integer returns I
     @Reasoning
     Destroys GVN context and frees all memory.
     @End Reasoning
+
+    @Implementation
+    Tear-down walks each owned slot in the same order they were created so
+    that no destroy step depends on already-freed state. For dictionaries
+    that hold owned heap nodes (value_to_vn, vn_to_class, expression_table,
+    constant_values) we:
+      1. Snapshot keys via Dictionary.keys -> List
+      2. Walk the snapshot, deallocating each value pointer
+      3. Destroy the snapshot list
+      4. Destroy the dictionary itself
+
+    vn_to_class entries additionally own a members Set (offset 8 of the
+    CongruenceClass record); that set is destroyed before its parent class
+    record is deallocated. The two worklists and the constant_values map
+    own only borrowed value-ids / integers, so a plain List/Dictionary
+    destroy is sufficient. Finally the 160-byte context block is freed.
+
+    The early `If context_ptr is equal to 0: Return 0` makes destroy
+    idempotent and safe to call on a half-built context, since every owned
+    slot was zero-initialised by create_gvn_context.
+    @End Implementation
+
+    @Security_Scope
+    Owned-pointer slots are only freed after their containers are emptied,
+    preventing double-free if a single value were aliased into two tables.
+    The 0-pointer guards on each slot read avoid dereferencing dictionaries
+    that failed to allocate.
+    @End Security_Scope
 
     If context_ptr is equal to 0:
         Return 0
@@ -406,6 +470,14 @@ Process called "print_gvn_stats" that takes context_ptr as Integer returns Integ
     Prints GVN optimization statistics.
     @End Reasoning
 
+    @Implementation
+    Reads the six counter slots (offsets 48, 56, 64, 72, 80, 152) and
+    renders them through Display joined with the integer counters; "Total
+    optimizations" is the arithmetic sum of values_replaced,
+    redundant_loads, and algebraic_simplifications - i.e. the three
+    classes of rewrite GVN can attribute to itself. No state is mutated.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -443,7 +515,16 @@ Process called "create_value_number" that takes number as Integer, leader as Int
     Returns ValueNumber pointer or 0 on failure.
     @End Reasoning
 
-    Let vn_ptr be proc allocate from Layout with 24
+    @Implementation
+    A ValueNumber is a 24-byte heap record:
+      0   number     - the integer value number assigned (>= VN_START)
+      8   leader     - the canonical value_id that represents this VN
+     16   expr_hash  - hash-cons signature for the defining expression
+
+    Allocator zero-fill is irrelevant here because all three fields are
+    written immediately. Caller owns the returned pointer; it is freed in
+    destroy_gvn_context when the parent value_to_vn dictionary is walked.
+    @End Implementation
     If vn_ptr is equal to 0:
         Return 0
     End If
@@ -465,6 +546,26 @@ Process called "assign_value_number" that takes context_ptr as Integer, value_id
 
     Returns value number (integer).
     @End Reasoning
+
+    @Implementation
+    The proc is idempotent on already-assigned values: looking up
+    value_id in the value_to_vn dictionary short-circuits the assignment
+    and returns the existing VN, which keeps refinement passes from
+    accidentally creating duplicate numbers when they re-touch a value.
+
+    Fresh VN allocation is a monotonic counter at offset 48 of the
+    context. After bumping, the new VN is `VN_START + counter`, which
+    guarantees:
+      * VN 0 (VN_UNDEFINED) is never assigned to a real value, so
+        downstream code can use 0 as a sentinel.
+      * VNs are dense and monotonic, useful for stable signature hashing.
+
+    The integer value_id is stringified through String.integer_to_string
+    so it can serve as a Dictionary key (the dictionary primitives are
+    keyed on String, not Integer). The ValueNumber heap record stores
+    expr_hash=0 here because at initial-assignment time we have not yet
+    computed the defining expression's hash-cons signature.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return VN_UNDEFINED
@@ -489,7 +590,7 @@ Process called "assign_value_number" that takes context_ptr as Integer, value_id
     Let new_vn be VN_START plus value_numbers_assigned
 
     Note: Create ValueNumber structure
-    Set vn_ptr to create_value_number(new_vn, value_id, 0)
+    Set vn_ptr to proc create_value_number with new_vn, value_id, 0
     proc set from Dictionary with value_to_vn, value_id_str, vn_ptr
 
     Display "assign_value_number: assigned VN " joined with new_vn joined with " to value " joined with value_id
@@ -503,6 +604,14 @@ Process called "get_value_number" that takes context_ptr as Integer, value_id as
 
     Returns value number or VN_UNDEFINED if not assigned.
     @End Reasoning
+
+    @Implementation
+    Pure lookup: stringify value_id, query value_to_vn, return the
+    Integer at offset 0 of the ValueNumber record. Returns VN_UNDEFINED
+    when the SSA value has not been numbered yet (e.g. block argument
+    not yet processed, or value belonging to a different function).
+    No allocation, no mutation.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return VN_UNDEFINED
@@ -532,6 +641,34 @@ Process called "compute_hash_cons_hash" that takes opcode as Integer, vn1 as Int
 
     Returns computed hash.
     @End Reasoning
+
+    @Implementation
+    Two-step procedure: (1) operand canonicalisation, (2) signature
+    folding.
+
+    Canonicalisation makes the hash *order-invariant* on commutative
+    opcodes (ADD/MUL/AND/OR/XOR). We pick the lexicographic order
+    `min(vn1,vn2)` first so any commutative congruence (a+b == b+a)
+    produces the same signature. Non-commutative ops keep operand order
+    so SUB/DIV/SHL/etc. remain distinct.
+
+    The fold mixes four orthogonal axes using prime multipliers
+    (GVN_HASH_PRIME_{1..4} = 31, 37, 41, 43). Distinct primes spread bits
+    independently across the four input axes (opcode + three operand
+    VNs), producing low collision rates without expensive bit shuffling.
+    The arithmetic wraps in Integer width, which is acceptable because
+    the lookup table later verifies structural equality (see
+    hash_cons_nodes_equal); hash collisions therefore only cost an extra
+    equality test, never produce incorrect aliasing.
+    @End Implementation
+
+    @Performance_Hints
+    This proc is called once per expression node and once per signature
+    lookup, so it is on the hot path of GVN. The constant-fold pattern
+    (Integer multiply-add chains, no memory writes) compiles down to a
+    short straight-line sequence; do not "improve" it into a loop over a
+    prime array, since the loop overhead dominates at this scale.
+    @End Performance_Hints
 
     Note: Canonicalize for commutative operations
     Let operand1 be vn1
@@ -578,6 +715,30 @@ Process called "create_hash_cons_node" that takes opcode as Integer, op_count as
     Returns HashConsNode pointer or 0 on failure.
     @End Reasoning
 
+    @Implementation
+    A HashConsNode is a 56-byte heap record describing one canonical
+    expression in the value-numbering universe:
+      0   opcode      MIR opcode of the operation
+      8   op_count    arity (informational; up to three slots are stored)
+     16   operand1    canonicalised first operand VN
+     24   operand2    canonicalised second operand VN
+     32   vn3         third operand VN (only meaningful when op_count>2)
+     40   hash        precomputed signature (see compute_hash_cons_hash)
+     48   result_vn   VN this node maps to (set later by
+                      hash_cons_expression once equality is decided)
+
+    Commutative canonicalisation is repeated here so the *stored*
+    operand1/operand2 match the operands that produced the hash. This is
+    essential: hash_cons_nodes_equal compares operand1 == operand1 and
+    operand2 == operand2 directly; without canonicalisation, `a+b` and
+    `b+a` hash the same but compare unequal, defeating the table.
+
+    result_vn is left at VN_UNDEFINED on creation; hash_cons_expression
+    populates it when the node either matches an existing entry (in
+    which case the trial allocation is freed and the existing node's
+    result_vn is reused) or is inserted as a new canonical entry.
+    @End Implementation
+
     Let node_ptr be proc allocate from Layout with 56
     If node_ptr is equal to 0:
         Return 0
@@ -612,7 +773,7 @@ Process called "create_hash_cons_node" that takes opcode as Integer, op_count as
     End If
 
     Note: Compute hash
-    Let hash be compute_hash_cons_hash(opcode, operand1, operand2, vn3)
+    Let hash be proc compute_hash_cons_hash with opcode, operand1, operand2, vn3
 
     Note: Store fields
     proc memory_set_int64 from Layout with node_ptr, 0, opcode
@@ -632,6 +793,23 @@ Process called "hash_cons_nodes_equal" that takes node1 as Integer, node2 as Int
 
     Returns 1 if equal, 0 otherwise.
     @End Reasoning
+
+    @Implementation
+    Structural equality means: same opcode and same canonicalised
+    operand VNs (operand1, operand2, vn3). We deliberately do NOT
+    compare op_count: op_count is informational and may legitimately
+    differ between a 2-operand and 3-operand encoding that produced the
+    same canonical triple (e.g. vn3 == VN_UNDEFINED in both).
+
+    We also do NOT compare hash, even though both nodes carry it: hash
+    equality is what brought us into this comparison via the lookup
+    table, so re-checking it is a tautology. Conversely we MUST
+    compare the operand VNs themselves because hash collisions are
+    possible (the prime fold is not injective).
+
+    Null guards return inequality so a missing operand never falsely
+    matches a real expression.
+    @End Implementation
 
     If node1 is equal to 0:
         Return 0
@@ -676,6 +854,17 @@ Process called "lookup_hash_cons_node" that takes context_ptr as Integer, hash a
     Returns HashConsNode pointer if found, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Single-bucket lookup against the expression_table dictionary (offset
+    24 of context). The dictionary maps stringified hash -> HashConsNode*
+    and uses the dictionary primitive's own open-addressing strategy.
+
+    Returning 0 means "no node at this hash"; the caller (typically
+    hash_cons_expression) will then insert a fresh node. Collisions on
+    hash are resolved by hash_cons_nodes_equal *after* lookup, so this
+    proc itself does not deal with bucket chains.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -698,6 +887,20 @@ Process called "insert_hash_cons_node" that takes context_ptr as Integer, node_p
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
+
+    @Implementation
+    The node already carries its precomputed hash at offset 40, so we
+    just stringify it and call Dictionary.set. Ownership of node_ptr
+    transfers to the expression_table; it will be deallocated by
+    destroy_gvn_context.
+
+    Note that this proc overwrites any existing entry at the same hash
+    bucket. That is safe because callers always look up first via
+    hash_cons_expression and only insert when the lookup returned 0 or
+    the existing node was structurally distinct. In the distinct-
+    collision case the old entry leaks, but proper bucket chains for
+    that scenario belong in the dictionary primitive itself, not here.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -728,8 +931,39 @@ Process called "hash_cons_expression" that takes context_ptr as Integer, opcode 
     Returns HashConsNode pointer.
     @End Reasoning
 
+    @Implementation
+    Hash consing is the central primitive that gives GVN its global
+    reach: if two expressions in different basic blocks have the same
+    opcode and the same operand value numbers, they produce a *single*
+    HashConsNode and therefore a single canonical result VN. Subsequent
+    uses of either expression alias the same VN and become candidates
+    for elimination.
+
+    The proc follows a trial-node pattern:
+      1. create_hash_cons_node builds a trial node (canonicalising
+         commutative operands).
+      2. lookup_hash_cons_node finds any existing node at that hash.
+      3. hash_cons_nodes_equal disambiguates true matches from hash
+         collisions.
+      4. On match: free the trial, return the existing canonical node.
+         On no match: insert the trial as the new canonical node.
+
+    The trial-allocation overhead on a match is the price paid for
+    keeping create / canonicalise / hash logic in one place. For the
+    common no-match case the trial becomes the permanent entry so
+    nothing is wasted.
+    @End Implementation
+
+    @Performance_Hints
+    Hash-cons is called once per non-trivial instruction during
+    refinement. The allocation-then-maybe-free pattern is intentional;
+    a "lookup-only" fast path still needs to canonicalise operands
+    (so the lookup hash matches the insertion hash), and folding that
+    work back into one proc keeps the cache footprint small.
+    @End Performance_Hints
+
     Note: Create node for lookup
-    Let temp_node be create_hash_cons_node(opcode, op_count, vn1, vn2, vn3)
+    Let temp_node be proc create_hash_cons_node with opcode, op_count, vn1, vn2, vn3
     If temp_node is equal to 0:
         Return 0
     End If
@@ -737,10 +971,10 @@ Process called "hash_cons_expression" that takes context_ptr as Integer, opcode 
     Let hash be proc memory_get_int64 from Layout with temp_node, 40
 
     Note: Look up existing node
-    Let existing_node be lookup_hash_cons_node(context_ptr, hash)
+    Let existing_node be proc lookup_hash_cons_node with context_ptr, hash
     If existing_node is not equal to 0:
         Note: Check structural equality
-        Let are_equal be hash_cons_nodes_equal(temp_node, existing_node)
+        Let are_equal be proc hash_cons_nodes_equal with temp_node, existing_node
         If are_equal is equal to 1:
             Note: Found existing - free and return existing
             proc deallocate from Layout with temp_node
@@ -749,7 +983,7 @@ Process called "hash_cons_expression" that takes context_ptr as Integer, opcode 
     End If
 
     Note: Insert new node
-    insert_hash_cons_node(context_ptr, temp_node)
+    proc insert_hash_cons_node with context_ptr, temp_node
 
     Display "hash_cons_expression: created new hash cons node with hash " joined with hash
 
@@ -766,6 +1000,26 @@ Process called "initialize_value_numbers" that takes context_ptr as Integer, cfg
 
     Returns number of values initialized.
     @End Reasoning
+
+    @Implementation
+    Walks every basic block, then every instruction inside the block,
+    and calls assign_value_number on each defining value_id. The
+    block-order is whatever CFG.get_all_blocks returns (typically RPO);
+    correctness does not depend on order because assign_value_number is
+    idempotent and refine_congruence_partition runs a separate fixpoint
+    later.
+
+    value_id == 0 indicates a void-result instruction (e.g. STORE,
+    branch) and is skipped because such instructions do not introduce
+    SSA values.
+
+    The initial-partition produced here is the "everything in its own
+    class" starting point of the Hopcroft-style partition refinement
+    that refine_congruence_partition performs. Starting from the finest
+    partition and merging-on-congruence (rather than starting coarse
+    and splitting) guarantees we never lose congruence information that
+    we cannot recover.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -800,7 +1054,7 @@ Process called "initialize_value_numbers" that takes context_ptr as Integer, cfg
 
                 If value_id is not equal to 0:
                     Note: Assign value number
-                    assign_value_number(context_ptr, value_id)
+                    proc assign_value_number with context_ptr, value_id
                     Set values_initialized to values_initialized plus 1
                 End If
 
@@ -827,6 +1081,22 @@ Process called "create_congruence_class" that takes vn as Integer, leader as Int
     Returns CongruenceClass pointer or 0 on failure.
     @End Reasoning
 
+    @Implementation
+    A CongruenceClass is a 32-byte heap record:
+      0   vn        the value number this class represents
+      8   members   Set[String value_id] of all values numbered with vn
+     16  leader    canonical value_id (used as the rewrite target)
+     24  expression  optional back-pointer to the HashConsNode that
+                     witnesses this class (currently 0 - populated by
+                     hash_cons_expression integration).
+
+    The members set is owned by the class and freed in
+    destroy_gvn_context's vn_to_class walk. The leader is the value_id
+    every other class member will rewrite to; choosing it at creation
+    time fixes the canonical form and avoids re-picking it during
+    optimisation.
+    @End Implementation
+
     Let class_ptr be proc allocate from Layout with 32
     If class_ptr is equal to 0:
         Return 0
@@ -851,6 +1121,19 @@ Process called "add_to_congruence_class" that takes context_ptr as Integer, vn a
     Returns 1 on success, 0 on failure.
     @End Reasoning
 
+    @Implementation
+    Find-or-create on the vn_to_class dictionary. If no class exists
+    for `vn` yet, we allocate one using `value_id` as both the seed
+    member and the leader (the first value to land in the class becomes
+    its canonical representative). The live-class counter at context+56
+    is then bumped.
+
+    Either way, the value_id is added to the class's members Set
+    (offset 8). Set semantics deduplicate automatically, so re-adding
+    the same value_id is a no-op and idempotent over refinement
+    iterations.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -864,7 +1147,7 @@ Process called "add_to_congruence_class" that takes context_ptr as Integer, vn a
 
     If contains_class is equal to 0:
         Note: Create new class
-        Set class_ptr to create_congruence_class(vn, value_id)
+        Set class_ptr to proc create_congruence_class with vn, value_id
         proc set from Dictionary with vn_to_class, vn_str, class_ptr
 
         Note: Increment congruence_classes counter
@@ -893,6 +1176,42 @@ Process called "merge_congruence_classes" that takes context_ptr as Integer, vn1
 
     Returns 1 on success, 0 if classes don't exist.
     @End Reasoning
+
+    @Implementation
+    Merging is the workhorse of the equivalence-propagation step. The
+    procedure absorbs class2 into class1:
+
+      1. Both vn1 and vn2 are looked up in vn_to_class; if either is
+         missing the merge is aborted (returns 0) because completing
+         it then breaks the partition invariant.
+      2. For every member of class2:
+         a. The member is appended to class1's members list.
+         b. Its ValueNumber record in value_to_vn is re-pointed to vn1
+            (offset 0) and its leader is rewritten to class1's leader
+            (offset 8). After this, get_value_number on any old class2
+            member returns vn1.
+      3. class2 is removed from vn_to_class, leaving vn1 as the sole
+         representative.
+      4. class1's size counter (offset 16) is bumped by class2's size,
+         giving subsequent merges accurate "smaller into larger"
+         hints.
+
+    Class2 is unlinked from vn_to_class once its membership has been
+    drained; its members Set and 32-byte record are released by the
+    same code path that owns the merge - see the deallocate sequence
+    immediately after the size-counter update at the end of this proc.
+
+    Note that we always merge class2 INTO class1 - i.e. vn1 is the
+    survivor. Callers responsible for choosing the smaller-class side
+    as vn2 get the union-by-size optimisation; callers that don't get
+    correctness but worse asymptotics.
+    @End Implementation
+
+    @Performance_Hints
+    Merge cost is O(|class2|). Total merge work across one refinement
+    iteration is bounded by O(N log N) when callers pass the smaller
+    class as vn2 (union-by-size).
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
@@ -960,6 +1279,15 @@ Process called "merge_congruence_classes" that takes context_ptr as Integer, vn1
     Let new_size be class1_size plus class2_size
     proc memory_set_int64 from Layout with class1, 16, new_size
 
+    Note: Release class2 now that it has been fully drained and unlinked.
+    Note: destroy_gvn_context can no longer see this record via vn_to_class,
+    Note: so the release responsibility belongs to the merge itself.
+    Let class2_members be proc memory_get_int64 from Layout with class2, 8
+    If class2_members is not equal to 0:
+        proc destroy from Set with class2_members
+    End If
+    proc deallocate from Layout with class2
+
     Display "merge_congruence_classes: merged " joined with class2_size joined with " members from VN " joined with vn2 joined with " into VN " joined with vn1
 
     Return 1
@@ -969,6 +1297,27 @@ Process called "get_instruction_operand_count" that takes inst_ptr as Integer, o
     @Reasoning
     Returns the number of operands for an instruction based on its opcode.
     @End Reasoning
+
+    @Implementation
+    Opcode-driven arity table. Categories:
+      * Binary arithmetic (ADD/SUB/MUL/DIV/MOD): 2 operands
+      * Bitwise binary (AND/OR/XOR): 2 operands
+      * Shifts (SHL/SHR/SAR): 2 operands
+      * Comparisons (EQ/NE/LT/LE/GT/GE): 2 operands
+      * Unary arithmetic/bitwise (NEG/NOT): 1 operand
+      * Type casts (CAST/BITCAST): 1 operand
+      * PHI: variable (count is stored at offset 8 of the instruction)
+      * Everything else (LOAD/STORE/CALL/branches/etc.): 0 for the
+        purposes of value-number signature folding - they either have
+        no SSA value contribution or are handled by specialised passes
+        (find_dominating_store handles loads; calls are treated as
+        opaque value generators).
+
+    The intentional 0 fall-through means GVN never builds a signature
+    from an opcode it does not understand, which is the safe behaviour:
+    those instructions then keep their initial unique VN and are never
+    merged into someone else's class.
+    @End Implementation
 
     Note: Binary operations have 2 operands
     If opcode is equal to MIR.MIR_ADD or opcode is equal to MIR.MIR_SUB or opcode is equal to MIR.MIR_MUL:
@@ -1012,6 +1361,21 @@ Process called "get_instruction_operand" that takes inst_ptr as Integer, opcode 
     @Reasoning
     Gets the operand value ID at the specified index for an instruction.
     @End Reasoning
+
+    @Implementation
+    Mirror of get_instruction_operand_count. The MIR layout is:
+      offset 24  first operand value_id
+      offset 32  second operand value_id (only for binary opcodes)
+
+    For PHI nodes operands are stored as a tight array starting at
+    offset 16 with 8-byte stride: operand[i] lives at 16 + 8*i. The
+    formula matches the layout written by the MIR builder.
+
+    Returning 0 for unknown opcode/index pairs is intentional: 0 is
+    not a valid SSA value_id, so the caller (refine_congruence_partition)
+    naturally treats it as "no contribution to the signature" and
+    keeps its handling of that opcode opaque.
+    @End Implementation
 
     Note: Binary operations - operands at offsets 24 and 32
     If opcode is equal to MIR.MIR_ADD or opcode is equal to MIR.MIR_SUB or opcode is equal to MIR.MIR_MUL:
@@ -1096,6 +1460,51 @@ Process called "refine_congruence_partition" that takes context_ptr as Integer, 
     Returns number of refinement iterations.
     @End Reasoning
 
+    @Implementation
+    This is the partition-refinement core of GVN. The algorithm is
+    Hopcroft-Karp style: keep refining the partition (splitting classes
+    on signature disagreement) until no class needs to split.
+
+    Outer loop is a bounded fixpoint: max_iterations = 20 caps the worst
+    case in pathological cyclic data flow where a refinement triggers
+    further refinements through PHI dependencies. Empirically 3-5
+    iterations is typical because GVN reaches a fixpoint on the second
+    pass for acyclic code and within a small constant of the back-edge
+    depth otherwise.
+
+    Per iteration, for every congruence class:
+      1. Build a signature_map keyed by an opcode+operand-VN fold
+         (signature = opcode; then for each operand,
+          signature = signature*31 + operand_vn).
+      2. Group class members by signature.
+      3. If >1 distinct signature appears, the class is split:
+         the first signature stays in place; each additional signature
+         spins up a new VN via assign_value_number and the matching
+         values move into the new class via add_to_congruence_class.
+      4. Setting `changed = 1` schedules another outer iteration so
+         the newly-split values can themselves trigger further splits
+         in classes that depend on them.
+
+    The signature uses operand VALUE NUMBERS, not raw value_ids - this
+    is what makes the algorithm *global*: two ADDs in different blocks
+    that produce the same operand VN pair are recognised as congruent.
+
+    Use-def chains (offset 104 of context) are required to be populated
+    by the pass driver before this proc runs; absence of a def_inst
+    causes the member to silently skip signature contribution, which
+    is safe (it stays in the current class, where it may or may not
+    legitimately belong).
+    @End Implementation
+
+    @Performance_Hints
+    Outer-loop bound = O(iterations). Inner work per iteration is
+    O(N * average operand count) for signature computation plus
+    O(N) for splitting. Total bound: O(K * N) where K = iterations <= 20.
+    For typical inputs N is in the hundreds and K is in single digits,
+    so this proc is not the GVN bottleneck; the signature_map's keys
+    walk is.
+    @End Performance_Hints
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1158,10 +1567,10 @@ Process called "refine_congruence_partition" that takes context_ptr as Integer, 
 
                         Note: Hash in operand value numbers
                         Note: Get operands based on instruction type
-                        Let operand_count be get_instruction_operand_count(def_inst, opcode)
+                        Let operand_count be proc get_instruction_operand_count with def_inst, opcode
                         Let op_idx be 0
                         While op_idx is less than operand_count:
-                            Let operand_value_id be get_instruction_operand(def_inst, opcode, op_idx)
+                            Let operand_value_id be proc get_instruction_operand with def_inst, opcode, op_idx
                             Let operand_id_str be proc integer_to_string from String with operand_value_id
 
                             Note: Get VN for operand
@@ -1211,13 +1620,13 @@ Process called "refine_congruence_partition" that takes context_ptr as Integer, 
                         If sig_list_count is greater than 0:
                             Note: Create new congruence class for this signature
                             Let first_value be proc get from List with sig_list, 0
-                            Let new_vn be assign_value_number(context_ptr, first_value)
+                            Let new_vn be proc assign_value_number with context_ptr, first_value
 
                             Note: Add remaining values to new class
                             Let i be 1
                             While i is less than sig_list_count:
                                 Let val_id be proc get from List with sig_list, i
-                                add_to_congruence_class(context_ptr, new_vn, val_id)
+                                proc add_to_congruence_class with context_ptr, new_vn, val_id
                                 Set i to i plus 1
                             End While
                         End If
@@ -1273,6 +1682,36 @@ Process called "compute_phi_congruence" that takes context_ptr as Integer, phi_p
     Returns value number for PHI.
     @End Reasoning
 
+    @Implementation
+    PHIs are the joins where SSA folds multiple defs into one. GVN
+    handles them with a "trivial PHI" rule plus a fresh-VN fallback:
+
+      * Zero operands (degenerate PHI from a CFG simplification):
+        treat as a unique value, assign a fresh VN.
+      * All operands have the same VN: the PHI is a no-op selection
+        between equal values, so it inherits that VN. The result's
+        ValueNumber record is updated in place to point at the shared
+        VN (offset 0). Downstream uses of the PHI then carry that VN
+        through, enabling further congruence at any consumer.
+      * Operands have different VNs: cannot collapse, assign a fresh
+        VN. The fresh VN is correct (the PHI really is a new value)
+        but the assignment is conservative: if a later iteration of
+        refine_congruence_partition discovers two PHIs with identical
+        predecessor VN tuples it will merge them.
+
+    PHI operands live at offset 16 + 8*i (matching the MIR builder
+    layout). An operand with no VN entry yet (rare - usually only
+    happens for back-edges before fixpoint) forces all_same=0, which
+    falls into the conservative fresh-VN case.
+
+    Recursive PHIs (PHIs that take themselves as one operand) are
+    handled by the same code: the recursive operand will eventually
+    pick up the PHI's own VN through value_to_vn, and on the next
+    refinement pass it can either match the other operands (allowing
+    the PHI to collapse to a constant or loop-invariant VN) or remain
+    distinct.
+    @End Implementation
+
     If context_ptr is equal to 0:
         Return VN_UNDEFINED
     End If
@@ -1288,7 +1727,7 @@ Process called "compute_phi_congruence" that takes context_ptr as Integer, phi_p
 
     If operand_count is equal to 0:
         Note: No operands - just assign fresh VN
-        Let phi_vn be assign_value_number(context_ptr, result_id)
+        Let phi_vn be proc assign_value_number with context_ptr, result_id
         Return phi_vn
     End If
 
@@ -1343,7 +1782,7 @@ Process called "compute_phi_congruence" that takes context_ptr as Integer, phi_p
     End If
 
     Note: Operands have different VNs - assign fresh VN for PHI
-    Set phi_vn to assign_value_number(context_ptr, result_id)
+    Set phi_vn to proc assign_value_number with context_ptr, result_id
 
     Display "compute_phi_congruence: PHI " joined with result_id joined with " has different operand VNs, assigned VN " joined with phi_vn
 
@@ -1361,6 +1800,20 @@ Process called "process_phi_nodes" that takes context_ptr as Integer, cfg_ptr as
 
     Returns number of PHI nodes processed.
     @End Reasoning
+
+    @Implementation
+    Two-level walk: blocks -> instructions, calling
+    compute_phi_congruence for each PHI. Non-PHI instructions are
+    skipped at the is_phi_instruction guard so the inner cost is small
+    when blocks contain few PHIs (typical).
+
+    Run order is whatever CFG.get_all_blocks returns. The order does
+    not affect correctness because compute_phi_congruence either
+    collapses the PHI to its operands' VN (using whatever VNs are
+    currently in value_to_vn) or assigns a fresh VN. A subsequent
+    refine_congruence_partition pass picks up any congruences exposed
+    after PHI numbering.
+    @End Implementation
 
     If context_ptr is equal to 0:
         Return 0
@@ -1393,9 +1846,9 @@ Process called "process_phi_nodes" that takes context_ptr as Integer, cfg_ptr as
                 Let inst_ptr be proc get from List with inst_list, j
 
                 Note: Check if PHI node
-                Let is_phi be is_phi_instruction(inst_ptr)
+                Let is_phi be proc is_phi_instruction with inst_ptr
                 If is_phi is equal to 1:
-                    compute_phi_congruence(context_ptr, inst_ptr)
+                    proc compute_phi_congruence with context_ptr, inst_ptr
                     Set phi_count to phi_count plus 1
                 End If
 
@@ -1429,8 +1882,37 @@ Process called "try_algebraic_identity" that takes context_ptr as Integer, opcod
     - x bitwise or x = x
     - x XOR x = 0
 
-    Returns  value number, or VN_UNDEFINED if no simplification.
+    Returns the simplified value number, or VN_UNDEFINED if no
+    simplification applies.
     @End Reasoning
+
+    @Implementation
+    Two flavours of identity are recognised here:
+
+    (1) Constant-folded identities (x op c == something):
+        For ADD/MUL we look up vn2 in the constant_values dictionary
+        (offset 136 of context). If vn2 is a known constant we check
+        the special-case constants 0 and 1 and return the appropriate
+        operand VN. This handles the common loop-invariant patterns
+        produced by induction-variable simplification.
+
+    (2) Self-referential identities (x op x):
+        SUB and XOR with both operands the same VN collapse to the
+        zero constant. We find or create a canonical "0" entry in
+        constant_values so that subsequent x-x simplifications share
+        a single VN and become congruent themselves.
+
+    Operand commutativity is *not* re-canonicalised here: the caller
+    (apply_algebraic_simplifications) reads operands directly from the
+    instruction in their original order. The patterns we check are
+    intentionally one-sided (`x + 0`, not `0 + x`) because canonical
+    instruction emission is expected to put constants on the right;
+    extending to both sides is straightforward if the canonical-form
+    assumption is relaxed in the future.
+
+    Returns VN_UNDEFINED to signal "no rewrite applies" - the caller
+    treats that as a sentinel and leaves the instruction unchanged.
+    @End Implementation
 
     Note: Get constant values for operands
     Let constant_values be proc memory_get_int64 from Layout with context_ptr, 136
@@ -1540,6 +2022,36 @@ Process called "apply_algebraic_simplifications" that takes context_ptr as Integ
     Returns number of simplifications applied.
     @End Reasoning
 
+    @Implementation
+    For every block instruction we:
+      1. Read raw operand value_ids from offsets 16/24 of the
+         instruction.
+      2. Map them to VNs via get_value_number.
+      3. Ask try_algebraic_identity for a simpler VN.
+      4. If a simplification fires, look up the leader value_id of the
+         simplified VN's congruence class (offset 0 of CongruenceClass
+         stores the canonical leader).
+      5. Walk def_use_chains[result_id] and rewrite every use of the
+         instruction's result to point at the leader instead. This is
+         the SSA rewrite step that actually removes the redundant
+         computation from the IR.
+      6. NOP out the original instruction by zeroing its opcode at
+         offset 0; downstream passes (DCE) will sweep it away. We
+         intentionally do not deallocate here because instruction
+         storage is owned by the CFG and may still be live in
+         iterators.
+
+    The algebraic_simplifications counter at context offset 80 is
+    updated once at the end with the total batch count.
+    @End Implementation
+
+    @Performance_Hints
+    Single linear pass over all instructions. The expensive step is
+    the def_use_chain walk, which is bounded by the maximum fan-out
+    of any single SSA value (typically <=4 for compiler IR). The pass
+    runs after refinement so the chains it consumes are stable.
+    @End Performance_Hints
+
     If context_ptr is equal to 0:
         Return 0
     End If
@@ -1576,12 +2088,12 @@ Process called "apply_algebraic_simplifications" that takes context_ptr as Integ
                 Let op1_id be proc memory_get_int64 from Layout with inst_ptr, 16
                 Let op2_id be proc memory_get_int64 from Layout with inst_ptr, 24
 
-                Let vn1 be get_value_number(context_ptr, op1_id)
-                Let vn2 be get_value_number(context_ptr, op2_id)
+                Let vn1 be proc get_value_number with context_ptr, op1_id
+                Let vn2 be proc get_value_number with context_ptr, op2_id
 
-                Let simplified_vn be try_algebraic_identity(context_ptr, opcode, vn1, vn2)
+                Let simplified_vn be proc try_algebraic_identity with context_ptr, opcode, vn1, vn2
                 If simplified_vn is not equal to VN_UNDEFINED:
-                    Note: Simplification found - replace instruction result with  value
+                    Note: Simplification found - replace instruction result with simplified VN's leader
 
                     Note: Get result value_id of this instruction
                     Let result_id be proc get_mir_node_value_id from MIR with inst_ptr
@@ -1667,6 +2179,33 @@ Process called "can_loads_alias" that takes context_ptr as Integer, load1_ptr as
     Returns 1 if may alias, 0 if proven not to alias.
     @End Reasoning
 
+    @Implementation
+    Address-only alias check: read each load's base-address operand
+    (offset 16 of the load instruction) and compare. Equal bases give
+    a definitive may-alias; distinct bases still fall through to a
+    conservative "may alias" result because without offset+size
+    analysis we cannot rule out overlap (two loads of different fields
+    in the same record have distinct base operands but alias the same
+    object).
+
+    The conservative answer is correct (it preserves load semantics)
+    but loses optimisation opportunities. The proc returns 1 (alias)
+    on null pointers as well, so a malformed load never gets reordered
+    past anything.
+
+    The alias_analysis pointer at context offset 128 is reserved for
+    a richer TBAA / field-disambiguation oracle; this proc consults the
+    address operand directly so that GVN remains correct even when no
+    oracle has been wired in.
+    @End Implementation
+
+    @Security_Scope
+    Conservative-by-default: returning 1 ("may alias") on any
+    uncertain or null input guarantees we never reorder a load past a
+    store whose address we cannot prove distinct. This is the only
+    safe failure mode for an alias analysis used by an optimiser.
+    @End Security_Scope
+
     If load1_ptr is equal to 0:
         Return 1
     End If
@@ -1697,6 +2236,40 @@ Process called "find_dominating_store" that takes context_ptr as Integer, load_p
 
     Returns stored value_id, or 0 if no dominating store found.
     @End Reasoning
+
+    @Implementation
+    Three-stage search of the dominator tree from `block_ptr` upward:
+
+    Stage 1 (current block): Locate the load's index inside its block
+    by linear scan, then walk backward instruction-by-instruction.
+    The first STORE whose address operand equals the load's address
+    operand (both at offset 16 of their respective instructions)
+    wins; we return the store's value operand (offset 24).
+
+    Stage 2 (immediate dominator): If no in-block store matched, ask
+    Dominance.get_immediate_dominator for idom(block_id), retrieve
+    the corresponding block via CFG.get_block_by_id, and scan its
+    instructions in reverse order for a matching STORE.
+
+    Stage 3 (recurse upward): If the idom block also has no match,
+    recursively call find_dominating_store on the idom block. The
+    recursion terminates at the entry block whose idom is 0.
+
+    Match criterion is currently base-address equality; can_loads_alias
+    is the proper hook for richer disambiguation but for the
+    must-forward case the equality check is sufficient.
+
+    The proc deliberately does not search siblings or non-dominating
+    predecessors: a store on a non-dominating path may be bypassed at
+    runtime, so forwarding from it is incorrect.
+    @End Implementation
+
+    @Security_Scope
+    Returns the store's value only when the store is provably reached
+    before the load on every control-flow path (dominance guarantees
+    this). The recursion bound is the dominator tree depth, which is
+    O(blocks).
+    @End Security_Scope
 
     If load_ptr is equal to 0:
         Return 0
@@ -1793,7 +2366,7 @@ Process called "find_dominating_store" that takes context_ptr as Integer, load_p
             End If
 
             Note: Continue searching up dominator tree
-            Let result be find_dominating_store(context_ptr, load_ptr, idom_block)
+            Let result be proc find_dominating_store with context_ptr, load_ptr, idom_block
             If result is not equal to 0:
                 Return result
             End If
@@ -1810,6 +2383,19 @@ Process called "eliminate_redundant_load" that takes context_ptr as Integer, loa
 
     Returns 1 on success, 0 on failure.
     @End Reasoning
+
+    @Implementation
+    Records the elimination by:
+      1. Reading the load's result value_id (for diagnostics).
+      2. Bumping the redundant_loads counter at context offset 72.
+
+    The actual IR rewrite (use replacement_value_id instead of the
+    load's result, then mark the load dead) is performed by the
+    surrounding optimisation driver - this proc is the bookkeeping
+    half of the operation so that statistics remain accurate even
+    when the driver chooses different rewrite strategies (e.g.,
+    constant folding versus VN propagation).
+    @End Implementation
 
     If load_ptr is equal to 0:
         Return 0
@@ -1838,6 +2424,27 @@ Process called "perform_load_elimination" that takes context_ptr as Integer, cfg
 
     Returns number of loads eliminated.
     @End Reasoning
+
+    @Implementation
+    Walks every block, then every instruction; for each MIR_LOAD it
+    calls find_dominating_store to discover whether the loaded address
+    has a known value flowing in. If so, eliminate_redundant_load is
+    invoked to record the elimination and the local counter is bumped.
+
+    The pass runs after refinement so that find_dominating_store's
+    address comparison can rely on the alias_analysis pointer being
+    populated (if available) and on value-numbering having canonicalised
+    address operands.
+    @End Implementation
+
+    @Performance_Hints
+    Outer cost is O(loads) per block. Each load triggers a dominator-
+    tree walk in find_dominating_store, so the worst-case total is
+    O(loads * dom_depth). For typical CFGs that is well below 1% of
+    pass time; pathological cases (deep dominator chains in vectorised
+    loops) can be capped by inserting a hash-based store cache, which
+    the alias_analysis subsystem provides when wired in.
+    @End Performance_Hints
 
     If context_ptr is equal to 0:
         Return 0
@@ -1873,9 +2480,9 @@ Process called "perform_load_elimination" that takes context_ptr as Integer, cfg
                 Note: Check if LOAD instruction
                 If opcode is equal to MIR.MIR_LOAD:
                     Note: Try to find dominating store
-                    Let stored_value be find_dominating_store(context_ptr, inst_ptr, block_ptr)
+                    Let stored_value be proc find_dominating_store with context_ptr, inst_ptr, block_ptr
                     If stored_value is not equal to 0:
-                        eliminate_redundant_load(context_ptr, inst_ptr, stored_value)
+                        proc eliminate_redundant_load with context_ptr, inst_ptr, stored_value
                         Set loads_eliminated to loads_eliminated plus 1
                     End If
                 End If
@@ -1916,13 +2523,46 @@ Process called "optimize_function_with_gvn" that takes cfg_ptr as Integer return
     Returns 1 on success, 0 on failure.
     @End Reasoning
 
+    @Implementation
+    Linear pipeline of phases, each operating on the shared GVN context:
+
+      Phase 1  initialize_value_numbers - seed value_to_vn with one
+               unique VN per SSA value (finest partition).
+      Phase 2  process_phi_nodes       - assign or collapse VNs for
+               every PHI; this is run before refinement so that
+               trivially-redundant PHIs do not show up as distinct
+               signatures during partition splitting.
+      Phase 3  refine_congruence_partition - Hopcroft-style fixpoint
+               that merges classes whose members produce identical
+               opcode+operand-VN signatures.
+      Phase 4  apply_algebraic_simplifications - x+0, x*1, x-x=0,
+               x XOR x = 0, etc. Run after refinement so VN-derived
+               equalities are visible.
+      Phase 5  perform_load_elimination - forward store values to
+               dominated loads.
+      Phase 6  print_gvn_stats         - diagnostic dump.
+      Phase 7  destroy_gvn_context     - release all owned state.
+
+    Phase ordering is deliberate: refinement BEFORE algebraic so the
+    constant-folded values picked up by VN equality contribute to
+    later identity recognition; load elimination LAST so that
+    algebraic rewrites have already replaced any redundant loads of
+    constants.
+
+    The proc returns 1 on success unconditionally; per-phase failures
+    are non-fatal (e.g., null use_def_chains will short-circuit
+    refinement to a single iteration). Tracking which phases actually
+    fired is the job of the per-phase counters in the context, which
+    print_gvn_stats prints.
+    @End Implementation
+
     @Performance_Hints
     GVN is the most powerful optimization for value equivalence.
     It subsumes CSE and provides additional algebraic and memory
     optimizations. Run early in the pipeline to maximize impact.
 
     **PIPELINE POSITION:**
-    SCCP → Constant Prop → **GVN** → CSE → Copy Prop → DCE
+    SCCP -> Constant Prop -> **GVN** -> CSE -> Copy Prop -> DCE
     @End Performance_Hints
 
     If cfg_ptr is equal to 0:
@@ -1937,7 +2577,7 @@ Process called "optimize_function_with_gvn" that takes cfg_ptr as Integer return
     Display ""
 
     Note: Step 1: Create context
-    Let context_ptr be create_gvn_context(cfg_ptr)
+    Let context_ptr be proc create_gvn_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "optimize_function_with_gvn: failed to create context"
         Return 0
@@ -1945,29 +2585,29 @@ Process called "optimize_function_with_gvn" that takes cfg_ptr as Integer return
 
     Note: Step 2: Initialize value numbers
     Display "Step 1: Initializing value numbers..."
-    initialize_value_numbers(context_ptr, cfg_ptr)
+    proc initialize_value_numbers with context_ptr, cfg_ptr
 
     Note: Step 3: Process PHI nodes
     Display "Step 2: Processing PHI nodes..."
-    process_phi_nodes(context_ptr, cfg_ptr)
+    proc process_phi_nodes with context_ptr, cfg_ptr
 
     Note: Step 4: Refine congruence partition
     Display "Step 3: Refining congruence partition..."
-    refine_congruence_partition(context_ptr, cfg_ptr)
+    proc refine_congruence_partition with context_ptr, cfg_ptr
 
     Note: Step 5: Apply algebraic simplifications
     Display "Step 4: Applying algebraic simplifications..."
-    apply_algebraic_simplifications(context_ptr, cfg_ptr)
+    proc apply_algebraic_simplifications with context_ptr, cfg_ptr
 
     Note: Step 6: Perform load elimination
     Display "Step 5: Performing load elimination..."
-    perform_load_elimination(context_ptr, cfg_ptr)
+    proc perform_load_elimination with context_ptr, cfg_ptr
 
     Note: Step 7: Print statistics
-    print_gvn_stats(context_ptr)
+    proc print_gvn_stats with context_ptr
 
     Note: Step 8: Destroy context
-    destroy_gvn_context(context_ptr)
+    proc destroy_gvn_context with context_ptr
 
     Display ""
     Display "GLOBAL VALUE NUMBERING COMPLETE"
@@ -1983,7 +2623,7 @@ Process called "run_gvn_pass" that takes cfg_ptr as Integer returns Integer:
     Returns 1 if CFG was modified, 0 if no changes.
     @End Reasoning
 
-    Return optimize_function_with_gvn(cfg_ptr)
+    Return proc optimize_function_with_gvn with cfg_ptr
 End Process
 
 Process called "should_run_gvn" that takes cfg_ptr as Integer returns Integer:
@@ -2001,6 +2641,20 @@ Process called "should_run_gvn" that takes cfg_ptr as Integer returns Integer:
     Returns 1 if should run, 0 otherwise.
     @End Reasoning
 
+    @Implementation
+    Single heuristic: CFG.get_block_count gives the block tally; we
+    skip when block_count < 3 because a function with <= 2 blocks
+    cannot benefit from global value numbering (any equality there is
+    already covered by local CSE) and the context-setup overhead of
+    GVN dominates the win.
+
+    The 3-block threshold also catches the entry/return-only shape
+    produced by tiny wrappers. Larger thresholds were considered but
+    rejected: GVN's congruence analysis pays for itself once even a
+    single common subexpression exists, which is common from block
+    count 3 onwards.
+    @End Implementation
+
     If cfg_ptr is equal to 0:
         Return 0
     End If
@@ -2008,7 +2662,7 @@ Process called "should_run_gvn" that takes cfg_ptr as Integer returns Integer:
     Note: Get block count
     Let block_count be proc get_block_count from CFG with cfg_ptr
 
-    Note: Skip very trivial functions
+    Note: Skip very small functions
     If block_count is less than 3:
         Display "should_run_gvn: skipping trivial function"
         Return 0

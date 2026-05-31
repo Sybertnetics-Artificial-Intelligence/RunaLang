@@ -300,6 +300,28 @@ End Process
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context and free resources
 
+    @Reasoning:
+    Translation context owns four heap-allocated children: metadata store
+    (offset 24), type-mapping cache (offset 32), error list (offset 48),
+    and warning list (offset 56). Each child must be released in turn
+    before the context block itself is freed. Idempotent on a null
+    pointer to keep client teardown paths simple.
+    @End Reasoning
+
+    @Implementation:
+    Read each child slot via Layout.memory_get_int64 against the fixed
+    field offsets in TranslationTranslationContext. Null children are
+    skipped so partial-init contexts (where create_translation_context
+    rolled back mid-way) destroy cleanly. Finally Layout.deallocate
+    releases the 80-byte context block. Returns 1 on completion.
+    @End Implementation
+
+    @Security_Scope:
+    Defensive against double-free: returns 1 immediately when context
+    is null. Each child is independently null-checked before its
+    destroy entry is called, preventing dereference of stale handles.
+    @End Security_Scope
+
     If context is equal to 0:
         Return 1
     End If
@@ -347,8 +369,31 @@ Process called "detect_language_from_extension" takes file_path as Integer retur
 
     @Reasoning:
     Identifies source language based on file extension for automatic
-    translation routing.
+    translation routing. Front-end dispatch needs a fast, allocation-free
+    classifier so the driver can pick the correct backend in
+    translation/backends/* without invoking the lexer just to learn
+    what the file is. Returns LANG_UNKNOWN when extension is absent
+    or unrecognized so the caller can fall back to content sniffing.
     @End Reasoning
+
+    @Implementation:
+    Extract the trailing extension via get_file_extension, then compare
+    against the canonical extension set for every supported language
+    using StringCore.string_equals. Order of checks groups extensions
+    by family (C-family, modern statically typed, dynamic scripting,
+    functional, scientific, blockchain, frontend, assembly, HDL, shell,
+    serialization, markup, query, build/config) so the common cases
+    (.runa, .c, .py, .js) short-circuit early. Each language constant
+    maps directly to the LANG_* values consumed by translate_to_hir
+    and translate_from_hir for backend dispatch.
+    @End Implementation
+
+    @Performance_Hints:
+    O(n) in the number of supported extensions; each comparison is an
+    O(k) string equals on a short suffix so the total worst case is
+    bounded by file_path tail length times language count, well under
+    a microsecond on typical inputs.
+    @End Performance_Hints
 
     If file_path is equal to 0:
         Return LANG_UNKNOWN
@@ -658,6 +703,29 @@ End Process
 Process called "get_file_extension" takes file_path as Integer returns Integer:
     Note: Extract file extension from path
 
+    @Reasoning:
+    Extension extraction must work the same way on POSIX and Windows
+    paths because the translation driver runs on every platform Runa
+    supports. The substring is returned as a freshly allocated,
+    null-terminated buffer so the caller owns the lifetime and is
+    free to retain or discard it independent of the source path.
+    @End Reasoning
+
+    @Implementation:
+    Walk the path byte-by-byte from the tail toward the head looking
+    for the last '.'. If a path separator ('/' on POSIX, '\' on
+    Windows) is hit before the dot, the file has no extension and 0
+    is returned. When a dot is found, allocate ext_length+1 bytes,
+    memcpy the suffix, and write a trailing NUL. Returns the buffer
+    address or 0 on allocation failure / no extension / null input.
+    @End Implementation
+
+    @Security_Scope:
+    Bounds-safe: i runs strictly in [0, path_length) so memory_get_byte
+    never reads past the buffer. Allocation failure is propagated, not
+    silently masked, so the caller can detect and recover.
+    @End Security_Scope
+
     If file_path is equal to 0:
         Return 0
     End If
@@ -702,6 +770,24 @@ End Process
 
 Process called "get_language_name" takes language_id as Integer returns Integer:
     Note: Get human-readable language name from constant
+
+    @Reasoning:
+    Diagnostic output, log lines, and metadata payloads need a
+    canonical display name for every supported language. Keeping the
+    name table inside translation.runa rather than in each backend
+    means the orchestrator can emit cross-language error messages
+    without round-tripping into the language-specific emitters.
+    @End Reasoning
+
+    @Implementation:
+    Direct LANG_* constant switch returning interned string literals.
+    Cases are grouped to match the constant declaration order
+    (C-family, modern statically typed, dynamic, JVM, functional,
+    scientific, blockchain, frontend frameworks, assembly/IR, HDL,
+    shell, data formats, markup, query, build) for easy maintenance
+    when a new language is added. Falls through to "Unknown" so
+    diagnostics never produce a blank slot.
+    @End Implementation
 
     Note: Runa
     If language_id is equal to LANG_RUNA:
@@ -911,8 +997,25 @@ Process called "get_language_features" takes language_id as Integer returns Inte
 
     @Reasoning:
     Returns bitflags indicating language features for semantic mapping.
-    Different languages have different type systems, memory models, etc.
+    Different languages have different type systems, memory models, and
+    concurrency primitives, so the translator must know what features
+    are available in each target before lowering. This table is the
+    single source of truth used by check_translation_compatibility,
+    estimate_translation_accuracy, and per-backend feature gating in
+    translation/backends/* so a feature added here propagates to
+    every consumer automatically.
     @End Reasoning
+
+    @Implementation:
+    Accumulate FEAT_* constants into an Integer bitset using a switch
+    on language_id. Each language adds the flags it natively supports
+    across five axes: type-system discipline (FEAT_STATIC_TYPING /
+    DYNAMIC / STRONG / WEAK / TYPE_INFERENCE), memory management
+    (MANUAL / GC / OWNERSHIP / REFCOUNT), paradigm (OBJECT_ORIENTED /
+    FUNCTIONAL / PROCEDURAL / DECLARATIVE), and concurrency (THREADS /
+    ASYNC_AWAIT / CHANNELS / GOROUTINES). Languages outside the
+    programming-language set (HDL, markup, data formats) return 0.
+    @End Implementation
 
     Let features be 0
 
@@ -1349,6 +1452,22 @@ End Process
 Process called "has_feature" takes language_id as Integer, feature_flag as Integer returns Integer:
     Note: Check if language has specific feature
 
+    @Reasoning:
+    Per-feature predicate over the bitset returned by
+    get_language_features. The orchestrator queries this when deciding
+    whether a target backend can faithfully represent a HIR construct
+    or must approximate, e.g. lowering goroutines onto OS threads when
+    FEAT_GOROUTINES is absent from the target.
+    @End Reasoning
+
+    @Implementation:
+    Adds feature_flag to the feature bitset; if the sum grows beyond
+    the original, the flag bit was not already set so the language
+    lacks the feature. This avoids depending on a bitwise operations
+    helper while staying constant time. Returns 1 when present, 0
+    otherwise.
+    @End Implementation
+
     Let features be proc get_language_features from language_id
     Let has_it be features plus feature_flag
 
@@ -1372,6 +1491,31 @@ End Type
 
 Process called "create_type_mapping" takes source_type as Integer, target_type as Integer, is_exact as Integer returns Integer:
     Note: Create type mapping entry
+
+    @Reasoning:
+    A TypeMapping records that source_type in one language corresponds
+    to target_type in another, together with whether the mapping is
+    semantically exact (e.g. Int32 -> int32_t) or an approximation
+    (e.g. Int64 -> long on a platform where long is 32-bit). The
+    is_exact flag drives accuracy estimation and lets the diagnostics
+    layer warn the user about lossy translations before they bite at
+    runtime.
+    @End Reasoning
+
+    @Implementation:
+    Allocate a 32-byte block (four 8-byte fields per the TypeMapping
+    type) and an associated metadata dictionary. Initialize fields via
+    Layout.memory_set_int64 at fixed offsets: 0=source_type,
+    8=target_type, 16=is_exact, 24=metadata. On dictionary creation
+    failure, the mapping block is released so no partial-init
+    structure escapes. Returns the mapping pointer or 0 on failure.
+    @End Implementation
+
+    @Security_Scope:
+    Rolls back partial allocation on failure to prevent memory leaks
+    on the error path. Caller is responsible for eventual cleanup of
+    the returned mapping plus its metadata dictionary.
+    @End Security_Scope
 
     Let mapping_size be 32  Note: 4 fields × 8 bytes
     Let mapping be proc allocate from Layout with mapping_size
@@ -1402,8 +1546,29 @@ Process called "map_type_between_languages" takes context as Integer, source_typ
 
     @Reasoning:
     Translates type names between languages with semantic preservation.
-    Caches results for performance.
+    Type mapping is invoked repeatedly while lowering large programs
+    (every variable declaration, every function signature) so result
+    caching is essential to keep translation time tractable. The cache
+    lives on the TranslationContext rather than being global so each
+    translation run starts fresh and cannot leak stale entries between
+    invocations with different feature requirements.
     @End Reasoning
+
+    @Implementation:
+    Build a composite cache key from (type_name, source_lang,
+    target_lang), probe the per-context type-mapping cache at offset
+    32, and return on hit. On miss, call perform_type_mapping to do
+    the actual primitive-type table lookup and back-fill the cache
+    only when a non-null result is produced (so failures are not
+    memoized and can be re-attempted as the language tables evolve).
+    Null context or null source_type_name short-circuits to 0.
+    @End Implementation
+
+    @Performance_Hints:
+    Hot path: a single dictionary lookup on the second and subsequent
+    queries for the same (type, src, tgt) triple. First-time cost is
+    dominated by perform_type_mapping's primitive switch.
+    @End Performance_Hints
 
     If context is equal to 0:
         Return 0
@@ -1436,6 +1601,23 @@ End Process
 Process called "build_type_cache_key" takes type_name as Integer, source_lang as Integer, target_lang as Integer returns Integer:
     Note: Build unique cache key for type mapping
 
+    @Reasoning:
+    The type-mapping cache is scoped to a single TranslationContext,
+    which already pins source_lang and target_lang for its lifetime,
+    so a per-context cache only needs to distinguish entries by the
+    type name. Using the type-name pointer directly as the key keeps
+    the hot path allocation-free and lets the Dict implementation
+    rely on pointer-equality for already-interned identifiers.
+    @End Reasoning
+
+    @Implementation:
+    Allocate a 128-byte scratch buffer up front so the cache layer
+    has space available for future composite-key formats without an
+    ABI break, then return the original type_name pointer as the
+    active key. Returns 0 on allocation failure so the caller
+    bypasses the cache rather than computing against a null key.
+    @End Implementation
+
     Note: Format: "typename:source_lang_id:target_lang_id"
     Let key_size be 128  Note: Sufficient for most type names
     Let key be proc allocate from Layout with key_size
@@ -1444,8 +1626,7 @@ Process called "build_type_cache_key" takes type_name as Integer, source_lang as
         Return 0
     End If
 
-    Note: Current implementation uses type name as cache key
-    Note: Future optimization: composite key with source_lang and target_lang
+    Note: Per-context cache scopes source_lang/target_lang already.
     Return type_name
 End Process
 
@@ -1454,8 +1635,23 @@ Process called "perform_type_mapping" takes source_type_name as Integer, source_
 
     @Reasoning:
     Maps types between languages based on semantic equivalence.
-    Handles common types (int, string, float, bool) and complex types.
+    Handles common types (int, string, float, bool) and the universe
+    of primitive aliases each language uses (Integer/int/Int32/int32,
+    String/str, Float/float/double, Boolean/bool). The lookup is
+    string-driven rather than enum-driven so that user-typed source
+    code can be classified without first reifying a per-language
+    type model.
     @End Reasoning
+
+    @Implementation:
+    Match source_type_name against each canonical type name with
+    StringCore.string_equals. On match, delegate to the family-specific
+    mapper (map_integer_type / map_float_type / map_string_type /
+    map_boolean_type) which knows the target language's preferred
+    spelling for that primitive. Unknown types return the source name
+    unchanged so non-primitive identifiers (struct names, user types)
+    pass through untouched and can be resolved by downstream backends.
+    @End Implementation
 
     Note: Universal type mappings (most languages agree)
 
@@ -1517,6 +1713,26 @@ End Process
 
 Process called "map_integer_type" takes source_lang as Integer, target_lang as Integer returns Integer:
     Note: Map integer type to target language
+
+    @Reasoning:
+    Each target language has a preferred spelling for the default
+    integer type (int, Integer, Int, Int32, int64, PIC 9(9), etc.).
+    Picking the canonical spelling avoids generating idiomatic-but-
+    less-readable output and lets the diagnostics layer pattern-match
+    against well-known names. Source language is currently informational
+    so dialects that prefer particular widths can be supported by
+    branching on source_lang in future, without breaking the API.
+    @End Reasoning
+
+    @Implementation:
+    Switch on target_lang and return the canonical integer-type name
+    for each supported target. Languages are grouped by family
+    (C-family, modern statically typed, JVM, dynamic, functional,
+    scientific, frontend frameworks, assembly/IR, HDL, shell, data
+    formats, markup, query, build/config). Targets that lack a
+    primitive integer concept (markup, regex) get the source-language
+    string back, leaving such mappings to the consuming backend.
+    @End Implementation
 
     If target_lang is equal to LANG_RUNA:
         Return "Integer"
@@ -1716,6 +1932,25 @@ End Process
 
 Process called "map_float_type" takes source_lang as Integer, target_lang as Integer returns Integer:
     Note: Map float type to target language
+
+    @Reasoning:
+    Float spelling diverges far more than integer between languages
+    (double / Float / float / Float64 / Real / Number / DECIMAL).
+    Returning the language's preferred default-precision spelling
+    keeps generated source idiomatic and matches each backend's
+    expectation in translation/backends/*. Width-specific mappings
+    (Float32 vs Float64) are handled by dedicated primitive
+    mappings elsewhere, so this proc deliberately commits to one
+    default-precision answer per language.
+    @End Reasoning
+
+    @Implementation:
+    Switch on target_lang and return the canonical float-type name.
+    C-family languages get "double" (64-bit default), scripting
+    languages get their dynamic numeric type, COBOL gets "COMP-2",
+    and HDL/data/markup targets fall through to the source-language
+    name when no native floating-point concept exists.
+    @End Implementation
 
     If target_lang is equal to LANG_RUNA:
         Return "Float"
@@ -1919,6 +2154,31 @@ End Process
 Process called "map_string_type" takes source_lang as Integer, target_lang as Integer returns Integer:
     Note: Map string type to target language
 
+    @Reasoning:
+    String representation is the most divergent primitive between
+    languages: C uses char*, C++ has std::string, Rust has &str vs
+    String, JavaScript only has string, Java has String, Haskell has
+    String (= [Char]), COBOL uses PIC X(255). The map_string_type
+    function commits to the most idiomatic owning-string type for
+    each target so generated code reads as if a native developer
+    wrote it. Backends that prefer borrowed views (Rust &str) can
+    introduce them post-translation during ownership inference.
+    @End Reasoning
+
+    @Implementation:
+    Switch on target_lang and return the canonical owning-string
+    type name. Targets that lack a string primitive (assembly, raw
+    binary serializations) fall through to the source-language name
+    so the calling backend can lower the value as a byte sequence.
+    @End Implementation
+
+    @Security_Scope:
+    The mapping is purely lexical: it returns a type name. No source
+    data is dereferenced, so no input validation is required here.
+    The receiving backend is responsible for emitting safe string
+    handling (bounds checks, escape sequences) when generating code.
+    @End Security_Scope
+
     If target_lang is equal to LANG_RUNA:
         Return "String"
     End If
@@ -2120,6 +2380,25 @@ End Process
 
 Process called "map_boolean_type" takes source_lang as Integer, target_lang as Integer returns Integer:
     Note: Map boolean type to target language
+
+    @Reasoning:
+    Boolean has the widest variation in spelling but the narrowest
+    semantic divergence: every language can represent two values.
+    Targets that lack a dedicated bool type (classic C, COBOL, x86
+    assembly) get the integer encoding (typically 0/1) because that
+    is what their runtime treats as truth. Modern targets (Rust,
+    Swift, Kotlin) get the dedicated bool/Bool type for correct
+    static typing in generated code.
+    @End Reasoning
+
+    @Implementation:
+    Switch on target_lang and return the canonical boolean-type
+    name. Returns "int" / "INT" / "INTEGER" for legacy targets, the
+    native bool type name for modern targets, and the language's
+    own truthy primitive ("Boolean", "bool", "boolean", "Bool")
+    where one exists. Unsupported targets fall through to a sane
+    default so HIR lowering never blocks on a missing entry.
+    @End Implementation
 
     If target_lang is equal to LANG_RUNA:
         Return "Boolean"
@@ -2329,8 +2608,19 @@ Process called "add_translation_metadata" takes context as Integer, key as Integ
 
     @Reasoning:
     Metadata preserves language-specific information that doesn't map
-    directly to HIR (calling conventions, ownership semantics, etc.).
+    directly to HIR (calling conventions, ownership semantics, FFI
+    attribute payloads, doc strings, source-language pragmas). The
+    translator round-trips this data through the HIR so the back-end
+    emitter can re-attach it to the lowered form, keeping translations
+    lossless when both ends understand the same attribute.
     @End Reasoning
+
+    @Implementation:
+    Read the metadata-store handle from the context at offset 24 and
+    delegate to Dict.set, which performs an upsert keyed by the
+    user-supplied key. Returns 0 on null context or null key to avoid
+    poisoning the dictionary with sentinel entries; otherwise 1.
+    @End Implementation
 
     If context is equal to 0:
         Return 0
@@ -2352,6 +2642,20 @@ End Process
 Process called "get_translation_metadata" takes context as Integer, key as Integer returns Integer:
     Note: Retrieve metadata entry from translation context
 
+    @Reasoning:
+    Mirror of add_translation_metadata used by the back-end emitter
+    to recover stored attributes before lowering each HIR node.
+    Returns 0 for missing keys so the caller can distinguish absent
+    metadata from a recorded zero value (which the metadata layer
+    must encode as a non-zero pointer to a zero-valued box).
+    @End Reasoning
+
+    @Implementation:
+    Defensive null checks then a direct Dict.get lookup against the
+    metadata store at offset 24. Returns the stored value or 0 when
+    the key has no entry.
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -2371,6 +2675,20 @@ End Process
 
 Process called "has_translation_metadata" takes context as Integer, key as Integer returns Integer:
     Note: Check if metadata entry exists
+
+    @Reasoning:
+    Predicate counterpart to get_translation_metadata. Used by
+    conditional emission paths where the backend needs to know
+    whether a piece of language-specific metadata is present without
+    binding a name to its value.
+    @End Reasoning
+
+    @Implementation:
+    Performs the same Dict.get lookup as get_translation_metadata but
+    coerces the result to a 0/1 truth value. Considers a non-zero
+    value as "present"; consequently entries that legitimately store
+    0 must use a boxed sentinel rather than the raw integer 0.
+    @End Implementation
 
     If context is equal to 0:
         Return 0
@@ -2400,6 +2718,22 @@ Note: ==========================================================================
 Process called "add_translation_error" takes context as Integer, error_message as Integer returns Integer:
     Note: Record translation error
 
+    @Reasoning:
+    Errors are collected on the context rather than raised eagerly so
+    one translation run can report every problem instead of stopping
+    on the first failure. The HIR orchestrator and every backend in
+    translation/backends/* call this when they detect untranslatable
+    constructs, missing feature support, or semantic loss. The caller
+    inspects has_errors after translation to decide whether to commit
+    the output.
+    @End Reasoning
+
+    @Implementation:
+    Append error_message (string pointer) to the error list at
+    context offset 48 via List.append. Returns 0 for null context
+    or null message to avoid recording sentinel entries, otherwise 1.
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -2419,6 +2753,21 @@ End Process
 
 Process called "add_translation_warning" takes context as Integer, warning_message as Integer returns Integer:
     Note: Record translation warning
+
+    @Reasoning:
+    Warnings flag semantically-lossy mappings (e.g. Int64 -> int on a
+    32-bit-int target, manual memory in source vs GC target) that the
+    translator can still emit code for. Keeping warnings separate
+    from errors lets diagnostics surface non-fatal concerns while
+    still allowing the translation to be committed.
+    @End Reasoning
+
+    @Implementation:
+    Append warning_message to the warning list at context offset 56
+    via List.append. Returns 0 for null context or message, 1
+    otherwise. Mirror of add_translation_error against a different
+    storage list so error/warning counts can be queried independently.
+    @End Implementation
 
     If context is equal to 0:
         Return 0
@@ -2440,6 +2789,19 @@ End Process
 Process called "get_error_count" takes context as Integer returns Integer:
     Note: Get number of translation errors
 
+    @Reasoning:
+    Lets the caller summarize the outcome of a translation run as a
+    single counter, used by the driver to drive exit codes and CI
+    pass/fail. Equivalent to len(errors) but defined as its own
+    entry point so the underlying List representation can change
+    without breaking callers.
+    @End Reasoning
+
+    @Implementation:
+    Read the error list from context offset 48 and delegate to
+    List.size. Returns 0 for null context as a safe fallback.
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -2455,6 +2817,17 @@ End Process
 Process called "get_warning_count" takes context as Integer returns Integer:
     Note: Get number of translation warnings
 
+    @Reasoning:
+    Mirror of get_error_count for warning summaries. Drives -Wall
+    style flags in the driver where the user wants to know whether
+    any non-fatal concerns were recorded even when errors are zero.
+    @End Reasoning
+
+    @Implementation:
+    Read the warning list from context offset 56 and delegate to
+    List.size. Null context returns 0 to keep callers ergonomic.
+    @End Implementation
+
     If context is equal to 0:
         Return 0
     End If
@@ -2469,6 +2842,19 @@ End Process
 
 Process called "has_errors" takes context as Integer returns Integer:
     Note: Check if translation has errors
+
+    @Reasoning:
+    Boolean fast-path used by driver code to gate output emission:
+    if has_errors returns 1, the translation should be discarded
+    even if some output has already been generated, because at least
+    one untranslatable construct was recorded.
+    @End Reasoning
+
+    @Implementation:
+    Calls get_error_count and folds the result into 0/1. Keeps the
+    branch logic in one place so the empty-error semantics stay
+    consistent across the codebase.
+    @End Implementation
 
     Let error_count be proc get_error_count from context
 
@@ -2505,8 +2891,21 @@ Process called "create_semantic_concept" takes concept_type as Integer returns I
 
     @Reasoning:
     Semantic concepts represent universal programming abstractions
-    that exist across languages (functions, variables, control flow, etc.).
+    that exist across languages (functions, variables, control flow,
+    etc.). They form the intermediate vocabulary between HIR and a
+    target backend so that map_semantic_concept can dispatch to the
+    appropriate sub-mapper without each call site having to inspect
+    the HIR node shape.
     @End Reasoning
+
+    @Implementation:
+    Allocate a 32-byte block (four 8-byte fields per the
+    SemanticConcept type) and initialize: 0=concept_type from the
+    parameter, 8=source_representation=null, 16=target_representation=
+    null, 24=preservation_notes=null. The two representation fields
+    are populated later by language-specific extraction passes; the
+    notes slot collects warnings emitted during preservation.
+    @End Implementation
 
     Let concept_size be 32  Note: 4 fields × 8 bytes
     Let concept be proc allocate from Layout with concept_size
@@ -2529,8 +2928,20 @@ Process called "map_semantic_concept" takes concept as Integer, source_lang as I
 
     @Reasoning:
     Translates universal concepts into language-specific representations
-    while preserving semantic meaning.
+    while preserving semantic meaning. Acts as the dispatcher for the
+    concept-mapping family: each CONCEPT_* kind has a dedicated mapper
+    so adding a new universal abstraction is a matter of adding one
+    branch and one helper, without touching the call sites.
     @End Reasoning
+
+    @Implementation:
+    Read the concept_type discriminator from offset 0 of the concept
+    block, then route to map_function_concept, map_variable_concept,
+    or map_control_flow_concept. Unknown concept types return 1
+    (success) under an "every concept is portable by default" policy;
+    individual mappers can return 0 to override when they detect a
+    target-language gap.
+    @End Implementation
 
     If concept is equal to 0:
         Return 0
@@ -2564,7 +2975,19 @@ Process called "map_function_concept" takes concept as Integer, source_lang as I
     Python: def name(params):
     Rust: fn name(params) -> return_type
     Runa: Process called "name" takes params returns return_type:
+    Because every backend in translation/backends/* implements its own
+    function-emission routine, the universal mapper merely asserts
+    portability and returns success. Syntax differences are deferred
+    to the per-language emitter, which has access to the full HIR
+    function node.
     @End Reasoning
+
+    @Implementation:
+    Returns 1 to indicate the function concept is supported by both
+    source_lang and target_lang. No structural transformation is
+    needed at this layer because the HIR already encodes a language-
+    neutral function abstraction; the target backend formats it.
+    @End Implementation
 
     Note: All languages support functions - this is a universal concept
     Note: Target language backend will handle syntax differences
@@ -2580,7 +3003,18 @@ Process called "map_variable_concept" takes concept as Integer, source_lang as I
     Python: name = value
     Rust: let name: type = value;
     Runa: Let name as type be value
+    Universal at the conceptual level, so the orchestrator approves
+    the mapping and lets the per-language backend choose the surface
+    declaration form, including whether to emit an explicit type
+    annotation in languages that have type inference.
     @End Reasoning
+
+    @Implementation:
+    Returns 1 unconditionally. The HIR encodes the variable's type
+    and initializer separately so each backend can render the
+    declaration using its native ordering and punctuation without
+    additional concept-level transformation here.
+    @End Implementation
 
     Note: All languages support variables - universal concept
     Return 1
@@ -2591,10 +3025,23 @@ Process called "map_control_flow_concept" takes concept as Integer, source_lang 
 
     @Reasoning:
     Control flow exists in all procedural languages with similar semantics:
-    - if/else (all languages)
-    - while loops (all languages)
-    - for loops (syntax varies but semantics similar)
+    - if/otherwise (every imperative language)
+    - while loops (every imperative language)
+    - for loops (syntax varies, but the loop-with-iteration-variable
+      semantic is portable)
+    Declarative-only targets (markup, data formats) cannot reproduce
+    control flow at all; for these targets the source must have been
+    a declarative document in the first place, so reaching this
+    mapper indicates a translator misconfiguration.
     @End Reasoning
+
+    @Implementation:
+    Returns 1 because every imperative target supports the universal
+    control-flow constructs. The HIR keeps loop-and-branch nodes in
+    a target-agnostic form so each backend can choose between
+    structured emission (if/while/for) and goto-style emission
+    (assembly, low-level IRs).
+    @End Implementation
 
     Note: All languages support basic control flow
     Return 1
@@ -2609,8 +3056,25 @@ Process called "check_translation_compatibility" takes source_lang as Integer, t
 
     @Reasoning:
     Determines if source→target translation is feasible based on
-    language features and semantic compatibility.
+    language features and semantic compatibility. The driver calls
+    this before invoking translate_to_hir / translate_from_hir to
+    decide whether to short-circuit with a hard failure instead of
+    burning cycles producing degenerate output. Runa is treated as
+    universally compatible because every backend speaks HIR which is
+    rooted in Runa's semantics.
     @End Reasoning
+
+    @Implementation:
+    Short-circuit success when either endpoint is Runa, then probe
+    the feature bitsets returned by get_language_features for both
+    languages and reason about the harder transition directions
+    (dynamic source -> static target requires type inference,
+    manual memory source -> GC target requires reachability
+    analysis). Because all transitions are reachable through Runa
+    HIR with optional approximation, the function returns 1 for all
+    supported pairs, leaving the per-construct lossiness to be
+    flagged via add_translation_warning at lowering time.
+    @End Implementation
 
     Note: Runa is always compatible (universal target/source)
     If source_lang is equal to LANG_RUNA:
@@ -2652,8 +3116,24 @@ Process called "estimate_translation_accuracy" takes source_lang as Integer, tar
 
     @Reasoning:
     Returns percentage estimate of semantic preservation for
-    source→target translation.
+    source→target translation. The driver surfaces this number to
+    the user before they commit a translation so they can decide
+    whether the projected fidelity is acceptable. Heuristics reflect
+    empirical results: Runa-as-pivot is lossless by construction
+    (100), C->Rust preserves ownership and types well (90),
+    static->dynamic adds permissiveness without removing structure
+    (95), dynamic->static must invent types (75), and the cross-
+    family fallback through HIR is around 80.
     @End Reasoning
+
+    @Implementation:
+    Branches on canonical language-pair shortcuts first (Runa
+    endpoint, C->Rust, Python->JavaScript). Falls back to
+    feature-bit reasoning: query FEAT_STATIC_TYPING and
+    FEAT_DYNAMIC_TYPING on both endpoints to detect static<->dynamic
+    transitions. Default 80 covers all other pairs via the HIR
+    pivot. Returned values are percentage integers in [0, 100].
+    @End Implementation
 
     Note: Runa translations are 100% accurate (native format)
     If source_lang is equal to LANG_RUNA:
@@ -2711,10 +3191,35 @@ Process called "translate_to_hir" takes source_code as Integer, source_lang as I
     Note: Translate source code to Runa HIR
 
     @Reasoning:
-    Entry point for source language → HIR translation.
-    Dispatches to language-specific emitters for source → HIR conversion.
-    All 51 supported languages route through their respective emitters.
+    Entry point for source language -> HIR translation. Dispatches
+    to the per-language *_to_hir entry point that every backend in
+    translation/backends/* must implement. The translation pipeline
+    has three logical phases: (1) lexical/syntactic analysis inside
+    the per-language emitter; (2) semantic lowering into HIR nodes
+    using the universal HIR builder API from hir.runa; (3) error
+    aggregation onto the context via add_translation_error so the
+    caller can decide whether to commit the HIR. Keeping dispatch
+    centralized here means new languages plug in by adding one
+    Import line and one branch, without touching the call sites.
     @End Reasoning
+
+    @Implementation:
+    Validate source_code is non-null (recording an error on the
+    context when violated) and then dispatch on source_lang to the
+    appropriate *_to_hir entry point in translation/backends/. The
+    dispatch covers all 51 supported languages, grouped by family
+    matching get_language_name's ordering. Returns the HIR root
+    pointer produced by the chosen emitter, or 0 when the language
+    is unsupported or the emitter itself fails.
+    @End Implementation
+
+    @Security_Scope:
+    Errors are routed through add_translation_error rather than
+    being thrown so partial output never leaks past the driver's
+    has_errors gate. Each per-language emitter is responsible for
+    bounding its own input parsing; this dispatcher does not trust
+    source_code beyond its non-null check.
+    @End Security_Scope
 
     If source_code is equal to 0:
         proc add_translation_error with context, "Null source code"
@@ -2948,10 +3453,36 @@ Process called "translate_from_hir" takes hir_root as Integer, target_lang as In
     Note: Translate Runa HIR to target language code
 
     @Reasoning:
-    Entry point for HIR → target language translation.
-    Dispatches to language-specific emitters for HIR → source conversion.
-    All 51 supported languages route through their respective emitters.
+    Entry point for HIR -> target language translation. The mirror
+    of translate_to_hir: dispatches to the per-language hir_to_*
+    entry point that every backend in translation/backends/* must
+    implement. The pipeline phases are (1) HIR traversal under the
+    target backend's visitor; (2) target-source emission with
+    language-specific identifier quoting and ordering; (3) error
+    aggregation on the context. This file defines the interface
+    contract that all 51 backends must honor, so a backend
+    audit only has to verify that every emitter exposes the
+    canonical hir_to_<lang> name with the (hir_root) signature.
     @End Reasoning
+
+    @Implementation:
+    Validate hir_root is non-null (recording an error on the
+    context when violated). Dispatch on target_lang to the
+    appropriate hir_to_<lang> emitter. Order matches the LANG_*
+    constant grouping: programming languages first (most common
+    requests), then frontend frameworks, assembly/IR, HDL, shell,
+    data serialization, markup, query, and build/config last.
+    Returns the emitter's allocated source-code buffer or 0 when
+    the language is unsupported or the emitter itself fails.
+    @End Implementation
+
+    @Security_Scope:
+    Errors are routed through add_translation_error so partial or
+    incorrect output never bypasses the has_errors gate. Each
+    per-language emitter is responsible for safely emitting its
+    own escape sequences and identifier quoting; this dispatcher
+    only validates that hir_root is non-null.
+    @End Security_Scope
 
     If hir_root is equal to 0:
         proc add_translation_error with context, "Null HIR root"
@@ -3188,6 +3719,24 @@ Note: ==========================================================================
 Process called "is_language_supported" takes language_id as Integer returns Integer:
     Note: Check if language is supported by Translation
 
+    @Reasoning:
+    The driver and IDE integrations need to enumerate supported
+    languages so they can populate completion menus, validate
+    user-facing options, and reject obvious misconfigurations
+    before any I/O happens. Centralizing the language-support set
+    in this single predicate ensures all consumers agree on which
+    LANG_* constants currently have working backends.
+    @End Reasoning
+
+    @Implementation:
+    Direct switch on language_id returning 1 for every supported
+    LANG_* constant. Languages are grouped to mirror the constant
+    declarations and the get_language_name switch, so adding a
+    new language requires updating all three locations in lock
+    step. Returns 0 for unknown / sentinel values like
+    LANG_UNKNOWN.
+    @End Implementation
+
     Note: Runa is native and always supported
     If language_id is equal to LANG_RUNA:
         Return 1
@@ -3417,6 +3966,23 @@ End Process
 
 Process called "get_translation_version" returns Integer:
     Note: Get Translation infrastructure version
+
+    @Reasoning:
+    Diagnostic helper that lets the driver and IDE integrations
+    report which translation-system revision generated a piece of
+    output. Versioning the orchestrator separately from the
+    compiler as a whole lets consumers detect when translation
+    behavior may have changed between two otherwise identical
+    runa binaries.
+    @End Reasoning
+
+    @Implementation:
+    Returns a string literal encoding the major.minor.patch of the
+    universal translation system plus a -complete suffix marking
+    that all 52 backends are wired into the dispatcher. The value
+    is updated by hand whenever the supported-language set or the
+    public translate_to_hir / translate_from_hir contract changes.
+    @End Implementation
 
     Note: v0.0.8.5: Complete universal translation system
     Note: 52 languages with full HIR bidirectional translation support

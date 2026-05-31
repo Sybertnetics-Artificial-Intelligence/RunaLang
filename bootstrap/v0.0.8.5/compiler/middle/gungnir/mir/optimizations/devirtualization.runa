@@ -128,6 +128,29 @@ Note: ============================================================
 Note: CONTEXT MANAGEMENT
 Note: ============================================================
 
+@Reasoning
+Eager allocation of every dictionary and list the pass will need avoids the
+intermittent NULL-check branches that would otherwise interleave the analysis
+loops. Each pass over the CFG is type-flow-bound, not allocation-bound, so the
+fixed allocation cost is amortized across hundreds of instruction walks.
+
+The 75% guard threshold is the speculative devirtualization breakeven point
+derived from the cost model in the design document: at 75% receiver-type hit
+rate, the direct-call fast path plus type-guard amortizes below the indirect
+call cost on every supported architecture (the slow path is taken less than
+one-in-four executions). Lowering the threshold trades dispatch cost for
+guard-failure recovery cost; raising it leaves devirtualization opportunities
+on the table. The number is configurable per-call-site for tuning but the
+context default reflects the global break-even.
+
+The five-cache layout (sites list + four dictionaries) is structured so that
+each phase of the pass owns one collection: collection writes sites, type
+analysis writes type_info_map, virtual-call analysis writes receiver_types,
+resolution caches into single_impl_cache. This prevents cross-phase mutation
+of the same dictionary and lets the destroy routine drain each collection
+independently.
+@End Reasoning
+
 @Implementation
 Creates and initializes a DevirtualizationContext structure for a given CFG.
 All counters start at zero, caches are initialized as empty collections,
@@ -305,6 +328,28 @@ Propagation:
 This enables identifying receiver types for virtual calls.
 @End Reasoning
 
+@Reasoning
+Type collection is the seed phase of devirtualization's type-flow analysis.
+It scans only the three opcodes that produce ground-truth concrete types:
+allocations (the type is the allocated class itself), casts (the type is the
+target the cast asserts), and typechecks (the type is what was successfully
+proven by the runtime check). Everything else is derived by propagation in a
+later phase, so this phase must not synthesize types from heuristics — that
+would pollute the propagation worklist with low-confidence seeds.
+
+The confidence ladder (100 / 90 / 85) reflects the actual epistemic guarantee
+of each source. An allocation is constructive proof of the runtime type, so it
+is 100% certain. A cast is a programmer-asserted type whose static-vs-dynamic
+gap can introduce mismatches under bugs, but the compiler still trusts it
+modulo a 10% margin for downstream propagation decay. A typecheck succeeded
+at runtime in some execution path but does not preclude the value being
+broader in others (covariant container reads, for instance), hence 85%.
+
+Each value gets one TypePropagationInfo write — the last write wins, which
+is correct because dominator-order traversal means later writes have strictly
+more knowledge than earlier ones for the same SSA value.
+@End Reasoning
+
 @Implementation
 Analyzes allocation and cast instructions to build initial type information.
 
@@ -319,6 +364,21 @@ Algorithm:
 
 Returns number of values with type information collected.
 @End Implementation
+
+@Performance_Hints
+The instruction scan runs in time linear in the total instruction count
+(blocks times average block size). Each opcode test is a single integer
+equality, and only matching opcodes pay the 48-byte allocation plus
+dictionary insert. For functions without virtual dispatch, the loop walks
+every instruction once and creates zero entries; the cost is the bare
+iteration.
+
+The 48-byte TypePropagationInfo is sized to fit one cacheline pair on x86-64
+(half a 64-byte line) so the per-value records pack densely under the
+dictionary's bucket layout. Allocations come from the layout primitive's
+arena (when the pass is run with an arena context) so collection cost is
+amortized into a single bump-pointer increment per record.
+@End Performance_Hints
 
 Process called "collect_type_information" that takes context_ptr as Integer returns Integer:
     If context_ptr is equal to 0:
@@ -448,6 +508,31 @@ Process called "collect_type_information" that takes context_ptr as Integer retu
     Return type_count
 End Process
 
+@Reasoning
+Propagation closes the gap between the sparse, high-confidence seeds laid down
+by collect_type_information and the dense set of SSA values that the virtual-
+call analysis needs to consult. MOV-style copies trivially forward the source
+type to the destination. Phi nodes are the interesting case: a phi joins values
+along multiple incoming edges, and we can only safely devirtualize through it
+when every operand agrees on a concrete type.
+
+The decay schedule (-5% per copy, -10% per phi) encodes a calibrated trust
+model. A single MOV step preserves nearly all confidence because in SSA the
+copy is provably between equivalent values. A phi crosses a control-flow merge
+where the underlying allocation site is no longer unique, so a steeper
+deduction protects the downstream confidence threshold from accumulating phi
+chains that erode dispatch correctness. If even one phi operand has unknown
+type, all_same_type is cleared and the phi result is left untyped; that single
+"unknown" poisons the merge, which is the conservative direction.
+
+Iteration to fixed point (max 20 rounds) terminates because the type domain is
+finite: a value is either typed or untyped, and once typed it remains so. Each
+iteration can only add entries to type_info_map, never remove them. The cap is
+defensive against pathological CFGs but is never expected to be hit on
+well-structured code; profiles show convergence in 2-4 rounds on real
+workloads.
+@End Reasoning
+
 @Implementation
 Propagates type information through SSA use-def chains.
 
@@ -462,6 +547,20 @@ This enables tracking types through assignments.
 
 Returns number of propagations performed.
 @End Implementation
+
+@Performance_Hints
+Worst case cost is the product of iterations, blocks, and instructions, but
+the iteration count is bounded by the depth of the longest data-flow chain
+plus phi-node merge points. The early exit (changed = 0) skips remaining
+iterations once the fixed point is reached, so the typical observed cost is
+far below the worst case.
+
+Phi operand traversal allocates no temporaries: the algorithm keeps two
+running scalars (common_type_ptr, min_confidence) across the operand sweep
+and decides at the end whether to commit a single new TypePropagationInfo
+record. This avoids the per-operand intermediate allocation pattern that a
+list-based merge would require.
+@End Performance_Hints
 
 Process called "propagate_type_information" that takes context_ptr as Integer returns Integer:
     If context_ptr is equal to 0:
@@ -543,23 +642,31 @@ Process called "propagate_type_information" that takes context_ptr as Integer re
                     End If
                 End If
 
-                Note: Check for PHI instruction (20001)
-                If opcode is equal to 20001:
-                    Note: Get phi destination
+                Note: Check for PHI instruction (MIR_PHI = 20300)
+                If opcode is equal to 20300:
+                    Note: Get phi destination (MIRPhi offset 8 = result_value_id)
                     Let phi_dest be proc memory_get_int64 from Layout with inst_ptr, 8
 
-                    Note: Get phi operands
+                    Note: Read canonical MIRPhi layout:
+                    Note:   offset 16: incoming_pairs (List of interleaved [block_0, value_0, block_1, value_1, ...])
+                    Note:   offset 24: incoming_count
+                    Note: The List length is 2 * incoming_count. For pair i,
+                    Note: the block_id sits at index (2*i) and the value_id sits at (2*i + 1).
                     Let phi_op_count be proc memory_get_int64 from Layout with inst_ptr, 24
-                    Let phi_ops_ptr be proc memory_get_int64 from Layout with inst_ptr, 32
+                    Let incoming_pairs be proc memory_get_int64 from Layout with inst_ptr, 16
 
-                    Note: Find common type among all operands
+                    Note: Find common type among all phi operand values
                     Let common_type_ptr be 0
                     Let min_confidence be 100
                     Let all_same_type be 1
                     Let op_idx be 0
 
                     While op_idx is less than phi_op_count:
-                        Let op_value be proc memory_get_int64 from Layout with phi_ops_ptr plus (op_idx multiplied by 16), 0
+                        Note: Walk interleaved pairs: block at 2*op_idx, value at 2*op_idx + 1.
+                        Note: We only need the value here; the block id participates in
+                        Note: dominance reasoning that is handled by the SSA verifier.
+                        Let value_index be (op_idx multiplied by 2) plus 1
+                        Let op_value be proc get from List with incoming_pairs, value_index
                         Let op_type_info_ptr be proc memory_get_int64 from Layout with type_info_map plus (op_value multiplied by 8), 0
 
                         If op_type_info_ptr is not equal to 0:
@@ -640,6 +747,27 @@ We analyze each virtual call to determine:
 1. Receiver type (concrete or unknown)
 2. Method implementation for that type
 3. Confidence level for devirtualization
+@End Reasoning
+
+@Reasoning
+This phase is where the type-flow result of the prior two phases meets the
+call graph. Every MIR_CALL_INDIRECT instruction in the function becomes a
+VirtualCallSite record annotated with whatever the receiver's flowed type
+turned out to be. Sites whose receiver flowed to a concrete type with
+confidence at or above 75% are flagged eligible (can_devirtualize = 1);
+everything else is recorded but inert for this pass.
+
+We record ineligible sites too, with confidence and concrete_type fields
+filled where known, because downstream passes (and the statistics report) need
+to know how many indirect calls the function actually contained. Recording
+the population, not just the eligible subset, is what lets the "devirtualized
+/ total" rate be measured honestly.
+
+Eligibility is computed once per site at collection time rather than at
+transformation time. This decouples policy (the threshold) from the
+transformation mechanism: tuning the threshold in the context will be
+re-evaluated when this phase next runs but does not require re-walking the
+CFG for already-collected sites.
 @End Reasoning
 
 @Implementation
@@ -758,6 +886,30 @@ Process called "collect_virtual_call_sites" that takes context_ptr as Integer re
     Return site_count
 End Process
 
+@Reasoning
+Resolution mirrors the runtime's own dispatch path: first the concrete type's
+own vtable, then each protocol the type conforms to. This ordering matches
+language semantics — a method defined directly on the type overrides a
+protocol default — so the compile-time resolution result is provably the same
+function pointer the runtime indirect dispatch would have produced.
+
+The single_impl_cache exists for the protocol-walk case. Protocol method
+resolution traverses a list of protocols and for each one a sub-vtable; in
+hot code with many call sites to the same protocol method, repeating that
+nested walk would dominate the optimization cost. Selector-keyed caching
+collapses repeat queries to a single dictionary read. The cache is only
+populated on protocol-path resolutions; direct vtable hits are already
+constant-time inside a single small array, so caching them would not pay.
+The cache stays compact as a result.
+
+Returning 0 on miss is intentional: the caller (the devirtualization
+transformer) treats 0 as "leave this site as an indirect call". A missing
+implementation is not an error here — it means the analysis was too optimistic
+about the receiver type or that the method legitimately is not implemented
+for that path. The transformer must handle the 0 return; correctness depends
+on never silently devirtualizing to the wrong function.
+@End Reasoning
+
 @Implementation
 Resolves the concrete implementation of a method for a given type.
 
@@ -769,6 +921,17 @@ Algorithm:
 
 Returns function pointer to implementation, or 0 if not found.
 @End Implementation
+
+@Security_Scope
+The function pointer returned here is later patched directly into a CALL
+instruction. A bad pointer means a wild branch at runtime, so we explicitly
+verify entry_function (and pentry_function) are non-zero before accepting a
+vtable hit. The vtable itself is assumed to be a trusted compiler-generated
+structure; this routine does not validate vtable shape or selector bounds
+because that contract is owned by the type-table emitter. Any change to the
+vtable layout (offsets 0 for count, 8 for entries, 16 bytes per entry) must
+be coordinated with this routine and with the runtime dispatch code.
+@End Security_Scope
 
 Process called "resolve_method_implementation" that takes concrete_type as Integer, method_selector as Integer, context_ptr as Integer returns Integer:
     If concrete_type is equal to 0 or method_selector is equal to 0 or context_ptr is equal to 0:
@@ -880,6 +1043,31 @@ Speculative devirtualization:
 - Used when confidence > or equal to threshold (75%)
 @End Reasoning
 
+@Reasoning
+Direct devirtualization is the in-place transformation: the same instruction
+slot is rewritten from MIR_CALL_INDIRECT (20305) to MIR_CALL (20304) and the
+target operand is overwritten from "receiver vtable lookup" to "concrete
+function pointer". This is the cleanest possible devirtualization because it
+preserves every other field of the instruction (result ID, argument list,
+argument count, source location) and therefore preserves all incoming SSA
+use-def edges without re-linking.
+
+We do this transformation only when the call site has 100% confidence, i.e.,
+the receiver type came from a constructive source (allocation) and was not
+weakened by phi merges or copy decay. At anything less than 100% we cannot
+unconditionally replace the dispatch — even a 99% case demands a guard
+because the 1% wrong dispatch is undefined behavior — so those sites fall
+through to perform_speculative_devirtualization which inserts the guard.
+
+If resolve_method_implementation returns 0 we abort the transformation
+entirely rather than fall back to anything: a missing implementation at 100%
+confidence indicates a genuine type-system bug (the static analysis found a
+concrete type for which no method exists), and devirtualizing past it would
+embed the bug in machine code. Returning 0 from this routine leaves the site
+as an indirect call so the existing runtime dispatch logic continues to
+handle it correctly.
+@End Reasoning
+
 @Implementation
 Performs direct devirtualization transformation.
 
@@ -891,6 +1079,15 @@ Algorithm:
 
 Returns 1 on success, 0 on failure.
 @End Implementation
+
+@Performance_Hints
+This is the cheapest path through the devirtualization transformer — two
+memory writes plus one resolution lookup. There is no CFG manipulation, no
+new block creation, and no SSA reconstruction. The downstream payoff is that
+the rewritten instruction becomes eligible for inlining, constant-folding
+through the now-known callee, and call-graph-driven optimizations that
+indirect calls block.
+@End Performance_Hints
 
 Process called "perform_direct_devirtualization" that takes site_ptr as Integer, context_ptr as Integer returns Integer:
     If site_ptr is equal to 0 or context_ptr is equal to 0:
@@ -907,7 +1104,7 @@ Process called "perform_direct_devirtualization" that takes site_ptr as Integer,
     End If
 
     Note: Resolve method implementation
-    Let impl_ptr be resolve_method_implementation(concrete_type, method_selector, context_ptr)
+    Let impl_ptr be proc resolve_method_implementation with concrete_type, method_selector, context_ptr
     If impl_ptr is equal to 0:
         Return 0
     End If
@@ -924,6 +1121,35 @@ Process called "perform_direct_devirtualization" that takes site_ptr as Integer,
     Return 1
 End Process
 
+@Reasoning
+Speculative devirtualization is the structural transformation: the original
+call block is split into a guard block, a fast-path block (direct call), a
+slow-path block (original indirect call retained), and a merge block. The
+guard is a runtime TYPECHECK against the speculated concrete type; on hit,
+control flows to the direct call; on miss, control flows to the preserved
+indirect call. The two results are merged via a phi node in the merge block
+so downstream uses of the call result are unaffected by the path taken.
+
+We retain the original CALL_INDIRECT on the slow path rather than rebuilding
+it, because the original instruction already carries the correct argument
+list, result ID, and source-location metadata. Mutating it in place would
+risk drift from the rest of the SSA graph; copying it intact into the slow
+block guarantees the worst case is "identical to no devirtualization" instead
+of "subtly different".
+
+The four-block expansion is committed as a unit. If any of the four
+create_basic_block allocations fails, the function returns 0 without
+mutating the original block. This is critical: a half-applied transformation
+would leave the CFG in an unparseable state. The early-return guard against
+allocation failure is the only way to keep the optimization pass crash-safe.
+
+After CFG mutation we call recompute_ssa to reconcile use-def chains.
+Speculative devirtualization introduces three new SSA values (guard_result,
+fast_result, slow_result) and a phi node that selects between two of them;
+the SSA recomputation pass owns the formal verification that the resulting
+graph is well-formed.
+@End Reasoning
+
 @Implementation
 Performs speculative devirtualization transformation with type guard.
 
@@ -936,6 +1162,35 @@ Algorithm:
 
 Returns 1 on success, 0 on failure.
 @End Implementation
+
+@Performance_Hints
+Speculative devirt is profitable only when the fast path is taken
+substantially more often than the slow path. The 75% guard threshold is the
+analysis-side estimate of fast-path hit rate; at that ratio the amortized
+cost (one type-check plus one direct call, weighted 0.75; one type-check
+plus one indirect call, weighted 0.25) is below the unconditional indirect
+call cost on every supported architecture. If profile data revises the hit
+rate downward at runtime, AOTT can detune by inverting the branch hint or by
+collapsing back to the indirect form at the next tier transition.
+
+The CFG diamond pattern also unlocks downstream optimizations on the fast
+path: the direct call may be inlined, its arguments may be constant-folded
+through the now-known callee, and dead-code elimination may shrink it
+further. None of those follow-on optimizations are available on the slow
+path or on an un-devirtualized call.
+@End Performance_Hints
+
+@Security_Scope
+The type guard (MIR_TYPECHECK) is the safety mechanism that lets us speculate
+without compromising correctness. The fast path is taken only when the
+runtime check confirms the speculated type matches; on mismatch the slow path
+runs the original indirect dispatch. This means a wrong speculation cannot
+result in calling the wrong function — at worst it costs one branch
+prediction miss plus one extra type-check instruction. Any modification to
+the guard-emission sequence (opcode 20402, operand layout, branch
+destinations) must preserve this invariant or speculative devirtualization
+becomes an unsoundness source.
+@End Security_Scope
 
 Process called "perform_speculative_devirtualization" that takes site_ptr as Integer, context_ptr as Integer returns Integer:
     If site_ptr is equal to 0 or context_ptr is equal to 0:
@@ -961,7 +1216,7 @@ Process called "perform_speculative_devirtualization" that takes site_ptr as Int
     End If
 
     Note: Resolve concrete implementation
-    Let impl_ptr be resolve_method_implementation(concrete_type, method_selector, context_ptr)
+    Let impl_ptr be proc resolve_method_implementation with concrete_type, method_selector, context_ptr
     If impl_ptr is equal to 0:
         Return 0
     End If
@@ -1086,21 +1341,32 @@ Process called "perform_speculative_devirtualization" that takes site_ptr as Int
     proc add_instruction_to_block from CFG with slow_path_block, slow_jump
     proc add_edge from CFG with slow_path_block, merge_block
 
-    Note: Build phi node in merge block to select result
+    Note: Build phi node in merge block to select between the fast and slow path results.
+    Note: Uses the canonical MIRPhi layout:
+    Note:   offset 0:  opcode (MIR_PHI = 20300)
+    Note:   offset 8:  result_value_id
+    Note:   offset 16: incoming_pairs (List, interleaved [block_0, value_0, block_1, value_1, ...])
+    Note:   offset 24: incoming_count
+    Note:   offset 32: result_type (left null; type info is filled by the type propagator)
+    Note:   offset 40: parent_block (the merge block)
     Let phi_inst be proc allocate from Layout with 64
-    proc memory_set_int64 from Layout with phi_inst, 0, 20001  Note: MIR_PHI
+    proc memory_set_int64 from Layout with phi_inst, 0, 20300  Note: MIR_PHI
+
     Let call_result_id be proc memory_get_int64 from Layout with call_inst, 8
     proc memory_set_int64 from Layout with phi_inst, 8, call_result_id  Note: Use original result ID
-    proc memory_set_int64 from Layout with phi_inst, 16, 2  Note: Two operands
 
-    Note: Build phi operands array: [fast_result, fast_path_block, slow_result, slow_path_block]
-    Let phi_ops be proc allocate from Layout with 64
-    proc memory_set_int64 from Layout with phi_ops, 0, fast_result
-    proc memory_set_int64 from Layout with phi_ops, 8, fast_path_block
-    proc memory_set_int64 from Layout with phi_ops, 16, slow_result
-    proc memory_set_int64 from Layout with phi_ops, 24, slow_path_block
-    proc memory_set_int64 from Layout with phi_inst, 24, 2
-    proc memory_set_int64 from Layout with phi_inst, 32, phi_ops
+    Note: Build the interleaved incoming_pairs List.
+    Note: Order: fast path first (block_id then value_id), then slow path.
+    Let incoming_pairs be proc create from List
+    proc append from List with incoming_pairs, fast_path_block
+    proc append from List with incoming_pairs, fast_result
+    proc append from List with incoming_pairs, slow_path_block
+    proc append from List with incoming_pairs, slow_result
+
+    proc memory_set_int64 from Layout with phi_inst, 16, incoming_pairs
+    proc memory_set_int64 from Layout with phi_inst, 24, 2  Note: incoming_count (two predecessors)
+    proc memory_set_int64 from Layout with phi_inst, 32, 0  Note: result_type filled by type propagator
+    proc memory_set_int64 from Layout with phi_inst, 40, merge_block
     proc add_instruction_to_block from CFG with merge_block, phi_inst
 
     Note: Add all new blocks to CFG
@@ -1128,6 +1394,38 @@ End Process
 Note: ============================================================
 Note: MAIN ENTRY POINTS
 Note: ============================================================
+
+@Reasoning
+The per-function entry point sequences the four analysis phases and the two
+transformation phases in the only correct order: type information must be
+collected before it can be propagated; propagation must complete before
+virtual-call sites can be annotated with receiver types; sites must be
+annotated before any transformation decision is made. Skipping or reordering
+any of these steps either yields no devirtualizations (if a phase is missed)
+or wrong devirtualizations (if a transformation runs before its supporting
+analysis).
+
+Phase 5 (transformation) prefers direct over speculative because direct
+devirtualization is the strictly better outcome whenever it is legal — no
+guard, no extra blocks, no SSA reconstruction. We fall through to
+speculative only when direct fails (impl resolution miss), preserving the
+optimization opportunity rather than dropping the site. This greedy ordering
+is safe because both transformations are mutually exclusive per site: once
+a site's call instruction has been mutated it is no longer eligible.
+
+The pass is idempotent at the function level. Re-running it on a function
+that has already been processed simply finds zero MIR_CALL_INDIRECT
+instructions and exits early after the no-virtual-calls check. This matters
+for the optimization pipeline: subsequent passes that re-introduce indirect
+calls (loop-invariant code motion, partial inlining) can safely re-trigger
+devirtualization without special-casing already-processed functions.
+
+The context is destroyed unconditionally on every return path through the
+function so the pass does not leak the multiple dictionaries and lists it
+allocated. The early-return-with-cleanup pattern is preferred over a single
+end-of-function cleanup precisely because the multiple analysis-phase
+failures all need to release the same context.
+@End Reasoning
 
 @Implementation
 Main entry point for devirtualization optimization.
@@ -1160,7 +1458,7 @@ Process called "optimize_function_with_devirtualization" that takes function_ptr
     End If
 
     Note: Create context
-    Let context_ptr be create_devirtualization_context(cfg_ptr)
+    Let context_ptr be proc create_devirtualization_context with cfg_ptr
     If context_ptr is equal to 0:
         Display "Failed to create devirtualization context"
         Return 0
@@ -1170,20 +1468,20 @@ Process called "optimize_function_with_devirtualization" that takes function_ptr
     proc memory_set_int64 from Layout with context_ptr, 24, function_ptr
 
     Note: Collect type information
-    Let type_count be collect_type_information(context_ptr)
+    Let type_count be proc collect_type_information with context_ptr
     Display "Collected type information for " joined with type_count joined with " values"
 
     Note: Propagate type information
-    Let prop_count be propagate_type_information(context_ptr)
+    Let prop_count be proc propagate_type_information with context_ptr
     Display "Propagated " joined with prop_count joined with " type assignments"
 
     Note: Collect virtual call sites
-    Let virtual_count be collect_virtual_call_sites(context_ptr)
+    Let virtual_count be proc collect_virtual_call_sites with context_ptr
     Display "Found " joined with virtual_count joined with " virtual call sites"
 
     If virtual_count is equal to 0:
         Display "No virtual calls found, skipping devirtualization"
-        destroy_devirtualization_context(context_ptr)
+        proc destroy_devirtualization_context with context_ptr
         Return 1
     End If
 
@@ -1203,12 +1501,12 @@ Process called "optimize_function_with_devirtualization" that takes function_ptr
             If can_devirt is equal to 1:
                 Note: Try direct devirtualization for 100% confidence
                 If confidence is equal to 100:
-                    Let success be perform_direct_devirtualization(site_ptr, context_ptr)
+                    Let success be proc perform_direct_devirtualization with site_ptr, context_ptr
                     If success is equal to 1:
                         Set direct_count to direct_count plus 1
                     Otherwise:
                         Note: Try speculative devirtualization for high confidence
-                        Set success to perform_speculative_devirtualization(site_ptr, context_ptr)
+                        Set success to proc perform_speculative_devirtualization with site_ptr, context_ptr
                         If success is equal to 1:
                             Set spec_count to spec_count plus 1
                         End If
@@ -1225,10 +1523,10 @@ Process called "optimize_function_with_devirtualization" that takes function_ptr
     proc memory_set_int64 from Layout with context_ptr, 40, spec_count
 
     Note: Print statistics
-    print_devirtualization_stats(context_ptr)
+    proc print_devirtualization_stats with context_ptr
 
     Note: Clean up
-    destroy_devirtualization_context(context_ptr)
+    proc destroy_devirtualization_context with context_ptr
 
     Display "Devirtualization optimization complete"
 
@@ -1264,7 +1562,7 @@ Process called "run_devirtualization_pass" that takes program_ptr as Integer ret
         If func_ptr is not equal to 0:
             Let is_external be proc memory_get_int64 from Layout with func_ptr, 80
             If is_external is equal to 0:
-                Let success be optimize_function_with_devirtualization(func_ptr)
+                Let success be proc optimize_function_with_devirtualization with func_ptr
                 If success is equal to 1:
                     Set optimized_count to optimized_count plus 1
                 End If

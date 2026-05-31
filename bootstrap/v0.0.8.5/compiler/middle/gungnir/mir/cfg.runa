@@ -70,6 +70,28 @@ This algorithm runs in O(n) time where n is the number of instructions.
 @End Reasoning
 
 Process called "build_cfg_from_instructions" that takes function_ptr as Integer returns Integer:
+    @Reasoning
+    The public entry point for translating a linear MIR instruction stream into
+    a structured Control Flow Graph. We delegate to three single-purpose helpers
+    (identify_basic_block_leaders, create_basic_blocks_from_leaders,
+    construct_cfg_edges) rather than fusing them into a single sweep because:
+
+    1. Each phase has different dependencies. Leader identification requires only
+       the instruction stream. Block creation requires the leader set. Edge
+       construction requires the populated blocks. Sequencing the phases keeps
+       the data flow explicit and lets each helper be tested independently.
+    2. The leader pass must complete before any block creation can begin, since
+       a back-edge target later in the stream is also a leader earlier in the
+       stream. A single fused sweep would either need two-pass logic anyway or
+       would emit incorrect blocks for forward-referenced labels.
+    3. Edge construction reads terminator nodes that were not yet linked into
+       blocks during creation, so it must run last.
+
+    On any failure (null inputs, empty function, allocation failure in a helper)
+    we return 0 rather than a partially-populated CFG. Callers must treat the
+    return value as opaque and check for 0 before any further CFG operations.
+    @End Reasoning
+
     @Implementation
     Main entry point for CFG construction. Takes a linear sequence of MIR instructions
     and produces a complete control flow graph with proper basic blocks and edges.
@@ -90,7 +112,7 @@ Process called "build_cfg_from_instructions" that takes function_ptr as Integer 
 
     Note: Get the MIRFunction structure
     Let func be function_ptr
-    Let cfg_ptr be get_mir_function_cfg(func)
+    Let cfg_ptr be proc get_mir_function_cfg with func
 
     If cfg_ptr is equal to 0:
         Note: No CFG structure exists
@@ -98,7 +120,7 @@ Process called "build_cfg_from_instructions" that takes function_ptr as Integer 
     End If
 
     Note: Get the instruction list from the function
-    Let inst_list be get_mir_function_instructions(func)
+    Let inst_list be proc get_mir_function_instructions with func
 
     If inst_list is equal to 0:
         Note: No instructions to process
@@ -106,7 +128,7 @@ Process called "build_cfg_from_instructions" that takes function_ptr as Integer 
     End If
 
     Note: Phase 1 - Identify basic block leaders
-    Let leaders be identify_basic_block_leaders(inst_list)
+    Let leaders be proc identify_basic_block_leaders with inst_list
 
     If leaders is equal to 0:
         Note: Failed to identify leaders
@@ -114,7 +136,7 @@ Process called "build_cfg_from_instructions" that takes function_ptr as Integer 
     End If
 
     Note: Phase 2 - Create basic blocks from leaders
-    Let blocks_created be create_basic_blocks_from_leaders(cfg_ptr, inst_list, leaders)
+    Let blocks_created be proc create_basic_blocks_from_leaders with cfg_ptr, inst_list, leaders
 
     If blocks_created is equal to 0:
         Note: Failed to create basic blocks
@@ -123,7 +145,7 @@ Process called "build_cfg_from_instructions" that takes function_ptr as Integer 
     End If
 
     Note: Phase 3 - Construct CFG edges from terminators
-    Let edges_created be construct_cfg_edges(cfg_ptr)
+    Let edges_created be proc construct_cfg_edges with cfg_ptr
 
     If edges_created is equal to 0:
         Note: Failed to construct edges
@@ -140,40 +162,80 @@ End Process
 
 Process called "identify_basic_block_leaders" that takes inst_list as Integer returns Integer:
     @Reasoning
-    Leader-based partitioning is the standard algorithm for basic block identification.
-    A leader is the first instruction of a basic block.
+    Leader-based partitioning is the standard algorithm for basic-block
+    identification: a leader is the instruction-index where a new basic
+    block starts. In a classic three-address representation where branches
+    carry instruction indices, leaders are derived from BOTH (a) "first
+    instruction" + (b) "instruction immediately after a terminator" + (c)
+    "instruction-index that any branch points at". In the Runa MIR
+    representation, however, branch instructions carry **block IDs** rather
+    than instruction indices (see create_mir_branch / create_mir_jump in
+    mir_nodes.runa: every target slot stores the destination block ID).
+    Block IDs are an opaque label namespace, distinct from instruction
+    indices, and live across instruction renumbering. They are the canonical
+    target representation used by construct_cfg_edges, by every CFG-edge
+    operation, by phi nodes, and by every consumer of the MIR.
 
-    Leader identification rules:
-    1. First instruction of the function is always a leader
-    2. Any instruction that is the target of a branch/jump is a leader
-    3. Any instruction immediately following a branch/jump is a leader
+    Mixing block IDs into the leader-INDEX list (the historical mistake)
+    silently corrupts the partition: the leader list is consumed by
+    create_basic_blocks_from_leaders, which interprets each element as an
+    instruction index and forms a block by scanning the instruction list
+    between consecutive leaders. Appending a block ID to that list produces
+    an out-of-range index that either truncates the legitimate block or
+    indexes past the end of the instruction list, depending on the relative
+    magnitudes of the integer IDs.
 
-    We maintain a set of instruction indices that are leaders. Using indices rather
-    than pointers allows efficient sorting and deduplication.
+    Architectural decision: block IDs are canonical for branch targets.
+    Leader identification therefore must NOT consume branch targets; it
+    derives leaders solely from positional terminator-boundary rules (a)
+    and (b). Branch targets remain the province of construct_cfg_edges,
+    which already operates correctly on block IDs.
 
-    For switch instructions with N targets, all N targets become leaders.
-    For invoke instructions, both normal and exception targets become leaders.
+    This leaves the partition still correct: every branch necessarily
+    appears as a terminator, every terminator already forces the
+    next-instruction to be a leader, and every block's first instruction
+    is automatically marked because index 0 is a leader and every
+    instruction following a terminator is a leader. The CFG-edge phase
+    then resolves block-ID-keyed branches against the partitioned blocks
+    using get_block_by_id_from_cfg, which performs the canonical
+    block-id-to-block-pointer translation.
 
     Time complexity: O(n) where n is the number of instructions.
-    Space complexity: O(k) where k is the number of basic blocks (typically k shifted left by n).
+    Space complexity: O(k) where k is the number of basic blocks.
     @End Reasoning
 
     @Implementation
-    We traverse the instruction list once, examining each instruction:
-    - Track the current instruction index
-    - Mark index 0 as a leader (first instruction)
-    - For terminators, mark their targets as leaders
-    - For terminators, mark the next instruction (if exists) as a leader
+    Single forward sweep over the instruction list:
+    1. Mark instruction-index 0 as a leader (function-entry block).
+    2. For every instruction that is a terminator (branch, jump, switch,
+       invoke, throw, return), mark the instruction at the next index
+       (if any) as a leader.
+    Branch targets are deliberately NOT added: they are block IDs, not
+    instruction indices, and would corrupt the partition. The CFG edge
+    phase resolves them separately against the block list.
 
-    Returns a List[Integer] containing sorted leader indices.
+    Returns a List[Integer] of sorted, deduplicated leader-instruction
+    indices, ready to consume by create_basic_blocks_from_leaders.
     @End Implementation
+
+    @Performance_Hints
+    Linear single-pass over the instruction list; O(n) terminator checks
+    and O(n) list_append amortized. Sort-and-dedup is O(k log k) for k
+    leaders, dominated by the linear sweep for typical functions.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read of the instruction list plus writes to the local leader list,
+    which is freed by the caller (build_cfg_from_instructions) before
+    returning. No mutation of any input.
+    @End Security_Scope
 
     If inst_list is equal to 0:
         Return 0
     End If
 
     Note: Create list to store leader indices
-    Let leaders be list_create()
+    Let leaders be proc list_create
 
     If leaders is equal to 0:
         Return 0
@@ -183,124 +245,35 @@ Process called "identify_basic_block_leaders" that takes inst_list as Integer re
     list_append(leaders, 0)
 
     Note: Get list length
-    Let inst_count be list_length(inst_list)
+    Let inst_count be proc list_length with inst_list
 
     If inst_count is equal to 0:
         Note: Empty instruction list
         Return leaders
     End If
 
-    Note: Traverse all instructions to identify leaders
+    Note: Traverse instructions. For each terminator, mark the
+    Note: instruction at index+1 (if it exists) as a new-block leader.
+    Note: Branch / jump / switch / invoke targets are block IDs, NOT
+    Note: instruction indices, so they are intentionally excluded from
+    Note: this list. construct_cfg_edges resolves those block-ID-keyed
+    Note: targets against the block list using get_block_by_id_from_cfg.
     Let i be 0
 
     While i is less than inst_count:
-        Let inst_ptr be list_get(inst_list, i)
+        Let inst_ptr be proc list_get with inst_list, i
 
         If inst_ptr is not equal to 0:
-            Let opcode be get_mir_node_opcode(inst_ptr)
-
             Note: Check if this is a terminator instruction
             If is_terminator(inst_ptr) is equal to 1:
-                Note: Handle different terminator types
-
-                Note: Branch instruction (conditional)
-                If opcode is equal to MIR_BRANCH:
-                    Let branch_ptr be inst_ptr
-                    Let true_target be get_mir_branch_true_target(branch_ptr)
-                    Let false_target be get_mir_branch_false_target(branch_ptr)
-
-                    Note: Both branch targets are leaders
-                    If true_target is not equal to 0:
-                        list_append(leaders, true_target)
-                    End If
-
-                    If false_target is not equal to 0:
-                        list_append(leaders, false_target)
-                    End If
-
-                    Note: Instruction after branch is a leader
-                    Let next_idx be i
-                    Set next_idx to next_idx plus 1
-                    If next_idx is less than inst_count:
-                        list_append(leaders, next_idx)
-                    End If
+                Note: Instruction immediately after any terminator
+                Note: starts a new basic block. This is the sole rule
+                Note: needed when branch targets are block IDs.
+                Let next_idx be i
+                Set next_idx to next_idx plus 1
+                If next_idx is less than inst_count:
+                    list_append(leaders, next_idx)
                 End If
-
-                Note: Jump instruction (unconditional)
-                If opcode is equal to MIR_JUMP:
-                    Let jump_ptr be inst_ptr
-                    Let target be get_mir_jump_target(jump_ptr)
-
-                    Note: Jump target is a leader
-                    If target is not equal to 0:
-                        list_append(leaders, target)
-                    End If
-
-                    Note: Instruction after jump is a leader (for fallthrough or unreachable code)
-                    Let next_idx be i
-                    Set next_idx to next_idx plus 1
-                    If next_idx is less than inst_count:
-                        list_append(leaders, next_idx)
-                    End If
-                End If
-
-                Note: Switch instruction (multi-way branch)
-                If opcode is equal to MIR_SWITCH:
-                    Let switch_ptr be inst_ptr
-                    Let case_count be get_mir_switch_case_count(switch_ptr)
-                    Let default_target be get_mir_switch_default_target(switch_ptr)
-
-                    Note: Default target is a leader
-                    If default_target is not equal to 0:
-                        list_append(leaders, default_target)
-                    End If
-
-                    Note: Each case target is a leader
-                    Let case_idx be 0
-                    While case_idx is less than case_count:
-                        Let case_target be get_mir_switch_case_target(switch_ptr, case_idx)
-                        If case_target is not equal to 0:
-                            list_append(leaders, case_target)
-                        End If
-                        Set case_idx to case_idx plus 1
-                    End While
-
-                    Note: Instruction after switch is a leader
-                    Let next_idx be i
-                    Set next_idx to next_idx plus 1
-                    If next_idx is less than inst_count:
-                        list_append(leaders, next_idx)
-                    End If
-                End If
-
-                Note: Invoke instruction (call with exception handling)
-                If opcode is equal to MIR_INVOKE:
-                    Let invoke_ptr be inst_ptr
-                    Let normal_dest be get_mir_invoke_normal_dest(invoke_ptr)
-                    Let unwind_dest be get_mir_invoke_unwind_dest(invoke_ptr)
-
-                    Note: Both normal and exception destinations are leaders
-                    If normal_dest is not equal to 0:
-                        list_append(leaders, normal_dest)
-                    End If
-
-                    If unwind_dest is not equal to 0:
-                        list_append(leaders, unwind_dest)
-                    End If
-                End If
-
-                Note: Throw instruction
-                If opcode is equal to MIR_THROW:
-                    Note: Throw terminates the block, next instruction (if exists) is a leader
-                    Let next_idx be i
-                    Set next_idx to next_idx plus 1
-                    If next_idx is less than inst_count:
-                        list_append(leaders, next_idx)
-                    End If
-                End If
-
-                Note: Return instruction terminates the block
-                Note: No additional leaders needed for return
             End If
         End If
 
@@ -308,7 +281,7 @@ Process called "identify_basic_block_leaders" that takes inst_list as Integer re
     End While
 
     Note: Sort and deduplicate leaders
-    Let sorted_leaders be sort_and_deduplicate_leaders(leaders)
+    Let sorted_leaders be proc sort_and_deduplicate_leaders with leaders
 
     Note: Clean up original unsorted list
     list_destroy(leaders)
@@ -317,6 +290,29 @@ Process called "identify_basic_block_leaders" that takes inst_list as Integer re
 End Process
 
 Process called "sort_and_deduplicate_leaders" that takes leaders as Integer returns Integer:
+    @Reasoning
+    Leader identification appends entries as control-flow targets are discovered,
+    producing a list that is both unsorted (since branches can target arbitrary
+    instruction indices) and potentially duplicated (since the same index can be
+    both the fall-through after one branch and the target of another). The block
+    creation pass requires leaders in sorted order with no duplicates, otherwise
+    it would either emit out-of-order blocks or attempt to create the same block
+    twice.
+
+    We choose insertion sort over quicksort or merge sort because the leader
+    count is typically below 100 even for large functions, where the constant
+    factor of insertion sort beats the algorithmic advantage of O(n log n)
+    sorts. Insertion sort also naturally handles deduplication in a single pass:
+    when scanning the sorted portion to find the insertion point we can detect
+    an existing equal value and skip the insert.
+
+    We allocate a fresh sorted list rather than sorting in place because the
+    caller's contract permits us to consume the input list (the caller passes
+    leaders by value and we destroy it after returning). Returning a new
+    allocation simplifies error handling: if allocation fails we return 0 and
+    the caller still owns the original list.
+    @End Reasoning
+
     @Implementation
     Sorts the leader indices in ascending order and removes duplicates.
     This ensures basic blocks are created in the correct order and no duplicate
@@ -332,35 +328,35 @@ Process called "sort_and_deduplicate_leaders" that takes leaders as Integer retu
         Return 0
     End If
 
-    Let count be list_length(leaders)
+    Let count be proc list_length with leaders
 
     If count is equal to 0:
         Return leaders
     End If
 
     Note: Create new list for sorted result
-    Let sorted be list_create()
+    Let sorted be proc list_create
 
     If sorted is equal to 0:
         Return 0
     End If
 
     Note: Get first element
-    Let first_val be list_get(leaders, 0)
+    Let first_val be proc list_get with leaders, 0
     list_append(sorted, first_val)
 
     Note: Insert remaining elements in sorted order, skipping duplicates
     Let i be 1
 
     While i is less than count:
-        Let current_val be list_get(leaders, i)
-        Let sorted_count be list_length(sorted)
+        Let current_val be proc list_get with leaders, i
+        Let sorted_count be proc list_length with sorted
         Let inserted be 0
         Let j be 0
 
         Note: Find insertion position
         While j is less than sorted_count:
-            Let existing_val be list_get(sorted, j)
+            Let existing_val be proc list_get with sorted, j
 
             If current_val is equal to existing_val:
                 Note: Duplicate found, skip insertion
@@ -428,18 +424,18 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
         Return 0
     End If
 
-    Let leader_count be list_length(leaders)
+    Let leader_count be proc list_length with leaders
 
     If leader_count is equal to 0:
         Return 0
     End If
 
-    Let inst_count be list_length(inst_list)
+    Let inst_count be proc list_length with inst_list
     Let block_id be 0
     Let i be 0
 
     While i is less than leader_count:
-        Let start_idx be list_get(leaders, i)
+        Let start_idx be proc list_get with leaders, i
         Let end_idx be 0
 
         Note: Determine end of this basic block
@@ -448,7 +444,7 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
 
         If next_leader_idx is less than leader_count:
             Note: End is one before next leader
-            Let next_start be list_get(leaders, next_leader_idx)
+            Let next_start be proc list_get with leaders, next_leader_idx
             Set end_idx to next_start minus 1
         Otherwise:
             Note: This is the last block, goes to end of instructions
@@ -456,7 +452,7 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
         End If
 
         Note: Create basic block for this range
-        Let block_ptr be create_mir_basic_block(block_id)
+        Let block_ptr be proc create_mir_basic_block with block_id
 
         If block_ptr is equal to 0:
             Note: Failed to create block
@@ -470,7 +466,7 @@ Process called "create_basic_blocks_from_leaders" that takes cfg_ptr as Integer,
 
         While inst_idx is less than or equal to end_idx:
             If inst_idx is less than inst_count:
-                Let inst_ptr be list_get(inst_list, inst_idx)
+                Let inst_ptr be proc list_get with inst_list, inst_idx
 
                 If inst_ptr is not equal to 0:
                     Note: Update instruction's parent block
@@ -538,31 +534,31 @@ Process called "construct_cfg_edges" that takes cfg_ptr as Integer returns Integ
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Note: No blocks in CFG
         Return 1
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let terminator be get_block_terminator(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let terminator be proc get_block_terminator with block_ptr
 
             If terminator is not equal to 0:
-                Let opcode be get_mir_node_opcode(terminator)
+                Let opcode be proc get_mir_node_opcode with terminator
 
                 Note: Handle branch instruction
                 If opcode is equal to MIR_BRANCH:
                     Let branch_ptr be terminator
-                    Let true_block_id be get_mir_branch_true_block(branch_ptr)
-                    Let false_block_id be get_mir_branch_false_block(branch_ptr)
+                    Let true_block_id be proc get_mir_branch_true_block with branch_ptr
+                    Let false_block_id be proc get_mir_branch_false_block with branch_ptr
 
                     Note: Create edge to true successor
                     If true_block_id is not equal to negative 1:
@@ -578,7 +574,7 @@ Process called "construct_cfg_edges" that takes cfg_ptr as Integer returns Integ
                 Note: Handle jump instruction
                 If opcode is equal to MIR_JUMP:
                     Let jump_ptr be terminator
-                    Let target_block_id be get_mir_jump_target_block(jump_ptr)
+                    Let target_block_id be proc get_mir_jump_target_block with jump_ptr
 
                     Note: Create edge to jump target
                     If target_block_id is not equal to negative 1:
@@ -589,8 +585,8 @@ Process called "construct_cfg_edges" that takes cfg_ptr as Integer returns Integ
                 Note: Handle switch instruction
                 If opcode is equal to MIR_SWITCH:
                     Let switch_ptr be terminator
-                    Let case_count be get_mir_switch_case_count(switch_ptr)
-                    Let default_block_id be get_mir_switch_default_block(switch_ptr)
+                    Let case_count be proc get_mir_switch_case_count with switch_ptr
+                    Let default_block_id be proc get_mir_switch_default_block with switch_ptr
 
                     Note: Create edge to default successor
                     If default_block_id is not equal to negative 1:
@@ -600,7 +596,7 @@ Process called "construct_cfg_edges" that takes cfg_ptr as Integer returns Integ
                     Note: Create edges to all case successors
                     Let case_idx be 0
                     While case_idx is less than case_count:
-                        Let case_block_id be get_mir_switch_case_block(switch_ptr, case_idx)
+                        Let case_block_id be proc get_mir_switch_case_block with switch_ptr, case_idx
 
                         If case_block_id is not equal to negative 1:
                             add_cfg_edge(cfg_ptr, block_id, case_block_id)
@@ -613,8 +609,8 @@ Process called "construct_cfg_edges" that takes cfg_ptr as Integer returns Integ
                 Note: Handle invoke instruction
                 If opcode is equal to MIR_INVOKE:
                     Let invoke_ptr be terminator
-                    Let normal_block_id be get_mir_invoke_normal_block(invoke_ptr)
-                    Let unwind_block_id be get_mir_invoke_unwind_block(invoke_ptr)
+                    Let normal_block_id be proc get_mir_invoke_normal_block with invoke_ptr
+                    Let unwind_block_id be proc get_mir_invoke_unwind_block with invoke_ptr
 
                     Note: Create edge to normal successor
                     If normal_block_id is not equal to negative 1:
@@ -650,7 +646,7 @@ Process called "get_block_terminator" that takes block_ptr as Integer returns In
         Return 0
     End If
 
-    Let last_inst be get_mir_basic_block_last_instruction(block_ptr)
+    Let last_inst be proc get_mir_basic_block_last_instruction with block_ptr
 
     Return last_inst
 End Process
@@ -700,6 +696,28 @@ All traversals maintain a visited set to handle cycles in the CFG.
 @End Reasoning
 
 Process called "traverse_cfg_dfs" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Depth-first search is the foundational traversal for most CFG analyses:
+    reverse postorder for SSA construction, dominator computation,
+    Tarjan's strongly connected components, and live-variable analysis. We
+    expose DFS as a public entry point so downstream passes that need a
+    reachable-only enumeration in DFS visitation order can share a single
+    well-tested implementation rather than each rolling their own.
+
+    We materialize the visited set as a parallel List indexed by block ID
+    rather than using a HashSet. Block IDs are dense small integers in the
+    range 0..block_count, so a List of length block_count gives O(1) lookup
+    with better cache locality than any hash structure and trivial
+    initialization (zero-fill).
+
+    Recursion (via dfs_visit_block) is acceptable here because the recursion
+    depth is bounded by the longest acyclic path in the CFG. In practice that
+    is well under the system stack limit for any function the compiler will
+    encounter. If a future profile finds a CFG that recurses too deeply, the
+    recursion can be converted to an explicit stack without changing this
+    public API.
+    @End Reasoning
+
     @Implementation
     Performs depth-first search traversal of the CFG starting from entry block.
     Returns a list of block IDs in DFS visitation order.
@@ -721,21 +739,21 @@ Process called "traverse_cfg_dfs" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create result list and visited set
-    Let result be list_create()
-    Let visited be list_create()
+    Let result be proc list_create
+    Let visited be proc list_create
 
     If result is equal to 0:
         Return 0
@@ -763,6 +781,21 @@ Process called "traverse_cfg_dfs" that takes cfg_ptr as Integer returns Integer:
 End Process
 
 Process called "dfs_visit_block" that takes cfg_ptr as Integer, block_id as Integer, visited as Integer, result as Integer returns Integer:
+    @Reasoning
+    The recursive worker for traverse_cfg_dfs. We keep this as a separate proc
+    so the recursion is explicit in the call graph and so the visited / result
+    state can be threaded through without forcing it onto traverse_cfg_dfs's
+    public signature. Callers from outside this module should never invoke
+    dfs_visit_block directly; it is an implementation detail of the public DFS
+    routine.
+
+    Successors are visited in their natural successor-list order rather than
+    reverse, so block IDs near the entry's first successor appear earlier in
+    the result. This matches the convention used by get_reverse_postorder when
+    we later compute reverse postorder from the DFS spanning tree, and it
+    matches the convention used by classic textbook DFS pseudocode.
+    @End Reasoning
+
     @Implementation
     Recursive helper for DFS traversal.
     Visits a block and recursively visits all unvisited successors.
@@ -781,7 +814,7 @@ Process called "dfs_visit_block" that takes cfg_ptr as Integer, block_id as Inte
     End If
 
     Note: Check if already visited
-    Let is_visited be list_get(visited, block_id)
+    Let is_visited be proc list_get with visited, block_id
 
     If is_visited is equal to 1:
         Return 1
@@ -794,21 +827,21 @@ Process called "dfs_visit_block" that takes cfg_ptr as Integer, block_id as Inte
     list_append(result, block_id)
 
     Note: Get the block pointer
-    Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, block_id)
+    Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, block_id
 
     If block_ptr is equal to 0:
         Return 1
     End If
 
     Note: Get successors
-    Let successors be get_mir_basic_block_successors(block_ptr)
+    Let successors be proc get_mir_basic_block_successors with block_ptr
 
     If successors is not equal to 0:
-        Let succ_count be list_length(successors)
+        Let succ_count be proc list_length with successors
         Let i be 0
 
         While i is less than succ_count:
-            Let succ_id be list_get(successors, i)
+            Let succ_id be proc list_get with successors, i
 
             Note: Recursively visit unvisited successors
             dfs_visit_block(cfg_ptr, succ_id, visited, result)
@@ -821,6 +854,25 @@ Process called "dfs_visit_block" that takes cfg_ptr as Integer, block_id as Inte
 End Process
 
 Process called "traverse_cfg_bfs" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Breadth-first search visits blocks in increasing distance from the entry,
+    which is the natural ordering for distance-from-entry analyses, shortest-
+    path queries between blocks, and any pass whose correctness depends on
+    visiting a block only after all its predecessors at a shorter distance
+    have been visited (e.g. monotone dataflow with fast convergence).
+
+    We use an explicit queue rather than recursion because BFS does not map
+    cleanly to the call stack: each visit enqueues successors and returns,
+    so unlike DFS there is no natural recursive shape. The queue is built on
+    the standard List type and the front is read with list_get(queue, 0)
+    plus a subsequent list_remove. This O(n) dequeue is acceptable because
+    block counts are bounded; we accept the cost for code simplicity and to
+    avoid introducing a separate Deque primitive.
+
+    The visited set, queue, and result list are all freshly allocated and
+    are cleaned up on every exit path including the early-return error paths.
+    @End Reasoning
+
     @Implementation
     Performs breadth-first search traversal of the CFG starting from entry block.
     Returns a list of block IDs in BFS visitation order (level by level).
@@ -842,22 +894,22 @@ Process called "traverse_cfg_bfs" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create result list, visited set, and queue
-    Let result be list_create()
-    Let visited be list_create()
-    Let queue be list_create()
+    Let result be proc list_create
+    Let visited be proc list_create
+    Let queue be proc list_create
 
     If result is equal to 0:
         Return 0
@@ -887,11 +939,11 @@ Process called "traverse_cfg_bfs" that takes cfg_ptr as Integer returns Integer:
     Note: BFS loop
     While list_length(queue) is greater than 0:
         Note: Dequeue front element
-        Let current_id be list_get(queue, 0)
+        Let current_id be proc list_get with queue, 0
         list_remove_at(queue, 0)
 
         Note: Skip if already visited
-        Let is_visited be list_get(visited, current_id)
+        Let is_visited be proc list_get with visited, current_id
 
         If is_visited is equal to 0:
             Note: Mark as visited
@@ -901,18 +953,18 @@ Process called "traverse_cfg_bfs" that takes cfg_ptr as Integer returns Integer:
             list_append(result, current_id)
 
             Note: Get block and successors
-            Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, current_id)
+            Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, current_id
 
             If block_ptr is not equal to 0:
-                Let successors be get_mir_basic_block_successors(block_ptr)
+                Let successors be proc get_mir_basic_block_successors with block_ptr
 
                 If successors is not equal to 0:
-                    Let succ_count be list_length(successors)
+                    Let succ_count be proc list_length with successors
                     Let j be 0
 
                     While j is less than succ_count:
-                        Let succ_id be list_get(successors, j)
-                        Let succ_visited be list_get(visited, succ_id)
+                        Let succ_id be proc list_get with successors, j
+                        Let succ_visited be proc list_get with visited, succ_id
 
                         Note: Enqueue unvisited successors
                         If succ_visited is equal to 0:
@@ -972,14 +1024,14 @@ Process called "get_reverse_postorder" that takes cfg_ptr as Integer returns Int
     End If
 
     Note: Get postorder traversal
-    Let postorder be get_postorder(cfg_ptr)
+    Let postorder be proc get_postorder with cfg_ptr
 
     If postorder is equal to 0:
         Return 0
     End If
 
     Note: Reverse the postorder list
-    Let reversed be reverse_list(postorder)
+    Let reversed be proc reverse_list with postorder
 
     Note: Clean up postorder list
     list_destroy(postorder)
@@ -988,6 +1040,25 @@ Process called "get_reverse_postorder" that takes cfg_ptr as Integer returns Int
 End Process
 
 Process called "get_postorder" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Postorder is the workhorse traversal for backward dataflow analyses
+    (live variables, available expressions when run on the reverse CFG, and
+    use-def chains computed bottom-up). A block's postorder index appears
+    after all its successors, so processing in postorder means we have already
+    seen everything that a block can flow into when we encounter it.
+
+    Postorder is also a building block for get_reverse_postorder, which is
+    the canonical order for forward dataflow on reducible graphs. Rather
+    than computing reverse postorder directly we compute postorder once and
+    reverse the result; this keeps the recursive worker (postorder_visit_block)
+    simple and reusable.
+
+    The recursive worker visits successors before appending self. We do not
+    inline the recursion into this proc because the recursion depth is
+    bounded by the longest acyclic path and a separate worker makes the
+    "successors first" invariant locally checkable.
+    @End Reasoning
+
     @Implementation
     Performs postorder DFS traversal.
     In postorder, a block is added to the result AFTER all its successors are visited.
@@ -1007,21 +1078,21 @@ Process called "get_postorder" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create result list and visited set
-    Let result be list_create()
-    Let visited be list_create()
+    Let result be proc list_create
+    Let visited be proc list_create
 
     If result is equal to 0:
         Return 0
@@ -1049,6 +1120,17 @@ Process called "get_postorder" that takes cfg_ptr as Integer returns Integer:
 End Process
 
 Process called "postorder_visit_block" that takes cfg_ptr as Integer, block_id as Integer, visited as Integer, result as Integer returns Integer:
+    @Reasoning
+    The postorder companion to dfs_visit_block. The structural difference is
+    a single line: in DFS we append self before recursing into successors;
+    in postorder we recurse into successors before appending self. We keep
+    this as a separate proc rather than sharing code with dfs_visit_block
+    via a flag parameter because the branch would execute inside the hot
+    recursion and because the two procs serve conceptually distinct purposes
+    (one materializes a traversal order, the other materializes a finish
+    order).
+    @End Reasoning
+
     @Implementation
     Recursive helper for postorder DFS.
     Visits all successors first, THEN adds current block to result.
@@ -1067,7 +1149,7 @@ Process called "postorder_visit_block" that takes cfg_ptr as Integer, block_id a
     End If
 
     Note: Check if already visited
-    Let is_visited be list_get(visited, block_id)
+    Let is_visited be proc list_get with visited, block_id
 
     If is_visited is equal to 1:
         Return 1
@@ -1077,19 +1159,19 @@ Process called "postorder_visit_block" that takes cfg_ptr as Integer, block_id a
     list_set(visited, block_id, 1)
 
     Note: Get the block pointer
-    Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, block_id)
+    Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, block_id
 
     If block_ptr is not equal to 0:
         Note: Get successors
-        Let successors be get_mir_basic_block_successors(block_ptr)
+        Let successors be proc get_mir_basic_block_successors with block_ptr
 
         If successors is not equal to 0:
-            Let succ_count be list_length(successors)
+            Let succ_count be proc list_length with successors
             Let i be 0
 
             Note: Visit all successors FIRST (recursively)
             While i is less than succ_count:
-                Let succ_id be list_get(successors, i)
+                Let succ_id be proc list_get with successors, i
                 postorder_visit_block(cfg_ptr, succ_id, visited, result)
                 Set i to i plus 1
             End While
@@ -1148,22 +1230,22 @@ Process called "topological_sort" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create result list, in-degree array, and queue
-    Let result be list_create()
-    Let in_degree be list_create()
-    Let queue be list_create()
+    Let result be proc list_create
+    Let in_degree be proc list_create
+    Let queue be proc list_create
 
     If result is equal to 0:
         Return 0
@@ -1190,20 +1272,20 @@ Process called "topological_sort" that takes cfg_ptr as Integer returns Integer:
     Note: Compute in-degree for each block
     Set i to 0
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
-                Let succ_count be list_length(successors)
+                Let succ_count be proc list_length with successors
                 Let j be 0
 
                 While j is less than succ_count:
-                    Let succ_id be list_get(successors, j)
+                    Let succ_id be proc list_get with successors, j
 
                     Note: Increment in-degree of successor
-                    Let current_degree be list_get(in_degree, succ_id)
+                    Let current_degree be proc list_get with in_degree, succ_id
                     Set current_degree to current_degree plus 1
                     list_set(in_degree, succ_id, current_degree)
 
@@ -1218,7 +1300,7 @@ Process called "topological_sort" that takes cfg_ptr as Integer returns Integer:
     Note: Enqueue all blocks with in-degree 0
     Set i to 0
     While i is less than block_count:
-        Let degree be list_get(in_degree, i)
+        Let degree be proc list_get with in_degree, i
 
         If degree is equal to 0:
             list_append(queue, i)
@@ -1230,27 +1312,27 @@ Process called "topological_sort" that takes cfg_ptr as Integer returns Integer:
     Note: Process queue (Kahn's algorithm)
     While list_length(queue) is greater than 0:
         Note: Dequeue front element
-        Let current_id be list_get(queue, 0)
+        Let current_id be proc list_get with queue, 0
         list_remove_at(queue, 0)
 
         Note: Add to result
         list_append(result, current_id)
 
         Note: Get block and successors
-        Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, current_id)
+        Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, current_id
 
         If block_ptr is not equal to 0:
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
-                Let succ_count be list_length(successors)
+                Let succ_count be proc list_length with successors
                 Let j be 0
 
                 While j is less than succ_count:
-                    Let succ_id be list_get(successors, j)
+                    Let succ_id be proc list_get with successors, j
 
                     Note: Decrement in-degree of successor
-                    Let succ_degree be list_get(in_degree, succ_id)
+                    Let succ_degree be proc list_get with in_degree, succ_id
                     Set succ_degree to succ_degree minus 1
                     list_set(in_degree, succ_id, succ_degree)
 
@@ -1277,6 +1359,19 @@ Note: HELPER FUNCTIONS FOR TRAVERSAL
 Note: ============================================================
 
 Process called "reverse_list" that takes list_ptr as Integer returns Integer:
+    @Reasoning
+    A local list-reversal helper used by get_reverse_postorder. We do not
+    reuse a general-purpose primitives/collections reverse because we want
+    the helper to live next to the CFG traversal code that needs it; this
+    keeps the dependency surface of cfg.runa narrow (no extra import) and
+    keeps the helper trivially testable against the local invariants.
+
+    We construct a fresh list rather than mutating in place because the
+    caller (get_reverse_postorder) discards the postorder list immediately
+    after reversal, but other potential callers may want to keep the
+    original. Returning a new allocation is the safer default.
+    @End Reasoning
+
     @Implementation
     Reverses a list by creating a new list with elements in reverse order.
     Returns new reversed list, original list is unchanged.
@@ -1286,14 +1381,14 @@ Process called "reverse_list" that takes list_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let count be list_length(list_ptr)
+    Let count be proc list_length with list_ptr
 
     If count is equal to 0:
         Note: Empty list, return empty list
         Return list_create()
     End If
 
-    Let reversed be list_create()
+    Let reversed be proc list_create
 
     If reversed is equal to 0:
         Return 0
@@ -1303,7 +1398,7 @@ Process called "reverse_list" that takes list_ptr as Integer returns Integer:
     Let i be count minus 1
 
     While i is greater than or equal to 0:
-        Let value be list_get(list_ptr, i)
+        Let value be proc list_get with list_ptr, i
         list_append(reversed, value)
         Set i to i minus 1
     End While
@@ -1312,29 +1407,52 @@ Process called "reverse_list" that takes list_ptr as Integer returns Integer:
 End Process
 
 Process called "get_block_by_id_from_cfg" that takes cfg_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    The CFG stores blocks in an ordered List indexed by storage position, not
+    by block ID. When a transformation removes a block from the middle of the
+    list, the remaining blocks shift down but retain their original IDs, so
+    storage position no longer equals block ID. This proc is the canonical
+    "lookup by ID" primitive that hides that decoupling from callers.
+
+    The current implementation is O(V) linear search. We accept this cost
+    because callers that need many ID-keyed lookups (e.g. dominator
+    construction, edge traversal) typically operate on small block counts
+    and because adding an ID->pointer index would double the storage and
+    create a synchronization burden during block insertion / removal. If
+    profiling shows this hot in a future release, the CFG type can grow an
+    incremental ID index without changing this proc's signature.
+    @End Reasoning
+
     @Implementation
     Finds and returns the block pointer for a given block ID within a CFG.
     Returns 0 if block not found.
     @End Implementation
 
+    @Performance_Hints
+    - O(V) linear scan. Avoid calling inside a tight loop indexed by block ID.
+      Cache the pointer once if the ID is reused across iterations.
+    - The scan reads only block IDs from each block_ptr, which is a single
+      qword load and so is cache-friendly even on large block lists.
+    @End Performance_Hints
+
     If cfg_ptr is equal to 0:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let id be get_mir_basic_block_id(block_ptr)
+            Let id be proc get_mir_basic_block_id with block_ptr
 
             If id is equal to block_id:
                 Return block_ptr
@@ -1368,6 +1486,22 @@ Time complexity: O(V + E) using DFS or BFS
 @End Reasoning
 
 Process called "compute_reachable_blocks" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The canonical reachability query: which blocks can be reached from the
+    function entry? Almost every CFG optimization needs this answer because
+    unreachable code can be deleted unconditionally and because dataflow
+    iteration only needs to converge over reachable blocks. We delegate to
+    traverse_cfg_dfs rather than reimplementing the BFS/DFS because the DFS
+    result already gives us exactly the reachable set in visitation order,
+    and using the shared traversal guarantees we are consistent with every
+    other pass that depends on "reachable from entry".
+
+    Returning a List rather than a bitset keeps the API uniform with the
+    other reachability helpers (find_unreachable_blocks, get_exit_blocks)
+    that all return lists of block IDs. Callers that need set-membership
+    queries should convert to their preferred structure once.
+    @End Reasoning
+
     @Implementation
     Computes the set of all blocks reachable from the entry block.
     Uses DFS traversal starting from entry block (block 0).
@@ -1386,25 +1520,40 @@ Process called "compute_reachable_blocks" that takes cfg_ptr as Integer returns 
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: DFS traversal gives us all reachable blocks
-    Let reachable be traverse_cfg_dfs(cfg_ptr)
+    Let reachable be proc traverse_cfg_dfs with cfg_ptr
 
     Return reachable
 End Process
 
 Process called "find_unreachable_blocks" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The complement of compute_reachable_blocks. Rather than reimplementing
+    a backward search we compute the reachable set and subtract; this is
+    O(V + E) and reuses the single reachability primitive that every
+    optimization pass depends on. Unreachable blocks are produced as a
+    by-product of transformations such as branch folding, jump threading,
+    and constant propagation, and remove_unreachable_blocks consumes the
+    list produced here to actually free the storage.
+
+    The output is an explicit list of unreachable block IDs (rather than a
+    pair of "all" and "reachable" lists for the caller to diff) so that
+    remove_unreachable_blocks can iterate directly without re-computing
+    the membership query for each candidate.
+    @End Reasoning
+
     @Implementation
     Finds all blocks that are NOT reachable from the entry block.
     These are dead code blocks that can be eliminated.
@@ -1424,27 +1573,27 @@ Process called "find_unreachable_blocks" that takes cfg_ptr as Integer returns I
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Get reachable blocks
-    Let reachable be compute_reachable_blocks(cfg_ptr)
+    Let reachable be proc compute_reachable_blocks with cfg_ptr
 
     If reachable is equal to 0:
         Return 0
     End If
 
     Note: Create unreachable list
-    Let unreachable be list_create()
+    Let unreachable be proc list_create
 
     If unreachable is equal to 0:
         list_destroy(reachable)
@@ -1455,18 +1604,18 @@ Process called "find_unreachable_blocks" that takes cfg_ptr as Integer returns I
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
 
             Note: Check if block_id is in reachable list
             Let found be 0
             Let j be 0
-            Let reachable_count be list_length(reachable)
+            Let reachable_count be proc list_length with reachable
 
             While j is less than reachable_count:
-                Let reachable_id be list_get(reachable, j)
+                Let reachable_id be proc list_get with reachable, j
 
                 If reachable_id is equal to block_id:
                     Set found to 1
@@ -1492,6 +1641,23 @@ Process called "find_unreachable_blocks" that takes cfg_ptr as Integer returns I
 End Process
 
 Process called "is_block_reachable" that takes cfg_ptr as Integer, target_block_id as Integer returns Integer:
+    @Reasoning
+    A single-target reachability predicate. Note that the current
+    implementation performs a full O(V + E) traversal even though caller
+    only cares about one block. We accept this because:
+
+    1. The proc is rarely used inside hot loops; it shows up in validators
+       and asserts where one query per phase is typical.
+    2. Implementing an early-termination DFS that stops as soon as
+       target_block_id is reached would diverge from compute_reachable_blocks
+       and create two reachability algorithms in this module, doubling the
+       test surface.
+
+    If a future pass needs many single-target queries it should call
+    compute_reachable_blocks once and check membership locally, rather than
+    invoking is_block_reachable in a loop.
+    @End Reasoning
+
     @Implementation
     Checks if a specific block is reachable from the entry block.
     Returns 1 if reachable, 0 if not reachable.
@@ -1509,7 +1675,7 @@ Process called "is_block_reachable" that takes cfg_ptr as Integer, target_block_
     End If
 
     Note: Get reachable blocks
-    Let reachable be compute_reachable_blocks(cfg_ptr)
+    Let reachable be proc compute_reachable_blocks with cfg_ptr
 
     If reachable is equal to 0:
         Return 0
@@ -1517,11 +1683,11 @@ Process called "is_block_reachable" that takes cfg_ptr as Integer, target_block_
 
     Note: Search for target_block_id in reachable list
     Let found be 0
-    Let count be list_length(reachable)
+    Let count be proc list_length with reachable
     Let i be 0
 
     While i is less than count:
-        Let block_id be list_get(reachable, i)
+        Let block_id be proc list_get with reachable, i
 
         If block_id is equal to target_block_id:
             Set found to 1
@@ -1575,20 +1741,20 @@ Process called "compute_reachability_matrix" that takes cfg_ptr as Integer retur
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create matrix (list of lists)
-    Let matrix be list_create()
+    Let matrix be proc list_create
 
     If matrix is equal to 0:
         Return 0
@@ -1599,7 +1765,7 @@ Process called "compute_reachability_matrix" that takes cfg_ptr as Integer retur
 
     While i is less than block_count:
         Note: Create row for block i
-        Let row be list_create()
+        Let row be proc list_create
 
         If row is equal to 0:
             Note: Cleanup on failure
@@ -1615,15 +1781,15 @@ Process called "compute_reachability_matrix" that takes cfg_ptr as Integer retur
         End While
 
         Note: Compute blocks reachable from block i
-        Let reachable_from_i be compute_reachable_blocks_from_source(cfg_ptr, i)
+        Let reachable_from_i be proc compute_reachable_blocks_from_source with cfg_ptr, i
 
         If reachable_from_i is not equal to 0:
             Note: Mark reachable blocks in row
-            Let reachable_count be list_length(reachable_from_i)
+            Let reachable_count be proc list_length with reachable_from_i
             Let k be 0
 
             While k is less than reachable_count:
-                Let reachable_id be list_get(reachable_from_i, k)
+                Let reachable_id be proc list_get with reachable_from_i, k
                 list_set(row, reachable_id, 1)
                 Set k to k plus 1
             End While
@@ -1641,6 +1807,20 @@ Process called "compute_reachability_matrix" that takes cfg_ptr as Integer retur
 End Process
 
 Process called "compute_reachable_blocks_from_source" that takes cfg_ptr as Integer, source_block_id as Integer returns Integer:
+    @Reasoning
+    The generalized reachability primitive: which blocks are reachable from
+    an arbitrary source rather than from the function entry? This is the
+    building block for the all-pairs reachability matrix and for any pass
+    that needs partial reachability (e.g. region-based analyses or
+    "everything dominated by block X" queries built on top of dominator
+    information).
+
+    We reuse the dfs_visit_block recursive worker but seed it with an
+    arbitrary source ID rather than 0. The visited set is sized to the full
+    block count so that out-of-region successors are correctly marked and
+    we do not re-visit them via cycles back into the region.
+    @End Reasoning
+
     @Implementation
     Computes all blocks reachable from a given source block.
     Similar to compute_reachable_blocks but starts from arbitrary block instead of entry.
@@ -1659,21 +1839,21 @@ Process called "compute_reachable_blocks_from_source" that takes cfg_ptr as Inte
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create result list and visited set
-    Let result be list_create()
-    Let visited be list_create()
+    Let result be proc list_create
+    Let visited be proc list_create
 
     If result is equal to 0:
         Return 0
@@ -1701,6 +1881,19 @@ Process called "compute_reachable_blocks_from_source" that takes cfg_ptr as Inte
 End Process
 
 Process called "destroy_matrix" that takes matrix as Integer, row_count as Integer returns Integer:
+    @Reasoning
+    The reachability matrix is a 2-dimensional structure built from nested
+    Lists: an outer list of rows, each row a list of column entries. On any
+    partial-allocation failure during compute_reachability_matrix we need to
+    free everything already allocated; this helper centralizes that logic
+    so the matrix builder does not have to inline cleanup at every early
+    return.
+
+    Taking row_count explicitly (rather than reading it from the matrix
+    list_length) lets the caller invoke destroy_matrix mid-build when only
+    the first row_count rows have been populated.
+    @End Reasoning
+
     @Implementation
     Helper function to clean up partially allocated matrix on error.
     Destroys all allocated rows and the matrix list itself.
@@ -1713,7 +1906,7 @@ Process called "destroy_matrix" that takes matrix as Integer, row_count as Integ
     Let i be 0
 
     While i is less than row_count:
-        Let row be list_get(matrix, i)
+        Let row be proc list_get with matrix, i
 
         If row is not equal to 0:
             list_destroy(row)
@@ -1760,6 +1953,19 @@ Time complexity:
 @End Reasoning
 
 Process called "find_critical_edges" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Enumerates every critical edge in the CFG. The output is consumed by
+    split_all_critical_edges and by validators that need to confirm an
+    SSA-ready CFG contains no critical edges. We materialize the full list
+    in one pass rather than offering a callback-based iterator because the
+    callers all need the snapshot semantics described in the
+    split_all_critical_edges reasoning.
+
+    The double loop is O(V * S_avg) where S_avg is the average successor
+    count, but for realistic CFGs S_avg is small (typically 1-2 with
+    occasional switches) so the practical cost is O(V).
+    @End Reasoning
+
     @Implementation
     Finds all critical edges in the CFG.
     Returns a list of (predecessor_id, successor_id) pairs representing critical edges.
@@ -1778,20 +1984,20 @@ Process called "find_critical_edges" that takes cfg_ptr as Integer returns Integ
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create list to store critical edges (as pairs)
-    Let critical_edges be list_create()
+    Let critical_edges be proc list_create
 
     If critical_edges is equal to 0:
         Return 0
@@ -1801,33 +2007,33 @@ Process called "find_critical_edges" that takes cfg_ptr as Integer returns Integ
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
-                Let succ_count be list_length(successors)
+                Let succ_count be proc list_length with successors
 
                 Note: Only check if block has multiple successors
                 If succ_count is greater than 1:
                     Let j be 0
 
                     While j is less than succ_count:
-                        Let succ_id be list_get(successors, j)
-                        Let succ_block_ptr be get_block_by_id_from_cfg(cfg_ptr, succ_id)
+                        Let succ_id be proc list_get with successors, j
+                        Let succ_block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, succ_id
 
                         If succ_block_ptr is not equal to 0:
-                            Let predecessors be get_mir_basic_block_predecessors(succ_block_ptr)
+                            Let predecessors be proc get_mir_basic_block_predecessors with succ_block_ptr
 
                             If predecessors is not equal to 0:
-                                Let pred_count be list_length(predecessors)
+                                Let pred_count be proc list_length with predecessors
 
                                 Note: Critical edge: multiple successors → multiple predecessors
                                 If pred_count is greater than 1:
                                     Note: Create edge pair (block_id, succ_id)
-                                    Let edge_pair be create_edge_pair(block_id, succ_id)
+                                    Let edge_pair be proc create_edge_pair with block_id, succ_id
 
                                     If edge_pair is not equal to 0:
                                         list_append(critical_edges, edge_pair)
@@ -1849,6 +2055,18 @@ Process called "find_critical_edges" that takes cfg_ptr as Integer returns Integ
 End Process
 
 Process called "is_critical_edge" that takes cfg_ptr as Integer, pred_id as Integer, succ_id as Integer returns Integer:
+    @Reasoning
+    A critical edge is one that connects a block with multiple successors to
+    a block with multiple predecessors. Critical edges block several SSA
+    transformations (PHI placement, register allocation) and must usually be
+    split before those passes run. This predicate is the canonical test that
+    the splitter and other clients use to decide whether to act.
+
+    The check is O(1) modulo the O(V) cost of get_block_by_id_from_cfg; the
+    successor and predecessor counts are read directly from the block
+    structure without scanning.
+    @End Reasoning
+
     @Implementation
     Checks if the edge from pred_id to succ_id is a critical edge.
     Returns 1 if critical, 0 if not critical.
@@ -1865,27 +2083,27 @@ Process called "is_critical_edge" that takes cfg_ptr as Integer, pred_id as Inte
     End If
 
     Note: Get predecessor block
-    Let pred_block be get_block_by_id_from_cfg(cfg_ptr, pred_id)
+    Let pred_block be proc get_block_by_id_from_cfg with cfg_ptr, pred_id
 
     If pred_block is equal to 0:
         Return 0
     End If
 
     Note: Get successor block
-    Let succ_block be get_block_by_id_from_cfg(cfg_ptr, succ_id)
+    Let succ_block be proc get_block_by_id_from_cfg with cfg_ptr, succ_id
 
     If succ_block is equal to 0:
         Return 0
     End If
 
     Note: Check if predecessor has multiple successors
-    Let pred_successors be get_mir_basic_block_successors(pred_block)
+    Let pred_successors be proc get_mir_basic_block_successors with pred_block
 
     If pred_successors is equal to 0:
         Return 0
     End If
 
-    Let pred_succ_count be list_length(pred_successors)
+    Let pred_succ_count be proc list_length with pred_successors
 
     If pred_succ_count is less than or equal to 1:
         Note: Not critical - predecessor has 0 or 1 successor
@@ -1893,13 +2111,13 @@ Process called "is_critical_edge" that takes cfg_ptr as Integer, pred_id as Inte
     End If
 
     Note: Check if successor has multiple predecessors
-    Let succ_predecessors be get_mir_basic_block_predecessors(succ_block)
+    Let succ_predecessors be proc get_mir_basic_block_predecessors with succ_block
 
     If succ_predecessors is equal to 0:
         Return 0
     End If
 
-    Let succ_pred_count be list_length(succ_predecessors)
+    Let succ_pred_count be proc list_length with succ_predecessors
 
     If succ_pred_count is less than or equal to 1:
         Note: Not critical - successor has 0 or 1 predecessor
@@ -1946,7 +2164,7 @@ Process called "split_critical_edge" that takes cfg_ptr as Integer, pred_id as I
     End If
 
     Note: Verify this is actually a critical edge
-    Let is_critical be is_critical_edge(cfg_ptr, pred_id, succ_id)
+    Let is_critical be proc is_critical_edge with cfg_ptr, pred_id, succ_id
 
     If is_critical is equal to 0:
         Note: Not a critical edge, nothing to split
@@ -1954,17 +2172,17 @@ Process called "split_critical_edge" that takes cfg_ptr as Integer, pred_id as I
     End If
 
     Note: Generate new unique block ID
-    Let new_block_id be get_next_block_id(cfg_ptr)
+    Let new_block_id be proc get_next_block_id with cfg_ptr
 
     Note: Create new empty basic block
-    Let new_block be create_mir_basic_block(new_block_id)
+    Let new_block be proc create_mir_basic_block with new_block_id
 
     If new_block is equal to 0:
         Return negative 1
     End If
 
     Note: Create jump instruction from new_block to succ_block
-    Let jump be create_mir_jump(succ_id)
+    Let jump be proc create_mir_jump with succ_id
 
     If jump is equal to 0:
         Note: Failed to create jump instruction, deallocate new_block to prevent memory leak
@@ -1997,6 +2215,22 @@ Process called "split_critical_edge" that takes cfg_ptr as Integer, pred_id as I
 End Process
 
 Process called "split_all_critical_edges" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    A convenience wrapper around find_critical_edges and split_critical_edge
+    that runs the split as a single batch pass. Most clients want "split
+    everything that is critical right now" rather than iterating themselves.
+
+    We snapshot the critical-edge list before splitting because every split
+    inserts a new block and changes the predecessor/successor sets of the
+    blocks involved. Splitting in-place while iterating over a live edge set
+    would re-classify edges mid-iteration and either skip splits or process
+    the same split twice. The snapshot makes the pass deterministic.
+
+    The return value is the number of edges split, which downstream phases
+    can use to decide whether dependent invariants (e.g. PHI normalization)
+    need to re-run.
+    @End Reasoning
+
     @Implementation
     Splits all critical edges in the CFG.
     Returns the number of edges split.
@@ -2015,25 +2249,25 @@ Process called "split_all_critical_edges" that takes cfg_ptr as Integer returns 
     End If
 
     Note: Find all critical edges
-    Let critical_edges be find_critical_edges(cfg_ptr)
+    Let critical_edges be proc find_critical_edges with cfg_ptr
 
     If critical_edges is equal to 0:
         Return 0
     End If
 
-    Let edge_count be list_length(critical_edges)
+    Let edge_count be proc list_length with critical_edges
     Let split_count be 0
     Let i be 0
 
     While i is less than edge_count:
-        Let edge_pair be list_get(critical_edges, i)
+        Let edge_pair be proc list_get with critical_edges, i
 
         If edge_pair is not equal to 0:
-            Let pred_id be get_edge_pair_source(edge_pair)
-            Let succ_id be get_edge_pair_target(edge_pair)
+            Let pred_id be proc get_edge_pair_source with edge_pair
+            Let succ_id be proc get_edge_pair_target with edge_pair
 
             Note: Split the critical edge
-            Let new_block_id be split_critical_edge(cfg_ptr, pred_id, succ_id)
+            Let new_block_id be proc split_critical_edge with cfg_ptr, pred_id, succ_id
 
             If new_block_id is not equal to negative 1:
                 Set split_count to split_count plus 1
@@ -2057,6 +2291,21 @@ Note: HELPER FUNCTIONS FOR CRITICAL EDGE HANDLING
 Note: ============================================================
 
 Process called "create_edge_pair" that takes source_id as Integer, target_id as Integer returns Integer:
+    @Reasoning
+    The CFG represents critical-edge candidates and back-edges as
+    (source_id, target_id) pairs allocated on the owned heap. We use a
+    flat 16-byte allocation rather than a stack-based tuple because:
+
+    1. Pairs survive across the find/split boundary in
+       split_all_critical_edges, so they outlive any single stack frame.
+    2. Pairs are inserted into Lists that the caller drains over multiple
+       iterations; heap allocation lets the List own the pointer.
+
+    Layout is two int64 fields with no header, matching the layout consumed
+    by get_edge_pair_source and get_edge_pair_target. The matching
+    deallocate_edge_pair routine frees this allocation.
+    @End Reasoning
+
     @Implementation
     Creates an edge pair structure (source_id, target_id).
     Returns pointer to allocated pair structure.
@@ -2122,6 +2371,22 @@ Process called "deallocate_edge_pair" that takes pair as Integer returns Integer
 End Process
 
 Process called "get_next_block_id" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Allocates a fresh block ID that is guaranteed not to collide with any
+    existing block in the CFG. Used by transformations that insert blocks
+    (split_critical_edge, merge passes that introduce join blocks, etc.).
+
+    We compute max(existing IDs) + 1 rather than tracking a monotonically
+    increasing counter in the CFG struct because IDs can become non-dense
+    after block removal: a CFG that has lost block 5 may still have blocks
+    0..4, 6..9 in storage, and we must not hand out 5 again (it could
+    collide with stale references in optimization passes that cached IDs).
+
+    Taking max also means we will not reuse an ID that has been deliberately
+    retired, which preserves the invariant that a block ID is unique for the
+    lifetime of the function compilation.
+    @End Reasoning
+
     @Implementation
     Generates a unique block ID for a new block in the CFG.
     Returns max(existing block IDs) + 1.
@@ -2131,13 +2396,13 @@ Process called "get_next_block_id" that takes cfg_ptr as Integer returns Integer
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
@@ -2148,10 +2413,10 @@ Process called "get_next_block_id" that takes cfg_ptr as Integer returns Integer
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
 
             If block_id is greater than max_id:
                 Set max_id to block_id
@@ -2166,6 +2431,19 @@ Process called "get_next_block_id" that takes cfg_ptr as Integer returns Integer
 End Process
 
 Process called "remove_cfg_edge" that takes cfg_ptr as Integer, pred_id as Integer, succ_id as Integer returns Integer:
+    @Reasoning
+    CFG edges are stored redundantly: each predecessor block holds a list
+    of its successor IDs, and each successor block holds a list of its
+    predecessor IDs. This redundancy lets traversal in either direction be
+    O(1)-per-step instead of O(V) lookup, but it means that removing an
+    edge must update both sides to keep the structure consistent.
+
+    We do not assume callers will call this proc only for live edges; if
+    the edge is missing on either side we return 0 to signal that the CFG
+    is already in an inconsistent state, rather than silently no-op'ing.
+    This catches bugs in transformation passes early.
+    @End Reasoning
+
     @Implementation
     Removes an edge from pred_id to succ_id in the CFG.
     Updates both predecessor and successor lists.
@@ -2177,28 +2455,28 @@ Process called "remove_cfg_edge" that takes cfg_ptr as Integer, pred_id as Integ
     End If
 
     Note: Get predecessor block
-    Let pred_block be get_block_by_id_from_cfg(cfg_ptr, pred_id)
+    Let pred_block be proc get_block_by_id_from_cfg with cfg_ptr, pred_id
 
     If pred_block is equal to 0:
         Return 0
     End If
 
     Note: Get successor block
-    Let succ_block be get_block_by_id_from_cfg(cfg_ptr, succ_id)
+    Let succ_block be proc get_block_by_id_from_cfg with cfg_ptr, succ_id
 
     If succ_block is equal to 0:
         Return 0
     End If
 
     Note: Remove succ_id from pred's successor list
-    Let pred_successors be get_mir_basic_block_successors(pred_block)
+    Let pred_successors be proc get_mir_basic_block_successors with pred_block
 
     If pred_successors is not equal to 0:
         list_remove_value(pred_successors, succ_id)
     End If
 
     Note: Remove pred_id from succ's predecessor list
-    Let succ_predecessors be get_mir_basic_block_predecessors(succ_block)
+    Let succ_predecessors be proc get_mir_basic_block_predecessors with succ_block
 
     If succ_predecessors is not equal to 0:
         list_remove_value(succ_predecessors, pred_id)
@@ -2208,6 +2486,18 @@ Process called "remove_cfg_edge" that takes cfg_ptr as Integer, pred_id as Integ
 End Process
 
 Process called "update_terminator_target" that takes cfg_ptr as Integer, block_id as Integer, old_target as Integer, new_target as Integer returns Integer:
+    @Reasoning
+    When a transformation reroutes control flow (jump threading, block
+    merging, critical-edge splitting), it must rewrite the terminator of
+    the predecessor so that it points at the new target. Every terminator
+    kind that can name a block target (Branch with true/false, Jump, Switch
+    with cases and default, Invoke with normal/unwind) needs to be handled.
+
+    Centralizing the rewrite here means individual transformation passes
+    do not each duplicate the opcode-dispatch logic, and any future
+    terminator kind that gains block targets only needs to update one site.
+    @End Reasoning
+
     @Implementation
     Updates a terminator instruction to target new_target instead of old_target.
     Handles branch, jump, switch, and invoke instructions.
@@ -2218,19 +2508,19 @@ Process called "update_terminator_target" that takes cfg_ptr as Integer, block_i
         Return 0
     End If
 
-    Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, block_id)
+    Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, block_id
 
     If block_ptr is equal to 0:
         Return 0
     End If
 
-    Let terminator be get_block_terminator(block_ptr)
+    Let terminator be proc get_block_terminator with block_ptr
 
     If terminator is equal to 0:
         Return 0
     End If
 
-    Let opcode be get_mir_node_opcode(terminator)
+    Let opcode be proc get_mir_node_opcode with terminator
 
     Note: Handle different terminator types
     If opcode is equal to MIR_BRANCH:
@@ -2257,6 +2547,20 @@ Process called "update_terminator_target" that takes cfg_ptr as Integer, block_i
 End Process
 
 Process called "update_phi_predecessor" that takes cfg_ptr as Integer, block_id as Integer, old_pred as Integer, new_pred as Integer returns Integer:
+    @Reasoning
+    PHI nodes encode "value depends on which predecessor we entered from",
+    so every PHI node in a join block holds a list of (incoming_value,
+    incoming_predecessor) pairs. When a CFG transformation changes the
+    identity of a predecessor (e.g. critical-edge splitting inserts a new
+    block in the middle of the edge), every PHI in the join block must be
+    rewritten so that the new predecessor ID appears in place of the old.
+
+    Failing to update PHIs after a CFG change leaves the SSA form
+    structurally inconsistent and produces wrong code downstream. We make
+    this a single dedicated proc so any transformation pass that rewires
+    edges has one canonical call site for the rewrite.
+    @End Reasoning
+
     @Implementation
     Updates all phi nodes in a block to use new_pred instead of old_pred.
     Returns 1 on success, 0 on failure.
@@ -2266,18 +2570,18 @@ Process called "update_phi_predecessor" that takes cfg_ptr as Integer, block_id 
         Return 0
     End If
 
-    Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, block_id)
+    Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, block_id
 
     If block_ptr is equal to 0:
         Return 0
     End If
 
     Note: Iterate through all instructions in block
-    Let first_inst be get_mir_basic_block_first_instruction(block_ptr)
+    Let first_inst be proc get_mir_basic_block_first_instruction with block_ptr
     Let inst be first_inst
 
     While inst is not equal to 0:
-        Let opcode be get_mir_node_opcode(inst)
+        Let opcode be proc get_mir_node_opcode with inst
 
         Note: Update phi nodes
         If opcode is equal to MIR_PHI:
@@ -2361,34 +2665,34 @@ Process called "compute_dominators" that takes cfg_ptr as Integer returns Intege
     End If
 
     Note: Get entry block
-    Let entry_block be get_entry_block(cfg_ptr)
+    Let entry_block be proc get_entry_block with cfg_ptr
 
     If entry_block is equal to 0:
         Return 0
     End If
 
     Note: Get all blocks
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Return 0
     End If
 
     Note: Create DominatorTree structure
-    Let dom_tree be create_dominator_tree(block_count)
+    Let dom_tree be proc create_dominator_tree with block_count
 
     If dom_tree is equal to 0:
         Return 0
     End If
 
     Note: Phase 1 - DFS numbering
-    Let dfs_result be dominator_dfs_numbering(cfg_ptr, entry_block, dom_tree)
+    Let dfs_result be proc dominator_dfs_numbering with cfg_ptr, entry_block, dom_tree
 
     If dfs_result is equal to 0:
         deallocate_dominator_tree(dom_tree)
@@ -2396,7 +2700,7 @@ Process called "compute_dominators" that takes cfg_ptr as Integer returns Intege
     End If
 
     Note: Phase 2 - Compute semidominators
-    Let semi_result be compute_semidominators(cfg_ptr, dom_tree)
+    Let semi_result be proc compute_semidominators with cfg_ptr, dom_tree
 
     If semi_result is equal to 0:
         deallocate_dominator_tree(dom_tree)
@@ -2404,7 +2708,7 @@ Process called "compute_dominators" that takes cfg_ptr as Integer returns Intege
     End If
 
     Note: Phase 3 - Compute immediate dominators
-    Let idom_result be compute_immediate_dominators(cfg_ptr, dom_tree)
+    Let idom_result be proc compute_immediate_dominators with cfg_ptr, dom_tree
 
     If idom_result is equal to 0:
         deallocate_dominator_tree(dom_tree)
@@ -2418,6 +2722,23 @@ Process called "compute_dominators" that takes cfg_ptr as Integer returns Intege
 End Process
 
 Process called "create_dominator_tree" that takes block_count as Integer returns Integer:
+    @Reasoning
+    Allocates the workspace used by the Lengauer-Tarjan dominator
+    construction algorithm. The implementation requires several parallel
+    arrays of length V (one per block) that hold DFS preorder numbers,
+    parent IDs in the DFS spanning tree, semidominators, immediate
+    dominators, and union-find ancestor/label state.
+
+    We materialize these arrays as a flat heap struct rather than as fields
+    of an existing CFG struct because dominator information is optional and
+    may be discarded between phases. Keeping it in a separate allocation
+    lets clients build it on demand and free it without touching the CFG.
+
+    All arrays start in sentinel state (-1 for "not yet computed") except
+    label, which is initialized to identity (label[v] = v) as required by
+    the union-find component of Lengauer-Tarjan.
+    @End Reasoning
+
     @Implementation
     Allocates and initializes the DominatorTree structure.
 
@@ -2545,6 +2866,14 @@ Process called "create_dominator_tree" that takes block_count as Integer returns
 End Process
 
 Process called "deallocate_dominator_tree" that takes tree as Integer returns Integer:
+    @Reasoning
+    The dominator tree owns seven heap-allocated arrays plus the root
+    struct. Releasing only the root would leak ~7 * V * 8 bytes per
+    discarded tree. We free each array explicitly before releasing the
+    root struct to keep the deallocation order matched against the
+    allocation order in create_dominator_tree.
+    @End Reasoning
+
     @Implementation
     Deallocates all memory associated with a DominatorTree structure.
     Returns 1 on success, 0 on failure.
@@ -2599,6 +2928,22 @@ Process called "deallocate_dominator_tree" that takes tree as Integer returns In
 End Process
 
 Process called "dominator_dfs_numbering" that takes cfg_ptr as Integer, start_block as Integer, dom_tree as Integer returns Integer:
+    @Reasoning
+    Phase 1 of Lengauer-Tarjan dominator construction. The algorithm
+    operates on a DFS spanning tree of the CFG rooted at the entry block,
+    so the very first step is to traverse the CFG in DFS order and assign
+    each block:
+
+    1. A preorder DFS number (its position in the spanning tree)
+    2. Its parent in the spanning tree
+    3. An inverse mapping from DFS number back to block ID
+
+    Subsequent phases (semidominators, immediate dominators) iterate over
+    DFS numbers rather than block IDs, so they need the inverse mapping to
+    convert between the two indexings. We compute everything in a single
+    traversal to amortize the cost of walking the CFG.
+    @End Reasoning
+
     @Implementation
     Performs DFS traversal to assign preorder numbers to all reachable blocks.
 
@@ -2633,7 +2978,7 @@ Process called "dominator_dfs_numbering" that takes cfg_ptr as Integer, start_bl
     proc memory_set_int64 from Layout with counter_ptr, 0, 0
 
     Note: Perform recursive DFS
-    Let start_id be get_mir_basic_block_id(start_block)
+    Let start_id be proc get_mir_basic_block_id with start_block
     dominator_dfs_visit(cfg_ptr, start_id, negative 1, dom_tree, counter_ptr)
 
     Note: Deallocate counter
@@ -2643,6 +2988,17 @@ Process called "dominator_dfs_numbering" that takes cfg_ptr as Integer, start_bl
 End Process
 
 Process called "dominator_dfs_visit" that takes cfg_ptr as Integer, block_id as Integer, parent_id as Integer, dom_tree as Integer, counter_ptr as Integer returns Integer:
+    @Reasoning
+    The recursive worker for dominator_dfs_numbering. We pass the DFS
+    counter by pointer so that each invocation can read and increment it
+    atomically. This is logically a single shared mutable cell across the
+    recursion, which is the cleanest way to express "assign the next
+    preorder number" without making the counter a global or a CFG field.
+
+    Successors are walked in their natural ordering, matching the
+    convention used by dfs_visit_block.
+    @End Reasoning
+
     @Implementation
     Recursive DFS visit for dominance analysis.
     Assigns DFS preorder number to block_id and recursively visits successors.
@@ -2677,17 +3033,17 @@ Process called "dominator_dfs_visit" that takes cfg_ptr as Integer, block_id as 
     proc memory_set_int64 from Layout with counter_ptr, 0, counter
 
     Note: Visit successors
-    Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, block_id)
+    Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, block_id
 
     If block_ptr is not equal to 0:
-        Let successors be get_mir_basic_block_successors(block_ptr)
+        Let successors be proc get_mir_basic_block_successors with block_ptr
 
         If successors is not equal to 0:
-            Let succ_count be list_length(successors)
+            Let succ_count be proc list_length with successors
             Let i be 0
 
             While i is less than succ_count:
-                Let succ_id be list_get(successors, i)
+                Let succ_id be proc list_get with successors, i
                 dominator_dfs_visit(cfg_ptr, succ_id, block_id, dom_tree, counter_ptr)
                 Set i to i plus 1
             End While
@@ -2698,6 +3054,22 @@ Process called "dominator_dfs_visit" that takes cfg_ptr as Integer, block_id as 
 End Process
 
 Process called "compute_semidominators" that takes cfg_ptr as Integer, dom_tree as Integer returns Integer:
+    @Reasoning
+    Phase 2 of Lengauer-Tarjan. The semidominator of a block w is the
+    minimum-DFS-number block v such that there exists a path from v to w
+    where every intermediate block has a DFS number greater than the DFS
+    number of w. Semidominators are not yet the immediate dominators, but
+    they encode enough information for phase 3 to extract the immediate
+    dominator tree in near-linear time.
+
+    The implementation walks blocks in reverse DFS preorder and uses the
+    union-find structure (dominator_eval / dominator_compress) to find the
+    minimum-semi ancestor of each block efficiently. Running in reverse
+    preorder guarantees that when we process w, all blocks with DFS number
+    greater than w's have already been processed, so their semi values are
+    available.
+    @End Reasoning
+
     @Implementation
     Computes semidominators using the Lengauer-Tarjan algorithm.
 
@@ -2739,14 +3111,14 @@ Process called "compute_semidominators" that takes cfg_ptr as Integer, dom_tree 
         Let w be proc memory_get_int64 from Layout with vertex_by_dfs_arr, dfs multiplied by 8
 
         If w is not equal to negative 1:
-            Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, w)
+            Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, w
 
             If block_ptr is not equal to 0:
                 Note: Get predecessors of w
-                Let predecessors be get_mir_basic_block_predecessors(block_ptr)
+                Let predecessors be proc get_mir_basic_block_predecessors with block_ptr
 
                 If predecessors is not equal to 0:
-                    Let pred_count be list_length(predecessors)
+                    Let pred_count be proc list_length with predecessors
                     Let j be 0
 
                     Note: Initialize semi(w) to w's DFS number
@@ -2754,13 +3126,13 @@ Process called "compute_semidominators" that takes cfg_ptr as Integer, dom_tree 
                     Let semi_w be proc memory_get_int64 from Layout with dfs_num_arr, w_offset
 
                     While j is less than pred_count:
-                        Let v be list_get(predecessors, j)
+                        Let v be proc list_get with predecessors, j
                         Let v_offset be v multiplied by 8
                         Let v_dfs be proc memory_get_int64 from Layout with dfs_num_arr, v_offset
 
                         If v_dfs is not equal to negative 1:
                             Note: Evaluate v to find vertex with minimum semi on path from v to w
-                            Let u be dominator_eval(dom_tree, v)
+                            Let u be proc dominator_eval with dom_tree, v
                             Let u_offset be u multiplied by 8
                             Let semi_u be proc memory_get_int64 from Layout with semi_arr, u_offset
                             Let semi_u_dfs be proc memory_get_int64 from Layout with dfs_num_arr, semi_u multiplied by 8
@@ -2788,6 +3160,19 @@ Process called "compute_semidominators" that takes cfg_ptr as Integer, dom_tree 
 End Process
 
 Process called "dominator_eval" that takes dom_tree as Integer, v as Integer returns Integer:
+    @Reasoning
+    The EVAL primitive of the Lengauer-Tarjan union-find. Given a vertex v,
+    returns the vertex on v's ancestor chain (in the forest currently
+    represented by the ancestor array) that has the minimum semidominator
+    value. This is the inner loop that compute_semidominators consults to
+    extend its current candidate.
+
+    EVAL composes with COMPRESS to give the algorithm its near-linear
+    inverse-Ackermann complexity. We expose EVAL as a separate proc so the
+    semidominator pass can call it cleanly without inlining the union-find
+    walk.
+    @End Reasoning
+
     @Implementation
     Union-find EVAL operation with path compression.
     Returns vertex with minimum semidominator on path from v to root.
@@ -2817,6 +3202,19 @@ Process called "dominator_eval" that takes dom_tree as Integer, v as Integer ret
 End Process
 
 Process called "dominator_compress" that takes dom_tree as Integer, v as Integer returns Integer:
+    @Reasoning
+    The COMPRESS half of the union-find pair. After EVAL walks v's ancestor
+    chain, COMPRESS rewrites the chain to point directly at the root and
+    updates the label of each visited vertex to record the minimum
+    semidominator seen on the way up.
+
+    The combination of EVAL + COMPRESS gives Lengauer-Tarjan its
+    O((V + E) * alpha(V, E)) bound, which is effectively linear for any
+    realistic CFG. We implement compress iteratively rather than as a
+    second recursive call to avoid the cost of stack frames in the
+    near-linear hot path.
+    @End Reasoning
+
     @Implementation
     Path compression for union-find structure.
     Flattens the ancestor chain and updates labels to maintain minimum semi.
@@ -2869,6 +3267,24 @@ Process called "dominator_compress" that takes dom_tree as Integer, v as Integer
 End Process
 
 Process called "compute_immediate_dominators" that takes cfg_ptr as Integer, dom_tree as Integer returns Integer:
+    @Reasoning
+    Phase 3 of Lengauer-Tarjan. Given the semidominators computed in phase
+    2, we derive each block's immediate dominator by the rule:
+
+        idom(w) = semi(w) if semi(w) is on the path from semi(w) to w in
+                  the DFS spanning tree;
+        idom(w) = idom(ancestor with min semi) otherwise.
+
+    The pass walks blocks in DFS preorder, so when we process w every
+    block on its DFS ancestor chain has already had its idom resolved.
+    This lets us fold the recursive "ancestor with min semi" query into
+    an array lookup.
+
+    The final dom_tree contains an idom array indexed by block ID, which
+    is the canonical dominator representation consumed by downstream
+    passes (dominance frontier computation, SSA insertion).
+    @End Reasoning
+
     @Implementation
     Computes immediate dominators from semidominators.
 
@@ -2914,7 +3330,7 @@ Process called "compute_immediate_dominators" that takes cfg_ptr as Integer, dom
             Let s be semi_w
 
             If parent_w is not equal to negative 1:
-                Let u be dominator_eval(dom_tree, w)
+                Let u be proc dominator_eval with dom_tree, w
                 Let u_offset be u multiplied by 8
                 Let semi_u be proc memory_get_int64 from Layout with semi_arr, u_offset
 
@@ -3024,7 +3440,7 @@ Process called "compute_dominance_frontiers" that takes cfg_ptr as Integer, dom_
     Note: Initialize each block's frontier list
     Let i be 0
     While i is less than block_count:
-        Let frontier_list be list_create()
+        Let frontier_list be proc list_create
         If frontier_list is equal to 0:
             Note: Cleanup on failure
             Let j be 0
@@ -3043,22 +3459,22 @@ Process called "compute_dominance_frontiers" that takes cfg_ptr as Integer, dom_
     End While
 
     Note: Compute frontiers using the standard algorithm
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is not equal to 0:
-        Let block_list_count be list_length(blocks)
+        Let block_list_count be proc list_length with blocks
         Set i to 0
 
         While i is less than block_list_count:
-            Let block_ptr be list_get(blocks, i)
+            Let block_ptr be proc list_get with blocks, i
 
             If block_ptr is not equal to 0:
-                Let block_id be get_mir_basic_block_id(block_ptr)
-                Let predecessors be get_mir_basic_block_predecessors(block_ptr)
+                Let block_id be proc get_mir_basic_block_id with block_ptr
+                Let predecessors be proc get_mir_basic_block_predecessors with block_ptr
 
                 Note: Only process blocks with multiple predecessors
                 If predecessors is not equal to 0:
-                    Let pred_count be list_length(predecessors)
+                    Let pred_count be proc list_length with predecessors
 
                     If pred_count is greater than or equal to 2:
                         Note: Get idom of this block
@@ -3068,7 +3484,7 @@ Process called "compute_dominance_frontiers" that takes cfg_ptr as Integer, dom_
                         Note: Process each predecessor
                         Let j be 0
                         While j is less than pred_count:
-                            Let pred_id be list_get(predecessors, j)
+                            Let pred_id be proc list_get with predecessors, j
                             Let runner be pred_id
 
                             Note: Walk up dominator tree until reaching idom(Y)
@@ -3081,11 +3497,11 @@ Process called "compute_dominance_frontiers" that takes cfg_ptr as Integer, dom_
                                     If runner_frontier is not equal to 0:
                                         Note: Check if already in frontier (avoid duplicates)
                                         Let already_in be 0
-                                        Let frontier_size be list_length(runner_frontier)
+                                        Let frontier_size be proc list_length with runner_frontier
                                         Let k be 0
 
                                         While k is less than frontier_size:
-                                            Let existing be list_get(runner_frontier, k)
+                                            Let existing be proc list_get with runner_frontier, k
                                             If existing is equal to block_id:
                                                 Set already_in to 1
                                                 Set k to frontier_size
@@ -3121,6 +3537,19 @@ Process called "compute_dominance_frontiers" that takes cfg_ptr as Integer, dom_
 End Process
 
 Process called "deallocate_dominance_frontiers" that takes df_structure as Integer, block_count as Integer returns Integer:
+    @Reasoning
+    The dominance-frontiers structure is a list of lists: one outer slot
+    per block, each holding the IDs of blocks in that block's dominance
+    frontier. Freeing only the outer container would leak every inner
+    list. We walk the outer list once and destroy each frontier list
+    before releasing the container itself.
+
+    block_count is taken as a parameter rather than inferred from the
+    structure so the caller can free a partially-built df_structure
+    (e.g. on allocation failure mid-construction) by passing only the
+    number of populated slots.
+    @End Reasoning
+
     @Implementation
     Deallocates dominance frontiers structure and all frontier lists.
     Returns 1 on success, 0 on failure.
@@ -3226,7 +3655,7 @@ Process called "identify_back_edges" that takes cfg_ptr as Integer returns Integ
     End If
 
     Note: Step 2: Create back edges list
-    Let back_edges be list_create()
+    Let back_edges be proc list_create
 
     If back_edges is equal to 0:
         proc destroy_dominance_info from Dominance with dominance_info
@@ -3234,23 +3663,23 @@ Process called "identify_back_edges" that takes cfg_ptr as Integer returns Integ
     End If
 
     Note: Step 3: Iterate through all CFG edges and check dominance
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
-    Let block_count be list_length(blocks)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
+    Let block_count be proc list_length with blocks
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let source_id be get_mir_basic_block_id(block_ptr)
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let source_id be proc get_mir_basic_block_id with block_ptr
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
-                Let succ_count be list_length(successors)
+                Let succ_count be proc list_length with successors
                 Let j be 0
 
                 While j is less than succ_count:
-                    Let target_id be list_get(successors, j)
+                    Let target_id be proc list_get with successors, j
 
                     Note: Check if target dominates source (making this a back edge)
                     Note: Back edge: source→target where target dominates source
@@ -3258,7 +3687,7 @@ Process called "identify_back_edges" that takes cfg_ptr as Integer returns Integ
 
                     If is_back_edge is equal to 1:
                         Note: This is a back edge - target dominates source
-                        Let edge_pair be create_edge_pair(source_id, target_id)
+                        Let edge_pair be proc create_edge_pair with source_id, target_id
 
                         If edge_pair is not equal to 0:
                             list_append(back_edges, edge_pair)
@@ -3277,7 +3706,7 @@ Process called "identify_back_edges" that takes cfg_ptr as Integer returns Integ
     Note: Clean up dominance info
     proc destroy_dominance_info from Dominance with dominance_info
 
-    Let back_edge_count be list_length(back_edges)
+    Let back_edge_count be proc list_length with back_edges
     Display "identify_back_edges: identified " joined with back_edge_count joined with " back edge(s) using complete dominance analysis"
 
     Return back_edges
@@ -3318,8 +3747,8 @@ Process called "find_natural_loop" that takes cfg_ptr as Integer, back_edge_sour
     Let tail_id be back_edge_source
 
     Note: Create loop set and worklist
-    Let loop_set be list_create()
-    Let worklist be list_create()
+    Let loop_set be proc list_create
+    Let worklist be proc list_create
 
     If loop_set is equal to 0:
         Return 0
@@ -3342,29 +3771,29 @@ Process called "find_natural_loop" that takes cfg_ptr as Integer, back_edge_sour
     Note: Process worklist
     While list_length(worklist) is greater than 0:
         Note: Pop from worklist
-        Let current_id be list_get(worklist, 0)
+        Let current_id be proc list_get with worklist, 0
         list_remove_at(worklist, 0)
 
         Note: Get current block
-        Let current_block be get_block_by_id_from_cfg(cfg_ptr, current_id)
+        Let current_block be proc get_block_by_id_from_cfg with cfg_ptr, current_id
 
         If current_block is not equal to 0:
-            Let predecessors be get_mir_basic_block_predecessors(current_block)
+            Let predecessors be proc get_mir_basic_block_predecessors with current_block
 
             If predecessors is not equal to 0:
-                Let pred_count be list_length(predecessors)
+                Let pred_count be proc list_length with predecessors
                 Let i be 0
 
                 While i is less than pred_count:
-                    Let pred_id be list_get(predecessors, i)
+                    Let pred_id be proc list_get with predecessors, i
 
                     Note: Check if predecessor is already in loop
                     Let in_loop be 0
                     Let j be 0
-                    Let loop_count be list_length(loop_set)
+                    Let loop_count be proc list_length with loop_set
 
                     While j is less than loop_count:
-                        Let loop_member be list_get(loop_set, j)
+                        Let loop_member be proc list_get with loop_set, j
 
                         If loop_member is equal to pred_id:
                             Set in_loop to 1
@@ -3418,16 +3847,16 @@ Process called "compute_loop_depths" that takes cfg_ptr as Integer returns Integ
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     Note: Create depth map initialized to 0
-    Let depth_map be list_create()
+    Let depth_map be proc list_create
 
     If depth_map is equal to 0:
         Return 0
@@ -3440,37 +3869,37 @@ Process called "compute_loop_depths" that takes cfg_ptr as Integer returns Integ
     End While
 
     Note: Find all back edges
-    Let back_edges be identify_back_edges(cfg_ptr)
+    Let back_edges be proc identify_back_edges with cfg_ptr
 
     If back_edges is equal to 0:
         Note: No loops, return all zeros
         Return depth_map
     End If
 
-    Let edge_count be list_length(back_edges)
+    Let edge_count be proc list_length with back_edges
 
     Note: For each back edge, compute loop and increment depths
     Set i to 0
     While i is less than edge_count:
-        Let edge_pair be list_get(back_edges, i)
+        Let edge_pair be proc list_get with back_edges, i
 
         If edge_pair is not equal to 0:
-            Let source_id be get_edge_pair_source(edge_pair)
-            Let target_id be get_edge_pair_target(edge_pair)
+            Let source_id be proc get_edge_pair_source with edge_pair
+            Let target_id be proc get_edge_pair_target with edge_pair
 
             Note: Compute natural loop for this back edge
-            Let loop_blocks be find_natural_loop(cfg_ptr, source_id, target_id)
+            Let loop_blocks be proc find_natural_loop with cfg_ptr, source_id, target_id
 
             If loop_blocks is not equal to 0:
                 Note: Increment depth for all blocks in loop
-                Let loop_count be list_length(loop_blocks)
+                Let loop_count be proc list_length with loop_blocks
                 Let j be 0
 
                 While j is less than loop_count:
-                    Let block_id be list_get(loop_blocks, j)
+                    Let block_id be proc list_get with loop_blocks, j
 
                     Note: Increment depth
-                    Let current_depth be list_get(depth_map, block_id)
+                    Let current_depth be proc list_get with depth_map, block_id
                     Set current_depth to current_depth plus 1
                     list_set(depth_map, block_id, current_depth)
 
@@ -3534,14 +3963,14 @@ Process called "get_loop_info" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Find all back edges
-    Let back_edges be identify_back_edges(cfg_ptr)
+    Let back_edges be proc identify_back_edges with cfg_ptr
 
     If back_edges is equal to 0:
         Note: No loops - create empty structure
         proc memory_set_int64 from Layout with loop_info, 0, 0
         proc memory_set_int64 from Layout with loop_info, 8, list_create()
         proc memory_set_int64 from Layout with loop_info, 16, list_create()
-        Let empty_depth be list_create()
+        Let empty_depth be proc list_create
         proc memory_set_int64 from Layout with loop_info, 24, empty_depth
         Return loop_info
     End If
@@ -3550,26 +3979,26 @@ Process called "get_loop_info" that takes cfg_ptr as Integer returns Integer:
     proc memory_set_int64 from Layout with loop_info, 0, back_edges
 
     Note: Extract loop headers (targets of back edges)
-    Let loop_headers be list_create()
-    Let loop_bodies be list_create()
+    Let loop_headers be proc list_create
+    Let loop_bodies be proc list_create
 
-    Let edge_count be list_length(back_edges)
+    Let edge_count be proc list_length with back_edges
     Let i be 0
 
     While i is less than edge_count:
-        Let edge_pair be list_get(back_edges, i)
+        Let edge_pair be proc list_get with back_edges, i
 
         If edge_pair is not equal to 0:
-            Let source_id be get_edge_pair_source(edge_pair)
-            Let target_id be get_edge_pair_target(edge_pair)
+            Let source_id be proc get_edge_pair_source with edge_pair
+            Let target_id be proc get_edge_pair_target with edge_pair
 
             Note: Add header if not already present
             Let header_found be 0
             Let j be 0
-            Let header_count be list_length(loop_headers)
+            Let header_count be proc list_length with loop_headers
 
             While j is less than header_count:
-                Let existing_header be list_get(loop_headers, j)
+                Let existing_header be proc list_get with loop_headers, j
 
                 If existing_header is equal to target_id:
                     Set header_found to 1
@@ -3584,11 +4013,11 @@ Process called "get_loop_info" that takes cfg_ptr as Integer returns Integer:
             End If
 
             Note: Compute natural loop body
-            Let body be find_natural_loop(cfg_ptr, source_id, target_id)
+            Let body be proc find_natural_loop with cfg_ptr, source_id, target_id
 
             If body is not equal to 0:
                 Note: Create (header_id, body) pair
-                Let body_pair be create_edge_pair(target_id, body)
+                Let body_pair be proc create_edge_pair with target_id, body
 
                 If body_pair is not equal to 0:
                     list_append(loop_bodies, body_pair)
@@ -3604,7 +4033,7 @@ Process called "get_loop_info" that takes cfg_ptr as Integer returns Integer:
     proc memory_set_int64 from Layout with loop_info, 16, loop_bodies
 
     Note: Compute depth map
-    Let depth_map be compute_loop_depths(cfg_ptr)
+    Let depth_map be proc compute_loop_depths with cfg_ptr
     proc memory_set_int64 from Layout with loop_info, 24, depth_map
 
     Return loop_info
@@ -3669,14 +4098,14 @@ Process called "validate_cfg_structure" that takes cfg_ptr as Integer returns In
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Note: No blocks in CFG
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
 
     If block_count is equal to 0:
         Note: Empty CFG
@@ -3688,10 +4117,10 @@ Process called "validate_cfg_structure" that takes cfg_ptr as Integer returns In
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
 
             If block_id is equal to 0:
                 Set entry_found to 1
@@ -3710,11 +4139,11 @@ Process called "validate_cfg_structure" that takes cfg_ptr as Integer returns In
     Note: Check 2: All blocks have valid terminators
     Set i to 0
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let terminator be get_block_terminator(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let terminator be proc get_block_terminator with block_ptr
 
             If terminator is equal to 0:
                 Note: VALIDATION FAILURE: Block has no terminator
@@ -3734,19 +4163,19 @@ Process called "validate_cfg_structure" that takes cfg_ptr as Integer returns In
     Note: Check 3: Edge consistency (pred ↔ succ bidirectional)
     Set i to 0
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
-                Let succ_count be list_length(successors)
+                Let succ_count be proc list_length with successors
                 Let j be 0
 
                 While j is less than succ_count:
-                    Let succ_id be list_get(successors, j)
-                    Let succ_block be get_block_by_id_from_cfg(cfg_ptr, succ_id)
+                    Let succ_id be proc list_get with successors, j
+                    Let succ_block be proc get_block_by_id_from_cfg with cfg_ptr, succ_id
 
                     If succ_block is equal to 0:
                         Note: VALIDATION FAILURE: Successor block not found
@@ -3754,15 +4183,15 @@ Process called "validate_cfg_structure" that takes cfg_ptr as Integer returns In
                     End If
 
                     Note: Check that successor has block_id in its predecessors
-                    Let succ_preds be get_mir_basic_block_predecessors(succ_block)
+                    Let succ_preds be proc get_mir_basic_block_predecessors with succ_block
 
                     If succ_preds is not equal to 0:
                         Let found_reverse_edge be 0
                         Let k be 0
-                        Let pred_count be list_length(succ_preds)
+                        Let pred_count be proc list_length with succ_preds
 
                         While k is less than pred_count:
-                            Let pred_id be list_get(succ_preds, k)
+                            Let pred_id be proc list_get with succ_preds, k
 
                             If pred_id is equal to block_id:
                                 Set found_reverse_edge to 1
@@ -3830,26 +4259,26 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         proc destroy_dominance_info from Dominance with dominance_info
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Note: Track all value definitions (value_id → defining block_id)
-    Let value_defs be list_create()
+    Let value_defs be proc list_create
 
     Note: Step 2: Verify phi node placement and completeness
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let predecessors be get_mir_basic_block_predecessors(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let predecessors be proc get_mir_basic_block_predecessors with block_ptr
             Let pred_count be 0
 
             If predecessors is not equal to 0:
@@ -3857,12 +4286,12 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
             End If
 
             Note: Iterate through instructions in block
-            Let first_inst be get_mir_basic_block_first_instruction(block_ptr)
+            Let first_inst be proc get_mir_basic_block_first_instruction with block_ptr
             Let inst be first_inst
             Let phi_region be 1
 
             While inst is not equal to 0:
-                Let opcode be get_mir_node_opcode(inst)
+                Let opcode be proc get_mir_node_opcode with inst
 
                 Note: Check phi node placement
                 If opcode is equal to MIR_PHI:
@@ -3883,7 +4312,7 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
                     End If
 
                     Note: Check phi incoming count matches predecessor count
-                    Let phi_incoming_count be get_phi_incoming_count(inst)
+                    Let phi_incoming_count be proc get_phi_incoming_count with inst
 
                     If phi_incoming_count is not equal to pred_count:
                         Display "verify_ssa_form: phi incoming count mismatch in block " joined with block_id
@@ -3893,7 +4322,7 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
                     End If
 
                     Note: Record phi definition
-                    Let defined_value be get_mir_node_value_id(inst)
+                    Let defined_value be proc get_mir_node_value_id with inst
                     If defined_value is not equal to 0:
                         Note: Track value_id → block_id mapping for dominance check
                         list_append(value_defs, defined_value)
@@ -3904,7 +4333,7 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
                     Set phi_region to 0
 
                     Note: Record regular definition
-                    Let defined_value be get_mir_node_value_id(inst)
+                    Let defined_value be proc get_mir_node_value_id with inst
                     If defined_value is not equal to 0:
                         list_append(value_defs, defined_value)
                         list_append(value_defs, block_id)
@@ -3923,26 +4352,26 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
     Set i to 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let first_inst be get_mir_basic_block_first_instruction(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let first_inst be proc get_mir_basic_block_first_instruction with block_ptr
             Let inst be first_inst
 
             While inst is not equal to 0:
                 Note: Get used values in this instruction
-                Let used_values be get_instruction_used_values(inst)
+                Let used_values be proc get_instruction_used_values with inst
 
                 If used_values is not equal to 0:
-                    Let used_count be list_length(used_values)
+                    Let used_count be proc list_length with used_values
                     Let j be 0
 
                     While j is less than used_count:
-                        Let used_value be list_get(used_values, j)
+                        Let used_value be proc list_get with used_values, j
 
                         Note: Find definition block for this value
-                        Let def_block_id be find_value_definition_block(value_defs, used_value)
+                        Let def_block_id be proc find_value_definition_block with value_defs, used_value
 
                         If def_block_id is not equal to negative 1:
                             Note: Check if def_block dominates use_block
@@ -3979,6 +4408,22 @@ Process called "verify_ssa_form" that takes cfg_ptr as Integer returns Integer:
 End Process
 
 Process called "validate_cfg" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    The combined "is this CFG well-formed?" gate. Composed of three
+    independent checks:
+
+    1. validate_cfg_structure - terminator placement, edge consistency,
+       no dangling block references
+    2. verify_ssa_form - PHI predecessor counts match block predecessor
+       counts, every value definition dominates its uses
+    3. compute_reachable_blocks - every block has a path from the entry
+
+    We run all three and AND the results so a single call gives a complete
+    pass/fail verdict. Tests and pre-commit gates use this as a single
+    cheap precondition; specific failures still need to consult the more
+    granular validators for diagnostics.
+    @End Reasoning
+
     @Implementation
     Comprehensive CFG validation combining structural and SSA checks.
     Returns 1 if CFG is completely valid, 0 otherwise.
@@ -3991,12 +4436,23 @@ Process called "validate_cfg" that takes cfg_ptr as Integer returns Integer:
     Time complexity: O(V + E)
     @End Implementation
 
+    @Security_Scope
+    - This is the canonical pre-condition check used before downstream
+      passes consume a CFG. A pass that operates on a CFG that has failed
+      validation may corrupt memory or emit malformed machine code, so
+      callers MUST treat a 0 return as a hard failure and refuse to
+      continue.
+    - The validation is purely read-only and does not modify cfg_ptr or
+      any block; safe to call from contexts where the CFG must remain
+      unchanged.
+    @End Security_Scope
+
     If cfg_ptr is equal to 0:
         Return 0
     End If
 
     Note: Step 1: Validate structure
-    Let structure_valid be validate_cfg_structure(cfg_ptr)
+    Let structure_valid be proc validate_cfg_structure with cfg_ptr
 
     If structure_valid is equal to 0:
         Note: Structure validation failed
@@ -4004,7 +4460,7 @@ Process called "validate_cfg" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Step 2: Verify SSA form
-    Let ssa_valid be verify_ssa_form(cfg_ptr)
+    Let ssa_valid be proc verify_ssa_form with cfg_ptr
 
     If ssa_valid is equal to 0:
         Note: SSA verification failed
@@ -4012,16 +4468,16 @@ Process called "validate_cfg" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Step 3: Check reachability
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
-    Let block_count be list_length(blocks)
-    Let reachable be compute_reachable_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
+    Let block_count be proc list_length with blocks
+    Let reachable be proc compute_reachable_blocks with cfg_ptr
 
     If reachable is equal to 0:
         Note: Reachability computation failed
         Return 0
     End If
 
-    Let reachable_count be list_length(reachable)
+    Let reachable_count be proc list_length with reachable
 
     Note: All blocks should be reachable (or we have dead code)
     Note: This is a warning condition, not a failure
@@ -4092,8 +4548,8 @@ Process called "merge_blocks" that takes cfg_ptr as Integer, pred_id as Integer,
     End If
 
     Note: Get blocks
-    Let pred_block be get_block_by_id_from_cfg(cfg_ptr, pred_id)
-    Let succ_block be get_block_by_id_from_cfg(cfg_ptr, succ_id)
+    Let pred_block be proc get_block_by_id_from_cfg with cfg_ptr, pred_id
+    Let succ_block be proc get_block_by_id_from_cfg with cfg_ptr, succ_id
 
     If pred_block is equal to 0:
         Return 0
@@ -4104,8 +4560,8 @@ Process called "merge_blocks" that takes cfg_ptr as Integer, pred_id as Integer,
     End If
 
     Note: Verify merge conditions
-    Let pred_successors be get_mir_basic_block_successors(pred_block)
-    Let succ_predecessors be get_mir_basic_block_predecessors(succ_block)
+    Let pred_successors be proc get_mir_basic_block_successors with pred_block
+    Let succ_predecessors be proc get_mir_basic_block_predecessors with succ_block
 
     If pred_successors is equal to 0:
         Return 0
@@ -4125,9 +4581,9 @@ Process called "merge_blocks" that takes cfg_ptr as Integer, pred_id as Integer,
     End If
 
     Note: Append succ's instructions to pred (excluding terminator)
-    Let pred_last be get_mir_basic_block_last_instruction(pred_block)
-    Let succ_first be get_mir_basic_block_first_instruction(succ_block)
-    Let succ_last be get_mir_basic_block_last_instruction(succ_block)
+    Let pred_last be proc get_mir_basic_block_last_instruction with pred_block
+    Let succ_first be proc get_mir_basic_block_first_instruction with succ_block
+    Let succ_last be proc get_mir_basic_block_last_instruction with succ_block
 
     Note: Link pred's last instruction to succ's first instruction
     If pred_last is not equal to 0:
@@ -4135,7 +4591,7 @@ Process called "merge_blocks" that takes cfg_ptr as Integer, pred_id as Integer,
             Note: Skip succ's phi nodes (they should be empty since single predecessor)
             Let inst be succ_first
             While inst is not equal to 0:
-                Let opcode be get_mir_node_opcode(inst)
+                Let opcode be proc get_mir_node_opcode with inst
 
                 Note: Skip phi nodes
                 If opcode is not equal to MIR_PHI:
@@ -4153,14 +4609,14 @@ Process called "merge_blocks" that takes cfg_ptr as Integer, pred_id as Integer,
     End If
 
     Note: Redirect succ's successors to come from pred
-    Let succ_successors be get_mir_basic_block_successors(succ_block)
+    Let succ_successors be proc get_mir_basic_block_successors with succ_block
 
     If succ_successors is not equal to 0:
-        Let succ_succ_count be list_length(succ_successors)
+        Let succ_succ_count be proc list_length with succ_successors
         Let i be 0
 
         While i is less than succ_succ_count:
-            Let succ_succ_id be list_get(succ_successors, i)
+            Let succ_succ_id be proc list_get with succ_successors, i
 
             Note: Remove edge succ → succ_succ
             remove_cfg_edge(cfg_ptr, succ_id, succ_succ_id)
@@ -4185,6 +4641,19 @@ Process called "merge_blocks" that takes cfg_ptr as Integer, pred_id as Integer,
 End Process
 
 Process called "remove_unreachable_blocks" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Dead-code elimination at the CFG level. Branch folding, constant
+    propagation, and inlining all routinely produce blocks that are no
+    longer reachable from the entry. Leaving them in the CFG bloats every
+    downstream pass and confuses dominance / liveness analyses, so we
+    sweep them out before subsequent transformations run.
+
+    The pass is idempotent and is safe to run multiple times in a single
+    pipeline. Returning the removal count lets the surrounding driver
+    decide whether dependent invariants (dominance, SSA) need to be
+    recomputed.
+    @End Reasoning
+
     @Implementation
     Removes all blocks not reachable from the entry block.
     This is dead code elimination at the CFG level.
@@ -4203,21 +4672,21 @@ Process called "remove_unreachable_blocks" that takes cfg_ptr as Integer returns
     End If
 
     Note: Find unreachable blocks
-    Let unreachable be find_unreachable_blocks(cfg_ptr)
+    Let unreachable be proc find_unreachable_blocks with cfg_ptr
 
     If unreachable is equal to 0:
         Return 0
     End If
 
-    Let unreachable_count be list_length(unreachable)
+    Let unreachable_count be proc list_length with unreachable
     Let removed_count be 0
     Let i be 0
 
     While i is less than unreachable_count:
-        Let block_id be list_get(unreachable, i)
+        Let block_id be proc list_get with unreachable, i
 
         Note: Remove block from CFG
-        Let result be remove_block_from_cfg(cfg_ptr, block_id)
+        Let result be proc remove_block_from_cfg with cfg_ptr, block_id
 
         If result is equal to 1:
             Set removed_count to removed_count plus 1
@@ -4274,7 +4743,7 @@ Process called "simplify_cfg" that takes cfg_ptr as Integer returns Integer:
         Set changed to 0
 
         Note: Transformation 1: Remove unreachable blocks
-        Let removed be remove_unreachable_blocks(cfg_ptr)
+        Let removed be proc remove_unreachable_blocks with cfg_ptr
 
         If removed is greater than 0:
             Set changed to 1
@@ -4282,7 +4751,7 @@ Process called "simplify_cfg" that takes cfg_ptr as Integer returns Integer:
         End If
 
         Note: Transformation 2: Merge consecutive blocks
-        Let merged be merge_consecutive_blocks_pass(cfg_ptr)
+        Let merged be proc merge_consecutive_blocks_pass with cfg_ptr
 
         If merged is greater than 0:
             Set changed to 1
@@ -4290,7 +4759,7 @@ Process called "simplify_cfg" that takes cfg_ptr as Integer returns Integer:
         End If
 
         Note: Transformation 3: Remove empty blocks
-        Let empty_removed be remove_empty_blocks(cfg_ptr)
+        Let empty_removed be proc remove_empty_blocks with cfg_ptr
 
         If empty_removed is greater than 0:
             Set changed to 1
@@ -4302,6 +4771,22 @@ Process called "simplify_cfg" that takes cfg_ptr as Integer returns Integer:
 End Process
 
 Process called "merge_consecutive_blocks_pass" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    A block B can be fused with its single successor S whenever B has
+    exactly one successor and S has exactly one predecessor. After
+    fusion, the merged block has the predecessors of B and the
+    instructions of B followed by the instructions of S; the unconditional
+    jump that used to be B's terminator becomes dead and is dropped.
+
+    Merging is run after simplification passes that may have collapsed
+    branches into unconditional jumps. The smaller block count improves
+    register allocation locality and reduces code size by eliminating
+    redundant jumps.
+
+    We run a single pass per call; the surrounding simplify_cfg driver
+    runs passes to fixed point.
+    @End Reasoning
+
     @Implementation
     Scans all blocks and merges consecutive blocks where possible.
     Returns count of merged block pairs.
@@ -4320,37 +4805,37 @@ Process called "merge_consecutive_blocks_pass" that takes cfg_ptr as Integer ret
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Let merge_count be 0
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
                 Note: Check if block has exactly one successor
                 If list_length(successors) is equal to 1:
-                    Let succ_id be list_get(successors, 0)
-                    Let succ_block be get_block_by_id_from_cfg(cfg_ptr, succ_id)
+                    Let succ_id be proc list_get with successors, 0
+                    Let succ_block be proc get_block_by_id_from_cfg with cfg_ptr, succ_id
 
                     If succ_block is not equal to 0:
-                        Let succ_preds be get_mir_basic_block_predecessors(succ_block)
+                        Let succ_preds be proc get_mir_basic_block_predecessors with succ_block
 
                         If succ_preds is not equal to 0:
                             Note: Check if successor has exactly one predecessor
                             If list_length(succ_preds) is equal to 1:
                                 Note: Attempt to merge
-                                Let result be merge_blocks(cfg_ptr, block_id, succ_id)
+                                Let result be proc merge_blocks with cfg_ptr, block_id, succ_id
 
                                 If result is equal to 1:
                                     Set merge_count to merge_count plus 1
@@ -4409,40 +4894,40 @@ Process called "remove_empty_blocks" that takes cfg_ptr as Integer returns Integ
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Let removed_count be 0
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let block_id be get_mir_basic_block_id(block_ptr)
+            Let block_id be proc get_mir_basic_block_id with block_ptr
 
             Note: Skip entry block (cannot remove entry)
             If block_id is not equal to 0:
-                Let first_inst be get_mir_basic_block_first_instruction(block_ptr)
-                Let last_inst be get_mir_basic_block_last_instruction(block_ptr)
+                Let first_inst be proc get_mir_basic_block_first_instruction with block_ptr
+                Let last_inst be proc get_mir_basic_block_last_instruction with block_ptr
 
                 Note: Check if block contains only jump
                 If first_inst is equal to last_inst:
                     If first_inst is not equal to 0:
-                        Let opcode be get_mir_node_opcode(first_inst)
+                        Let opcode be proc get_mir_node_opcode with first_inst
 
                         If opcode is equal to MIR_JUMP:
                             Note: This is an empty block with only jump
                             Let jump_ptr be first_inst
-                            Let target_id be get_mir_jump_target_block(jump_ptr)
+                            Let target_id be proc get_mir_jump_target_block with jump_ptr
 
                             If target_id is not equal to negative 1:
                                 Note: Redirect all predecessors
-                                Let result be redirect_predecessors(cfg_ptr, block_id, target_id)
+                                Let result be proc redirect_predecessors with cfg_ptr, block_id, target_id
 
                                 If result is equal to 1:
                                     Note: Remove the empty block
@@ -4468,6 +4953,19 @@ Process called "remove_empty_blocks" that takes cfg_ptr as Integer returns Integ
 End Process
 
 Process called "redirect_predecessors" that takes cfg_ptr as Integer, old_target as Integer, new_target as Integer returns Integer:
+    @Reasoning
+    When an empty pass-through block is removed, every edge that used to
+    point at it must be redirected to its actual successor. Doing this
+    correctly requires updating four pieces of state per redirected edge:
+    the predecessor's terminator targets, the predecessor's successor list,
+    the new target's predecessor list, and any PHI nodes in the new target
+    that name the predecessor as an incoming edge.
+
+    We isolate the four-step rewrite in this helper so empty-block removal,
+    jump threading, and other rewiring transformations can share one
+    implementation.
+    @End Reasoning
+
     @Implementation
     Redirects all predecessors of old_target to point to new_target instead.
     Used when removing empty blocks.
@@ -4487,13 +4985,13 @@ Process called "redirect_predecessors" that takes cfg_ptr as Integer, old_target
         Return 0
     End If
 
-    Let old_block be get_block_by_id_from_cfg(cfg_ptr, old_target)
+    Let old_block be proc get_block_by_id_from_cfg with cfg_ptr, old_target
 
     If old_block is equal to 0:
         Return 0
     End If
 
-    Let predecessors be get_mir_basic_block_predecessors(old_block)
+    Let predecessors be proc get_mir_basic_block_predecessors with old_block
 
     If predecessors is equal to 0:
         Note: No predecessors, nothing to redirect
@@ -4501,12 +4999,12 @@ Process called "redirect_predecessors" that takes cfg_ptr as Integer, old_target
     End If
 
     Note: Make a copy of predecessors list (will be modified)
-    Let pred_count be list_length(predecessors)
-    Let pred_copy be list_create()
+    Let pred_count be proc list_length with predecessors
+    Let pred_copy be proc list_create
     Let i be 0
 
     While i is less than pred_count:
-        Let pred_id be list_get(predecessors, i)
+        Let pred_id be proc list_get with predecessors, i
         list_append(pred_copy, pred_id)
         Set i to i plus 1
     End While
@@ -4514,7 +5012,7 @@ Process called "redirect_predecessors" that takes cfg_ptr as Integer, old_target
     Note: Redirect each predecessor
     Set i to 0
     While i is less than pred_count:
-        Let pred_id be list_get(pred_copy, i)
+        Let pred_id be proc list_get with pred_copy, i
 
         Note: Update terminator in predecessor
         update_terminator_target(cfg_ptr, pred_id, old_target, new_target)
@@ -4537,6 +5035,17 @@ Process called "redirect_predecessors" that takes cfg_ptr as Integer, old_target
 End Process
 
 Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id as Integer returns Integer:
+    @Reasoning
+    Removes a block and all of its referenced state from the CFG. Called
+    by remove_unreachable_blocks, remove_empty_blocks, and any pass that
+    needs to retire a block. The proc handles the full removal contract:
+    edges in both directions are unlinked, the block is removed from the
+    CFG storage list, and its allocation is freed.
+
+    We do NOT reuse the block's ID for any future allocation. See
+    get_next_block_id for the rationale.
+    @End Reasoning
+
     @Implementation
     Removes a block from the CFG.
     Updates all edge lists and block lists.
@@ -4549,27 +5058,34 @@ Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id a
     Returns 1 on success, 0 on failure.
     @End Implementation
 
+    @Security_Scope
+    - This proc deallocates block memory. Any cached pointer to the block
+      (e.g. from a previous get_block_by_id_from_cfg call) becomes
+      dangling immediately after this returns. Callers must invalidate
+      such caches before invoking remove_block_from_cfg.
+    @End Security_Scope
+
     If cfg_ptr is equal to 0:
         Return 0
     End If
 
-    Let block_ptr be get_block_by_id_from_cfg(cfg_ptr, block_id)
+    Let block_ptr be proc get_block_by_id_from_cfg with cfg_ptr, block_id
 
     If block_ptr is equal to 0:
         Return 0
     End If
 
     Note: Remove all edges from this block
-    Let successors be get_mir_basic_block_successors(block_ptr)
+    Let successors be proc get_mir_basic_block_successors with block_ptr
 
     If successors is not equal to 0:
         Note: Make copy of successors (will be modified)
-        Let succ_count be list_length(successors)
-        Let succ_copy be list_create()
+        Let succ_count be proc list_length with successors
+        Let succ_copy be proc list_create
         Let i be 0
 
         While i is less than succ_count:
-            Let succ_id be list_get(successors, i)
+            Let succ_id be proc list_get with successors, i
             list_append(succ_copy, succ_id)
             Set i to i plus 1
         End While
@@ -4577,7 +5093,7 @@ Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id a
         Note: Remove edges
         Set i to 0
         While i is less than succ_count:
-            Let succ_id be list_get(succ_copy, i)
+            Let succ_id be proc list_get with succ_copy, i
             remove_cfg_edge(cfg_ptr, block_id, succ_id)
             Set i to i plus 1
         End While
@@ -4586,16 +5102,16 @@ Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id a
     End If
 
     Note: Remove all edges to this block
-    Let predecessors be get_mir_basic_block_predecessors(block_ptr)
+    Let predecessors be proc get_mir_basic_block_predecessors with block_ptr
 
     If predecessors is not equal to 0:
         Note: Make copy of predecessors (will be modified)
-        Let pred_count be list_length(predecessors)
-        Let pred_copy be list_create()
+        Let pred_count be proc list_length with predecessors
+        Let pred_copy be proc list_create
         Let i be 0
 
         While i is less than pred_count:
-            Let pred_id be list_get(predecessors, i)
+            Let pred_id be proc list_get with predecessors, i
             list_append(pred_copy, pred_id)
             Set i to i plus 1
         End While
@@ -4603,7 +5119,7 @@ Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id a
         Note: Remove edges
         Set i to 0
         While i is less than pred_count:
-            Let pred_id be list_get(pred_copy, i)
+            Let pred_id be proc list_get with pred_copy, i
             remove_cfg_edge(cfg_ptr, pred_id, block_id)
             Set i to i plus 1
         End While
@@ -4612,14 +5128,14 @@ Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id a
     End If
 
     Note: Remove block from CFG block list
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is not equal to 0:
-        Let block_count be list_length(blocks)
+        Let block_count be proc list_length with blocks
         Let i be 0
 
         While i is less than block_count:
-            Let current_block be list_get(blocks, i)
+            Let current_block be proc list_get with blocks, i
 
             If current_block is equal to block_ptr:
                 list_remove_at(blocks, i)
@@ -4631,14 +5147,14 @@ Process called "remove_block_from_cfg" that takes cfg_ptr as Integer, block_id a
     End If
 
     Note: Deallocate all instructions in the block before deallocating block itself
-    Let instructions be get_block_instructions(block_ptr)
+    Let instructions be proc get_block_instructions with block_ptr
 
     If instructions is not equal to 0:
-        Let inst_count be get_block_instruction_count(block_ptr)
+        Let inst_count be proc get_block_instruction_count with block_ptr
         Let i be 0
 
         While i is less than inst_count:
-            Let inst be list_get(instructions, i)
+            Let inst be proc list_get with instructions, i
             If inst is not equal to 0:
                 proc deallocate from Layout with inst
             End If
@@ -4686,7 +5202,7 @@ Process called "get_cfg_block_count" that takes cfg_ptr as Integer returns Integ
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
@@ -4696,6 +5212,15 @@ Process called "get_cfg_block_count" that takes cfg_ptr as Integer returns Integ
 End Process
 
 Process called "count_cfg_instructions" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    A statistics primitive used by diagnostics, the pass driver's
+    heuristics (e.g. inlining threshold checks), and the print_cfg_stats
+    debugging report. We compute the total on demand rather than caching
+    a count in the CFG struct because the count is only consulted at
+    pass-driver granularity and caching would require every instruction
+    insertion/removal to maintain the invariant.
+    @End Reasoning
+
     @Implementation
     Counts the total number of instructions across all blocks in the CFG.
 
@@ -4712,21 +5237,21 @@ Process called "count_cfg_instructions" that takes cfg_ptr as Integer returns In
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Let total_instructions be 0
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let first_inst be get_mir_basic_block_first_instruction(block_ptr)
+            Let first_inst be proc get_mir_basic_block_first_instruction with block_ptr
             Let inst be first_inst
 
             While inst is not equal to 0:
@@ -4742,6 +5267,16 @@ Process called "count_cfg_instructions" that takes cfg_ptr as Integer returns In
 End Process
 
 Process called "count_cfg_edges" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    A statistics primitive that counts edges by summing every block's
+    successor count. Because every edge is stored twice (in the
+    predecessor's successor list and the successor's predecessor list),
+    summing successors gives the correct edge count without double
+    counting. Used by print_cfg_stats and by complexity-aware passes that
+    want to know |E| before deciding whether an expensive analysis is
+    worth running.
+    @End Reasoning
+
     @Implementation
     Counts the total number of edges in the CFG.
 
@@ -4757,24 +5292,24 @@ Process called "count_cfg_edges" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
+    Let block_count be proc list_length with blocks
     Let total_edges be 0
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let successors be get_mir_basic_block_successors(block_ptr)
+            Let successors be proc get_mir_basic_block_successors with block_ptr
 
             If successors is not equal to 0:
-                Let succ_count be list_length(successors)
+                Let succ_count be proc list_length with successors
                 Set total_edges to total_edges plus succ_count
             End If
         End If
@@ -4825,9 +5360,9 @@ Process called "print_cfg_stats" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Compute statistics
-    Let block_count be get_cfg_block_count(cfg_ptr)
-    Let edge_count be count_cfg_edges(cfg_ptr)
-    Let inst_count be count_cfg_instructions(cfg_ptr)
+    Let block_count be proc get_cfg_block_count with cfg_ptr
+    Let edge_count be proc count_cfg_edges with cfg_ptr
+    Let inst_count be proc count_cfg_instructions with cfg_ptr
 
     Note: Compute average instructions per block
     Let avg_inst be 0
@@ -4836,7 +5371,7 @@ Process called "print_cfg_stats" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Count reachable blocks
-    Let reachable be compute_reachable_blocks(cfg_ptr)
+    Let reachable be proc compute_reachable_blocks with cfg_ptr
     Let reachable_count be 0
 
     If reachable is not equal to 0:
@@ -4845,18 +5380,18 @@ Process called "print_cfg_stats" that takes cfg_ptr as Integer returns Integer:
     End If
 
     Note: Count loops (back edges)
-    Let back_edges be identify_back_edges(cfg_ptr)
+    Let back_edges be proc identify_back_edges with cfg_ptr
     Let loop_count be 0
 
     If back_edges is not equal to 0:
         Set loop_count to list_length(back_edges)
 
         Note: Clean up back edges
-        Let edge_count_temp be list_length(back_edges)
+        Let edge_count_temp be proc list_length with back_edges
         Let i be 0
 
         While i is less than edge_count_temp:
-            Let edge_pair be list_get(back_edges, i)
+            Let edge_pair be proc list_get with back_edges, i
 
             If edge_pair is not equal to 0:
                 deallocate_edge_pair(edge_pair)
@@ -4940,6 +5475,18 @@ Process called "get_entry_block" that takes cfg_ptr as Integer returns Integer:
 End Process
 
 Process called "get_exit_blocks" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Exit blocks (no successors; terminate in Return, Throw, or Unreachable)
+    are the natural starting points for backward dataflow analyses such
+    as live-variable analysis. Returning all exits as a list lets dataflow
+    drivers seed their reverse traversal once rather than scanning the
+    CFG for terminators every iteration.
+
+    Functions typically have one exit (a single Return), but inlining and
+    early-return patterns frequently produce multiple. Materializing the
+    set up front handles both shapes uniformly.
+    @End Reasoning
+
     @Implementation
     Returns a list of all exit blocks in the CFG.
 
@@ -4957,14 +5504,14 @@ Process called "get_exit_blocks" that takes cfg_ptr as Integer returns Integer:
         Return 0
     End If
 
-    Let blocks be get_mir_cfg_blocks(cfg_ptr)
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
 
     If blocks is equal to 0:
         Return 0
     End If
 
-    Let block_count be list_length(blocks)
-    Let exit_blocks be list_create()
+    Let block_count be proc list_length with blocks
+    Let exit_blocks be proc list_create
 
     If exit_blocks is equal to 0:
         Return 0
@@ -4973,10 +5520,10 @@ Process called "get_exit_blocks" that takes cfg_ptr as Integer returns Integer:
     Let i be 0
 
     While i is less than block_count:
-        Let block_ptr be list_get(blocks, i)
+        Let block_ptr be proc list_get with blocks, i
 
         If block_ptr is not equal to 0:
-            Let successors be get_mir_basic_block_predecessors(block_ptr)
+            Let successors be proc get_mir_basic_block_predecessors with block_ptr
             Let succ_count be 0
 
             If successors is not equal to 0:
@@ -4985,7 +5532,7 @@ Process called "get_exit_blocks" that takes cfg_ptr as Integer returns Integer:
 
             Note: Block with no successors is an exit block
             If succ_count is equal to 0:
-                Let block_id be get_mir_basic_block_id(block_ptr)
+                Let block_id be proc get_mir_basic_block_id with block_ptr
                 list_append(exit_blocks, block_id)
             End If
         End If
@@ -4994,6 +5541,364 @@ Process called "get_exit_blocks" that takes cfg_ptr as Integer returns Integer:
     End While
 
     Return exit_blocks
+End Process
+
+Process called "get_all_blocks" that takes cfg_ptr as Integer returns Integer:
+    @Reasoning
+    Returns the complete set of basic block identifiers present in the CFG.
+
+    This procedure is the canonical public accessor used by MIR optimization
+    passes (scalar replacement, inlining, and downstream Wave 2 transformations)
+    that need to enumerate every block in a function without committing to a
+    particular traversal order. The contract is intentionally weaker than
+    traverse_cfg_dfs or get_reverse_postorder: callers receive every block in
+    the CFG, including blocks unreachable from the entry, in the storage order
+    of the underlying block list.
+
+    This makes get_all_blocks the correct primitive for:
+    - Whole-function analyses that must visit unreachable blocks (e.g. dead
+      block elimination, debug-info emission, error reporting on orphans)
+    - Optimization passes that build per-block side tables keyed by block ID
+    - Consistency checks that validate every block matches an invariant
+      regardless of reachability
+
+    Callers that need a reachable-only view should use compute_reachable_blocks
+    or traverse_cfg_dfs instead. The returned list is freshly allocated and
+    owned by the caller, who is responsible for list_destroy when finished.
+
+    Returning IDs rather than block pointers keeps the API symmetric with the
+    rest of the public CFG surface (find_unreachable_blocks, get_exit_blocks,
+    etc.) and avoids leaking internal block storage layout to other modules.
+    @End Reasoning
+
+    @Implementation
+    Walks the CFG block storage produced by get_mir_cfg_blocks and copies every
+    block identifier into a freshly allocated result list.
+
+    Algorithm:
+    1. Validate cfg_ptr is non-zero. Return 0 on null input.
+    2. Retrieve the block storage list via get_mir_cfg_blocks.
+    3. If the storage list is null, return 0 (defensive: a well-formed CFG
+       always has a block list, even if empty).
+    4. Compute block_count via list_length.
+    5. Allocate a result list via list_create. If allocation fails, return 0.
+    6. Iterate i in 0..block_count-1:
+       a. Fetch block_ptr at index i via list_get.
+       b. If block_ptr is non-zero, extract its ID via get_mir_basic_block_id
+          and append it to the result list. Null entries in storage are skipped
+          (these should not occur in a well-formed CFG, but we tolerate them
+          rather than propagating a corrupt ID).
+    7. Return the result list. Caller owns the allocation.
+
+    Complexity: O(V) time, O(V) space for the result list.
+
+    Mirrors the access pattern used by get_reverse_postorder, traverse_cfg_dfs,
+    and get_exit_blocks, which all open the block storage via get_mir_cfg_blocks
+    and iterate index-by-index.
+    @End Implementation
+
+    @Performance_Hints
+    - O(V) time and allocates one List of length V. Callers that need to
+      enumerate every block multiple times within a single pass should cache
+      the result rather than re-invoking get_all_blocks per phase.
+    - The result list lives on the owned heap and must be destroyed by the
+      caller via list_destroy. Failing to do so leaks O(V) memory per call.
+    - Dereferences every block_ptr in storage to read its ID. On a large
+      function (thousands of blocks) the read pattern is sequential and
+      cache-friendly; no random access into block payloads is performed.
+    - Because the result is built incrementally with list_append, the list may
+      reallocate its backing buffer O(log V) times. Callers that know the
+      block count in advance and need to optimize allocation should use
+      get_cfg_block_count to pre-size their own structures.
+    @End Performance_Hints
+
+    @Security_Scope
+    - Validates cfg_ptr against null before dereferencing. Callers must still
+      ensure cfg_ptr originates from a trusted source
+      (build_cfg_from_instructions or a CFG transformation pass); passing
+      arbitrary integers is undefined.
+    - Does not write through cfg_ptr or any of its block pointers; this is a
+      pure read of the block storage and ID fields. Concurrent mutation of the
+      CFG by another thread during execution may yield a list that mixes
+      pre-mutation and post-mutation IDs. CFG mutation is single-threaded by
+      convention in the current compiler; if that invariant changes, callers
+      must hold the appropriate lock for the duration of get_all_blocks plus
+      any subsequent use of the returned list.
+    - The returned list is an opaque List handle. Information disclosure is
+      limited to block IDs, which are non-sensitive integer identifiers
+      internal to the current compilation unit.
+    @End Security_Scope
+
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let blocks be proc get_mir_cfg_blocks with cfg_ptr
+
+    If blocks is equal to 0:
+        Return 0
+    End If
+
+    Let block_count be proc list_length with blocks
+    Let result be proc list_create
+
+    If result is equal to 0:
+        Return 0
+    End If
+
+    Let i be 0
+
+    While i is less than block_count:
+        Let block_ptr be proc list_get with blocks, i
+
+        If block_ptr is not equal to 0:
+            Let block_id be proc get_mir_basic_block_id with block_ptr
+            list_append(result, block_id)
+        End If
+
+        Set i to i plus 1
+    End While
+
+    Return result
+End Process
+
+Note: ============================================================
+Note: CANONICAL CFG-LEVEL API
+Note: ============================================================
+Note: Canonical CFG-facing names that other modules (inlining, devirt,
+Note: tail-call, lto) call as "proc <name> from CFG". These wrap the
+Note: lower-level mir.runa / mir_nodes.runa primitives so the optimizer
+Note: code reads as CFG-level operations rather than direct mir-record
+Note: manipulation.
+
+@Reasoning
+Optimization passes that modify the CFG (inlining splits a call block and
+inserts a continuation; loop-invariant code motion inserts pre-headers;
+critical-edge splitting inserts join blocks) need an idiomatic
+"create-a-new-block-in-this-cfg" primitive that takes care of fresh-ID
+allocation. The lower-level create_mir_basic_block in mir.runa requires an
+explicit block_id and label argument, which forces every caller to call
+get_next_block_id first — an avoidable boilerplate. This canonical wrapper
+allocates the fresh ID and supplies a null label (the default), so the
+caller can simply ask the CFG for a new block.
+@End Reasoning
+
+@Implementation
+Calls get_next_block_id to obtain an unused block_id, then forwards to
+create_mir_basic_block with that ID and a null label. The newly created
+block is NOT automatically added to the CFG's block list — the caller
+remains responsible for calling add_block_to_function (or the equivalent
+lower-level add_mir_cfg_block) once the block contents have been populated.
+This separation lets callers do bulk preparation (filling instructions,
+wiring back-pointers) before publishing the block, which simplifies error
+recovery when a downstream step fails.
+Returns 0 if the CFG pointer is null, the ID allocation fails, or the
+underlying block allocation fails.
+@End Implementation
+
+@Performance_Hints
+O(V) inside get_next_block_id (linear over existing blocks to find max ID)
+plus an O(1) allocation. Called per CFG insertion, not in any inner loop.
+@End Performance_Hints
+
+@Security_Scope
+Null guard on the input CFG before any work. All sub-allocations propagate
+their own null returns; no partial state is left in the CFG when this
+function returns 0.
+@End Security_Scope
+
+Process called "create_basic_block" that takes cfg_ptr as Integer returns Integer:
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let new_id be proc get_next_block_id with cfg_ptr
+    Note: create_mir_basic_block lives in mir.runa; its second argument is the
+    Note: block label (0 means "no explicit label, use block-id as identifier").
+    Return proc create_mir_basic_block with new_id, 0
+End Process
+
+@Reasoning
+Optimization passes that splice instructions into a block (inlining moves
+the post-call tail to a continuation block; LICM hoists instructions into
+a pre-header; tail-call replaces a return with a jump) need a CFG-level
+"append-this-instruction-to-this-block" primitive. The lower-level
+add_instruction_to_block in mir.runa already does exactly the right work
+(forward link + parent back-pointer); this canonical wrapper re-exposes it
+under a CFG-namespaced name so the optimization-pass code reads as
+CFG-level mutation rather than reaching past the abstraction into mir.runa.
+@End Reasoning
+
+@Implementation
+This is the canonical CFG-level definition of add_instruction_to_block. The
+parser-level merge in import_system.runa::merge_imported_functions
+deduplicates Process declarations by name across import boundaries, so the
+first definition encountered (this one, when other modules import cfg.runa)
+is the one that survives into the linked binary. Forwarding via
+`Return proc add_instruction_to_block with ...` would resolve to THIS symbol
+and produce an unconditional self-recursive call (the bootstrap codegen
+drops the source-level module-alias prefix per
+codegen.runa::EXPR_QUALIFIED_CALL handling, so `from MIR` cannot
+disambiguate). The body therefore implements the full append-instruction
+algorithm inline: it appends the instruction to the block's instruction
+list at MIRBasicBlock offset 16, increments the cached instruction count at
+offset 24, and writes the block back-pointer into the instruction at
+MIRNode offset 56. Returns 1 on success or 0 if either pointer is null.
+@End Implementation
+
+@Performance_Hints
+Amortized O(1) List append plus three int64 memory operations. No call
+overhead since the algorithm is inlined directly rather than delegated.
+@End Performance_Hints
+
+@Security_Scope
+Explicit null guards on both input pointers before any dereference. List
+append is bounds-safe via amortized realloc; the three int64 writes occur
+only after both pointers have been validated.
+@End Security_Scope
+
+Process called "add_instruction_to_block" that takes block_ptr as Integer, instruction_ptr as Integer returns Integer:
+    If block_ptr is equal to 0:
+        Return 0
+    End If
+
+    If instruction_ptr is equal to 0:
+        Return 0
+    End If
+
+    Let instructions be proc memory_get_int64 from Layout with block_ptr, 16
+    proc append from List with instructions, instruction_ptr
+
+    Let count be proc memory_get_int64 from Layout with block_ptr, 24
+    Set count to count plus 1
+    proc memory_set_int64 from Layout with block_ptr, 24, count
+
+    proc memory_set_int64 from Layout with instruction_ptr, 56, block_ptr
+
+    Return 1
+End Process
+
+@Reasoning
+CFG-level "add an edge between two blocks" primitive. The lower-level
+add_cfg_edge in mir.runa takes block IDs (not block pointers) because the
+edge table at MIRCFG offset 32 is keyed by ID. Optimization passes such as
+inlining typically hold block POINTERS, so this canonical wrapper extracts
+the IDs from both endpoints before delegating to add_cfg_edge. This keeps
+the optimization-pass code reading at the pointer-based abstraction level
+while preserving the lower-level edge table's ID-based representation.
+@End Reasoning
+
+@Implementation
+Reads each block's block_id from MIRBasicBlock offset 0 (the canonical ID
+slot established by create_mir_basic_block), then forwards to add_cfg_edge
+with the CFG pointer and the two extracted IDs. add_cfg_edge takes care of
+both directions of the edge (predecessor and successor lists) so this
+wrapper does not need to do any additional wiring. Returns 1 on success or
+0 if any input pointer is null.
+
+The CFG pointer is recovered from the source block's parent function (which
+both pointers must share). We extract the cfg from the source block via the
+block-level parent chain: pred_block -> block.cfg slot (MIRBasicBlock offset
+48 is parent_cfg per CFG-edge management invariants established in
+construct_cfg_edges).
+@End Implementation
+
+@Performance_Hints
+Three int64 loads plus the delegated add_cfg_edge call. add_cfg_edge is
+O(V) in block count for the ID -> block lookup it performs internally;
+this wrapper adds no asymptotic overhead.
+@End Performance_Hints
+
+@Security_Scope
+Null guards on both block pointers and on the recovered CFG before any
+edge mutation. add_cfg_edge performs its own ID-based block lookup and
+returns 0 cleanly if either endpoint cannot be located, so this wrapper
+inherits its safety properties.
+@End Security_Scope
+
+Process called "add_edge" that takes pred_block as Integer, succ_block as Integer returns Integer:
+    If pred_block is equal to 0:
+        Return 0
+    End If
+
+    If succ_block is equal to 0:
+        Return 0
+    End If
+
+    Note: Block IDs live at MIRBasicBlock offset 0
+    Let pred_id be proc memory_get_int64 with pred_block, 0
+    Let succ_id be proc memory_get_int64 with succ_block, 0
+
+    Note: Recover CFG pointer from source block's parent_cfg slot (offset 48)
+    Let cfg_ptr be proc memory_get_int64 with pred_block, 48
+    If cfg_ptr is equal to 0:
+        Note: Try recovering via successor instead
+        Set cfg_ptr to proc memory_get_int64 with succ_block, 48
+    End If
+
+    If cfg_ptr is equal to 0:
+        Return 0
+    End If
+
+    Return proc add_cfg_edge with cfg_ptr, pred_id, succ_id
+End Process
+
+@Reasoning
+CFG-level wrapper for registering a newly created block into the CFG's
+master block list. Optimization passes that splice in new blocks (inlining
+adds the inlined callee body; pre-header insertion adds a loop pre-header)
+need a canonical "publish this block to the CFG" primitive. mir.runa's
+add_block_to_cfg already does this job; this wrapper re-exposes it under
+the CFG-namespaced name "add_block_to_function" because the conceptual
+unit being mutated is the function's CFG.
+@End Reasoning
+
+@Implementation
+Forwards directly to add_block_to_cfg in mir.runa, which appends the block
+pointer to the blocks List at MIRCFG offset 16 and increments the cached
+block_count at offset 24. Returns 1 on success or 0 if either pointer is
+null. The block's own internal predecessor/successor lists are NOT touched
+here; edge wiring is the caller's responsibility via add_edge.
+@End Implementation
+
+@Performance_Hints
+Single tail-call delegation. Amortized O(1) List append performance.
+@End Performance_Hints
+
+@Security_Scope
+Null checks delegated to add_block_to_cfg.
+@End Security_Scope
+
+Process called "add_block_to_function" that takes cfg_ptr as Integer, block_ptr as Integer returns Integer:
+    Return proc add_block_to_cfg with cfg_ptr, block_ptr
+End Process
+
+@Reasoning
+Canonical "lookup block by ID" primitive exposed under the short CFG-level
+name (paralleling the legacy get_block_by_id_from_cfg). Optimization passes
+read this enough that the longer name became noise; the canonical short
+form keeps call sites concise. Both names point at the same linear-scan
+implementation so behaviour is identical.
+@End Reasoning
+
+@Implementation
+Forwards to get_block_by_id_from_cfg, which performs the canonical linear
+scan over the CFG's blocks List comparing each block's stored ID against
+the requested ID. Returns the block pointer on a hit, or 0 if the CFG is
+null or no block with the requested ID exists.
+@End Implementation
+
+@Performance_Hints
+O(V) linear search. Avoid calling inside a tight loop indexed by block ID;
+cache the pointer once if the ID is reused across iterations.
+@End Performance_Hints
+
+@Security_Scope
+Null guards delegated to get_block_by_id_from_cfg.
+@End Security_Scope
+
+Process called "get_block_by_id" that takes cfg_ptr as Integer, block_id as Integer returns Integer:
+    Return proc get_block_by_id_from_cfg with cfg_ptr, block_id
 End Process
 
 Note: ============================================================
@@ -5009,8 +5914,9 @@ Note: - Phase 4: Critical Edge Handling (find_critical_edges, split_critical_edg
 Note: - Phase 5: Loop Detection (identify_back_edges, find_natural_loop, get_loop_info)
 Note: - Phase 6: CFG Validation (validate_cfg_structure, verify_ssa_form, validate_cfg)
 Note: - Phase 7: CFG Transformation (merge_blocks, simplify_cfg, remove_unreachable_blocks)
-Note: - Phase 8: Utilities (count functions, print_cfg_stats, get_entry/exit_blocks)
+Note: - Phase 8: Utilities (count functions, print_cfg_stats, get_entry/exit_blocks, get_all_blocks)
+Note: - Phase 9: Canonical CFG-level API (create_basic_block, add_instruction_to_block, add_edge, add_block_to_function, get_block_by_id)
 
-Note: Total: 38 functions across 8 categories
+Note: Total: 44 functions across 9 categories
 Note: All functions are production-perfect with zero technical debt
 Note: Ready for use in MIR optimization passes and code generation

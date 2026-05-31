@@ -321,11 +321,28 @@ Note: MIR Core Creation Functions
 Note: All allocations use TIER 3 (OWNED HEAP) - permanent structures
 Note: ============================================================================
 
+@Reasoning
+Allocates and initialises a fresh MIRNode — the unit of three-address SSA in
+this IR. Every instruction the compiler will ever optimise, schedule, or lower
+flows through this constructor, so the layout and initial-state guarantees
+established here are load-bearing for every downstream pass (verifier, DCE,
+inliner, LIR builder, register allocator).
+@End Reasoning
+
 @Implementation
-Creates a MIR instruction node with specified opcode. All fields are initialized
-to safe defaults. The instruction does not produce a value initially (value_id = 0).
-Caller must set operands and type information as needed.
+Allocates 72 bytes on the owned heap (TIER 3) — matching the 9-field MIRNode
+type — and zero-initialises all fields except opcode (offset 0). value_id
+(offset 8) starts at 0 to mark the instruction as non-producing until the
+caller assigns one, and operand1/2/3 (offsets 16/24/32), type_info (40),
+next (48), parent_block (56), and metadata (64) all start at 0. Returns 0
+if allocation fails, allowing the caller to abort safely.
 @End Implementation
+
+@Security_Scope
+Heap allocation followed by deterministic field writes through fixed offsets
+within the 72-byte block; no unchecked pointer arithmetic. Failure to allocate
+returns 0 rather than dereferencing a null pointer.
+@End Security_Scope
 
 Process called "create_mir_node" that takes opcode as Integer returns Integer:
     Let node_size be 72
@@ -348,11 +365,30 @@ Process called "create_mir_node" that takes opcode as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning
+Allocates and initialises a fresh MIRValue — the SSA virtual-register record
+that anchors def-use tracking. Every optimisation pass that walks def-use
+chains (constant propagation, value numbering, DCE, copy propagation,
+mem2reg) reads from the structure created here, so the freshly-zeroed
+use-list and use-count established at construction are a precondition for
+those passes' correctness.
+@End Reasoning
+
 @Implementation
-Creates an SSA value (temporary). The value starts with zero uses and is marked
-as non-constant. The defining instruction must be set by the caller after
-the instruction is created and linked to this value.
+Allocates 56 bytes (7 fields, TIER 3 owned heap) and writes value_id at
+offset 0 and type_info at offset 8. def_instruction (offset 16) is zeroed —
+the caller must call set_value_def once the producing instruction exists.
+use_list (offset 24) gets a fresh List, use_count (offset 32) starts at 0,
+and is_constant (40) / constant_value (48) start at 0. Returns 0 on
+allocation failure.
 @End Implementation
+
+@Security_Scope
+Heap allocation followed by field initialisation through fixed offsets in a
+56-byte block. The use_list backing store is independently allocated by
+List.create; any failure of that sub-allocation propagates a null pointer
+that subsequent add_value_use / remove_value_use calls must tolerate.
+@End Security_Scope
 
 Process called "create_mir_value" that takes value_id as Integer, type_info as Integer returns Integer:
     Let value_size be 56
@@ -375,11 +411,29 @@ Process called "create_mir_value" that takes value_id as Integer, type_info as I
     Return value
 End Process
 
+@Reasoning
+Allocates and initialises a fresh MIRBasicBlock — the node type of the CFG.
+Every control-flow analysis (dominance, loop detection, liveness, scheduling)
+and every transformation that splits or merges control flow operates on these
+records, so the empty-instruction / empty-edge / unset-dominator initial
+state established here is the contract every CFG-mutating pass relies on.
+@End Reasoning
+
 @Implementation
-Creates a basic block with specified ID and label. The block starts with empty
-instruction and edge lists. Phi nodes list is also initially empty.
-Dominance information is initialized to invalid state.
+Allocates 96 bytes (12 fields, TIER 3 owned heap). Writes block_id at offset
+0 and label pointer at offset 8. Creates fresh Lists for instructions (16),
+predecessors (32), successors (48), phi_nodes (88), and zeroes their
+respective counts (24, 40, 56). Sets dominator (offset 64) to -1 to encode
+"not yet computed", and zeroes loop_depth (72) and is_loop_header (80).
+Returns 0 on allocation failure.
 @End Implementation
+
+@Security_Scope
+Heap allocation followed by deterministic field writes through fixed offsets
+in a 96-byte block. Four sub-allocations for the embedded Lists; any null
+from List.create yields a block whose iteration loops will simply be no-ops
+(length 0), so partial allocation does not produce dangling reads.
+@End Security_Scope
 
 Process called "create_mir_basic_block" that takes block_id as Integer, label as Integer returns Integer:
     Let block_size be 96
@@ -414,11 +468,29 @@ Process called "create_mir_basic_block" that takes block_id as Integer, label as
     Return block
 End Process
 
+@Reasoning
+Allocates the per-function MIRCFG that owns the block list, edge list, and
+the per-function block-id counter. The CFG is the substrate on which every
+control-flow pass runs (dominance, loops, mem2reg, scheduling, lowering),
+and several of those passes assume entry and exit are settable but not
+required at construction, and that ssa_form / dominance_computed start at
+"invalid" so passes know to (re)compute them.
+@End Reasoning
+
 @Implementation
-Creates a control flow graph with entry and exit blocks. The CFG starts in
-non-SSA form and without computed dominance information. Optimization passes
-will construct SSA form and compute dominance as needed.
+Allocates 72 bytes (9 fields, TIER 3 owned heap). Zeroes entry_block (0)
+and exit_block (8) — set later by set_cfg_entry_block / set_cfg_exit_block.
+Creates fresh Lists for blocks (offset 16) and edges (offset 32) and zeroes
+their counts (24, 40). next_block_id (48), dominance_computed (56), and
+ssa_form (64) all start at 0. Returns 0 if allocation fails.
 @End Implementation
+
+@Security_Scope
+Heap allocation plus two sub-allocations for the embedded Lists. All field
+writes go through fixed offsets within the 72-byte record; null returns
+from List.create propagate as empty backing stores rather than dangling
+pointers.
+@End Security_Scope
 
 Process called "create_mir_cfg" returns Integer:
     Let cfg_size be 72
@@ -446,11 +518,33 @@ Process called "create_mir_cfg" returns Integer:
     Return cfg
 End Process
 
+@Reasoning
+Allocates and initialises the MIRFunction record — the unit of compilation
+inside the MIR program. Every later pass (inlining, devirtualisation, tail
+call, LTO, LIR lowering) reads through this record's authoritative offsets
+(name, cfg, parameters, return_type, value_to_instruction map, is_external,
+FFI fields), so the offsets and zero-initialised invariants set here are a
+hard contract shared with every consumer. The retained hir_node reference
+also lets diagnostics map MIR-level errors back to source.
+@End Reasoning
+
 @Implementation
-Creates a MIR function with specified name and return type. The function
-starts with an empty CFG, no parameters, and no SSA values. The HIR node
-reference preserves connection to source for debugging and error reporting.
+Allocates 120 bytes (15 fields, TIER 3 owned heap). Writes name at offset 0,
+creates a fresh MIRCFG at offset 8, creates parameter List at offset 16 with
+count 0 at offset 24, writes return_type at 32, creates the local-values
+List at 40 with count 0 at 48 and next_value_id seeded 0 at 56, allocates
+the value_to_instruction Dictionary at offset 64, writes hir_node at 72,
+zeroes is_external at the authoritative offset 80, zeroes metadata at 88,
+and zeroes the three P2-D FFI fields library_name (96), alias_name (104),
+convention_id (112). Returns 0 if allocation fails.
 @End Implementation
+
+@Security_Scope
+Heap allocation plus three sub-allocations (CFG, two Lists, Dictionary). The
+is_external flag MUST be written at offset 80 specifically — every consumer
+(inlining, devirt, tail_call, lto, lir_builder) reads at offset 80, and a
+mismatch here would silently corrupt FFI dispatch.
+@End Security_Scope
 
 Process called "create_mir_function" that takes name as Integer, return_type as Integer, hir_node as Integer returns Integer:
     Let function_size be 120
@@ -464,7 +558,7 @@ Process called "create_mir_function" that takes name as Integer, return_type as 
     proc memory_set_int64 from Layout with function, 0, name
 
     Note: cfg (offset 8)
-    Let cfg be create_mir_cfg()
+    Let cfg be proc create_mir_cfg
     proc memory_set_int64 from Layout with function, 8, cfg
 
     Note: parameters list (offset 16), parameter_count (offset 24)
@@ -502,6 +596,31 @@ Process called "create_mir_function" that takes name as Integer, return_type as 
     Return function
 End Process
 
+@Reasoning
+Marks a MIRFunction as external (FFI binding) and records the metadata that
+the LIR builder, inliner, devirtualizer, tail-call pass, and LTO link layer
+need in order to emit a proper extern symbol reference rather than an
+in-module definition. Without this metadata, an externally-imported function
+would be lowered as an empty body and the linker would emit unresolved-symbol
+errors at static-link time.
+@End Reasoning
+
+@Implementation
+Sets is_external = 1 at offset 80 (the authoritative offset matching the Type
+definition and every consumer pass) and stores the three FFI fields:
+library_name (96), alias_name (104), and convention_id (112). The convention_id
+follows the wire encoding established by the FFI primitives: 0 = CDecl,
+1 = StdCall, 2 = FastCall, 3 = SysV. Null function pointer returns 0 to allow
+the caller to fail safely without mutating arbitrary memory.
+@End Implementation
+
+@Security_Scope
+Direct memory writes via memory_set_int64 occur only after a null check on the
+function pointer. No bounds checking is required because the offsets are fixed
+constants inside the 120-byte MIRFunction layout established by
+create_mir_function.
+@End Security_Scope
+
 Process called "mir_function_set_external" that takes function as Integer, library_name as Integer, alias_name as Integer, convention_id as Integer returns Integer:
     Note: P2-D FFI: Mark a MIRFunction as external and record FFI metadata.
     Note: Sets is_external=1 (at offset 80 per consumer-side convention) plus FFI fields.
@@ -521,12 +640,44 @@ Process called "mir_function_set_external" that takes function as Integer, libra
     Return 1
 End Process
 
+@Reasoning
+Reads the P2-D FFI library_name pointer that the LIR builder and the linker
+front-end use to emit the correct extern symbol reference for an
+externally-imported function. A null library_name means "no explicit
+library" — the linker then resolves the symbol against the default
+namespace. Every consumer that emits extern references (lir_builder, lto,
+the bytecode emitter) calls this accessor to obtain the FFI binding.
+@End Reasoning
+
+@Implementation
+Reads the int64 stored at MIRFunction offset 96 (the authoritative library_name
+slot established by create_mir_function and mir_function_set_external).
+Returns 0 for a null function pointer to allow safe handling of partial
+records.
+@End Implementation
+
 Process called "mir_function_get_library_name" that takes function as Integer returns Integer:
     If function is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with function, 96
 End Process
+
+@Reasoning
+Reads the P2-D FFI alias_name pointer — the C-side symbol name that the
+emitter must use when this name differs from the Runa-side function name
+(e.g. when binding to a C library function whose name conflicts with a Runa
+keyword or naming convention). If alias_name is 0, the function name itself
+(offset 0) is returned, encoding the rule "no alias means the Runa name IS
+the C symbol".
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRFunction offset 104. When the read returns 0, falls
+back to reading the function name at offset 0, implementing the "alias
+defaults to name" rule that the lir_builder and FFI emitter rely on. Returns
+0 for a null function pointer.
+@End Implementation
 
 Process called "mir_function_get_alias_name" that takes function as Integer returns Integer:
     If function is equal to 0:
@@ -540,6 +691,20 @@ Process called "mir_function_get_alias_name" that takes function as Integer retu
     Return alias
 End Process
 
+@Reasoning
+Reads the P2-D FFI calling-convention id. The id selects the ABI the LIR
+builder and machine-code emitter use to lower call sites: 0 = CDecl,
+1 = StdCall, 2 = FastCall, 3 = SysV, 4 = SystemCall, 5 = ObjC. The wrong
+convention would produce miscompiled call sequences (wrong register usage,
+wrong stack cleanup), so this accessor's correctness is critical for FFI
+correctness on every architecture.
+@End Reasoning
+
+@Implementation
+Reads the int64 stored at MIRFunction offset 112. Returns 0 (CDecl, the
+safe default) for a null function pointer.
+@End Implementation
+
 Process called "mir_function_get_convention_id" that takes function as Integer returns Integer:
     If function is equal to 0:
         Return 0
@@ -547,10 +712,28 @@ Process called "mir_function_get_convention_id" that takes function as Integer r
     Return proc memory_get_int64 from Layout with function, 112
 End Process
 
+@Reasoning
+Allocates and initialises the MIRProgram — the root container for the
+entire MIR representation that flows through the optimisation pipeline.
+Optimisation drivers, the LTO link layer, and the LIR builder all start
+from this record, so its empty-but-valid initial state (empty function
+list, empty globals, empty string constants, shared HIR type table) is
+the precondition every pass driver relies on.
+@End Reasoning
+
 @Implementation
-Creates the top-level MIR program container. The type table is shared from HIR
-to avoid duplicating type information. All function and global lists start empty.
+Allocates 64 bytes (8 fields, TIER 3 owned heap). Creates fresh Lists for
+functions (offset 0), global_values (16), and string_constants (32), with
+their counts (8, 24, 40) zeroed. Writes the shared type_table at offset 48
+(by reference — never duplicated, the HIR is the single owner). metadata
+at offset 56 starts at 0. Returns 0 if allocation fails.
 @End Implementation
+
+@Security_Scope
+Heap allocation plus three List sub-allocations. The type_table pointer is
+borrowed, not owned — destroying the MIRProgram MUST NOT free the type
+table, which has HIR-level lifetime that outlives MIR.
+@End Security_Scope
 
 Process called "create_mir_program" that takes type_table as Integer returns Integer:
     Let program_size be 64
@@ -582,12 +765,47 @@ Note: ==========================================================================
 Note: MIR Access and Modification Functions
 Note: ============================================================================
 
+@Reasoning
+Returns an instruction's opcode — the single field that determines instruction
+shape for every consumer (the verifier checks operand arity by opcode, the
+optimiser dispatches transformations by opcode, the LIR lowering pass selects
+machine instructions by opcode). Because opcode classification is needed in
+almost every pass, this read is on the inner hot loop of essentially every
+MIR walk.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRNode offset 0 (the canonical opcode slot established
+by create_mir_node). Returns 0 for a null node pointer; 0 is MIR_NOP, which
+is the safe interpretation of "no instruction".
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor. Always inlines to a single load on x86_64; the null
+check predicts cleanly. Called by every pass that walks instructions.
+@End Performance_Hints
+
 Process called "get_mir_node_opcode" that takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with node, 0
 End Process
+
+@Reasoning
+Mutates an instruction's opcode. Used by peephole optimisation and strength
+reduction to rewrite an instruction in place rather than allocating a new
+MIRNode — preserving the existing value_id, operand slots, and def-use
+linkage. In-place opcode rewriting avoids touching the use-list which would
+require a use-list rewrite for every consumer.
+@End Reasoning
+
+@Implementation
+Writes opcode at MIRNode offset 0. Returns 1 on success, 0 for a null node
+pointer. Does not validate that the new opcode is compatible with the
+existing operand layout — that is the caller's responsibility (peephole
+rules enforce shape compatibility before invoking this mutator).
+@End Implementation
 
 Process called "set_mir_node_opcode" that takes node as Integer, opcode as Integer returns Integer:
     If node is equal to 0:
@@ -597,12 +815,44 @@ Process called "set_mir_node_opcode" that takes node as Integer, opcode as Integ
     Return 1
 End Process
 
+@Reasoning
+Returns the SSA value-id that this instruction defines (the "destination
+register" in three-address code). A 0 here means the instruction is
+non-producing (store, branch, return, nop). The verifier and DCE both read
+this field to classify producers vs side-effect-only instructions.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRNode offset 8. Returns 0 for null node; 0 is
+indistinguishable from "non-producing" but the caller can call
+produces_value(opcode) for that distinction when needed.
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor; read on every def-use walk. Inlines to a single load.
+@End Performance_Hints
+
 Process called "get_mir_node_value_id" that takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with node, 8
 End Process
+
+@Reasoning
+Assigns or rewrites the SSA value-id of an instruction. Used by SSA
+construction (to attach a freshly allocated value-id to a defining
+instruction) and by value-renaming passes that retag a definition during
+copy propagation. The companion register_value_definition / replace_all_uses
+must keep the value-to-instruction map and def-use chain in sync after
+this write.
+@End Reasoning
+
+@Implementation
+Writes value_id at MIRNode offset 8. Returns 1 on success, 0 for null node.
+Does not update the value_to_instruction map — the caller must call
+register_value_definition separately to maintain map invariants.
+@End Implementation
 
 Process called "set_mir_node_value_id" that takes node as Integer, value_id as Integer returns Integer:
     If node is equal to 0:
@@ -611,6 +861,22 @@ Process called "set_mir_node_value_id" that takes node as Integer, value_id as I
     proc memory_set_int64 from Layout with node, 8, value_id
     Return 1
 End Process
+
+@Reasoning
+Reads one of an instruction's three operand slots (operand1, operand2,
+operand3). MIR uses a fixed three-operand encoding because the vast majority
+of three-address-code instructions need at most that many — calls with more
+than two arguments use a separate side-channel argument list rather than
+expanding this slot count, keeping MIRNode at a stable 64-byte layout.
+@End Reasoning
+
+@Implementation
+Dispatches on operand_index (1-based to match the human-facing convention used
+elsewhere in the SSA construction code) and returns the value-id stored at the
+corresponding fixed offset: 16 for operand1, 24 for operand2, 32 for operand3.
+Returns 0 for null node or any out-of-range operand_index, which the caller
+must interpret as "no such operand" since 0 is not a valid SSA value-id.
+@End Implementation
 
 Process called "get_mir_node_operand" that takes node as Integer, operand_index as Integer returns Integer:
     If node is equal to 0:
@@ -631,6 +897,21 @@ Process called "get_mir_node_operand" that takes node as Integer, operand_index 
 
     Return 0
 End Process
+
+@Reasoning
+Writes a new value-id into one of the instruction's three operand slots.
+This is the canonical mutator used by SSA renaming, copy/constant propagation,
+and value numbering — passes that need to redirect a use without changing
+the instruction's opcode or other operands.
+@End Reasoning
+
+@Implementation
+Mirrors get_mir_node_operand: dispatches on the 1-based operand_index and
+writes value_id at offset 16, 24, or 32. Returns 1 on successful write or 0
+for null node / out-of-range index. The caller is responsible for updating
+def-use chains (add_value_use / remove_value_use) — this function only
+mutates the slot.
+@End Implementation
 
 Process called "set_mir_node_operand" that takes node as Integer, operand_index as Integer, value_id as Integer returns Integer:
     If node is equal to 0:
@@ -655,12 +936,39 @@ Process called "set_mir_node_operand" that takes node as Integer, operand_index 
     Return 0
 End Process
 
+@Reasoning
+Returns the HIRTypeInfo pointer for the value this instruction produces.
+The type drives instruction selection (different machine instructions for
+i32 vs i64 vs f64), register-class selection (GPR vs FPR vs vector), and
+calling-convention placement (integer args vs SSE args). Every backend pass
+that lowers MIR to machine code reads through this accessor.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRNode offset 40 (the canonical type_info slot per the
+Type definition). Returns 0 for null node, which downstream lowering MUST
+treat as a type-erased instruction (an error in normal flow).
+@End Implementation
+
 Process called "get_mir_node_type" that takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with node, 40
 End Process
+
+@Reasoning
+Sets the HIRTypeInfo pointer for an instruction's result. Used by SSA
+construction when wiring instructions to their declared result type, and by
+type-rewriting passes (sign extension insertion, vector lowering) that
+generate new instructions with derived types.
+@End Reasoning
+
+@Implementation
+Writes type_info at MIRNode offset 40. Returns 1 on success, 0 for null
+node. The type pointer is borrowed from the HIR type table; the caller
+must NOT pass a heap-owned type that could be freed before this MIRNode.
+@End Implementation
 
 Process called "set_mir_node_type" that takes node as Integer, type_info as Integer returns Integer:
     If node is equal to 0:
@@ -670,12 +978,38 @@ Process called "set_mir_node_type" that takes node as Integer, type_info as Inte
     Return 1
 End Process
 
+@Reasoning
+Returns the MIRBasicBlock pointer that contains this instruction. The parent
+back-pointer enables passes that walk instructions independently of blocks
+(e.g. iterating a global def-use list) to navigate back to control-flow
+context — needed by loop analysis, dominance checks, and the verifier when
+checking that uses dominate definitions.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRNode offset 56 (the canonical parent_block slot).
+Returns 0 for null node or for an instruction not yet linked into a block.
+@End Implementation
+
 Process called "get_mir_node_parent_block" that takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with node, 56
 End Process
+
+@Reasoning
+Sets an instruction's parent-block back-pointer. Used by
+add_instruction_to_block and insert_instruction_at_block_start whenever the
+instruction is linked into a block, and by code-motion passes (LICM, GVN
+PRE) that relocate instructions across blocks.
+@End Reasoning
+
+@Implementation
+Writes block pointer at MIRNode offset 56. Returns 1 on success, 0 for
+null node. The block pointer is a borrowed reference — the block owns the
+instruction, not vice versa.
+@End Implementation
 
 Process called "set_mir_node_parent_block" that takes node as Integer, block as Integer returns Integer:
     If node is equal to 0:
@@ -685,6 +1019,18 @@ Process called "set_mir_node_parent_block" that takes node as Integer, block as 
     Return 1
 End Process
 
+@Reasoning
+Returns the HIRTypeInfo pointer associated with an SSA value. Type analysis,
+register-class assignment, and constant-folding rules all dispatch on the
+value's type — for instance, addition of two i32 values lowers to a 32-bit
+ADD whereas i64 addition lowers to a 64-bit ADD on x86_64.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRValue offset 8 (the type_info slot per the Type
+definition). Returns 0 for null value pointer.
+@End Implementation
+
 Process called "get_value_type" that takes value as Integer returns Integer:
     If value is equal to 0:
         Return 0
@@ -692,12 +1038,43 @@ Process called "get_value_type" that takes value as Integer returns Integer:
     Return proc memory_get_int64 from Layout with value, 8
 End Process
 
+@Reasoning
+Returns the instruction that defines this SSA value — the "def" side of
+the def-use chain. SSA's single-assignment invariant guarantees this is
+well-defined: exactly one instruction in the function writes any given
+value. Used by GVN, copy propagation, and the verifier (to check that
+defs dominate all uses).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRValue offset 16 (the def_instruction slot). Returns
+0 for null value pointer; a non-null value with def_instruction == 0
+indicates an SSA value not yet linked to its producing instruction, which
+is a transient state during SSA construction.
+@End Implementation
+
 Process called "get_value_def" that takes value as Integer returns Integer:
     If value is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with value, 16
 End Process
+
+@Reasoning
+Sets the defining instruction for an SSA value. Called during SSA
+construction once both the MIRValue record and the producing MIRNode exist
+and need to be linked. SSA's single-assignment property means this should
+be called exactly once per value over its lifetime; subsequent rewrites
+constitute an SSA-invariant violation.
+@End Reasoning
+
+@Implementation
+Writes instruction pointer at MIRValue offset 16. Returns 1 on success, 0
+for null value. Does not enforce single-assignment — that contract is the
+caller's responsibility (SSA construction passes call this once at value
+creation; transforms preserve it by allocating new values instead of
+re-defining existing ones).
+@End Implementation
 
 Process called "set_value_def" that takes value as Integer, instruction as Integer returns Integer:
     If value is equal to 0:
@@ -707,6 +1084,23 @@ Process called "set_value_def" that takes value as Integer, instruction as Integ
     Return 1
 End Process
 
+@Reasoning
+Returns the cached use-count of an SSA value — the number of instructions
+currently consuming this value. DCE uses this directly (zero uses + no side
+effect ⇒ dead) and GVN uses it to decide whether a redundant computation is
+worth eliminating (one use ⇒ cheap to inline, many uses ⇒ keep).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRValue offset 32 (the use_count slot, maintained by
+add_value_use and remove_value_use). Returns 0 for null value pointer.
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor — DCE reads this on every instruction. Inlines to a
+single load.
+@End Performance_Hints
+
 Process called "get_value_use_count" that takes value as Integer returns Integer:
     If value is equal to 0:
         Return 0
@@ -714,10 +1108,32 @@ Process called "get_value_use_count" that takes value as Integer returns Integer
     Return proc memory_get_int64 from Layout with value, 32
 End Process
 
+@Reasoning
+Records that an instruction uses this SSA value. The def-use chain is the
+core data structure backing every optimisation that needs to find consumers
+of a definition: DCE (find values with zero uses), constant propagation
+(rewrite all consumers when a value becomes constant), copy propagation,
+value numbering, mem2reg promotion, and replace_all_uses.
+@End Reasoning
+
 @Implementation
-Adds an instruction to the use list of a value and increments use count.
-This maintains the def-use chain critical for optimization passes.
+Appends the instruction to the use_list at MIRValue offset 24 and increments
+the cached use_count at offset 32. Returns 1 on success or 0 if either
+pointer is null. The use_count is cached (rather than recomputed from
+list length) because get_value_use_count is on the inner loop of DCE.
 @End Implementation
+
+@Security_Scope
+Mutates a List backing store and a counter. Null checks gate both writes;
+no unchecked allocation occurs (the use_list was allocated at value
+creation).
+@End Security_Scope
+
+@Performance_Hints
+Called for every operand of every instruction created by SSA construction
+and by every optimiser that introduces new uses. The List append is
+amortised O(1).
+@End Performance_Hints
 
 Process called "add_value_use" that takes value as Integer, instruction as Integer returns Integer:
     If value is equal to 0:
@@ -738,10 +1154,28 @@ Process called "add_value_use" that takes value as Integer, instruction as Integ
     Return 1
 End Process
 
+@Reasoning
+Removes an instruction from a value's use list — the inverse of
+add_value_use. Called whenever an instruction is deleted (DCE), retargeted
+to a different operand (constant propagation, copy propagation,
+replace_all_uses), or rewritten so it no longer reads this value. Stale
+use-list entries would corrupt every subsequent DCE / GVN decision, so this
+must run on every operand mutation.
+@End Reasoning
+
 @Implementation
-Removes an instruction from the use list of a value. This is used when
-instructions are deleted or operands are replaced during optimization.
+Scans the use_list at MIRValue offset 24 linearly for the instruction. On
+match, shifts subsequent entries left by one (compacting the list) and
+decrements use_count at offset 32. Returns 1 on found-and-removed, 0 if
+the instruction was not in the use list. Linear scan is acceptable because
+typical use counts are small; if a value has hundreds of uses the optimiser
+should already have eliminated most of them.
 @End Implementation
+
+@Security_Scope
+Mutates the use_list backing store and the cached use_count. Null checks on
+both pointers; list-index arithmetic bounded by the cached list length.
+@End Security_Scope
 
 Process called "remove_value_use" that takes value as Integer, instruction as Integer returns Integer:
     If value is equal to 0:
@@ -784,13 +1218,31 @@ Note: VALUE → INSTRUCTION MAPPING FUNCTIONS
 Note: Critical infrastructure for metadata and variable name lookup
 Note: ============================================================================
 
-Process called "register_value_definition" that takes function_ptr as Integer, value_id as Integer, inst_ptr as Integer returns Integer:
-    @Reasoning
-    Registers that value_id is defined by inst_ptr in the value_to_instruction map.
-    This enables looking up metadata for any value by finding its defining instruction.
-    MUST be called whenever an instruction produces a value.
-    @End Reasoning
+@Reasoning
+Registers a value-id → defining-instruction binding in the function's
+value_to_instruction dictionary. This second mapping (parallel to the
+def_instruction field on MIRValue itself) exists so that passes which only
+hold a value-id (e.g. operand walks that recover the producer for metadata
+lookup) can recover the producing instruction in O(1) without scanning all
+blocks. MUST be called whenever an instruction is created that produces a
+value; failure to register breaks variable-name resolution in error
+messages and breaks metadata propagation through optimisations.
+@End Reasoning
 
+@Implementation
+Reads the value_to_instruction Dictionary at MIRFunction offset 64,
+serialises value_id to a string key, and stores the inst_ptr under that
+key. Returns 1 on success, 0 if any of function_ptr, inst_ptr, or
+value_id is 0, or if the value map itself is null (uninitialised function).
+@End Implementation
+
+@Security_Scope
+Dictionary write; the integer-to-string conversion allocates a temporary
+key string that the Dictionary copies internally. Null checks gate all
+dereferences.
+@End Security_Scope
+
+Process called "register_value_definition" that takes function_ptr as Integer, value_id as Integer, inst_ptr as Integer returns Integer:
     If function_ptr is equal to 0:
         Return 0
     End If
@@ -817,12 +1269,24 @@ Process called "register_value_definition" that takes function_ptr as Integer, v
     Return 1
 End Process
 
-Process called "lookup_defining_instruction" that takes function_ptr as Integer, value_id as Integer returns Integer:
-    @Reasoning
-    Looks up which instruction defines value_id.
-    Returns instruction pointer, or 0 if value_id not found.
-    @End Reasoning
+@Reasoning
+Recovers the producing MIRNode for a given SSA value-id by querying the
+function's value_to_instruction dictionary. This is the read companion to
+register_value_definition; used by get_operand_variable_name (to look up a
+source-level variable name for an operand) and by diagnostic / error
+reporting code that needs to map an SSA id back to a concrete instruction.
+@End Reasoning
 
+@Implementation
+Reads the value_to_instruction Dictionary at MIRFunction offset 64,
+serialises value_id to a string key, and queries the dictionary. Returns
+the stored instruction pointer or 0 if function_ptr is null, value_id is
+0, the value map is uninitialised, or the value_id has no registered
+producer (which can occur for constants and for values defined outside
+this function).
+@End Implementation
+
+Process called "lookup_defining_instruction" that takes function_ptr as Integer, value_id as Integer returns Integer:
     If function_ptr is equal to 0:
         Return 0
     End If
@@ -846,11 +1310,30 @@ Process called "lookup_defining_instruction" that takes function_ptr as Integer,
     Return inst_ptr
 End Process
 
+@Reasoning
+Redirects every consumer of old_value to consume new_value instead. This
+is the core primitive of constant propagation (rewrite every use of a
+computed value with the constant), copy propagation (rewrite every use of
+a copy with the original), and value numbering (rewrite every redundant
+computation with the canonical representative). After this returns,
+old_value is dead (zero uses) and DCE can remove its defining instruction.
+@End Reasoning
+
 @Implementation
-Replaces all uses of old_value with new_value. This is fundamental for
-constant propagation, copy propagation, and value numbering optimizations.
-All instructions using old_value are updated to use new_value instead.
+Walks the use_list at MIRValue offset 24 of old_value. For each consuming
+instruction, scans operand1 (offset 16), operand2 (24), and operand3 (32);
+where the operand equals old_value, writes new_value in its place AND
+calls add_value_use(new_value, inst) to register the new dependency.
+After the scan, zeroes the cached use_count of old_value at offset 32.
+Returns 1 on success, 0 if either pointer is null.
 @End Implementation
+
+@Security_Scope
+Reads through old_value's use list and writes to each instruction's operand
+slots. Null checks gate both pointers. The use_list backing store is not
+modified directly here — only the cached use_count is reset; subsequent
+DCE deletes the value record and its use_list together.
+@End Security_Scope
 
 Process called "replace_all_uses" that takes old_value as Integer, new_value as Integer returns Integer:
     If old_value is equal to 0:
@@ -895,12 +1378,47 @@ Process called "replace_all_uses" that takes old_value as Integer, new_value as 
     Return 1
 End Process
 
+@Reasoning
+Returns the instruction List of a basic block — the ordered sequence of
+instructions that forms the block's body. Every traversal pass (DCE, GVN,
+scheduling, register allocation, lowering) iterates this list. The list
+is the canonical source of truth for block contents; instruction_count
+is a cached length kept in sync by add_instruction_to_block /
+insert_instruction_at_block_start.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRBasicBlock offset 16 (the instructions slot). Returns
+0 for null block. The returned list is borrowed — callers must NOT free it;
+its lifetime is tied to the block.
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor; called on every block walk. Inlines to a single load.
+@End Performance_Hints
+
 Process called "get_block_instructions" that takes block as Integer returns Integer:
     If block is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with block, 16
 End Process
+
+@Reasoning
+Returns the cached length of the block's instruction list. Used as the
+loop bound by every block-walking pass; reading the cached count avoids
+a function call into List.length on every iteration.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRBasicBlock offset 24 (the instruction_count slot,
+kept in sync by add_instruction_to_block and
+insert_instruction_at_block_start). Returns 0 for null block.
+@End Implementation
+
+@Performance_Hints
+Read once before every block-instruction loop. Inlines to a single load.
+@End Performance_Hints
 
 Process called "get_block_instruction_count" that takes block as Integer returns Integer:
     If block is equal to 0:
@@ -909,10 +1427,29 @@ Process called "get_block_instruction_count" that takes block as Integer returns
     Return proc memory_get_int64 from Layout with block, 24
 End Process
 
+@Reasoning
+Appends an instruction to the end of a basic block's instruction list and
+wires the instruction's parent_block back-pointer. Used by HIR-to-MIR
+lowering when emitting instructions in source order, and by optimisation
+passes that synthesise new instructions to append. Maintaining both the
+forward link (block ⇒ inst list) and back-link (inst ⇒ parent block) in
+the same operation prevents the inconsistency that arises if a pass forgets
+to update one side.
+@End Reasoning
+
 @Implementation
-Adds an instruction to a basic block and sets the instruction's parent block
-pointer. The instruction is appended to the block's instruction list.
+Reads the instructions List at MIRBasicBlock offset 16, appends instruction,
+reads instruction_count at offset 24 and increments it, then writes
+instruction's parent_block back-pointer at MIRNode offset 56. Returns 1 on
+success, 0 if either pointer is null. Does NOT verify that the instruction
+is not already in some other block — caller responsibility.
 @End Implementation
+
+@Security_Scope
+Three writes: List append, counter increment, back-pointer write. Null
+checks gate every dereference; List append is itself bounds-safe (amortised
+realloc).
+@End Security_Scope
 
 Process called "add_instruction_to_block" that takes block as Integer, instruction as Integer returns Integer:
     If block is equal to 0:
@@ -935,12 +1472,42 @@ Process called "add_instruction_to_block" that takes block as Integer, instructi
     Return 1
 End Process
 
+@Reasoning
+Returns the List of predecessor block-ids — every block from which control
+can enter this block. The predecessor list is the substrate of every
+reverse CFG walk: dominance computation, phi-node placement (Cytron's
+algorithm reads predecessors to determine merge points), and liveness
+analysis (a live-in must propagate back to every predecessor's live-out).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRBasicBlock offset 32 (the predecessors slot, populated
+by add_cfg_edge). Returns 0 for null block. List ownership belongs to the
+block — callers must NOT free it.
+@End Implementation
+
 Process called "get_block_predecessors" that takes block as Integer returns Integer:
     If block is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with block, 32
 End Process
+
+@Reasoning
+Returns the cached predecessor count of a block. Used as the loop bound by
+reverse CFG walks (dominance, liveness, phi placement) and as the test for
+phi-node necessity: a block with predecessor_count >= 2 needs phis for any
+value live across the merge.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRBasicBlock offset 40 (the predecessor_count slot,
+maintained by add_cfg_edge). Returns 0 for null block.
+@End Implementation
+
+@Performance_Hints
+Read once before every reverse CFG walk. Inlines to a single load.
+@End Performance_Hints
 
 Process called "get_block_predecessor_count" that takes block as Integer returns Integer:
     If block is equal to 0:
@@ -949,12 +1516,41 @@ Process called "get_block_predecessor_count" that takes block as Integer returns
     Return proc memory_get_int64 from Layout with block, 40
 End Process
 
+@Reasoning
+Returns the List of successor block-ids — every block to which control
+can flow from this block. The successor list drives every forward CFG
+walk: reachability analysis, forward dataflow (available expressions,
+reaching definitions), and emission ordering (a topological order over
+successors yields a fall-through-friendly layout).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRBasicBlock offset 48 (the successors slot, populated
+by add_cfg_edge). Returns 0 for null block; the list is borrowed.
+@End Implementation
+
 Process called "get_block_successors" that takes block as Integer returns Integer:
     If block is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with block, 48
 End Process
+
+@Reasoning
+Returns the cached successor count of a block. Used as the loop bound by
+forward CFG walks; also used as the branch-shape classifier (count 0 ⇒
+return / unwind, count 1 ⇒ unconditional jump or fall-through, count 2 ⇒
+conditional branch, count > 2 ⇒ switch / indirect branch).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRBasicBlock offset 56 (the successor_count slot,
+maintained by add_cfg_edge). Returns 0 for null block.
+@End Implementation
+
+@Performance_Hints
+Read once before every forward CFG walk. Inlines to a single load.
+@End Performance_Hints
 
 Process called "get_block_successor_count" that takes block as Integer returns Integer:
     If block is equal to 0:
@@ -963,12 +1559,32 @@ Process called "get_block_successor_count" that takes block as Integer returns I
     Return proc memory_get_int64 from Layout with block, 56
 End Process
 
+@Reasoning
+Wires a control-flow edge between two blocks, updating the predecessor /
+successor lists on both sides AND the CFG's master edge list. The
+bidirectional encoding is fundamental: every forward dataflow pass walks
+successor lists and every reverse dataflow pass walks predecessor lists,
+so both sides MUST agree. The separate cfg-level edge list at offset 32
+exists so dominance computation can iterate edges without re-walking the
+block graph.
+@End Reasoning
+
 @Implementation
-Adds a control flow edge from predecessor to successor block. This updates
-both blocks' edge lists and maintains the CFG invariant that each edge
-is represented in both the predecessor's successor list and the successor's
-predecessor list.
+Linear-scans the cfg's blocks list at offset 16 (length at offset 24) to
+locate the MIRBasicBlock records matching pred_id and succ_id. If either is
+missing, returns 0 — the caller must have registered both blocks via
+add_block_to_cfg first. Otherwise: appends succ_id to pred's successors
+list (offset 48) and increments pred.successor_count (offset 56); appends
+pred_id to succ's predecessors list (offset 32) and increments
+succ.predecessor_count (offset 40); appends (pred_id, succ_id) as two
+entries to cfg.edges (offset 32) and increments cfg.edge_count (offset 40).
 @End Implementation
+
+@Security_Scope
+Three List appends and three counter increments. The block-id lookup
+guarantees that successor / predecessor pointers are valid before any
+mutation. Null cfg short-circuits.
+@End Security_Scope
 
 Process called "add_cfg_edge" that takes cfg as Integer, pred_id as Integer, succ_id as Integer returns Integer:
     If cfg is equal to 0:
@@ -1027,6 +1643,20 @@ Process called "add_cfg_edge" that takes cfg as Integer, pred_id as Integer, suc
     Return 1
 End Process
 
+@Reasoning
+Registers a basic block in the CFG's master block list. This is the inverse
+companion to add_cfg_edge: blocks must be physically present in the CFG before
+their CFG edges can be wired up, otherwise add_cfg_edge's block-id lookup
+loop will fail to locate them.
+@End Reasoning
+
+@Implementation
+Appends the block pointer to the blocks list at offset 16 of the CFG record
+and increments the block_count field at offset 24. The block's own internal
+edge lists are NOT touched here — add_cfg_edge is responsible for predecessor
+and successor wiring. Returns 1 on success or 0 if either pointer is null.
+@End Implementation
+
 Process called "add_block_to_cfg" that takes cfg as Integer, block as Integer returns Integer:
     If cfg is equal to 0:
         Return 0
@@ -1046,12 +1676,38 @@ Process called "add_block_to_cfg" that takes cfg as Integer, block as Integer re
     Return 1
 End Process
 
+@Reasoning
+Returns the CFG's entry block — the block reached on function entry. The
+entry block is the root of every forward CFG analysis (dominance, available
+expressions, reachability) and is the only block in the function with no
+predecessors. The verifier checks that the entry block has predecessor
+count zero.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRCFG offset 0 (the entry_block slot, set by
+set_cfg_entry_block during CFG construction). Returns 0 for null cfg.
+@End Implementation
+
 Process called "get_cfg_entry_block" that takes cfg as Integer returns Integer:
     If cfg is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with cfg, 0
 End Process
+
+@Reasoning
+Sets the CFG's entry block. Called during HIR-to-MIR lowering once the
+first block of the function has been created; later passes (block
+splitting, loop rotation) may also need to update the entry pointer if
+they introduce a new pre-header that dominates the original entry.
+@End Reasoning
+
+@Implementation
+Writes block pointer at MIRCFG offset 0. Returns 1 on success, 0 for null
+cfg. Caller is responsible for ensuring the new entry block has been added
+to the CFG via add_block_to_cfg first.
+@End Implementation
 
 Process called "set_cfg_entry_block" that takes cfg as Integer, block as Integer returns Integer:
     If cfg is equal to 0:
@@ -1061,12 +1717,38 @@ Process called "set_cfg_entry_block" that takes cfg as Integer, block as Integer
     Return 1
 End Process
 
+@Reasoning
+Returns the CFG's exit block — the unique synthetic block that postdominates
+every return / unwind. Reverse dataflow analyses (liveness) start here, and
+function-epilogue lowering emits its prologue against this block. A unique
+exit simplifies postdominance: without it, multiple returns would produce
+multiple roots in the reverse CFG.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRCFG offset 8 (the exit_block slot). Returns 0 for
+null cfg, or for a CFG that has not yet had set_cfg_exit_block called
+(during very early construction).
+@End Implementation
+
 Process called "get_cfg_exit_block" that takes cfg as Integer returns Integer:
     If cfg is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with cfg, 8
 End Process
+
+@Reasoning
+Sets the CFG's exit block. Called during HIR-to-MIR lowering once the
+synthetic exit / return-merge block has been allocated. Code-motion passes
+that introduce additional return paths must redirect them to merge into
+this block rather than allocating new exit blocks.
+@End Reasoning
+
+@Implementation
+Writes block pointer at MIRCFG offset 8. Returns 1 on success, 0 for null
+cfg. Caller must have added the block via add_block_to_cfg first.
+@End Implementation
 
 Process called "set_cfg_exit_block" that takes cfg as Integer, block as Integer returns Integer:
     If cfg is equal to 0:
@@ -1075,6 +1757,22 @@ Process called "set_cfg_exit_block" that takes cfg as Integer, block as Integer 
     proc memory_set_int64 from Layout with cfg, 8, block
     Return 1
 End Process
+
+@Reasoning
+Allocates a fresh SSA value-id, monotonically increasing per function. The
+SSA invariant requires that every value-id within a function be unique so
+that def-use tracking, dominator analysis, and the value-to-instruction map
+can use the id as a stable key. Per-function (not per-program) numbering
+keeps ids dense and allows them to fit easily in 32 bits even for very
+large functions.
+@End Reasoning
+
+@Implementation
+Reads the next_value_id counter at MIRFunction offset 56, returns it as the
+allocated id, then writes back next_id + 1. Returns 0 for a null function
+pointer; legitimate value-ids begin at whatever the SSA construction context
+seeded the counter with (typically 1000+ to distinguish from constants).
+@End Implementation
 
 Process called "allocate_value_id" that takes function as Integer returns Integer:
     If function is equal to 0:
@@ -1086,6 +1784,19 @@ Process called "allocate_value_id" that takes function as Integer returns Intege
 
     Return next_id
 End Process
+
+@Reasoning
+Allocates a fresh basic-block id within a CFG, monotonically increasing.
+Block ids are used as keys by add_cfg_edge (to locate predecessor and
+successor blocks in the master block list) and by dominator analysis to
+index its dominator tree arrays, so dense, unique numbering is required.
+@End Reasoning
+
+@Implementation
+Reads the next_block_id counter at CFG offset 48, returns it as the
+allocated id, then writes back next_id + 1. Returns 0 for a null cfg
+pointer. The counter is initialised by create_mir_cfg.
+@End Implementation
 
 Process called "allocate_block_id" that takes cfg as Integer returns Integer:
     If cfg is equal to 0:
@@ -1103,12 +1814,38 @@ Note: Metadata Accessor Functions
 Note: Metadata provides extensibility for optimization hints, debug info, profiling
 Note: ============================================================================
 
+@Reasoning
+Returns the metadata pointer attached to an instruction. Metadata carries
+out-of-band information that does not affect semantics but is critical for
+diagnostics and optimisation hints: source variable names, source location,
+profile counts, alias-set tags, inlining hints. Each pass that consumes
+metadata must tolerate a null pointer (no metadata attached).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRNode offset 64 (the metadata slot per the Type
+definition). Returns 0 for null node.
+@End Implementation
+
 Process called "get_mir_node_metadata" that takes node as Integer returns Integer:
     If node is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with node, 64
 End Process
+
+@Reasoning
+Attaches a metadata pointer to an instruction. Called by HIR-to-MIR
+lowering to carry forward source-level information (variable names, source
+locations) and by analysis passes that compute and cache results
+(profile-derived branch weights, alias sets).
+@End Reasoning
+
+@Implementation
+Writes metadata pointer at MIRNode offset 64. Returns 1 on success, 0 for
+null node. The metadata pointer is borrowed; the metadata's lifetime must
+exceed the MIRNode's.
+@End Implementation
 
 Process called "set_mir_node_metadata" that takes node as Integer, metadata as Integer returns Integer:
     If node is equal to 0:
@@ -1118,6 +1855,19 @@ Process called "set_mir_node_metadata" that takes node as Integer, metadata as I
     Return 1
 End Process
 
+@Reasoning
+Returns the metadata pointer attached to a MIRFunction. Function-level
+metadata carries inlining hints (always_inline, never_inline), calling-
+convention overrides, profile-based hot/cold classification, and link-time
+attributes (weak, hidden, no_unwind). The LIR builder and the linker
+front-end read this on every function it lowers.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRFunction offset 88 (the authoritative metadata slot
+per P2-D offset audit 2026-05-24). Returns 0 for null function.
+@End Implementation
+
 Process called "get_mir_function_metadata" that takes function as Integer returns Integer:
     Note: metadata field is at offset 88 per Type definition (P2-D offset audit 2026-05-24)
     If function is equal to 0:
@@ -1125,6 +1875,17 @@ Process called "get_mir_function_metadata" that takes function as Integer return
     End If
     Return proc memory_get_int64 from Layout with function, 88
 End Process
+
+@Reasoning
+Sets the metadata pointer on a MIRFunction. Called by HIR-to-MIR lowering
+to forward source-declared attributes (inline-hints, linkage), and by
+profile-guided optimisation to attach hotness data after profile-load.
+@End Reasoning
+
+@Implementation
+Writes metadata pointer at MIRFunction offset 88 (authoritative offset per
+P2-D offset audit). Returns 1 on success, 0 for null function.
+@End Implementation
 
 Process called "set_mir_function_metadata" that takes function as Integer, metadata as Integer returns Integer:
     Note: metadata field is at offset 88 per Type definition (P2-D offset audit 2026-05-24)
@@ -1135,6 +1896,19 @@ Process called "set_mir_function_metadata" that takes function as Integer, metad
     Return 1
 End Process
 
+@Reasoning
+Returns the HIR-side definition node from which this MIRFunction was
+lowered. Diagnostics use this to trace MIR-level errors back to source
+location; reverse-translation tools (RunaConvert) read this to recover
+the source-level structure of the function for round-tripping.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRFunction offset 72 (the authoritative hir_node slot
+per P2-D offset audit 2026-05-24). Returns 0 for null function or for
+functions synthesised by the compiler with no HIR origin.
+@End Implementation
+
 Process called "get_mir_function_hir_node" that takes function as Integer returns Integer:
     Note: hir_node field is at offset 72 per Type definition (P2-D offset audit 2026-05-24)
     If function is equal to 0:
@@ -1142,6 +1916,18 @@ Process called "get_mir_function_hir_node" that takes function as Integer return
     End If
     Return proc memory_get_int64 from Layout with function, 72
 End Process
+
+@Reasoning
+Sets the HIR back-reference on a MIRFunction. Called by HIR-to-MIR
+lowering at function-creation time; rarely re-set later, except by
+specialisation / cloning passes that need to preserve a synthetic
+function's link to the original HIR.
+@End Reasoning
+
+@Implementation
+Writes hir_node pointer at MIRFunction offset 72. Returns 1 on success, 0
+for null function.
+@End Implementation
 
 Process called "set_mir_function_hir_node" that takes function as Integer, hir_node as Integer returns Integer:
     Note: hir_node field is at offset 72 per Type definition (P2-D offset audit 2026-05-24)
@@ -1152,6 +1938,21 @@ Process called "set_mir_function_hir_node" that takes function as Integer, hir_n
     Return 1
 End Process
 
+@Reasoning
+Predicate test for "is this function externally defined (FFI binding)?".
+The is_external flag determines whether the LIR builder emits a function
+body or just an extern declaration; inlining, devirtualisation, and tail-
+call all skip external functions because their bodies are not visible.
+Every pass that walks the function list reads through this accessor.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRFunction offset 80 (the authoritative is_external
+slot; all consumers — inlining, devirt, tail_call, lto, lir_builder —
+read at offset 80). Returns 0 for null function (treated as
+"not external", the safe default for a partial record).
+@End Implementation
+
 Process called "is_external_function" that takes function as Integer returns Integer:
     Note: Reads is_external at the authoritative offset 80.
     If function is equal to 0:
@@ -1160,12 +1961,35 @@ Process called "is_external_function" that takes function as Integer returns Int
     Return proc memory_get_int64 from Layout with function, 80
 End Process
 
+@Reasoning
+Returns the program-level metadata pointer. Program metadata carries
+build configuration (target triple, optimisation level), link-graph
+attributes (which functions are exported), and global profile data
+(per-module branch weight totals).
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRProgram offset 56 (the metadata slot per the Type
+definition). Returns 0 for null program.
+@End Implementation
+
 Process called "get_mir_program_metadata" that takes program as Integer returns Integer:
     If program is equal to 0:
         Return 0
     End If
     Return proc memory_get_int64 from Layout with program, 56
 End Process
+
+@Reasoning
+Sets program-level metadata. Called once by the compiler driver after
+target / options resolution, and again after PGO profile-load to attach
+per-program branch weights.
+@End Reasoning
+
+@Implementation
+Writes metadata pointer at MIRProgram offset 56. Returns 1 on success, 0
+for null program.
+@End Implementation
 
 Process called "set_mir_program_metadata" that takes program as Integer, metadata as Integer returns Integer:
     If program is equal to 0:
@@ -1179,10 +2003,26 @@ Note: ==========================================================================
 Note: MIR Analysis Helper Functions
 Note: ============================================================================
 
+@Reasoning
+Predicate testing whether an opcode terminates a basic block. The block
+verifier requires every block to end with exactly one terminator and to
+contain no terminator in any non-final position. CFG construction uses
+this test to decide where to close one block and open the next when
+emitting MIR linearly. Lowering uses it to identify points where the
+machine-code emitter must emit branch instructions.
+@End Reasoning
+
 @Implementation
-Determines if an instruction is a terminator (ends a basic block).
-Terminators include branches, jumps, returns, and switches.
+Returns 1 if opcode is one of MIR_BRANCH, MIR_JUMP, MIR_RETURN, MIR_SWITCH;
+otherwise returns 0. Sequential opcode-equals comparisons are used rather
+than a range check because terminator opcodes are non-contiguous in the
+20000+ MIR opcode space.
 @End Implementation
+
+@Performance_Hints
+Inlining candidate; called on every instruction during block-bounded
+optimisation passes. Compiles to four compare-and-branch sequences.
+@End Performance_Hints
 
 Process called "is_terminator" that takes opcode as Integer returns Integer:
     If opcode is equal to MIR_BRANCH:
@@ -1204,12 +2044,52 @@ Process called "is_terminator" that takes opcode as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning
+Predicate testing whether an opcode is a phi-node — the SSA merge
+instruction. Phi nodes are special-cased throughout the compiler: they MUST
+appear at the start of a block (before all non-phi instructions), they are
+not "regular" computations during instruction scheduling, and they are
+eliminated by SSA destruction during register allocation rather than
+lowered directly.
+@End Reasoning
+
+@Implementation
+Returns 1 if opcode equals MIR_PHI, 0 otherwise. Single comparison since
+there is exactly one phi opcode.
+@End Implementation
+
+@Performance_Hints
+Hot inline candidate; tested by every pass that walks block instructions.
+Compiles to a single compare-and-branch.
+@End Performance_Hints
+
 Process called "is_phi_node" that takes opcode as Integer returns Integer:
     If opcode is equal to MIR_PHI:
         Return 1
     End If
     Return 0
 End Process
+
+@Reasoning
+Predicate matching every binary arithmetic/bitwise/comparison opcode in one
+test. The MIR opcode numbering deliberately groups arithmetic ops (20002 to
+20016 = MIR_ADD to MIR_SAR) and comparison ops (20100 to 20105 = MIR_EQ to
+MIR_GE) into contiguous ranges so a two-range test is sufficient — no
+per-opcode comparison chain is required.
+@End Reasoning
+
+@Implementation
+Two range checks: [MIR_ADD..MIR_SAR] covers the arithmetic and bitwise
+operations, [MIR_EQ..MIR_GE] covers the relational comparisons. The numeric
+gap between MIR_SAR (20016) and MIR_EQ (20100) is intentional — unary
+operations and reserved opcode space sit between them and must NOT be
+classified as binary.
+@End Implementation
+
+@Performance_Hints
+Inlining candidate: the function compiles to two pairs of compare-and-branch.
+Used in hot loops during instruction selection and peephole optimization.
+@End Performance_Hints
 
 Process called "is_binary_op" that takes opcode as Integer returns Integer:
     If opcode is greater than or equal to MIR_ADD:
@@ -1227,6 +2107,27 @@ Process called "is_binary_op" that takes opcode as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning
+Predicate testing whether an opcode is a memory-access operation (load,
+store, address-of, dereference, field-access). Alias analysis must conservatively
+treat memory ops as potentially aliasing; mem2reg promotes only loads /
+stores of address-not-taken values to SSA registers; load / store
+elimination matches sequences of memory ops. All three passes need a fast
+O(1) classification.
+@End Reasoning
+
+@Implementation
+Range check: returns 1 if opcode is in [MIR_LOAD..MIR_DEREF] (the contiguous
+20200..20206 block in the MIR opcode numbering scheme), 0 otherwise. The
+range layout makes this a two-comparison test independent of how many
+memory opcodes exist.
+@End Implementation
+
+@Performance_Hints
+Hot inline candidate; tested in inner loops of alias analysis and
+load/store elimination. Compiles to a pair of compare-and-branch.
+@End Performance_Hints
+
 Process called "is_memory_op" that takes opcode as Integer returns Integer:
     If opcode is greater than or equal to MIR_LOAD:
         If opcode is less than or equal to MIR_DEREF:
@@ -1235,6 +2136,21 @@ Process called "is_memory_op" that takes opcode as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning
+Predicate distinguishing value-producing instructions (most arithmetic, loads,
+calls) from side-effect-only instructions (stores, branches, returns, nops).
+Used by DCE: if an instruction does not produce a value and has no other
+side effect, it can be deleted; if it produces a value with no uses, it can
+be deleted; if neither, it must be kept.
+@End Reasoning
+
+@Implementation
+Enumerated denial list: every non-producing opcode (NOP, STORE, STORE_FIELD,
+BRANCH, JUMP, RETURN) returns 0. All other opcodes default to 1 (producing).
+Default-to-producing is the correct bias because the producing set is much
+larger than the non-producing set.
+@End Implementation
 
 Process called "produces_value" that takes opcode as Integer returns Integer:
     If opcode is equal to MIR_NOP:
@@ -1269,10 +2185,28 @@ Note: MIR Debug Printing Functions
 Note: Essential for optimizer development and debugging
 Note: ============================================================================
 
+@Reasoning
+Translates a MIR opcode integer into its textual mnemonic. The debug
+printer, the verifier's error messages, and the dump-MIR tools all rely on
+human-readable opcode names. The opcode integer space (20000+) is sparse
+and not amenable to a table lookup without a dense-mapping table, so this
+function uses a sequential equality-chain that is simple to extend when
+new opcodes are added.
+@End Reasoning
+
 @Implementation
-Converts a MIR opcode constant to its string representation for debug output.
-Returns human-readable instruction name (e.g., "add", "phi", "branch").
+Compares opcode against every known MIR_* constant in order and returns a
+freshly-allocated string duplicate of the matching mnemonic. Returns the
+duplicate of "unknown" for any opcode that does not match a known
+constant. Every return path duplicates the string so the caller owns the
+result and must deallocate it after use, avoiding shared-buffer aliasing.
 @End Implementation
+
+@Security_Scope
+Each successful return path allocates a fresh string via
+StringCore.string_duplicate. Caller MUST deallocate; failure to do so leaks
+a small heap block per call. No bounds-unsafe operations occur.
+@End Security_Scope
 
 Process called "opcode_to_string" that takes opcode as Integer returns Integer:
     If opcode is equal to MIR_NOP:
@@ -1540,11 +2474,28 @@ Process called "opcode_to_string" that takes opcode as Integer returns Integer:
     Return proc string_duplicate from StringCore with "unknown"
 End Process
 
+@Reasoning
+Formats a single MIRNode as a one-line textual representation in the
+canonical "%dst = op %src1, %src2, %src3" form. This is the lowest level
+of MIR pretty-printing, called by mir_basic_block_to_string for every
+instruction in a block. The format mirrors LLVM-style SSA dumps so that
+developers used to other SSA IRs can read MIR dumps without translation.
+@End Reasoning
+
 @Implementation
-Formats a MIR instruction as a readable string for debug printing.
-Format: "%value_id = opcode operand1, operand2, operand3"
-Example: "%5 = add %3, %4"
+Reads opcode (offset 0), value_id (8), and operands 1/2/3 (offsets 16/24/32)
+from the MIRNode. Builds the result string incrementally: emits "%N = "
+when value_id is non-zero, appends the opcode mnemonic from
+opcode_to_string, then appends " %op1", ", %op2", ", %op3" for each
+non-zero operand. Every temporary string (value_str, op1_str, op2_str,
+op3_str, opcode_str) is deallocated after concatenation. Returns "<null>"
+for a null node pointer.
 @End Implementation
+
+@Security_Scope
+Allocates one result string and several temporary strings; every temporary
+is explicitly deallocated via Layout.deallocate after concatenation.
+@End Security_Scope
 
 Process called "mir_node_to_string" that takes node as Integer returns Integer:
     If node is equal to 0:
@@ -1557,7 +2508,7 @@ Process called "mir_node_to_string" that takes node as Integer returns Integer:
     Let op2 be proc memory_get_int64 from Layout with node, 24
     Let op3 be proc memory_get_int64 from Layout with node, 32
 
-    Let opcode_str be opcode_to_string(opcode)
+    Let opcode_str be proc opcode_to_string with opcode
 
     Let result be proc string_duplicate from StringCore with ""
 
@@ -1596,14 +2547,27 @@ Process called "mir_node_to_string" that takes node as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning
+Formats an entire basic block — label followed by every instruction
+indented under it — as a multi-line textual block. Used by
+mir_cfg_to_string to print every block in the CFG. The conventional
+"label:\n  inst1\n  inst2\n" layout matches IR-dump conventions in other
+SSA compilers, making MIR dumps visually familiar.
+@End Reasoning
+
 @Implementation
-Formats a basic block with all its instructions for debug printing.
-Format:
-  block_label:
-    instruction1
-    instruction2
-    ...
+Reads block_id (offset 0), label (offset 8), instructions list (offset 16),
+and instruction count (offset 24). Emits the label when present, otherwise
+synthesises "block_<block_id>". Appends ":\n", then iterates the
+instruction list, calling mir_node_to_string for each instruction,
+prefixing two-space indent and a newline. Every per-instruction string is
+deallocated after concatenation. Returns "<null block>" for null block.
 @End Implementation
+
+@Security_Scope
+Allocates one result string and a temporary per instruction; each
+temporary is explicitly deallocated after concatenation.
+@End Security_Scope
 
 Process called "mir_basic_block_to_string" that takes block as Integer returns Integer:
     If block is equal to 0:
@@ -1631,7 +2595,7 @@ Process called "mir_basic_block_to_string" that takes block as Integer returns I
     Let i be 0
     While i is less than inst_count:
         Let inst be proc get from List with instructions, i
-        Let inst_str be mir_node_to_string(inst)
+        Let inst_str be proc mir_node_to_string with inst
         Set result to proc string_concat from StringCore with result, "  "
         Set result to proc string_concat from StringCore with result, inst_str
         Set result to proc string_concat from StringCore with result, "\n"
@@ -1642,10 +2606,27 @@ Process called "mir_basic_block_to_string" that takes block as Integer returns I
     Return result
 End Process
 
+@Reasoning
+Formats the entire CFG by emitting every block in list order. Used by
+mir_function_to_string after the function-signature header. Block-list
+order is insertion order — not topological order — because dumping in
+insertion order preserves the developer's mental model of how the CFG
+was constructed; topological dumping is a separate dump-mode that the
+optimiser-debug subsystem provides.
+@End Reasoning
+
 @Implementation
-Formats the entire control flow graph for debug printing.
-Shows all basic blocks with their instructions in order.
+Reads the blocks list (offset 16) and block count (offset 24) from the
+CFG. Prepends "CFG:\n", iterates blocks and concatenates
+mir_basic_block_to_string output for each, separated by newlines. Every
+per-block string is deallocated after concatenation. Returns "<null cfg>"
+for null CFG.
 @End Implementation
+
+@Security_Scope
+Allocates one result and a temporary per block; each temporary is
+explicitly deallocated.
+@End Security_Scope
 
 Process called "mir_cfg_to_string" that takes cfg as Integer returns Integer:
     If cfg is equal to 0:
@@ -1660,7 +2641,7 @@ Process called "mir_cfg_to_string" that takes cfg as Integer returns Integer:
     Let i be 0
     While i is less than block_count:
         Let block be proc get from List with blocks, i
-        Let block_str be mir_basic_block_to_string(block)
+        Let block_str be proc mir_basic_block_to_string with block
         Set result to proc string_concat from StringCore with result, block_str
         Set result to proc string_concat from StringCore with result, "\n"
         proc deallocate from Layout with block_str
@@ -1670,9 +2651,18 @@ Process called "mir_cfg_to_string" that takes cfg as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning
+Formats a complete MIR function — its signature header followed by its
+CFG. The function-level dump is the unit the developer typically wants:
+a single function's full SSA representation across all blocks.
+@End Reasoning
+
 @Implementation
-Formats a complete MIR function with its CFG for debug printing.
-Shows function signature followed by all basic blocks.
+Reads name (offset 0) and cfg (offset 8) from the MIRFunction. Emits
+"function <name>:\n" (using "<anonymous>" if name is null), then appends
+mir_cfg_to_string(cfg) if cfg is non-null. The cfg-string temporary is
+deallocated after concatenation. Returns "<null function>" for null
+function.
 @End Implementation
 
 Process called "mir_function_to_string" that takes function as Integer returns Integer:
@@ -1694,7 +2684,7 @@ Process called "mir_function_to_string" that takes function as Integer returns I
     Set result to proc string_concat from StringCore with result, ":\n"
 
     If cfg is not equal to 0:
-        Let cfg_str be mir_cfg_to_string(cfg)
+        Let cfg_str be proc mir_cfg_to_string with cfg
         Set result to proc string_concat from StringCore with result, cfg_str
         proc deallocate from Layout with cfg_str
     End If
@@ -1702,10 +2692,24 @@ Process called "mir_function_to_string" that takes function as Integer returns I
     Return result
 End Process
 
+@Reasoning
+Top-level MIR dump entry point. Walks every function in the program and
+prints its formatted representation to the Display sink. Used by
+--dump-mir and by the optimiser-debug subsystem after every optimisation
+pass that has tracing enabled.
+@End Reasoning
+
 @Implementation
-Prints the entire MIR program including all functions.
-This is the top-level debug printing function.
+Reads the functions list (offset 0) and function count (offset 8) from
+MIRProgram. Iterates the list, calling mir_function_to_string for each
+function, Display-ing the result, then deallocating the per-function
+string. Returns 1 on success, 0 if program is null.
 @End Implementation
+
+@Security_Scope
+Per-function string allocations are explicitly deallocated after Display;
+no temporaries are leaked across iterations.
+@End Security_Scope
 
 Process called "print_mir_program" that takes program as Integer returns Integer:
     If program is equal to 0:
@@ -1718,7 +2722,7 @@ Process called "print_mir_program" that takes program as Integer returns Integer
     Let i be 0
     While i is less than function_count:
         Let function be proc get from List with functions, i
-        Let func_str be mir_function_to_string(function)
+        Let func_str be proc mir_function_to_string with function
         Display func_str
         proc deallocate from Layout with func_str
         Set i to i plus 1
@@ -1731,16 +2735,25 @@ Note: ============================================================
 Note: SSA CONSTRUCTION HELPER FUNCTIONS
 Note: ============================================================
 
+@Reasoning
+Predicate test for "does this instruction define an SSA value?". SSA
+construction (Cytron-style phi placement) walks every instruction in
+every block and partitions them into definitions and non-definitions;
+this predicate is the partitioning function. A non-zero value_id is the
+canonical encoding of "this instruction produces a value".
+@End Reasoning
+
+@Implementation
+Reads value_id from MIRNode offset 8 and returns 1 if non-zero, 0
+otherwise. Returns 0 for null inst_ptr.
+@End Implementation
+
+@Performance_Hints
+Inner-loop predicate during SSA construction; inlines to a single load
+and compare.
+@End Performance_Hints
+
 Process called "instruction_defines_variable" that takes inst_ptr as Integer returns Integer:
-    @Reasoning
-    Checks if an instruction defines a variable (has a destination operand).
-
-    An instruction defines a variable if it has a non-zero value_id.
-    This is used during SSA construction to identify definition sites.
-
-    Returns: 1 if instruction defines a variable, 0 otherwise
-    @End Reasoning
-
     Note: Null check
     If inst_ptr is equal to 0:
         Return 0
@@ -1757,24 +2770,41 @@ Process called "instruction_defines_variable" that takes inst_ptr as Integer ret
     Return 0
 End Process
 
+@Reasoning
+Recovers the source-level variable name that this instruction defines,
+falling back to a synthetic SSA name when no source name is available.
+Diagnostics, debug-info emission, and the optimiser-debug subsystem all
+need a human-readable name for every SSA value. The "temp_N" fallback
+mirrors LLVM's %0, %1, %2 convention for unnamed values.
+@End Reasoning
+
+@Implementation
+First calls instruction_defines_variable to short-circuit on non-producing
+instructions. Reads value_id (offset 8) and metadata_ptr (offset 64).
+If metadata_ptr is non-null, reads the variable_name pointer from
+MIRMetadata offset 0; returns it when non-null. Otherwise allocates a
+64-byte buffer and writes "temp_" followed by the base-10 ASCII
+representation of value_id (digit count computed by repeated division;
+digits stored in reverse and placed via offset arithmetic). Null
+terminator at the final position. Returns 0 for null inst_ptr.
+@End Implementation
+
+@Security_Scope
+Synthetic-name path allocates a 64-byte heap buffer. The base-10
+expansion loop is bounded by digit_count which is itself bounded by 20
+(int64 maximum), well under the 64-byte buffer. Buffer is null-terminated
+after digit emission. Caller owns the returned buffer and must
+deallocate it.
+@End Security_Scope
+
 Process called "get_instruction_defined_variable" that takes inst_ptr as Integer returns Integer:
-    @Reasoning
-    Gets the variable name (string pointer) defined by an instruction from metadata.
-
-    For SSA construction, we need to track which variables are defined.
-    This function extracts the variable name from the instruction's metadata.
-    If no metadata exists, returns a descriptive SSA name "temp_N".
-
-    Returns: Variable name string pointer, or 0 if no variable defined
-    @End Reasoning
-
     Note: Null check
     If inst_ptr is equal to 0:
         Return 0
     End If
 
     Note: Check if instruction defines a variable
-    Let defines_var be instruction_defines_variable(inst_ptr)
+    Let defines_var be proc instruction_defines_variable with inst_ptr
     If defines_var is equal to 0:
         Return 0
     End If
@@ -1840,16 +2870,23 @@ Process called "get_instruction_defined_variable" that takes inst_ptr as Integer
     Return name_buffer
 End Process
 
+@Reasoning
+Returns the HIRTypeInfo pointer for an instruction's result type. Semantic
+duplicate of get_mir_node_type retained here under the SSA-construction
+naming because the SSA-construction code paths consistently use the
+"instruction" vocabulary; aliasing for readability of the call sites.
+Used by type-driven phi-node typing and by SSA destruction's register-
+class assignment.
+@End Reasoning
+
+@Implementation
+Reads the int64 at MIRNode offset 40 (the type_info slot). Returns 0 for
+null inst_ptr. Functionally equivalent to get_mir_node_type — the two
+accessors share an offset to allow either vocabulary to be used at any
+call site.
+@End Implementation
+
 Process called "get_instruction_result_type" that takes inst_ptr as Integer returns Integer:
-    @Reasoning
-    Gets the HIRTypeInfo pointer for the instruction's result type.
-
-    The type_info field (offset 40) in MIRNode contains the type information
-    for the value produced by this instruction.
-
-    Returns: HIRTypeInfo pointer, or 0 if no type information
-    @End Reasoning
-
     Note: Null check
     If inst_ptr is equal to 0:
         Return 0
@@ -1860,38 +2897,47 @@ Process called "get_instruction_result_type" that takes inst_ptr as Integer retu
     Return type_info
 End Process
 
+@Reasoning
+Inserts an instruction at the beginning of a basic block. This operation
+is dedicated to phi-node placement: the SSA invariant requires phi nodes
+to appear strictly before all non-phi instructions in their block, so the
+appender path (add_instruction_to_block) is the wrong primitive for them.
+SSA-construction's phi-insertion phase calls this once per phi.
+@End Reasoning
+
+@Implementation
+Reads the block's instructions List at offset 16 and length at offset 24
+(canonical MIRBasicBlock layout from create_mir_basic_block). If the list
+is null, allocates a fresh one and stores it back. Allocates a NEW List,
+appends inst_ptr first, then appends every existing instruction in order —
+yielding a list with the new instruction at index 0. Destroys the old list,
+writes the new list pointer back to the block at offset 16, increments the
+instruction_count at offset 24, and writes the instruction's parent_block
+back-pointer at MIRNode offset 56. Returns 1 on success, 0 if either
+pointer is null. All offsets match the create_mir_basic_block writer
+and the get_block_instructions / get_block_instruction_count readers in
+this same file.
+@End Implementation
+
+@Security_Scope
+Allocates a new List, destroys the old one. The destroy is safe because
+the new list now holds all the original instructions plus the new one;
+the old list's storage is freed but its contents (the instruction
+pointers) live on under the new list.
+@End Security_Scope
+
 Process called "insert_instruction_at_block_start" that takes block_ptr as Integer, inst_ptr as Integer returns Integer:
-    @Reasoning
-    Inserts an instruction at the beginning of a block.
-
-    This is critical for phi node placement - phi nodes MUST be at the start
-    of a block before all other instructions.
-
-    MIRBasicBlock structure (from cfg.runa):
-    - Offset 0: block_id
-    - Offset 8: instructions (List pointer)
-    - Offset 16: instruction_count
-    - Offset 24: predecessors
-    - Offset 32: predecessor_count
-    - Offset 40: successors
-    - Offset 48: successor_count
-    - Offset 56: dominator
-    - Offset 64: metadata
-
-    Returns: 1 on success, 0 on failure
-    @End Reasoning
-
     Note: Null checks
     If block_ptr is equal to 0 or inst_ptr is equal to 0:
         Return 0
     End If
 
-    Note: Get instructions list (offset 8)
-    Let instructions be proc memory_get_int64 from Layout with block_ptr, 8
+    Note: Get instructions list (offset 16 - canonical MIRBasicBlock layout)
+    Let instructions be proc memory_get_int64 from Layout with block_ptr, 16
     If instructions is equal to 0:
         Note: Create new instructions list
         Set instructions to proc create from List
-        proc memory_set_int64 from Layout with block_ptr, 8, instructions
+        proc memory_set_int64 from Layout with block_ptr, 16, instructions
     End If
 
     Note: Insert at beginning of list
@@ -1899,8 +2945,8 @@ Process called "insert_instruction_at_block_start" that takes block_ptr as Integ
     Let new_instructions be proc create from List
     proc append from List with new_instructions, inst_ptr
 
-    Note: Append existing instructions
-    Let inst_count be proc memory_get_int64 from Layout with block_ptr, 16
+    Note: Append existing instructions (count at offset 24)
+    Let inst_count be proc memory_get_int64 from Layout with block_ptr, 24
     Let i be 0
     While i is less than inst_count:
         Let existing_inst be proc get from List with instructions, i
@@ -1910,10 +2956,10 @@ Process called "insert_instruction_at_block_start" that takes block_ptr as Integ
 
     Note: Replace instructions list
     proc destroy from List with instructions
-    proc memory_set_int64 from Layout with block_ptr, 8, new_instructions
+    proc memory_set_int64 from Layout with block_ptr, 16, new_instructions
 
-    Note: Update instruction count
-    proc memory_set_int64 from Layout with block_ptr, 16, inst_count plus 1
+    Note: Update instruction count (offset 24)
+    proc memory_set_int64 from Layout with block_ptr, 24, inst_count plus 1
 
     Note: Set instruction's parent block (offset 56 in MIRNode)
     proc memory_set_int64 from Layout with inst_ptr, 56, block_ptr
@@ -1921,16 +2967,29 @@ Process called "insert_instruction_at_block_start" that takes block_ptr as Integ
     Return 1
 End Process
 
+@Reasoning
+Returns a freshly-allocated List containing only the non-zero operand
+value-ids of an instruction. Compared to direct access via
+get_mir_node_operand(node, idx), this packaged form is convenient for
+passes that need to enumerate "every operand used by this instruction"
+without dispatching on operand-arity by opcode — e.g. liveness analysis
+when it tags every operand as a "use" at the instruction's program point.
+@End Reasoning
+
+@Implementation
+Allocates a fresh List (TIER 3 owned heap). Reads operand1 (offset 16),
+operand2 (offset 24), operand3 (offset 32); appends each non-zero value
+to the list. Returns the (possibly empty) list. For null inst_ptr,
+returns an empty list rather than 0 so the caller can iterate
+uniformly.
+@End Implementation
+
+@Security_Scope
+List allocation is the only heap mutation. Caller owns the returned list
+and must destroy it when done.
+@End Security_Scope
+
 Process called "get_instruction_operands" that takes inst_ptr as Integer returns Integer:
-    @Reasoning
-    Gets a list of operand value IDs for an instruction.
-
-    MIRNode has up to 3 operands (operand1, operand2, operand3).
-    This function returns a list containing the non-zero operand value IDs.
-
-    Returns: List of operand value IDs (TIER 3), or empty list
-    @End Reasoning
-
     Note: Create result list
     Let operands be proc create from List
 
@@ -1960,15 +3019,24 @@ Process called "get_instruction_operands" that takes inst_ptr as Integer returns
     Return operands
 End Process
 
+@Reasoning
+Returns the count of non-zero operand slots without allocating an
+operand list. Cheaper than get_instruction_operands when the caller only
+needs the count (e.g. branching by arity in the verifier, or budgeting
+register pressure during scheduling).
+@End Reasoning
+
+@Implementation
+Reads operand1 (offset 16), operand2 (offset 24), operand3 (offset 32);
+increments a counter for each non-zero value. Returns 0..3. Returns 0
+for null inst_ptr.
+@End Implementation
+
+@Performance_Hints
+Allocation-free; inlines to three loads, three compares, three increments.
+@End Performance_Hints
+
 Process called "get_instruction_operand_count" that takes inst_ptr as Integer returns Integer:
-    @Reasoning
-    Returns the number of non-zero operands in an instruction.
-
-    Simply counts how many of the three operand slots are non-zero.
-
-    Returns: Number of operands (0-3)
-    @End Reasoning
-
     Note: Null check
     If inst_ptr is equal to 0:
         Return 0
@@ -1997,16 +3065,25 @@ Process called "get_instruction_operand_count" that takes inst_ptr as Integer re
     Return count
 End Process
 
+@Reasoning
+Predicate testing whether an operand value-id refers to an SSA variable
+or to a constant. The convention "id >= 1000 ⇒ variable" is established
+by ssa.runa's context initialiser, which seeds next_value_id at 1000 so
+all subsequently allocated SSA ids are guaranteed to be in the variable
+range. Constants encode their value directly in the low-numbered id space.
+This classification is needed by every pass that lowers MIR to a target
+ISA where constants and registers take different operand encodings.
+@End Reasoning
+
+@Implementation
+Single comparison: returns 1 if operand_value_id >= 1000, else 0.
+@End Implementation
+
+@Performance_Hints
+Inlining candidate; compiles to a single compare-and-set-flag sequence.
+@End Performance_Hints
+
 Process called "operand_is_variable" that takes operand_value_id as Integer returns Integer:
-    @Reasoning
-    Checks if an operand value ID represents a variable (not a constant).
-
-    Convention: Value IDs > or equal to 1000 are SSA variables/temporaries.
-    Value IDs < 1000 are constants or special values.
-
-    Returns: 1 if variable, 0 if constant
-    @End Reasoning
-
     Note: SSA value IDs start from 1000 (as set in ssa.runa context creation)
     If operand_value_id is greater than or equal to 1000:
         Return 1
@@ -2015,19 +3092,35 @@ Process called "operand_is_variable" that takes operand_value_id as Integer retu
     Return 0
 End Process
 
+@Reasoning
+Recovers a human-readable variable name for an operand value-id, by
+first locating its defining instruction in the function's
+value_to_instruction map and then reading the metadata-attached source
+name. Falls back to a synthetic "v_<id>" name when no defining
+instruction exists (constants, function arguments before SSA registration)
+or when the instruction has no metadata. Diagnostics, debug-info, and
+the optimiser-debug subsystem all consume this.
+@End Reasoning
+
+@Implementation
+On null function_ptr, takes the synthetic-name path immediately. Otherwise,
+calls lookup_defining_instruction; on hit, reads metadata_ptr at MIRNode
+offset 64; on metadata hit, reads variable_name at MIRMetadata offset 0
+and returns it when non-null. Synthetic-name path: allocates a 64-byte
+buffer, writes "v_" (ASCII 118, 95) at offsets 0/1, then computes the
+base-10 ASCII representation of operand_value_id using a digit-count loop
+followed by a reverse-order digit-emission loop, and null-terminates.
+@End Implementation
+
+@Security_Scope
+Synthetic-name path allocates a 64-byte buffer. The base-10 expansion is
+bounded by 20 digits (int64 maximum), well under buffer size. Caller owns
+the returned buffer when it falls through to the synthetic path; when the
+metadata path returns a borrowed string, that string is owned by the
+MIRMetadata record.
+@End Security_Scope
+
 Process called "get_operand_variable_name" that takes function_ptr as Integer, operand_value_id as Integer returns Integer:
-    @Reasoning
-    Gets the variable name for an operand value ID by looking up its defining instruction.
-
-    This function:
-    1. Looks up which instruction defines operand_value_id
-    2. Gets metadata from that instruction
-    3. Returns the variable name from metadata
-    4. Falls back to SSA value name "v_N" if no metadata exists
-
-    Returns: Variable name string pointer
-    @End Reasoning
-
     If function_ptr is equal to 0:
         Note: No function context - generate SSA name
         Let name_buffer be proc allocate from Layout with 64
@@ -2039,7 +3132,7 @@ Process called "get_operand_variable_name" that takes function_ptr as Integer, o
     End If
 
     Note: Look up defining instruction for this value
-    Let inst_ptr be lookup_defining_instruction(function_ptr, operand_value_id)
+    Let inst_ptr be proc lookup_defining_instruction with function_ptr, operand_value_id
 
     If inst_ptr is not equal to 0:
         Note: Found defining instruction - try to get metadata
@@ -2097,18 +3190,25 @@ Process called "get_operand_variable_name" that takes function_ptr as Integer, o
     Return name_buffer
 End Process
 
+@Reasoning
+Updates one operand slot of an instruction to a new SSA value-id. Used
+during SSA renaming (Cytron's rename pass) to retarget operands to the
+correct reaching definition. The renaming pass walks the dominator tree
+and at every use point rewrites the operand to refer to the SSA name on
+top of the current variable's renaming stack — this is the per-operand
+write that pass invokes.
+@End Reasoning
+
+@Implementation
+Zero-based index dispatch (matching the convention used by SSA-rename's
+operand iteration) and writes new_value_id at MIRNode offset 16 (index 0
+⇒ operand1), 24 (index 1 ⇒ operand2), or 32 (index 2 ⇒ operand3). Returns
+1 on successful write, 0 for null inst_ptr or out-of-range index. Caller
+is responsible for maintaining def-use chains (remove old use, add new
+use) — this primitive only rewrites the slot.
+@End Implementation
+
 Process called "set_operand_ssa_value_id" that takes inst_ptr as Integer, operand_index as Integer, new_value_id as Integer returns Integer:
-    @Reasoning
-    Sets an operand of an instruction to a new SSA value ID.
-
-    This is used during SSA renaming to update instruction operands
-    to point to the correct SSA versions of variables.
-
-    operand_index: 0 = operand1, 1 = operand2, 2 = operand3
-
-    Returns: 1 on success, 0 on failure
-    @End Reasoning
-
     Note: Null check
     If inst_ptr is equal to 0:
         Return 0
@@ -2137,16 +3237,23 @@ Process called "set_operand_ssa_value_id" that takes inst_ptr as Integer, operan
     Return 0
 End Process
 
+@Reasoning
+Sets the result SSA value-id of an instruction. The renaming companion to
+set_operand_ssa_value_id: SSA rename walks every definition site and
+allocates a fresh SSA name for it, then writes that name as the
+instruction's result via this function. Functionally equivalent to
+set_mir_node_value_id; retained under the SSA-construction vocabulary
+for call-site readability.
+@End Reasoning
+
+@Implementation
+Writes new_value_id at MIRNode offset 8 (the value_id slot). Returns 1
+on success, 0 for null inst_ptr. Like set_mir_node_value_id, does not
+register the new id in the function's value_to_instruction map — caller
+must call register_value_definition separately to keep that map in sync.
+@End Implementation
+
 Process called "set_instruction_result_value_id" that takes inst_ptr as Integer, new_value_id as Integer returns Integer:
-    @Reasoning
-    Sets the result value ID of an instruction.
-
-    This is used during SSA construction to assign SSA names to
-    instruction results.
-
-    Returns: 1 on success, 0 on failure
-    @End Reasoning
-
     Note: Null check
     If inst_ptr is equal to 0:
         Return 0

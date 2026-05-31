@@ -1,0 +1,1196 @@
+Note:
+Copyright 2025 Sybertnetics Artificial Intelligence Solutions
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+:End Note
+
+Note:
+LOWERING CONTEXT - Visitor-Driven HIR to MIR Lowering State (P2-E Group B)
+
+This module owns the LoweringContext type, the dispatch table API, and the
+four trampoline procs that bridge the visitor framework's uniform callback
+shape to per-node-type lowering handlers.
+
+Architecture per P2-E v3 design Section 3:
+  - LoweringContext (9 fields, 72 bytes) carries builder-context pointer,
+    result accumulator, dispatch table, frame stack, and error state.
+  - Dispatch table is a sparse array indexed by HIR_* constants
+    (10000-14999), 32 bytes per slot (4 function pointers:
+    pre, post, child_enter, child_exit).
+  - Four trampolines (pre, post, child_enter, child_exit) read the
+    dispatch table by node_type and invoke the registered handler with
+    the lowering-specific signature.
+  - Control-flow frame stack provides inter-child state for IF/WHILE/
+    FOR/MATCH/TRY constructs whose per-child hooks need labels and
+    cursor management across multiple child visits.
+:End Note
+
+Note: ============================================================
+Note: IMPORTS
+Note: ============================================================
+
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/collections/list.runa" as List
+
+Note: ============================================================
+Note: CONSTANTS
+Note: ============================================================
+
+Note: Dispatch table covers HIR_* constants 10000-14999 (5000 slots).
+Note: Each slot is 32 bytes (4 function pointers x 8 bytes).
+Constant LOWERING_DISPATCH_TABLE_BASE as Integer is 10000
+Constant LOWERING_DISPATCH_TABLE_SIZE as Integer is 5000
+Constant LOWERING_DISPATCH_SLOT_BYTES as Integer is 32
+Constant LOWERING_DISPATCH_TABLE_BYTES as Integer is 160000
+
+Note: LoweringContext field offsets (9 fields, 72 bytes total).
+Constant LCTX_OFFSET_BUILDER_CTX as Integer is 0
+Constant LCTX_OFFSET_RESULT_STACK as Integer is 8
+Constant LCTX_OFFSET_INSTRUCTION_ACC as Integer is 16
+Constant LCTX_OFFSET_CURRENT_BLOCK_LABEL as Integer is 24
+Constant LCTX_OFFSET_DISPATCH_TABLE as Integer is 32
+Constant LCTX_OFFSET_ERROR_FLAG as Integer is 40
+Constant LCTX_OFFSET_ERROR_NODE as Integer is 48
+Constant LCTX_OFFSET_PENDING_LVALUE as Integer is 56
+Constant LCTX_OFFSET_CF_FRAME_STACK as Integer is 64
+
+Constant LOWERING_CONTEXT_BYTES as Integer is 72
+
+Note: Control-flow frame kinds (8-byte tag at frame offset 0).
+Constant CF_FRAME_KIND_IF as Integer is 1
+Constant CF_FRAME_KIND_WHILE as Integer is 2
+Constant CF_FRAME_KIND_FOR as Integer is 3
+Constant CF_FRAME_KIND_MATCH as Integer is 4
+Constant CF_FRAME_KIND_TRY as Integer is 5
+
+Note: Frame body capacity (largest frame is FOR at 8 fields of 8 bytes).
+Note: Layout: [kind(0)] [f1(8)] [f2(16)] [f3(24)] [f4(32)] [f5(40)]
+Note:         [f6(48)] [f7(56)] [f8(64)]
+Constant CF_FRAME_BYTES as Integer is 72
+
+Note: ============================================================
+Note: LoweringContext Type
+Note: ============================================================
+
+Type called "LoweringContext":
+    builder_ctx as Integer              Note: MIRBuilderContext pointer (state lives there)
+    result_stack as Integer             Note: List of lowered MIR value IDs
+    instruction_accumulator as Integer  Note: List of MIR instruction pointers (unused; emit goes via builder)
+    current_block_label as Integer      Note: Active basic-block label for emit cursor
+    dispatch_table as Integer           Note: Sparse array of {pre, post, child_enter, child_exit}
+    error_flag as Integer               Note: 0 OK, nonzero error code
+    error_node as Integer               Note: HIR node at which error occurred
+    pending_lvalue as Integer           Note: Carries lvalue marker for Set-statement lowering
+    cf_frame_stack as Integer           Note: List of control-flow frame pointers (LIFO)
+End Type
+
+Note: ============================================================
+Note: LoweringContext Lifecycle
+Note: ============================================================
+
+@Reasoning
+Allocates a LoweringContext wrapping the caller-supplied
+MIRBuilderContext pointer. The lowering context is a thin view that
+carries traversal-local state (result stack, frame stack, error flag,
+dispatch table) without taking ownership of the builder context — the
+caller retains responsibility for create_mir_builder_context /
+destroy_mir_builder_context.
+@End Reasoning
+
+@Implementation
+Tier 3 (Owned Heap) allocation per P2-E v3 design Section 3.4. Allocates
+72 bytes, fills the builder_ctx slot, creates two empty Lists (result
+stack at offset 8, cf_frame_stack at offset 64), and zeros remaining
+slots. Returns 0 if allocation fails so the caller can fall back to a
+diagnostic without leaking partial state.
+@End Implementation
+
+@Performance_Hints
+Cold path — called once per lowering pass (per top-level program
+lowering). Allocation cost is dominated by the two List.create calls
+and is amortised across the entire lowering of N HIR functions.
+@End Performance_Hints
+
+@Security_Scope
+The LoweringContext does not retain pointers to caller-owned HIR memory;
+it only carries integer state. Destroy-after-error guarantees no
+dangling pointers leak into subsequent compile sessions.
+@End Security_Scope
+
+Process called "create_lowering_context" that takes builder_ctx as Integer returns Integer:
+    Let ctx be proc allocate from Layout with LOWERING_CONTEXT_BYTES
+    If ctx is equal to 0:
+        Return 0
+    End If
+
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_BUILDER_CTX, builder_ctx
+
+    Let result_stack be proc create from List
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK, result_stack
+
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_INSTRUCTION_ACC, 0
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_CURRENT_BLOCK_LABEL, 0
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_DISPATCH_TABLE, 0
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_ERROR_FLAG, 0
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_ERROR_NODE, 0
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_PENDING_LVALUE, 0
+
+    Let cf_stack be proc create from List
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_CF_FRAME_STACK, cf_stack
+
+    Return ctx
+End Process
+
+@Reasoning
+Frees the LoweringContext and any per-pass auxiliary structures
+(result stack list, control-flow frame list, residual frame bodies)
+without touching the wrapped MIRBuilderContext — that lifetime is the
+caller's responsibility.
+@End Reasoning
+
+@Implementation
+Walks the cf_frame_stack draining any residual frames (defensive
+against error-unwind paths where post handlers did not run). Each
+frame is a separate heap allocation that must be freed before the
+list itself. Then destroys the two lists and deallocates the
+container.
+@End Implementation
+
+@Performance_Hints
+Cold path. Bounded by the residual frame count which, on a successful
+traversal, is zero (every push is matched by a pop). On error the
+unwind drains a worst-case proportional-to-tree-depth count of frames.
+@End Performance_Hints
+
+@Security_Scope
+Idempotent on null input (returns 1 without dereferencing). Setting
+fields to 0 after free is unnecessary because the container is freed
+in one step at the end; we never re-use the freed memory.
+@End Security_Scope
+
+Process called "destroy_lowering_context" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 1
+    End If
+
+    Note: Drain residual control-flow frames (defensive for error paths)
+    Let cf_stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_CF_FRAME_STACK
+    If cf_stack is not equal to 0:
+        Let frame_count be proc size from List with cf_stack
+        Let i be 0
+        While i is less than frame_count:
+            Let frame_ptr be proc get from List with cf_stack, i
+            If frame_ptr is not equal to 0:
+                proc deallocate from Layout with frame_ptr
+            End If
+            Set i to i plus 1
+        End While
+        proc destroy from List with cf_stack
+    End If
+
+    Let result_stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
+    If result_stack is not equal to 0:
+        proc destroy from List with result_stack
+    End If
+
+    proc deallocate from Layout with ctx
+    Return 1
+End Process
+
+@Reasoning
+Accessor returning the wrapped MIRBuilderContext pointer. Provided so
+lowering handlers can call create_mir_builder_context state mutators
+(allocate_temp_value, allocate_label, emit_instruction,
+map_hir_to_mir_value, lookup_mir_value) without each handler
+re-reading offset 0 directly.
+@End Reasoning
+
+@Implementation
+Single int64 load at LCTX_OFFSET_BUILDER_CTX. Returns 0 for null
+context (defensive).
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor — inlines to a single load on x86_64.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "lowering_get_builder_ctx" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_BUILDER_CTX
+End Process
+
+Note: ============================================================
+Note: Result Stack API
+Note: ============================================================
+
+@Reasoning
+Pushes a single MIR value id onto the result stack. Expression
+handlers' post callbacks call this exactly once to record their
+lowered MIR value for the parent handler to consume.
+@End Reasoning
+
+@Implementation
+List append. Returns 1 on success, 0 on null context or null stack.
+@End Implementation
+
+@Performance_Hints
+Amortised O(1). Called once per lowered expression node — the most
+frequent lowering primitive.
+@End Performance_Hints
+
+@Security_Scope
+Validates context and stack non-null; refuses to push onto an
+unallocated stack rather than silently dropping the value.
+@End Security_Scope
+
+Process called "lowering_push_result" that takes ctx as Integer, mir_value_id as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    proc append from List with stack, mir_value_id
+    Return 1
+End Process
+
+@Reasoning
+Pops the top MIR value id off the result stack. Parent post-handlers
+call this once per consumed child (e.g., binary expression's post
+pops twice: right then left).
+@End Reasoning
+
+@Implementation
+Reads stack size; if zero returns 0 (no value). Otherwise reads the
+last element, removes it via List.remove_last, and returns the value.
+@End Implementation
+
+@Performance_Hints
+O(1) amortised.
+@End Performance_Hints
+
+@Security_Scope
+Returns 0 on empty stack rather than crashing. Callers treat 0 as the
+"no value" sentinel matching the MIR-value-id convention.
+@End Security_Scope
+
+Process called "lowering_pop_result" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    Let n be proc size from List with stack
+    If n is equal to 0:
+        Return 0
+    End If
+    Let top_index be n minus 1
+    Let value be proc get from List with stack, top_index
+    proc remove_last from List with stack
+    Return value
+End Process
+
+@Reasoning
+Returns the top of the result stack without popping. Used by parent
+handlers that need to peek a child's result before deciding whether
+to consume it (e.g., return statement peeking optional value).
+@End Reasoning
+
+@Implementation
+List access at size-1. Returns 0 on empty stack or null context.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "lowering_peek_result" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    Let n be proc size from List with stack
+    If n is equal to 0:
+        Return 0
+    End If
+    Let top_index be n minus 1
+    Return proc get from List with stack, top_index
+End Process
+
+@Reasoning
+Returns the current depth of the result stack. Used by variadic
+post-handlers (call expression, block) to compute how many child
+results were pushed during traversal.
+@End Reasoning
+
+@Implementation
+Single List.size call.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "lowering_result_depth" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_RESULT_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with stack
+End Process
+
+Note: ============================================================
+Note: Error State API
+Note: ============================================================
+
+@Reasoning
+Records a lowering error: stores the error code and the HIR node at
+which it occurred. The driver inspects this state after
+visit_hir_tree returns to decide whether to discard the partial MIR
+program.
+@End Reasoning
+
+@Implementation
+Writes error_flag at offset 40 and error_node at offset 48. Idempotent
+— overwriting a previous error preserves the most-recent failure
+location, which is the typical desired diagnostic.
+@End Implementation
+
+@Performance_Hints
+Cold path — only invoked on lowering failure.
+@End Performance_Hints
+
+@Security_Scope
+Sets state used by destroy paths; no security boundary crossed.
+@End Security_Scope
+
+Process called "lowering_set_error" that takes ctx as Integer, error_code as Integer, hir_node as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_ERROR_FLAG, error_code
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_ERROR_NODE, hir_node
+    Return 1
+End Process
+
+@Reasoning
+Returns the recorded error code. Drivers check this after
+visit_hir_tree returns to detect partial-failure conditions.
+@End Reasoning
+
+@Implementation
+Single int64 load.
+@End Implementation
+
+@Performance_Hints
+Cold path.
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "lowering_get_error" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_ERROR_FLAG
+End Process
+
+Note: ============================================================
+Note: Dispatch Table API
+Note: ============================================================
+
+@Reasoning
+Allocates the per-pass dispatch table. The table is a sparse array
+keyed by HIR_* constants minus LOWERING_DISPATCH_TABLE_BASE; each
+slot holds four function pointers (pre, post, child_enter,
+child_exit) totalling 32 bytes. Unset slots are zero-initialised so
+the trampolines treat them as no-ops.
+@End Reasoning
+
+@Implementation
+Layout.allocate of LOWERING_DISPATCH_TABLE_BYTES (160 KB), then
+Layout.memory_zero across the whole range. Returns 0 on allocation
+failure. Caller stores the result via lowering_set_dispatch_table
+which writes it to offset 32 of the LoweringContext.
+@End Implementation
+
+@Performance_Hints
+160 KB allocation — Tier 3 owned heap, freed in
+destroy_lowering_dispatch_table. Zeroing dominates the cost; AOTT
+specialisation may eventually emit a vectorised zero loop for this
+known-size buffer.
+@End Performance_Hints
+
+@Security_Scope
+Allocation failure returns 0 cleanly; the caller's driver detects 0
+and bails out before attempting to populate the table.
+@End Security_Scope
+
+Process called "create_lowering_dispatch_table" returns Integer:
+    Let table be proc allocate from Layout with LOWERING_DISPATCH_TABLE_BYTES
+    If table is equal to 0:
+        Return 0
+    End If
+
+    Note: Zero-initialise so unset slots act as no-op handler addresses.
+    Let i be 0
+    While i is less than LOWERING_DISPATCH_TABLE_BYTES:
+        proc memory_set_int64 from Layout with table, i, 0
+        Set i to i plus 8
+    End While
+
+    Return table
+End Process
+
+@Reasoning
+Frees the dispatch table allocation. Called by the driver after
+visit_hir_tree completes (success or failure).
+@End Reasoning
+
+@Implementation
+Single Layout.deallocate. Idempotent on null.
+@End Implementation
+
+@Performance_Hints
+Cold path.
+@End Performance_Hints
+
+@Security_Scope
+No re-use of freed memory.
+@End Security_Scope
+
+Process called "destroy_lowering_dispatch_table" that takes table as Integer returns Integer:
+    If table is equal to 0:
+        Return 1
+    End If
+    proc deallocate from Layout with table
+    Return 1
+End Process
+
+@Reasoning
+Stores the dispatch table pointer in the LoweringContext. The
+trampolines read this slot to resolve handler addresses.
+@End Reasoning
+
+@Implementation
+Writes offset 32 of the context. Caller responsibility to allocate
+the table via create_lowering_dispatch_table first.
+@End Implementation
+
+@Performance_Hints
+Cold path.
+@End Performance_Hints
+
+@Security_Scope
+No validation that table is well-formed — the dispatch surface
+allows registering a null table for an explicit "no handlers" pass
+(used by visitor self-tests).
+@End Security_Scope
+
+Process called "lowering_set_dispatch_table" that takes ctx as Integer, table as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_DISPATCH_TABLE, table
+    Return 1
+End Process
+
+@Reasoning
+Computes the byte offset of a dispatch slot for a given HIR node
+type. Centralising this arithmetic prevents drift between the four
+trampolines and the registration helper, all of which key into the
+same layout.
+@End Reasoning
+
+@Implementation
+Returns (node_type - 10000) * 32. Out-of-range node types return -1
+so the caller's bounds check can short-circuit before any memory
+access.
+@End Implementation
+
+@Performance_Hints
+Pure arithmetic; inlined to a multiply-and-subtract.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checks the node_type range. Negative or out-of-range returns
+-1.
+@End Security_Scope
+
+Process called "lowering_slot_offset_for_node_type" that takes node_type as Integer returns Integer:
+    If node_type is less than LOWERING_DISPATCH_TABLE_BASE:
+        Return 0 minus 1
+    End If
+    Let max_type be LOWERING_DISPATCH_TABLE_BASE plus LOWERING_DISPATCH_TABLE_SIZE
+    If node_type is greater than or equal to max_type:
+        Return 0 minus 1
+    End If
+    Let index be node_type minus LOWERING_DISPATCH_TABLE_BASE
+    Let offset be index multiplied by LOWERING_DISPATCH_SLOT_BYTES
+    Return offset
+End Process
+
+@Reasoning
+Registers four handler function-pointer addresses for one HIR node
+type in the dispatch table. Each module's register_*_handlers calls
+this once per node type in scope. Passing 0 for any handler leaves
+that slot null which the trampoline interprets as a no-op.
+@End Reasoning
+
+@Implementation
+Computes the slot offset, validates it, then writes pre at +0, post
+at +8, child_enter at +16, child_exit at +24.
+@End Implementation
+
+@Performance_Hints
+Registration is cold-path. Four 64-bit writes per call.
+@End Performance_Hints
+
+@Security_Scope
+Validates the slot offset before writing; out-of-range registrations
+return 0 without mutating the table.
+@End Security_Scope
+
+Process called "lowering_register_handler" that takes table as Integer, node_type as Integer, pre_addr as Integer, post_addr as Integer, child_enter_addr as Integer, child_exit_addr as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let offset be proc lowering_slot_offset_for_node_type with node_type
+    If offset is less than 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with table, offset, pre_addr
+    proc memory_set_int64 from Layout with table, offset plus 8, post_addr
+    proc memory_set_int64 from Layout with table, offset plus 16, child_enter_addr
+    proc memory_set_int64 from Layout with table, offset plus 24, child_exit_addr
+    Return 1
+End Process
+
+@Reasoning
+Reads the pre-handler address for a node type. Returns 0 if no
+handler is registered (the trampoline treats 0 as no-op).
+@End Reasoning
+
+@Implementation
+Slot offset + 0 = pre slot.
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor on every visited node. Inlines to one load.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checks node_type.
+@End Security_Scope
+
+Process called "lowering_get_handler_pre" that takes table as Integer, node_type as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let offset be proc lowering_slot_offset_for_node_type with node_type
+    If offset is less than 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with table, offset
+End Process
+
+@Reasoning
+Reads the post-handler address for a node type.
+@End Reasoning
+
+@Implementation
+Slot offset + 8 = post slot.
+@End Implementation
+
+@Performance_Hints
+Inner-loop accessor.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checked.
+@End Security_Scope
+
+Process called "lowering_get_handler_post" that takes table as Integer, node_type as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let offset be proc lowering_slot_offset_for_node_type with node_type
+    If offset is less than 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with table, offset plus 8
+End Process
+
+@Reasoning
+Reads the child_enter-handler address for a node type. Only the
+seven control-flow node types (IF/WHILE/FOR/MATCH/WHEN_CLAUSE/TRY/
+PROCESS_DEFINITION) populate this slot.
+@End Reasoning
+
+@Implementation
+Slot offset + 16 = child_enter slot.
+@End Implementation
+
+@Performance_Hints
+Called once per child of every visited non-leaf node; the typical
+program has 90% null slots which short-circuit cheaply.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checked.
+@End Security_Scope
+
+Process called "lowering_get_handler_child_enter" that takes table as Integer, node_type as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let offset be proc lowering_slot_offset_for_node_type with node_type
+    If offset is less than 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with table, offset plus 16
+End Process
+
+@Reasoning
+Reads the child_exit-handler address for a node type.
+@End Reasoning
+
+@Implementation
+Slot offset + 24 = child_exit slot.
+@End Implementation
+
+@Performance_Hints
+Symmetric to lowering_get_handler_child_enter.
+@End Performance_Hints
+
+@Security_Scope
+Bounds-checked.
+@End Security_Scope
+
+Process called "lowering_get_handler_child_exit" that takes table as Integer, node_type as Integer returns Integer:
+    If table is equal to 0:
+        Return 0
+    End If
+    Let offset be proc lowering_slot_offset_for_node_type with node_type
+    If offset is less than 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with table, offset plus 24
+End Process
+
+Note: ============================================================
+Note: Trampolines (Visitor Framework Interface)
+Note: ============================================================
+
+@Reasoning
+The visitor framework calls back into the lowering layer through one
+of four trampolines. Each trampoline matches the visitor's uniform
+callback signature, looks up the dispatch-table slot for the current
+node type, and invokes the registered handler with the lowering-
+specific signature. This decoupling allows the visitor framework to
+remain ignorant of any specific consumer.
+@End Reasoning
+
+@Implementation
+Pre-visit trampoline. Signature matches the visitor's pre_callback
+contract: (node, node_type, user_data, visitor_ctx) returns Integer.
+1. user_data is the LoweringContext pointer.
+2. Read dispatch_table from the LoweringContext.
+3. Read handler_pre address from the slot.
+4. If null, return 1 (no-op continue).
+5. Otherwise invoke handler(lowering_ctx, node, node_type) and
+   return its result.
+@End Implementation
+
+@Performance_Hints
+Two loads (user_data is already in a register from the visitor)
+plus a null-check plus an indirect call. The null-check short-
+circuits for the majority of node types which have no pre handler.
+@End Performance_Hints
+
+@Security_Scope
+The handler address is treated as an opaque function pointer; the
+visitor framework owns the calling convention.
+@End Security_Scope
+
+Process called "lowering_pre_trampoline" that takes node as Integer, node_type as Integer, user_data as Integer, visitor_ctx as Integer returns Integer:
+    If user_data is equal to 0:
+        Return 1
+    End If
+    Let dispatch_table be proc memory_get_int64 from Layout with user_data, LCTX_OFFSET_DISPATCH_TABLE
+    If dispatch_table is equal to 0:
+        Return 1
+    End If
+    Let handler_addr be proc lowering_get_handler_pre with dispatch_table, node_type
+    If handler_addr is equal to 0:
+        Return 1
+    End If
+    Let result be proc handler_addr with user_data, node, node_type
+    Return result
+End Process
+
+@Reasoning
+Post-visit trampoline. Mirrors lowering_pre_trampoline but reads
+the post slot. After all children of a node have been visited, this
+fires once per node and gives the handler the chance to emit MIR
+that consumes its children's accumulated results.
+@End Reasoning
+
+@Implementation
+Identical to lowering_pre_trampoline but with
+lowering_get_handler_post.
+@End Implementation
+
+@Performance_Hints
+Inner-loop. Same cost profile as the pre trampoline.
+@End Performance_Hints
+
+@Security_Scope
+Opaque function pointer dispatch.
+@End Security_Scope
+
+Process called "lowering_post_trampoline" that takes node as Integer, node_type as Integer, user_data as Integer, visitor_ctx as Integer returns Integer:
+    If user_data is equal to 0:
+        Return 1
+    End If
+    Let dispatch_table be proc memory_get_int64 from Layout with user_data, LCTX_OFFSET_DISPATCH_TABLE
+    If dispatch_table is equal to 0:
+        Return 1
+    End If
+    Let handler_addr be proc lowering_get_handler_post with dispatch_table, node_type
+    If handler_addr is equal to 0:
+        Return 1
+    End If
+    Let result be proc handler_addr with user_data, node, node_type
+    Return result
+End Process
+
+@Reasoning
+Child-enter trampoline. Invoked by the visitor framework
+immediately before a non-null child is recursed into. The
+child_index argument lets handlers dispatch on which child is about
+to be visited (for IF: child_index 0 = condition, 1 = then, 2 =
+else). Only the seven control-flow node types populate this slot.
+@End Reasoning
+
+@Implementation
+Reads the child_enter slot. Handler signature is (lowering_ctx,
+node, node_type, child_index) returns Integer.
+@End Implementation
+
+@Performance_Hints
+Inner-loop on the child traversal hot path. The null short-circuit
+covers the typical 90% of node types that do not use child hooks.
+@End Performance_Hints
+
+@Security_Scope
+Same as the pre/post trampolines.
+@End Security_Scope
+
+Process called "lowering_child_enter_trampoline" that takes user_data as Integer, parent_node as Integer, parent_node_type as Integer, child_index as Integer, visitor_ctx as Integer returns Integer:
+    If user_data is equal to 0:
+        Return 1
+    End If
+    Let dispatch_table be proc memory_get_int64 from Layout with user_data, LCTX_OFFSET_DISPATCH_TABLE
+    If dispatch_table is equal to 0:
+        Return 1
+    End If
+    Let handler_addr be proc lowering_get_handler_child_enter with dispatch_table, parent_node_type
+    If handler_addr is equal to 0:
+        Return 1
+    End If
+    Let result be proc handler_addr with user_data, parent_node, parent_node_type, child_index
+    Return result
+End Process
+
+@Reasoning
+Child-exit trampoline. Invoked by the visitor framework immediately
+after a non-null child's post handler returns. This is the hook
+control-flow lowering uses to emit inter-child MIR (the conditional
+branch after the IF condition, the back-edge jump after the WHILE
+body).
+@End Reasoning
+
+@Implementation
+Symmetric to lowering_child_enter_trampoline.
+@End Implementation
+
+@Performance_Hints
+Inner-loop.
+@End Performance_Hints
+
+@Security_Scope
+Same as the other trampolines.
+@End Security_Scope
+
+Process called "lowering_child_exit_trampoline" that takes user_data as Integer, parent_node as Integer, parent_node_type as Integer, child_index as Integer, visitor_ctx as Integer returns Integer:
+    If user_data is equal to 0:
+        Return 1
+    End If
+    Let dispatch_table be proc memory_get_int64 from Layout with user_data, LCTX_OFFSET_DISPATCH_TABLE
+    If dispatch_table is equal to 0:
+        Return 1
+    End If
+    Let handler_addr be proc lowering_get_handler_child_exit with dispatch_table, parent_node_type
+    If handler_addr is equal to 0:
+        Return 1
+    End If
+    Let result be proc handler_addr with user_data, parent_node, parent_node_type, child_index
+    Return result
+End Process
+
+Note: ============================================================
+Note: Control-Flow Frame Stack API
+Note: ============================================================
+
+@Reasoning
+Allocates a fresh control-flow frame body (72 bytes) for the
+control-flow handlers to populate. Each frame carries its kind tag
+plus up to eight 8-byte fields whose meaning depends on the kind
+(see CF_FRAME_KIND_* constants).
+@End Reasoning
+
+@Implementation
+Single Tier 3 allocation, zero-initialised. Returns 0 on allocation
+failure.
+@End Implementation
+
+@Performance_Hints
+One allocation per control-flow construct in the lowered tree.
+@End Performance_Hints
+
+@Security_Scope
+Allocation failure returns 0 cleanly; caller treats this as a
+lowering error.
+@End Security_Scope
+
+Process called "cf_frame_allocate" that takes kind as Integer returns Integer:
+    Let frame be proc allocate from Layout with CF_FRAME_BYTES
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with frame, 0, kind
+    Let i be 8
+    While i is less than CF_FRAME_BYTES:
+        proc memory_set_int64 from Layout with frame, i, 0
+        Set i to i plus 8
+    End While
+    Return frame
+End Process
+
+@Reasoning
+Pushes a pre-allocated control-flow frame onto the lowering
+context's cf_frame_stack. Called by control-flow pre handlers.
+@End Reasoning
+
+@Implementation
+List.append; the list is LIFO via the corresponding peek/pop
+helpers.
+@End Implementation
+
+@Performance_Hints
+O(1) amortised.
+@End Performance_Hints
+
+@Security_Scope
+Validates ctx and frame non-null.
+@End Security_Scope
+
+Process called "cf_frame_push" that takes ctx as Integer, frame as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    If frame is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_CF_FRAME_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    proc append from List with stack, frame
+    Return 1
+End Process
+
+@Reasoning
+Returns the top frame on the cf_frame_stack without popping. Used
+by child_enter / child_exit handlers that read frame fields between
+children but must leave the frame in place for subsequent visits.
+@End Reasoning
+
+@Implementation
+List access at size-1. Returns 0 on empty stack.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "cf_frame_peek" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_CF_FRAME_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    Let n be proc size from List with stack
+    If n is equal to 0:
+        Return 0
+    End If
+    Let top_index be n minus 1
+    Return proc get from List with stack, top_index
+End Process
+
+@Reasoning
+Pops the top frame off the cf_frame_stack and frees its body. The
+post handler of each control-flow construct calls this exactly
+once to balance the pre handler's push. Returns 1 on success.
+@End Reasoning
+
+@Implementation
+List.get at size-1, List.remove_last, then Layout.deallocate the
+frame body. Caller must have already read any frame fields it needs
+before invoking pop.
+@End Implementation
+
+@Performance_Hints
+O(1) amortised. Frame deallocation is one Layout.deallocate.
+@End Performance_Hints
+
+@Security_Scope
+No use-after-free risk because pop reads, removes, then frees the
+frame; the caller cannot continue to read it because they called
+pop.
+@End Security_Scope
+
+Process called "cf_frame_pop" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_CF_FRAME_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    Let n be proc size from List with stack
+    If n is equal to 0:
+        Return 0
+    End If
+    Let top_index be n minus 1
+    Let frame be proc get from List with stack, top_index
+    proc remove_last from List with stack
+    If frame is not equal to 0:
+        proc deallocate from Layout with frame
+    End If
+    Return 1
+End Process
+
+@Reasoning
+Returns the current depth of the cf_frame_stack. Used by the driver
+to capture the pre-traversal depth so that on error unwind it can
+drain residual frames back to the saved depth.
+@End Reasoning
+
+@Implementation
+List.size on the cf_frame_stack.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Read-only.
+@End Security_Scope
+
+Process called "cf_frame_depth" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let stack be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_CF_FRAME_STACK
+    If stack is equal to 0:
+        Return 0
+    End If
+    Return proc size from List with stack
+End Process
+
+@Reasoning
+Drains the cf_frame_stack down to the supplied depth, freeing each
+popped frame body. The driver calls this after visit_hir_tree
+returns 0 (error) so that frames pushed by uncompleted control-flow
+constructs are not leaked.
+@End Reasoning
+
+@Implementation
+Pops frames in a loop until the stack depth equals saved_depth or
+the stack is empty (defensive — saved_depth above current depth is
+a no-op).
+@End Implementation
+
+@Performance_Hints
+Cold path (only fires on lowering error). Linear in the residual
+frame count.
+@End Performance_Hints
+
+@Security_Scope
+Idempotent on null context. Cannot under-pop because the inner
+condition checks against saved_depth on every iteration.
+@End Security_Scope
+
+Process called "cf_frame_unwind_to_depth" that takes ctx as Integer, saved_depth as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let current be proc cf_frame_depth with ctx
+    While current is greater than saved_depth:
+        proc cf_frame_pop with ctx
+        Set current to proc cf_frame_depth with ctx
+    End While
+    Return 1
+End Process
+
+@Reasoning
+Reads a frame field at the given byte offset (0, 8, 16, ... 64).
+Provides a single accessor so control-flow handlers don't each
+re-derive offsets manually.
+@End Reasoning
+
+@Implementation
+Single int64 load. Returns 0 on null frame.
+@End Implementation
+
+@Performance_Hints
+Inner accessor used inside child_enter / child_exit hot paths.
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated offset range.
+@End Security_Scope
+
+Process called "cf_frame_get_field" that takes frame as Integer, offset as Integer returns Integer:
+    If frame is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with frame, offset
+End Process
+
+@Reasoning
+Writes a frame field at the given byte offset. Mirror of
+cf_frame_get_field.
+@End Reasoning
+
+@Implementation
+Single int64 store.
+@End Implementation
+
+@Performance_Hints
+Inner mutator.
+@End Performance_Hints
+
+@Security_Scope
+Caller-validated offset range.
+@End Security_Scope
+
+Process called "cf_frame_set_field" that takes frame as Integer, offset as Integer, value as Integer returns Integer:
+    If frame is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with frame, offset, value
+    Return 1
+End Process
+
+Note: ============================================================
+Note: Pending Lvalue API (for Set-statement lowering)
+Note: ============================================================
+
+@Reasoning
+Records the lvalue target that Set-statement post needs to consume
+in its store emission. Set-statement pre seeds this slot from the
+HIR target ID; set-statement post reads and clears it.
+@End Reasoning
+
+@Implementation
+Writes offset 56.
+@End Implementation
+
+@Performance_Hints
+Cold compared to expression lowering — Set is rarer than literal /
+identifier in real programs.
+@End Performance_Hints
+
+@Security_Scope
+Single-slot scratchpad; set-then-clear discipline prevents stale
+reads from leaking across set-statements.
+@End Security_Scope
+
+Process called "lowering_set_pending_lvalue" that takes ctx as Integer, lvalue_id as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_PENDING_LVALUE, lvalue_id
+    Return 1
+End Process
+
+@Reasoning
+Returns the pending lvalue id and clears the slot. Set-statement
+post calls this exactly once.
+@End Reasoning
+
+@Implementation
+Read then write-zero in two instructions.
+@End Implementation
+
+@Performance_Hints
+Cold.
+@End Performance_Hints
+
+@Security_Scope
+Read-and-clear; subsequent reads return 0.
+@End Security_Scope
+
+Process called "lowering_take_pending_lvalue" that takes ctx as Integer returns Integer:
+    If ctx is equal to 0:
+        Return 0
+    End If
+    Let id be proc memory_get_int64 from Layout with ctx, LCTX_OFFSET_PENDING_LVALUE
+    proc memory_set_int64 from Layout with ctx, LCTX_OFFSET_PENDING_LVALUE, 0
+    Return id
+End Process
