@@ -272,6 +272,55 @@ Let slab_registry_initialized be 0  Note: 1 once slab_registry mmap completes
 Let pool_slab_addr_min be 0         Note: Lowest registered slab base; 0 before first insert
 Let pool_slab_addr_max be 0         Note: Highest registered slab base + POOL_SLAB_SIZE; 0 before first insert
 
+Note:
+==============================================================================
+OWNED-HEAP ADDRESS RANGE PRE-FILTER (brk/mmap fall-through guard)
+==============================================================================
+
+The slab_registry_contains check at the head of deallocate / allocator_user_size
+rejects non-pool pointers in O(1)..O(log N) before any 64-KB-rounded address is
+dereferenced. That handles the POOL fast path. The brk/mmap fall-through path
+that follows -- which reads the allocation header at ptr-header_size -- has the
+same structural risk: a foreign pointer (string literal, libc-owned memory,
+argv string, fabricated address) reaches the header read and SEGVs when
+ptr-header_size lands on an unmapped page.
+
+owned_addr_min / owned_addr_max are the loose bounding box of every brk and
+mmap region the owned-heap allocator has ever produced. They are updated by
+allocate() on every successful brk extension and every successful mmap (the
+mmap arm of the large-allocation path AND the heap_init brk reservation).
+deallocate() and allocator_user_size() consult these bounds AFTER the
+slab_registry_contains check fails; ptrs outside [owned_addr_min, owned_addr_max)
+are silently ignored (deallocate is a no-op on non-allocator pointers, matching
+the contract that allocator entry points accept "pointer previously returned by
+allocate() OR foreign pointer" and discriminate without crashing).
+
+Semantics:
+  - Both 0 before the first owned-heap region is created. Any ptr fails the
+    "ptr < owned_addr_min OR ptr >= owned_addr_max" guard while min == max == 0.
+  - owned_addr_min is monotone non-increasing after the first insert.
+  - owned_addr_max is monotone non-decreasing.
+  - mmap regions are typically far from the brk segment, so the bounding box
+    can grow large; this is acceptable because the registry-style mmap-tracking
+    list would cost an additional allocation per region and we are optimizing
+    for the common-case rejection of clearly-out-of-range pointers (most
+    foreign pointers ARE clearly out of range -- string literals in .rodata,
+    stack pointers, libc heap in glibc, etc.).
+  - The check is correct-but-loose: a fabricated address that happens to fall
+    inside the bounding box but outside any real region will still trigger
+    the header read. We accept this as the cost of avoiding per-region
+    bookkeeping; the slab_registry pattern is reserved for tier paths
+    that have a fixed slab size and benefit from binary search.
+
+Why a separate range from pool_slab_addr_*: pool slabs are typically mmap'd in
+a different VA region than the small-brk segment; combining them would let a
+brk pointer pass the bounding box because a pool slab is mmap'd far above. The
+two pre-filters are independent.
+:End Note
+
+Let owned_addr_min be 0  Note: Lowest brk/mmap base seen by owned-heap allocator; 0 before first
+Let owned_addr_max be 0  Note: Highest brk/mmap end seen by owned-heap allocator; 0 before first
+
 Note: ============================================================================
 Note: REGISTRY TRACKING GATE (E3 release-mode optimization)
 Note: ============================================================================
@@ -954,6 +1003,13 @@ Process called "heap_init" returns Integer:
     Note: Initialize metadata
     proc memory_set_pointer with heap_metadata_addr, 0, 0  Note: free_list_head = NULL
     proc memory_set_int64 from Memory with heap_metadata_addr, 8, 1     Note: heap_initialized = 1
+
+    Note: Seed the owned-heap bounding box with the initial brk reservation
+    Note: so subsequent deallocate calls on pointers within the heap-metadata
+    Note: region (none expected, but defensive) survive the range guard. The
+    Note: span [heap_metadata_addr, new_brk) covers exactly the 16 bytes we
+    Note: just reserved; later allocate() calls will extend it.
+    Let heap_init_track_ok be proc owned_range_extend with heap_metadata_addr, new_brk
 
     Return heap_metadata_addr
 End Process
@@ -2533,6 +2589,70 @@ Note: ==========================================================================
 Note: Allocation and Deallocation
 Note: ============================================================================
 
+Process called "owned_range_extend" takes low as Integer, high as Integer returns Integer:
+    @Reasoning
+    Grows the owned-heap bounding box [owned_addr_min, owned_addr_max) to
+    include the half-open range [low, high). Called by allocate() on every
+    successful brk extension and every successful mmap allocation. The bounds
+    are consulted by deallocate() and allocator_user_size() to reject foreign
+    pointers before the unconditional header read at ptr-header_size, which
+    would otherwise SEGV when the header offset lands in an unmapped page.
+
+    Monotone semantics: min only decreases, max only increases. The first
+    successful call (when min == max == 0) initializes both endpoints
+    unconditionally; subsequent calls take the elementwise min/max. This
+    matches the bounding-box discipline used by pool_slab_addr_min/max and
+    keeps the guard check on the hot path to two integer compares.
+
+    Single-threaded for v0.0.8.5; the read-modify-write of owned_addr_min and
+    owned_addr_max is non-atomic. The v0.0.9.x multi-thread upgrade will
+    swap these for relaxed atomics with min/max CAS (identical to the
+    slab_registry path that already documents the same upgrade).
+    @End Reasoning
+
+    @Implementation
+    1. Reject degenerate ranges (high <= low or low <= 0): no-op.
+    2. If owned_addr_min == 0 AND owned_addr_max == 0, set both endpoints
+       unconditionally (first-insert initialization).
+    3. Otherwise: if low < owned_addr_min, set owned_addr_min = low; if
+       high > owned_addr_max, set owned_addr_max = high.
+    @End Implementation
+
+    @Performance_Hints
+    Two loads, one compare, two stores in the common case. ~2 ns. Called
+    once per allocate() success on the owned-heap arm; never on the pool
+    arm (pool tracking lives in slab_registry).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure scalar bookkeeping. No memory dereference. No syscalls. Loose
+    bounding box is a defense-in-depth pre-filter; the authoritative
+    correctness gate is still the canary verification on the header
+    inside deallocate (which only runs once the range guard admits ptr).
+    @End Security_Scope
+
+    If high is less than or equal to low:
+        Return 0
+    End If
+    If low is less than or equal to 0:
+        Return 0
+    End If
+    If owned_addr_min is equal to 0:
+        If owned_addr_max is equal to 0:
+            Set owned_addr_min to low
+            Set owned_addr_max to high
+            Return 1
+        End If
+    End If
+    If low is less than owned_addr_min:
+        Set owned_addr_min to low
+    End If
+    If high is greater than owned_addr_max:
+        Set owned_addr_max to high
+    End If
+    Return 1
+End Process
+
 Process called "allocate" takes size as Integer returns Integer:
     @Reasoning
     Tier 3 owned-heap allocator. Returns a pointer to USER DATA. The
@@ -2684,6 +2804,14 @@ Process called "allocate" takes size as Integer returns Integer:
             Let reg_result be proc registry_insert with alloc_id, 0, user_ptr, aligned_size, 2
         End If
 
+        Note: Extend the owned-heap bounding box to cover this mmap region.
+        Note: The full region spans [header_ptr, header_ptr + total_size); we
+        Note: register that whole span so any pointer derived from this
+        Note: allocation (header reads at ptr-header_size on deallocate, etc.)
+        Note: passes the range guard cleanly.
+        Let mmap_region_end be header_ptr plus total_size
+        Let mmap_track_ok be proc owned_range_extend with header_ptr, mmap_region_end
+
         Return user_ptr
     End If
 
@@ -2818,6 +2946,14 @@ Process called "allocate" takes size as Integer returns Integer:
         proc registry_insert with alloc_id, 0, user_ptr, aligned_size, 1
     End If
 
+    Note: Extend the owned-heap bounding box to cover this brk region. The
+    Note: full block spans [current_brk, new_brk); we register that whole
+    Note: span so future deallocate calls on this pointer (and any other
+    Note: pointer derived from a brk block that ever existed in this range)
+    Note: pass the range guard cleanly. Because brk only ever grows, the
+    Note: max endpoint will monotonically widen across the program's life.
+    Let brk_track_ok be proc owned_range_extend with current_brk, new_brk
+
     Return user_ptr
 End Process
 
@@ -2900,6 +3036,22 @@ Process called "allocator_user_size" takes ptr as Integer returns Integer:
                 Return slot_size
             End If
         End If
+    End If
+
+    Note:
+    ====== OWNED-HEAP RANGE GUARD (mirrors deallocate) ======
+    Reject foreign pointers BEFORE the unconditional header read at
+    ptr-header_size below. Same rationale as deallocate: a foreign
+    pointer that survives the pool-registry rejection would SEGV when
+    the header offset lands in an unmapped page. Returning 0 here is
+    correct because allocator_user_size is documented to return 0 on
+    NULL / unknown pointers; foreign pointers fall under "unknown".
+    :End Note
+    If ptr is less than owned_addr_min:
+        Return 0
+    End If
+    If ptr is greater than or equal to owned_addr_max:
+        Return 0
     End If
 
     Note: Owned-heap (brk/mmap) path. Header sits at ptr-header_size
@@ -3019,6 +3171,35 @@ Process called "deallocate" takes ptr as Integer returns Integer:
                 Return pool_free_result
             End If
         End If
+    End If
+
+    Note:
+    ====== OWNED-HEAP RANGE GUARD (brk/mmap fall-through pre-filter) ======
+    Reject foreign pointers (string literals, libc-owned memory, argv
+    strings, fabricated addresses) BEFORE the unconditional header read
+    at ptr-header_size below. Without this guard, a foreign pointer
+    survives the pool-registry rejection and SEGVs when the header
+    offset lands in an unmapped page (e.g., the gap between the .rodata
+    section holding a string literal and the next mapped page).
+
+    The bounding box covers every brk/mmap region the owned-heap
+    allocator has ever produced. ptr < owned_addr_min and
+    ptr >= owned_addr_max are both proof that ptr is NOT an
+    owned-heap allocation; we return 0 (deallocate is a no-op on
+    non-allocator pointers, matching the documented "NULL guard" /
+    "unknown pointer" contract).
+
+    Both bounds are 0 before the first owned-heap alloc, in which case
+    EITHER compare rejects (low bound: any positive ptr is greater than
+    0 so the < check is false-but-also any positive ptr is >= 0 so the
+    >= check fires; combined the two compares always reject when both
+    bounds are 0).
+    :End Note
+    If ptr is less than owned_addr_min:
+        Return 0
+    End If
+    If ptr is greater than or equal to owned_addr_max:
+        Return 0
     End If
 
     Note: Compute header_size to match allocate()'s DEBUG-aware layout.
