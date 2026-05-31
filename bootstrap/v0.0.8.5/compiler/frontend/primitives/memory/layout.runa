@@ -185,6 +185,18 @@ Constant POOL_MAX_SIZE as Integer is 512
 Constant POOL_STATE_ENTRY_SIZE as Integer is 32
 Constant POOL_STATE_TABLE_SIZE as Integer is 640
 Constant POOL_SLAB_SIZE as Integer is 65536
+Note:
+POOL_SLAB_BASE_MASK is retired as of the registry-based slab-base
+recovery sweep. The bitmask approach (ptr & -65536) assumed pool
+slabs were 64 KiB-aligned, but syscall_mmap returns memory at
+kernel-page alignment (typically 4 KiB on x86-64), not 64 KiB. The
+mask therefore returned addresses numerically below the genuine
+slab base for any slab the kernel placed on a non-64 KiB boundary,
+which SEGV'd on the subsequent header read. pool_slab_base_of now
+delegates to slab_registry_base_of, which consults the authoritative
+slab_registry. The constant is kept here only as a historical anchor
+for the documentation that references its prior role.
+:End Note
 Constant POOL_SLAB_BASE_MASK as Integer is -65536
 Constant POOL_SLAB_HEADER_SIZE as Integer is 64
 Constant POOL_SLAB_PAYLOAD_SIZE as Integer is 65472
@@ -217,15 +229,24 @@ The slab registry replaces the pre-existing bitmask-only check
 ("pool_slab_base_of(ptr) followed by a signature read") with a
 sorted-array membership test that decisively distinguishes "ptr is
 from a pool slab" from "ptr is from brk/mmap/argv/libc/foreign
-memory".
+memory". The same registry now also backs the slab-base recovery
+itself via slab_registry_base_of, which pool_slab_base_of delegates
+to; the bitmask is fully retired.
 
-Why the bitmask alone is unsafe:
-* pool_slab_base_of(ptr) computes ptr & POOL_SLAB_BASE_MASK -- the
-  64-KB-rounded address. For pointers that lie BETWEEN registered
-  slabs (e.g. the lexer's mmap'd source buffer, an argv string, a
+Why the bitmask is unsafe (two independent failure modes):
+* Gap-between-slabs SEGV: ptr & POOL_SLAB_BASE_MASK rounds to a
+  64-KB boundary. For pointers that lie BETWEEN registered slabs
+  (e.g. the lexer's mmap'd source buffer, an argv string, a
   libc-owned allocation), this rounded address can land in an
   UNMAPPED page. Reading 8 bytes at that address segfaults the
   process even though the original pointer is perfectly valid.
+* Wrong-base SEGV on a registered slab: syscall_mmap returns
+  kernel-page-aligned memory (typically 4 KiB on x86-64), not
+  64 KiB-aligned memory. A pool slab placed at e.g. 0x7ffff7f0d000
+  is 4 KiB-aligned but not 64 KiB-aligned; ptr & -65536 yields
+  0x7ffff7f00000, which precedes the genuine slab base. A header
+  read at that wrong base SEGVs even for a pointer that genuinely
+  belongs to a registered pool slab.
 
 The registry is a single contiguous 32 KB array of 8-byte slab-base
 addresses kept sorted ascending. pool_slab_new inserts the slab base
@@ -1916,32 +1937,51 @@ End Process
 
 Process called "pool_slab_base_of" takes ptr as Integer returns Integer:
     @Reasoning
-    Recovers the slab base address from any pointer via bitwise mask with
-    POOL_SLAB_BASE_MASK (-65536 = bitwise complement of 65535 in two's
-    complement signed-64). If ptr lives inside a pool slab, this returns the
-    slab's start. Callers must verify the signature at offset 0 to confirm
-    the pointer is actually a pool slot vs. an arbitrary 64KB-aligned brk
-    address (probability of false signature match is 2^-64).
+    Recovers the slab base address from any pointer by consulting the
+    authoritative slab_registry rather than masking ptr to a 64 KiB
+    boundary. The bitmask approach (ptr & POOL_SLAB_BASE_MASK) was
+    UNSAFE: it assumed pool slabs are 64 KiB-aligned, but syscall_mmap
+    returns kernel-page-aligned memory (typically 4 KiB on x86-64), so
+    the rounded-down "base" can be numerically below the genuine slab
+    base. A subsequent header read at that wrong base lands in an
+    unmapped or unrelated page and SEGVs the process. The registry
+    lookup returns the ACTUAL base recorded by pool_slab_new at insert
+    time, so the result is correct regardless of the alignment the
+    kernel chose for the underlying mmap.
+
+    Returns 0 when ptr is not contained in any registered pool slab
+    (NULL pointer, pointer outside the pool address range, registry
+    not yet initialized, or pointer in a gap between registered slabs).
+    Callers may still treat the returned base as authoritative for
+    pool-slot recovery; the optional signature read at offset 0 remains
+    as a defense-in-depth check against future code paths that might
+    mis-register or stale-register a slab.
     @End Reasoning
 
     @Implementation
-    Single AND instruction. Returns 0 for ptr = 0 as a NULL-pointer guard.
+    Delegates to slab_registry_base_of, which performs an O(log N)
+    binary search over the sorted slab-base array (pre-filtered by the
+    pool_slab_addr_min / pool_slab_addr_max bounding box). Returns 0
+    for ptr = 0 indirectly through the same delegate's NULL guard.
     @End Implementation
 
     @Performance_Hints
-    ~1 ns. Single ALU op. This is the lookup at the head of deallocate.
+    Pre-filter rejects in ~1 ns; registry survivors complete in ~10-15
+    ns for a full 4096-entry registry. Replaces the prior single-AND
+    one-cycle implementation; the increase is intentional and bounded,
+    and is required for correctness (the prior implementation could
+    return a wrong base that SEGV'd on subsequent dereference).
     @End Performance_Hints
 
     @Security_Scope
-    Pure function; the returned address may or may not be a valid slab base.
-    The caller MUST verify via signature read before treating the result as
-    slab metadata.
+    Returns either a genuine slab base recorded by pool_slab_new (a
+    fully mapped, allocator-owned address) or 0; the returned value is
+    therefore always safe to dereference at offset 0 when non-zero,
+    because the registry only contains bases of slabs that have been
+    successfully mmap'd. Never dereferences ptr.
     @End Security_Scope
 
-    If ptr is equal to 0:
-        Return 0
-    End If
-    Return ptr bitwise and POOL_SLAB_BASE_MASK
+    Return proc slab_registry_base_of with ptr
 End Process
 
 Process called "slab_registry_init" returns Integer:
@@ -2222,11 +2262,14 @@ Process called "slab_registry_contains" takes ptr as Integer returns Integer:
     backed by the pool, argv strings, environment strings, libc-owned
     memory, foreign-library pointers, fabricated addresses.
 
-    Critical: this function MUST be called BEFORE the bitmask-based
-    pool_slab_base_of(ptr) is dereferenced via memory_get_int64. The
-    bitmask rounds to a 64-KB boundary which, for non-pool pointers,
-    can land in an unmapped page; reading 8 bytes from such an address
-    SEGVs the process even though the original pointer is valid.
+    Historically critical when pool_slab_base_of used a bitmask: a
+    64-KB-rounded address for a non-pool pointer could land in an
+    unmapped page, SEGVing on the subsequent header read. The bitmask
+    is now retired -- pool_slab_base_of delegates to
+    slab_registry_base_of, which is membership-safe by construction.
+    The membership pre-check via slab_registry_contains is preserved
+    for callers that want a cheap 0/1 gate before paying for the
+    base-lookup binary search.
 
     The pre-filter (pool_slab_addr_min / pool_slab_addr_max) handles
     the common case: brk pointers numerically far below the mmap'd
@@ -2309,6 +2352,109 @@ Process called "slab_registry_contains" takes ptr as Integer returns Integer:
     Let candidate_end be candidate_base plus POOL_SLAB_SIZE
     If ptr is less than candidate_end:
         Return 1
+    End If
+    Return 0
+End Process
+
+Process called "slab_registry_base_of" takes ptr as Integer returns Integer:
+    @Reasoning
+    Authoritative slab-base recovery. Given any pointer, returns the
+    actual base address of the registered pool slab that contains ptr,
+    or 0 if ptr is not in any registered slab. This is the SOLE correct
+    mechanism for recovering slab bases from interior pointers; the
+    older bitmask approach (ptr & POOL_SLAB_BASE_MASK) is unsafe because
+    pool slabs are mmap'd at kernel-page alignment (typically 4 KiB on
+    x86-64), NOT at 64 KiB alignment. A 64 KiB-rounded address can
+    therefore be numerically lower than the actual slab base, which
+    causes a header read at the wrong offset and SEGVs the process.
+
+    The registry stores the ACTUAL slab bases as recorded by
+    pool_slab_new at insert time, so this lookup returns the genuine
+    base regardless of the kernel-chosen alignment. Returns 0 when:
+    ptr is NULL, ptr falls outside the [pool_slab_addr_min,
+    pool_slab_addr_max) pre-filter, the registry is uninitialized, the
+    registry is empty, or ptr precedes every registered slab, or ptr
+    falls in a gap between registered slabs (i.e. ptr is numerically
+    inside the registered address range but does not actually live in
+    any registered slab's [base, base+POOL_SLAB_SIZE) interval).
+
+    Companion to slab_registry_contains: same binary search shape, same
+    pre-filter, same edge cases, but returns the matched base instead
+    of a 0/1 membership bit. The two procs are kept separate because
+    membership-only callers benefit from the slightly cheaper 0/1
+    return contract and because changing slab_registry_contains'
+    signature would force updates at every existing call site.
+    @End Reasoning
+
+    @Implementation
+    1. NULL guard.
+    2. Pre-filter: reject if ptr < pool_slab_addr_min or
+       ptr >= pool_slab_addr_max. Both bounds are 0 before the first
+       slab insert; either compare rejects in that case.
+    3. Early-out if slab_registry is 0 (not yet initialized).
+    4. Empty-registry short-circuit: count == 0 returns 0.
+    5. Upper-bound binary search yielding i in [0, count] such that
+       registry[i] > ptr (or i == count if every entry is <= ptr).
+    6. If i == 0, no entry is <= ptr; return 0.
+    7. Read candidate base at registry[i - 1]. If
+       ptr < candidate + POOL_SLAB_SIZE, return candidate (the true
+       slab base); otherwise return 0 (ptr fell in a gap).
+    @End Implementation
+
+    @Performance_Hints
+    Identical cost profile to slab_registry_contains: pre-filter
+    rejects in ~1 ns; registry survivors complete in ~10-15 ns for a
+    full 4096-entry registry (~12 iterations of load + compare +
+    branch). O(log N) in the number of registered slabs.
+    @End Performance_Hints
+
+    @Security_Scope
+    Reads only the slab_registry region (process-private mmap memory).
+    Never dereferences ptr; ptr is treated purely as a numeric key.
+    The returned value is either a genuine slab base recorded by
+    pool_slab_new (a fully mapped, allocator-owned address) or 0; no
+    attacker-controlled byte propagates into memory accesses.
+    @End Security_Scope
+
+    If ptr is equal to 0:
+        Return 0
+    End If
+    If ptr is less than pool_slab_addr_min:
+        Return 0
+    End If
+    If ptr is greater than or equal to pool_slab_addr_max:
+        Return 0
+    End If
+    If slab_registry is equal to 0:
+        Return 0
+    End If
+    If slab_registry_count is equal to 0:
+        Return 0
+    End If
+
+    Let lo be 0
+    Let hi be slab_registry_count
+    While lo is less than hi:
+        Let mid be lo plus hi
+        Set mid to mid divided by 2
+        Let mid_offset be mid multiplied by SLAB_REGISTRY_ENTRY_SIZE
+        Let mid_base be proc memory_get_int64 from Memory with slab_registry, mid_offset
+        If mid_base is greater than ptr:
+            Set hi to mid
+        Otherwise:
+            Set lo to mid plus 1
+        End If
+    End While
+
+    If lo is equal to 0:
+        Return 0
+    End If
+    Let candidate_index be lo minus 1
+    Let candidate_offset be candidate_index multiplied by SLAB_REGISTRY_ENTRY_SIZE
+    Let candidate_base be proc memory_get_int64 from Memory with slab_registry, candidate_offset
+    Let candidate_end be candidate_base plus POOL_SLAB_SIZE
+    If ptr is less than candidate_end:
+        Return candidate_base
     End If
     Return 0
 End Process
@@ -3017,15 +3163,16 @@ Process called "allocator_user_size" takes ptr as Integer returns Integer:
         Return 0
     End If
 
-    Note: E3 size-class pool fast path. Gate the slab_base + signature read
-    Note: behind slab_registry_contains so non-pool pointers (argv strings,
-    Note: libc-owned memory, brk allocations, foreign-library pointers) are
-    Note: rejected before any 64-KB-rounded address is dereferenced. The
-    Note: rounded address can land in an unmapped page for non-pool inputs;
-    Note: an ungated memory_get_int64 there would SEGV. For confirmed pool
-    Note: slots the slot_size at slab_base+16 is the user-buffer size; pool
-    Note: slots carry no per-allocation header so that IS the full writable
-    Note: range.
+    Note: E3 size-class pool fast path. Gate via slab_registry_contains
+    Note: so non-pool pointers (argv strings, libc-owned memory, brk
+    Note: allocations, foreign-library pointers) are rejected before any
+    Note: slab metadata is touched. pool_slab_base_of now delegates to
+    Note: slab_registry_base_of and returns the GENUINE slab base (the
+    Note: address the kernel actually returned from mmap), not a 64-KB-
+    Note: rounded approximation. The signature check at offset 0 is kept
+    Note: as defense in depth. For confirmed pool slots the slot_size at
+    Note: slab_base+16 is the user-buffer size; pool slots carry no
+    Note: per-allocation header so that IS the full writable range.
     Let in_pool_slab be proc slab_registry_contains with ptr
     If in_pool_slab is not equal to 0:
         Let pool_slab_base be proc pool_slab_base_of with ptr
@@ -3149,17 +3296,18 @@ Process called "deallocate" takes ptr as Integer returns Integer:
     The registry is authoritative: it returns 1 iff ptr lies inside a
     pool slab actually mmap'd by pool_slab_new. Non-pool pointers
     (brk allocations, argv/env strings, libc memory, foreign-library
-    pointers) are rejected here in ~1-15 ns and never reach the bitmask
-    + memory_get_int64 below.
+    pointers) are rejected here in ~1-15 ns and never reach the
+    base-lookup + memory_get_int64 below.
 
-    Why this gate is mandatory: pool_slab_base_of(ptr) rounds to a
-    64-KB boundary. For a non-pool pointer that boundary can land in an
-    UNMAPPED page (e.g. the page-aligned gap between two registered
-    slabs, or a page that no one mapped at all). Reading 8 bytes at
-    that address SEGVs the process even though ptr itself is valid.
-    The signature check that follows is still kept as a final
-    correctness gate against any future code path that mis-registers
-    or stale-registers a slab.
+    Why this gate is preserved: pool_slab_base_of now delegates to
+    slab_registry_base_of, which itself returns 0 for any pointer not
+    contained in a registered slab. The earlier
+    slab_registry_contains gate therefore serves as a cheap fast-path
+    pre-check that lets the common-case non-pool pointer skip the
+    base-lookup binary search entirely. The signature check that
+    follows is preserved as a defense-in-depth correctness gate
+    against any future code path that mis-registers or stale-registers
+    a slab.
     :End Note
     Let in_pool_slab be proc slab_registry_contains with ptr
     If in_pool_slab is not equal to 0:
