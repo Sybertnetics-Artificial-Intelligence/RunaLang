@@ -781,17 +781,53 @@ Process called "verify_loop_bounds" that takes graph as Integer, loop_nodes as I
     5. Return true if bounded
     @End Implementation
 
-    Note: Simplified loop bound verification
-    Note: Real implementation would analyze induction variables
-
-    Note: Assume bounded if loop size is finite
+    Note: A loop is bounded iff every node participating in the cycle has
+    Note: at least one Constant operand (the upper bound) and at least one
+    Note: induction-variable-style chain that monotonically converges. We
+    Note: verify this structurally: every node in the loop must have a
+    Note: predecessor outside the loop that is either Constant or Input
+    Note: (a kernel parameter, which is treated as a bound by ABI).
     Let loop_size be proc length from List with loop_nodes
-
-    If loop_size is greater than 0:
-        Return true
+    If loop_size is equal to 0:
+        Return false
     End If
 
-    Return false
+    Let loop_member be proc create from Dict
+    Let m be 0
+    While m is less than loop_size:
+        Let mn be proc get from List with loop_nodes, m
+        proc set from Dict with loop_member, mn, 1
+        Set m to m plus 1
+    End While
+
+    Let i be 0
+    While i is less than loop_size:
+        Let n be proc get from List with loop_nodes, i
+        Let preds be proc get_node_predecessors from Graph with 0, n
+        Let pc be proc length from List with preds
+        Let has_external_bound be false
+        Let p be 0
+        While p is less than pc:
+            Let pred be proc get from List with preds, p
+            Let in_loop be proc get from Dict with loop_member, pred
+            If in_loop is equal to 0:
+                Let pred_type be proc get_node_type from Node with pred
+                If pred_type is equal to 0:
+                    Set has_external_bound to true
+                End If
+                If pred_type is equal to 1:
+                    Set has_external_bound to true
+                End If
+            End If
+            Set p to p plus 1
+        End While
+        If has_external_bound is equal to false:
+            Return false
+        End If
+        Set i to i plus 1
+    End While
+
+    Return true
 End Process
 
 Note: ================================================================
@@ -866,8 +902,49 @@ Process called "verify_barrier_alignment" that takes graph as Integer, barriers 
     4. Return true if aligned
     @End Implementation
 
-    Note: Simplified barrier alignment check
-    Note: Real implementation would analyze control flow divergence
+    Note: A barrier is "aligned" iff every thread in the warp/block reaches
+    Note: it under the same control conditions. Structurally, a barrier
+    Note: node B is aligned iff every predecessor path from the kernel
+    Note: entry to B has no conditional Branch (OpKind 36) that gates B
+    Note: differently for different threads. We verify by checking that
+    Note: each barrier's predecessor set has no Branch node whose other
+    Note: successor escapes back to a non-barrier control point.
+    Let barrier_count be proc length from List with barriers
+    Let i be 0
+    While i is less than barrier_count:
+        Let barrier be proc get from List with barriers, i
+        Let preds be proc get_node_predecessors from Graph with graph, barrier
+        Let pc be proc length from List with preds
+        Let p be 0
+        While p is less than pc:
+            Let pred be proc get from List with preds, p
+            Let pred_op be proc get_node_opkind from Node with pred
+            Note: Conditional Branch (OpKind 36) before a barrier creates
+            Note: divergence iff some thread doesn't reach this barrier.
+            If pred_op is equal to 36:
+                Let pred_succs be proc get_node_successors from Graph with graph, pred
+                Let psc be proc length from List with pred_succs
+                If psc is greater than 1:
+                    Note: Branch with multiple successors and at least one
+                    Note: of them isn't this barrier -> divergent control.
+                    Let s be 0
+                    Let other_target be false
+                    While s is less than psc:
+                        Let succ be proc get from List with pred_succs, s
+                        If succ is not equal to barrier:
+                            Set other_target to true
+                        End If
+                        Set s to s plus 1
+                    End While
+                    If other_target is equal to true:
+                        Return false
+                    End If
+                End If
+            End If
+            Set p to p plus 1
+        End While
+        Set i to i plus 1
+    End While
 
     Return true
 End Process
@@ -988,20 +1065,74 @@ Process called "compute_value_range" that takes graph as Integer, node as Intege
     3. Return [min, max] range
     @End Implementation
 
-    Note: Check if constant
+    Note: Check if constant. For constants, we know the value precisely.
     Let is_constant be proc is_node_constant from Node with node
 
     If is_constant is equal to true:
-        Note: For constants, range is [value, value]
-        Note: Simplified: return [0, 0] as placeholder
+        Note: Constant payload value is stored at offset 8 of the node
+        Note: descriptor (Constant payload follows the discriminant).
+        Let v be proc memory_get_int64 from Layout with node, 8
         Let range be proc create from List
-        proc append from List with range, 0
-        proc append from List with range, 0
+        proc append from List with range, v
+        proc append from List with range, v
         Return range
     End If
 
-    Note: For non-constants, perform range analysis
-    Note: Simplified: return conservative range
+    Note: For non-constants, recursively compute by op kind. We support
+    Note: Add/Subtract/Multiply for affine offsets used in index expressions.
+    Let op_kind be proc get_node_opkind from Node with node
+    Let inputs be proc get_node_inputs from Node with node
+    Let in_count be proc length from List with inputs
+
+    If in_count is equal to 2:
+        Let l_edge be proc get from List with inputs, 0
+        Let r_edge be proc get from List with inputs, 1
+        Let l_src be proc get_edge_source from Edge with l_edge
+        Let r_src be proc get_edge_source from Edge with r_edge
+
+        Let l_range be analyze_value_range(graph, l_src)
+        Let r_range be analyze_value_range(graph, r_src)
+        Let l_min be proc get from List with l_range, 0
+        Let l_max be proc get from List with l_range, 1
+        Let r_min be proc get from List with r_range, 0
+        Let r_max be proc get from List with r_range, 1
+
+        Note: Add (OpKind 0): [l_min+r_min, l_max+r_max]
+        If op_kind is equal to 0:
+            Let new_min be l_min plus r_min
+            Let new_max be l_max plus r_max
+            Set range to proc create from List
+            proc append from List with range, new_min
+            proc append from List with range, new_max
+            Return range
+        End If
+        Note: Subtract (OpKind 1): [l_min-r_max, l_max-r_min]
+        If op_kind is equal to 1:
+            Let s_min be l_min minus r_max
+            Let s_max be l_max minus r_min
+            Set range to proc create from List
+            proc append from List with range, s_min
+            proc append from List with range, s_max
+            Return range
+        End If
+        Note: Multiply (OpKind 2) of two non-negative ranges:
+        Note: [l_min*r_min, l_max*r_max]. For general signs we'd need a
+        Note: 4-way max/min; in the GPU-index domain operands are >= 0.
+        If op_kind is equal to 2:
+            If l_min is greater than or equal to 0:
+                If r_min is greater than or equal to 0:
+                    Let m_min be l_min multiplied by r_min
+                    Let m_max be l_max multiplied by r_max
+                    Set range to proc create from List
+                    proc append from List with range, m_min
+                    proc append from List with range, m_max
+                    Return range
+                End If
+            End If
+        End If
+    End If
+
+    Note: Conservative fallback range for unmodeled ops.
     Set range to proc create from List
     proc append from List with range, 0
     proc append from List with range, 1000000
@@ -1025,10 +1156,39 @@ Process called "extract_base_index" that takes graph as Integer, address_node as
     3. Return [base_ptr, index_node]
     @End Implementation
 
-    Note: Simplified extraction
+    Note: Bifrost addresses are Add(base, index) by construction (the IR
+    Note: builder always lowers array accesses to this canonical form).
+    Note: Recover both halves by structural inspection.
     Let result be proc create from List
+    Let op_kind be proc get_node_opkind from Node with address_node
+    Let inputs be proc get_node_inputs from Node with address_node
+    Let in_count be proc length from List with inputs
+
+    Note: Add (OpKind 0): first input is the base pointer (often Input/Constant),
+    Note: second input is the index expression.
+    If op_kind is equal to 0:
+        If in_count is greater than or equal to 2:
+            Let base_edge be proc get from List with inputs, 0
+            Let index_edge be proc get from List with inputs, 1
+            Let base_src be proc get_edge_source from Edge with base_edge
+            Let index_src be proc get_edge_source from Edge with index_edge
+            proc append from List with result, base_src
+            proc append from List with result, index_src
+            Return result
+        End If
+    End If
+
+    Note: Multiply (OpKind 2): a pure index*stride expression has no base;
+    Note: signal "no base" with 0.
+    If op_kind is equal to 2:
+        proc append from List with result, 0
+        proc append from List with result, address_node
+        Return result
+    End If
+
+    Note: Non-arithmetic address node IS itself the base; index = none.
     proc append from List with result, address_node
-    proc append from List with result, address_node
+    proc append from List with result, 0
     Return result
 End Process
 
@@ -1043,7 +1203,58 @@ Process called "get_buffer_size" that takes graph as Integer, base_ptr as Intege
     3. Return buffer size
     @End Implementation
 
-    Note: Simplified: return large buffer size
+    Note: Trace the base pointer back to its allocator/Input. If we find:
+    Note:   - An Allocate operation: read its size operand (first input).
+    Note:   - An Input node: read its declared type size in bytes.
+    Note:   - A Constant: treat its value as the buffer base size.
+    Note: When the chain is opaque, fall back to a conservative 1 MB upper
+    Note: bound which keeps subsequent overflow checks conservative.
+    If base_ptr is equal to 0:
+        Return 1000000
+    End If
+
+    Let node_type be proc get_node_type from Node with base_ptr
+    Note: Input node (NodeType 1): use the parameter's type size.
+    If node_type is equal to 1:
+        Let in_type be proc get_node_output_type from Node with base_ptr
+        Let in_size be proc get_type_size_bytes from Node with in_type
+        If in_size is greater than 0:
+            Return in_size
+        End If
+    End If
+    Note: Constant node (NodeType 0): payload value at offset 8.
+    If node_type is equal to 0:
+        Let const_val be proc memory_get_int64 from Layout with base_ptr, 8
+        If const_val is greater than 0:
+            Return const_val
+        End If
+    End If
+
+    Note: Allocate operation (OpKind 42 by Bifrost convention).
+    Let op_kind be proc get_node_opkind from Node with base_ptr
+    If op_kind is equal to 42:
+        Let alloc_inputs be proc get_node_inputs from Node with base_ptr
+        Let alloc_in_count be proc length from List with alloc_inputs
+        If alloc_in_count is greater than 0:
+            Let size_edge be proc get from List with alloc_inputs, 0
+            Let size_src be proc get_edge_source from Edge with size_edge
+            Let size_type be proc get_node_type from Node with size_src
+            If size_type is equal to 0:
+                Let size_val be proc memory_get_int64 from Layout with size_src, 8
+                If size_val is greater than 0:
+                    Return size_val
+                End If
+            End If
+        End If
+        Note: Allocate with dynamic size: read declared output type bytes.
+        Let alloc_out_type be proc get_node_output_type from Node with base_ptr
+        Let alloc_size be proc get_type_size_bytes from Node with alloc_out_type
+        If alloc_size is greater than 0:
+            Return alloc_size
+        End If
+    End If
+
+    Note: Conservative fallback: 1 MB upper bound.
     Return 1000000
 End Process
 
@@ -1061,7 +1272,75 @@ Process called "compute_alignment" that takes graph as Integer, address_node as 
     2. Return guaranteed alignment in bytes
     @End Implementation
 
-    Note: Simplified: assume 16-byte alignment
+    Note: Recursively compute the alignment guarantee through arithmetic:
+    Note:   * Constant pointer: alignment is gcd(value, 16) if value > 0,
+    Note:     else 16 (treating 0 as fully-aligned per ABI).
+    Note:   * Input pointer: 16 bytes (the kernel ABI alignment contract).
+    Note:   * Add(a, b): min(alignment(a), alignment(b)).
+    Note:   * Multiply(a, b): alignment(a) * alignment(b) when both >= 1.
+    Note: Default alignment is 16 (the Bifrost-target ABI minimum).
+    If address_node is equal to 0:
+        Return 16
+    End If
+
+    Let node_type be proc get_node_type from Node with address_node
+    If node_type is equal to 1:
+        Note: Input pointer: ABI-aligned to 16 bytes.
+        Return 16
+    End If
+    If node_type is equal to 0:
+        Let cv be proc memory_get_int64 from Layout with address_node, 8
+        If cv is equal to 0:
+            Return 16
+        End If
+        Note: gcd-with-16 via descending power-of-2 probe.
+        Let candidates_8 be cv modulo by 8
+        Let candidates_16 be cv modulo by 16
+        If candidates_16 is equal to 0:
+            Return 16
+        End If
+        If candidates_8 is equal to 0:
+            Return 8
+        End If
+        Let candidates_4 be cv modulo by 4
+        If candidates_4 is equal to 0:
+            Return 4
+        End If
+        Let candidates_2 be cv modulo by 2
+        If candidates_2 is equal to 0:
+            Return 2
+        End If
+        Return 1
+    End If
+
+    Let op_kind be proc get_node_opkind from Node with address_node
+    Let inputs be proc get_node_inputs from Node with address_node
+    Let in_count be proc length from List with inputs
+    If in_count is greater than or equal to 2:
+        Let l_edge be proc get from List with inputs, 0
+        Let r_edge be proc get from List with inputs, 1
+        Let l_src be proc get_edge_source from Edge with l_edge
+        Let r_src be proc get_edge_source from Edge with r_edge
+        Let l_align be compute_alignment(graph, l_src)
+        Let r_align be compute_alignment(graph, r_src)
+
+        Note: Add: alignment is the minimum of the two
+        If op_kind is equal to 0:
+            If l_align is less than r_align:
+                Return l_align
+            End If
+            Return r_align
+        End If
+        Note: Multiply: alignment is the product when both > 0
+        If op_kind is equal to 2:
+            Let prod be l_align multiplied by r_align
+            If prod is greater than 16:
+                Return 16
+            End If
+            Return prod
+        End If
+    End If
+
     Return 16
 End Process
 
@@ -1085,9 +1364,59 @@ Process called "compute_liveness" that takes graph as Integer, nodes as Integer 
     4. Return [max_live, liveness_map]
     @End Implementation
 
-    Note: Simplified liveness analysis
+    Note: Standard SSA liveness sweep: walk nodes in given (topological)
+    Note: order and track active value count. Each node's value becomes
+    Note: live at definition and dies after its last consumer. The peak
+    Note: of active count is max_live. This is the same algorithm used
+    Note: by compute_peak_memory_usage but counts values, not bytes.
     Let node_count be proc length from List with nodes
-    Let max_live be node_count divided by 4
+    If node_count is equal to 0:
+        Let result0 be proc create from List
+        proc append from List with result0, 0
+        Return result0
+    End If
+
+    Let remaining_uses be proc create from Dict
+    Let i be 0
+    While i is less than node_count:
+        Let n be proc get from List with nodes, i
+        Let succs be proc get_node_successors from Graph with graph, n
+        Let sc be proc length from List with succs
+        proc set from Dict with remaining_uses, n, sc
+        Set i to i plus 1
+    End While
+
+    Let current_live be 0
+    Let max_live be 0
+
+    Set i to 0
+    While i is less than node_count:
+        Let cur be proc get from List with nodes, i
+        Set current_live to current_live plus 1
+        If current_live is greater than max_live:
+            Set max_live to current_live
+        End If
+
+        Let in_edges be proc get_node_inputs from Node with cur
+        Let in_count be proc length from List with in_edges
+        Let k be 0
+        While k is less than in_count:
+            Let e be proc get from List with in_edges, k
+            Let src be proc get_edge_source from Edge with e
+            Let prev be proc get from Dict with remaining_uses, src
+            If prev is greater than 0:
+                Let new_remaining be prev minus 1
+                proc set from Dict with remaining_uses, src, new_remaining
+                If new_remaining is equal to 0:
+                    If current_live is greater than 0:
+                        Set current_live to current_live minus 1
+                    End If
+                End If
+            End If
+            Set k to k plus 1
+        End While
+        Set i to i plus 1
+    End While
 
     Let result be proc create from List
     proc append from List with result, max_live
@@ -1123,9 +1452,50 @@ Process called "extract_memory_operations" that takes nodes as Integer returns I
 End Process
 
 Process called "check_memory_conflict" that takes op1 as Integer, op2 as Integer returns Integer:
-    Note: Simplified conflict check
-    Note: Real implementation would analyze address expressions
-    Return 1
+    @Reasoning
+    Determines whether two memory operations can conflict. Identical to the
+    parallelism-analysis predicate of the same name: Load/Load never
+    conflicts; otherwise we look at the address-producer (first input)
+    of each op. Same producer => potential conflict; distinct producers
+    => statically non-aliasing.
+
+    Returns 0 (no conflict) or 1 (potential conflict).
+    @End Reasoning
+
+    @Implementation
+    1. Two Loads (OpKind 40 both) => 0.
+    2. Compare first input source nodes; identical => 1, else 0.
+    @End Implementation
+
+    Let op1_kind be proc get_node_opkind from Node with op1
+    Let op2_kind be proc get_node_opkind from Node with op2
+
+    If op1_kind is equal to 40:
+        If op2_kind is equal to 40:
+            Return 0
+        End If
+    End If
+
+    Let inputs1 be proc get_node_inputs from Node with op1
+    Let inputs2 be proc get_node_inputs from Node with op2
+    Let len1 be proc length from List with inputs1
+    Let len2 be proc length from List with inputs2
+    If len1 is equal to 0:
+        Return 1
+    End If
+    If len2 is equal to 0:
+        Return 1
+    End If
+
+    Let addr1_edge be proc get from List with inputs1, 0
+    Let addr2_edge be proc get from List with inputs2, 0
+    Let addr1 be proc get_edge_source from Edge with addr1_edge
+    Let addr2 be proc get_edge_source from Edge with addr2_edge
+
+    If addr1 is equal to addr2:
+        Return 1
+    End If
+    Return 0
 End Process
 
 Process called "has_write_operation" that takes op1 as Integer, op2 as Integer returns Boolean:
@@ -1144,10 +1514,40 @@ Process called "has_write_operation" that takes op1 as Integer, op2 as Integer r
 End Process
 
 Process called "extract_sync_operations" that takes nodes as Integer returns Integer:
-    Let sync_ops be proc create from List
+    @Reasoning
+    Collects synchronization-class operations from the node list. The
+    Bifrost OpKind range 60..69 is reserved for synchronization primitives:
+      60 = Barrier         (work-group barrier)
+      61 = AtomicAdd       (atomic read-modify-write)
+      62 = AtomicSub
+      63 = AtomicMin
+      64 = AtomicMax
+      65 = AtomicCAS       (compare-and-swap)
+      66 = MemoryFence     (memory fence with ordering)
+      67 = AcquireFence
+      68 = ReleaseFence
+      69 = Reserved
+    @End Reasoning
 
-    Note: OpKind Barrier=60, AtomicAdd=61, etc.
-    Note: Simplified: no sync operations in basic set
+    @Implementation
+    1. Iterate the node list.
+    2. Collect nodes whose OpKind is in [60, 69].
+    @End Implementation
+
+    Let sync_ops be proc create from List
+    Let node_count be proc length from List with nodes
+
+    Let i be 0
+    While i is less than node_count:
+        Let n be proc get from List with nodes, i
+        Let op_kind be proc get_node_opkind from Node with n
+        If op_kind is greater than or equal to 60:
+            If op_kind is less than or equal to 69:
+                proc append from List with sync_ops, n
+            End If
+        End If
+        Set i to i plus 1
+    End While
 
     Return sync_ops
 End Process

@@ -39,25 +39,41 @@ Constant TRANSFORM_TILE as Integer is 4           Note: Apply tiling
 Constant TRANSFORM_PAD as Integer is 5            Note: Add padding
 
 Note: ================================================================
+Note: Fixed-Point Scale (PPM = Parts Per Million)
+Note: ================================================================
+Note: Stage1 of the bootstrap chain does not yet implement floating-point
+Note: literals or runtime float arithmetic (v0.0.8.6 work). All speedup
+Note: factors are therefore represented as fixed-point integers in PPM,
+Note: where 1_000_000 represents the floating-point value 1.0.
+Note:
+Note:   PPM_ONE        == 1_000_000   (== 1.0x)
+Note:   1_300_000 PPM  == 1.3x speedup
+Note:   2_000_000 PPM  == 2.0x speedup
+Note: ================================================================
+
+Constant PPM_ONE as Integer is 1000000
+Constant PPM_ZERO as Integer is 0
+
+Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
 
 Type called "DataLayout":
-    layout_type as Integer          Note: LAYOUT_* constant
-    dimensions as Integer           Note: List of dimension sizes
-    strides as Integer              Note: List of strides (bytes between elements)
-    tile_sizes as Integer           Note: List of tile sizes (if tiled)
-    padding as Integer              Note: Padding bytes per dimension
-    is_coalesced as Boolean         Note: Whether layout enables coalescing
+    layout_type as Integer               Note: LAYOUT_* constant
+    dimensions as Integer                Note: List of dimension sizes
+    strides as Integer                   Note: List of strides (bytes between elements)
+    tile_sizes as Integer                Note: List of tile sizes (if tiled)
+    padding as Integer                   Note: Padding bytes per dimension
+    is_coalesced as Boolean              Note: Whether layout enables coalescing
 End Type
 
 Type called "LayoutTransformation":
-    transform_type as Integer       Note: TRANSFORM_* constant
-    target_node as Integer          Note: Node whose layout to transform
-    source_layout as Integer        Note: Original DataLayout
-    target_layout as Integer        Note: Optimized DataLayout
-    estimated_benefit as Float      Note: Expected speedup
-    transformation_cost as Float    Note: Cost of layout conversion
+    transform_type as Integer            Note: TRANSFORM_* constant
+    target_node as Integer               Note: Node whose layout to transform
+    source_layout as Integer             Note: Original DataLayout
+    target_layout as Integer             Note: Optimized DataLayout
+    estimated_benefit_ppm as Integer     Note: Expected speedup in PPM (1_000_000 == 1x)
+    transformation_cost_ppm as Integer   Note: Layout conversion cost in PPM
 End Type
 
 Type called "TilingConfig":
@@ -323,8 +339,8 @@ Process called "generate_layout_transformations" that takes graph as Integer ret
                     target_node as node,
                     source_layout as current_layout,
                     target_layout as optimal_layout,
-                    estimated_benefit as benefit,
-                    transformation_cost as cost
+                    estimated_benefit_ppm as benefit,
+                    transformation_cost_ppm as cost
 
                 proc append from List with transformations, transformation
             End If
@@ -467,10 +483,13 @@ Process called "compute_optimal_tiling" that takes graph as Integer, node as Int
         Note: Compute square tile that fits in L1
         Note: tile_size^2 * element_size <= L1_size
         Let max_tile_elements be l1_cache_size divided by element_size
-        Let max_tile_size be proc sqrt from Math with Math.int_to_float(max_tile_elements )
+
+        Note: Integer square root via Newton's method (no Float dependency).
+        Note: We want max_tile_size = floor(sqrt(max_tile_elements)).
+        Let max_tile_size be integer_sqrt(max_tile_elements)
 
         Note: Round down to power of 2 (16, 32, 64, etc.)
-        Let tile_size be round_down_to_power_of_2(proc float_to_int from Math with max_tile_size)
+        Let tile_size be round_down_to_power_of_2(max_tile_size)
 
         Note: Cap at reasonable maximum (128)
         If tile_size is greater than 128:
@@ -509,7 +528,7 @@ End Process
 
 Process called "should_apply_tiling" that takes graph as Integer, node as Integer, layout as Integer returns Boolean:
     @Reasoning
-    Determines if tiling would be beneficial.
+    Determines whether tiling delivers a measurable benefit for this node.
 
     Tiling benefits:
     - Large arrays that don't fit in cache
@@ -638,7 +657,7 @@ End Process
 
 Process called "should_apply_padding" that takes graph as Integer, node as Integer, layout as Integer returns Boolean:
     @Reasoning
-    Determines if padding would be beneficial.
+    Determines whether padding delivers a measurable benefit for this layout.
 
     Padding benefits:
     - Improves cache line alignment
@@ -671,11 +690,16 @@ Process called "should_apply_padding" that takes graph as Integer, node as Integ
     Let dim_count be proc length from List with dimensions
     Let inner_dim be proc get from List with dimensions, dim_count minus 1
 
-    Note: Waste percentage = padding / (size + padding)
-    Let waste_ratio be proc int_to_float from Math with padding_needed divided by Math.int_to_float(inner_dim plus padding_needed)
+    Note: Waste percentage as PPM = padding * PPM_ONE / (size + padding).
+    Let denom be inner_dim plus padding_needed
+    If denom is less than or equal to 0:
+        Return false
+    End If
+    Let scaled be padding_needed multiplied by PPM_ONE
+    Let waste_ratio_ppm be scaled divided by denom
 
-    Note: Only pad if waste < 10%
-    If waste_ratio is greater than 0.1:
+    Note: Only pad if waste < 10% (== 100_000 PPM)
+    If waste_ratio_ppm is greater than 100000:
         Return false
     End If
 
@@ -695,125 +719,119 @@ Note: ================================================================
 Note: Benefit Estimation
 Note: ================================================================
 
-Process called "estimate_layout_benefit" that takes graph as Integer, node as Integer, current_layout as Integer, optimal_layout as Integer returns Float:
+Process called "estimate_layout_benefit" that takes graph as Integer, node as Integer, current_layout as Integer, optimal_layout as Integer returns Integer:
     @Reasoning
-    Estimates speedup from layout transformation.
+    Estimates the speedup from a layout transformation as a PPM-scaled
+    integer (PPM_ONE == 1.0x). Three benefit sources are combined
+    multiplicatively (in PPM domain):
+      1. Coalescing: 1.5x when the new layout enables coalescing and the
+         old one did not.
+      2. Tiling: 1.2x when the new layout introduces tiling (cache locality).
+      3. Padding: 1.1x when padding eliminates bank conflicts.
 
-    Benefit sources:
-    - Improved memory coalescing
-    - Better cache locality
-    - Reduced bank conflicts
-
-    Measurement:
-    - Memory transactions: optimal vs current
-    - Cache hit rate improvement
-    - Bandwidth utilization
+    Multiplicative combination in PPM:
+      result_ppm = (a_ppm * b_ppm / PPM_ONE * c_ppm) / PPM_ONE
     @End Reasoning
 
     @Implementation
-    1. Analyze coalescing improvement
-    2. Estimate cache locality improvement
-    3. Compute overall speedup
-    4. Return benefit factor
+    1. Probe each optimization individually and pick its PPM contribution.
+    2. Combine by sequential multiplication followed by PPM normalization.
+    3. Return the combined PPM benefit.
     @End Implementation
 
-    Note: Check if optimal layout enables coalescing
+    @Performance_Hints
+    O(1): three field reads from each layout descriptor and three
+    PPM multiplications.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure analysis on caller-supplied layout descriptors.
+    @End Security_Scope
+
     Let optimal_coalesced be proc memory_get_int64 from Layout with optimal_layout, 40
     Let current_coalesced be proc memory_get_int64 from Layout with current_layout, 40
 
-    Note: Base benefit from coalescing
-    Let coalescing_benefit be 1.0
-
+    Let coalescing_benefit_ppm be PPM_ONE
     If optimal_coalesced is equal to true:
         If current_coalesced is equal to false:
-            Note: Enabling coalescing: 1.3x to 2.0x typical
-            Set coalescing_benefit to 1.5
+            Note: Enabling coalescing: 1.5x (== 1_500_000 PPM)
+            Set coalescing_benefit_ppm to 1500000
         End If
     End If
 
-    Note: Tiling benefit (cache locality)
-    Let tiling_benefit be 1.0
-
+    Let tiling_benefit_ppm be PPM_ONE
     Let optimal_type be proc memory_get_int64 from Layout with optimal_layout, 0
     Let current_type be proc memory_get_int64 from Layout with current_layout, 0
-
     If optimal_type is equal to LAYOUT_TILED:
         If current_type is not equal to LAYOUT_TILED:
-            Note: Tiling benefit: 1.1x to 1.3x typical
-            Set tiling_benefit to 1.2
+            Note: Tiling benefit: 1.2x (== 1_200_000 PPM)
+            Set tiling_benefit_ppm to 1200000
         End If
     End If
 
-    Note: Padding benefit (bank conflicts)
-    Let padding_benefit be 1.0
-
+    Let padding_benefit_ppm be PPM_ONE
     Let optimal_padding be proc memory_get_int64 from Layout with optimal_layout, 32
     Let current_padding be proc memory_get_int64 from Layout with current_layout, 32
-
     If optimal_padding is greater than 0:
         If current_padding is equal to 0:
-            Note: Padding benefit: 1.05x to 1.15x typical
-            Set padding_benefit to 1.1
+            Note: Padding benefit: 1.1x (== 1_100_000 PPM)
+            Set padding_benefit_ppm to 1100000
         End If
     End If
 
-    Note: Combine benefits (multiplicative)
-    Let total_benefit be coalescing_benefit multiplied by tiling_benefit multiplied by padding_benefit
+    Note: Multiplicative combination in PPM:
+    Note:   combined = coalescing * tiling / PPM_ONE * padding / PPM_ONE
+    Let combined be coalescing_benefit_ppm multiplied by tiling_benefit_ppm
+    Set combined to combined divided by PPM_ONE
+    Set combined to combined multiplied by padding_benefit_ppm
+    Set combined to combined divided by PPM_ONE
 
-    Return total_benefit
+    If combined is less than PPM_ONE:
+        Set combined to PPM_ONE
+    End If
+
+    Return combined
 End Process
 
-Process called "estimate_transformation_cost" that takes source_layout as Integer, target_layout as Integer returns Float:
+Process called "estimate_transformation_cost" that takes source_layout as Integer, target_layout as Integer returns Integer:
     @Reasoning
-    Estimates cost of layout transformation.
-
-    Costs:
-    - Memory allocation for new layout
-    - Data copying/reorganization
-    - Runtime overhead
-
-    Measurement:
-    - Data size
-    - Transformation complexity
-    - Execution time
+    Estimates the relative cost of a layout transformation in PPM,
+    where PPM_ONE means "as costly as the original computation". The
+    cost is anchored at 5% (50_000 PPM) for cheap same-layout-type
+    transformations (e.g. just changing strides) and 10% (100_000 PPM)
+    when the layout TYPE changes (requiring full data reorganization).
+    A zero/missing dimensions list disqualifies the transformation
+    (returns 0, signaling "free" since no data to move).
     @End Reasoning
 
     @Implementation
-    1. Get data size
-    2. Estimate transformation time
-    3. Return cost (relative to original execution time)
+    1. If source has no dimensions, return 0 (no data).
+    2. Default cost = 50_000 PPM (5%).
+    3. If source.layout_type != target.layout_type, raise to 100_000 PPM (10%).
     @End Implementation
 
-    Note: Get data size
+    @Performance_Hints
+    O(1): two field reads from each layout descriptor.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure analysis on caller-supplied descriptors.
+    @End Security_Scope
+
     Let dimensions be proc memory_get_int64 from Layout with source_layout, 8
     If dimensions is equal to 0:
-        Return 0.0
+        Return 0
     End If
 
-    Let total_elements be 1
-    Let dim_count be proc length from List with dimensions
+    Let base_cost_ppm be 50000
 
-    Let i be 0
-    While i is less than dim_count:
-        Let dim_size be proc get from List with dimensions, i
-        Set total_elements to total_elements multiplied by dim_size
-        Set i to i plus 1
-    End While
-
-    Note: Transformation cost proportional to data size
-    Note: Typical: 0.01 to 0.1 relative cost
-    Let base_cost be 0.05
-
-    Note: Higher cost for complex transformations
     Let source_type be proc memory_get_int64 from Layout with source_layout, 0
     Let target_type be proc memory_get_int64 from Layout with target_layout, 0
-
     If source_type is not equal to target_type:
-        Note: Layout change requires data reorganization
-        Set base_cost to 0.1
+        Set base_cost_ppm to 100000
     End If
 
-    Return base_cost
+    Return base_cost_ppm
 End Process
 
 Note: ================================================================
@@ -854,20 +872,28 @@ Process called "optimize_data_layout" that takes graph as Integer returns Intege
         Return 0
     End If
 
-    Note: Filter to beneficial transformations
+    Note: Filter to beneficial transformations. Field offsets:
+    Note:   estimated_benefit_ppm @ 32, transformation_cost_ppm @ 40.
     Let beneficial be proc create from List
 
     Let i be 0
     While i is less than transform_count:
         Let transformation be proc get from List with transformations, i
-        Let benefit be proc memory_get_float64 from Layout with transformation, 32
-        Let cost be proc memory_get_float64 from Layout with transformation, 40
+        Let benefit_ppm be proc memory_get_int64 from Layout with transformation, 32
+        Let cost_ppm be proc memory_get_int64 from Layout with transformation, 40
 
-        Note: Net benefit = benefit / (1 + cost)
-        Let net_benefit be benefit divided by (1.0 plus cost)
+        Note: Net benefit in PPM = (benefit * PPM_ONE) / (PPM_ONE + cost),
+        Note: i.e. dividing the speedup by (1 + relative cost). Keeping all
+        Note: arithmetic in integer PPM avoids the missing-Float dependency.
+        Let denom be PPM_ONE plus cost_ppm
+        If denom is less than 1:
+            Set denom to 1
+        End If
+        Let scaled be benefit_ppm multiplied by PPM_ONE
+        Let net_benefit_ppm be scaled divided by denom
 
-        Note: Only apply if net benefit > 1.05 (5% improvement)
-        If net_benefit is greater than 1.05:
+        Note: Only apply if net benefit > 1.05x (== 1_050_000 PPM)
+        If net_benefit_ppm is greater than 1050000:
             proc append from List with beneficial, transformation
         End If
 
@@ -1598,7 +1624,26 @@ Process called "get_primitive_size" that takes primitive_kind as Integer returns
 End Process
 
 Process called "round_down_to_power_of_2" that takes n as Integer returns Integer:
-    Note: Round down to nearest power of 2
+    @Reasoning
+    Returns the largest power of two not exceeding n. Used for tile-size
+    selection where memory-aligned powers of two enable hardware-coalesced
+    access patterns on every supported accelerator.
+    @End Reasoning
+
+    @Implementation
+    Hand-unrolled lookup for n in [1, 128]; clamped at 128 because cache-
+    tile sizes beyond 128 elements rarely fit a single L1 line on the
+    targets Bifrost supports today.
+    @End Implementation
+
+    @Performance_Hints
+    O(1): a chain of fixed comparisons. Integer arithmetic only.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure function. Validates input range (returns 1 for n <= 0).
+    @End Security_Scope
+
     If n is less than or equal to 0:
         Return 1
     End If
@@ -1628,8 +1673,72 @@ Process called "round_down_to_power_of_2" that takes n as Integer returns Intege
     Return 1
 End Process
 
+Process called "integer_sqrt" that takes n as Integer returns Integer:
+    @Reasoning
+    Computes floor(sqrt(n)) using Newton's method on integers. We need an
+    integer-only square root because stage1 of the bootstrap chain has
+    no float support yet (v0.0.8.6 work). The classical Newton iteration
+        x_{k+1} = (x_k + n / x_k) / 2
+    converges in O(log log n) steps and is exact for floor(sqrt(n)) when
+    initialized at any x_0 >= sqrt(n). We initialize with n itself.
+    @End Reasoning
+
+    @Implementation
+    1. Return 0 for n <= 0 and 1 for n == 1.
+    2. Otherwise iterate Newton's update until convergence or the
+       monotonic-decrease invariant is broken.
+    @End Implementation
+
+    @Performance_Hints
+    O(log log n) Newton iterations on 64-bit Integer; effectively O(1).
+    Pure integer arithmetic; no Float dependency.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure function. Validates input range. Returns 0 for non-positive input.
+    @End Security_Scope
+
+    If n is less than or equal to 0:
+        Return 0
+    End If
+    If n is equal to 1:
+        Return 1
+    End If
+
+    Let x be n
+    Let y be (x plus 1) divided by 2
+    While y is less than x:
+        Set x to y
+        Set y to (x plus (n divided by x)) divided by 2
+    End While
+
+    Return x
+End Process
+
 Process called "sort_transformations_by_benefit" that takes transformations as Integer returns Integer:
-    Note: Simple bubble sort by net benefit (descending)
+    @Reasoning
+    Bubble-sorts layout transformations by their net benefit, computed as
+    net_ppm = benefit_ppm * PPM_ONE / (PPM_ONE + cost_ppm). Sorting puts
+    the highest-net-benefit transformation first so the greedy outer
+    loop picks the best win each iteration. Bubble sort suffices because
+    the candidate list is bounded by O(graph_nodes).
+    @End Reasoning
+
+    @Implementation
+    1. Clone the transformations list.
+    2. For each pair, compute net_ppm in PPM-domain (integer-only).
+    3. Swap into descending order.
+    @End Implementation
+
+    @Performance_Hints
+    O(N^2) bubble sort. N (= candidate transformations) is bounded by
+    graph node count and typically small per pass.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure sort over caller-supplied list; returns a sorted clone.
+    @End Security_Scope
+
     Let sorted be proc clone from List with transformations
     Let n be proc length from List with sorted
 
@@ -1640,15 +1749,25 @@ Process called "sort_transformations_by_benefit" that takes transformations as I
             Let t1 be proc get from List with sorted, j
             Let t2 be proc get from List with sorted, j plus 1
 
-            Let benefit1 be proc memory_get_float64 from Layout with t1, 32
-            Let cost1 be proc memory_get_float64 from Layout with t1, 40
-            Let net1 be benefit1 divided by (1.0 plus cost1)
+            Let benefit1_ppm be proc memory_get_int64 from Layout with t1, 32
+            Let cost1_ppm be proc memory_get_int64 from Layout with t1, 40
+            Let denom1 be PPM_ONE plus cost1_ppm
+            If denom1 is less than 1:
+                Set denom1 to 1
+            End If
+            Let net1_ppm be benefit1_ppm multiplied by PPM_ONE
+            Set net1_ppm to net1_ppm divided by denom1
 
-            Let benefit2 be proc memory_get_float64 from Layout with t2, 32
-            Let cost2 be proc memory_get_float64 from Layout with t2, 40
-            Let net2 be benefit2 divided by (1.0 plus cost2)
+            Let benefit2_ppm be proc memory_get_int64 from Layout with t2, 32
+            Let cost2_ppm be proc memory_get_int64 from Layout with t2, 40
+            Let denom2 be PPM_ONE plus cost2_ppm
+            If denom2 is less than 1:
+                Set denom2 to 1
+            End If
+            Let net2_ppm be benefit2_ppm multiplied by PPM_ONE
+            Set net2_ppm to net2_ppm divided by denom2
 
-            If net1 is less than net2:
+            If net1_ppm is less than net2_ppm:
                 proc set from List with sorted, j, t2
                 proc set from List with sorted, j plus 1, t1
             End If

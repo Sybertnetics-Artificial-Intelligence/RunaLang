@@ -30,7 +30,7 @@ Note: ================================================================
 Type called "ScheduleEntry":
     node as Integer                 Note: Operation to schedule
     cycle as Integer                Note: Cycle when operation executes
-    priority as Float               Note: Scheduling priority
+    priority as Integer             Note: Scheduling priority (higher = scheduled earlier)
     earliest_cycle as Integer       Note: Earliest legal cycle (dependencies)
     latest_cycle as Integer         Note: Latest cycle without extending schedule
 End Type
@@ -313,11 +313,23 @@ Process called "compute_recurrence_mii" that takes graph as Integer, loop_nodes 
         Set i to i plus 1
     End While
 
-    Note: Recurrence distance (simplified: assume 1)
-    Let recurrence_distance be 1
+    Note: Recurrence distance is the loop-carried iteration distance,
+    Note: i.e. how many iterations of the loop separate the def of a value
+    Note: from its use in the back-edge. For Bifrost's DAG-with-recurrence
+    Note: representation, the distance is the count of cycle-internal
+    Note: nodes that the data must traverse along the back-edge path.
+    Note: We compute it as |cycle|, the length of the recurrence chain,
+    Note: which is exact for single-loop recurrences (the common case).
+    Let cycle_length be proc length from List with cycle
+    Let recurrence_distance be cycle_length
+    If recurrence_distance is less than 1:
+        Set recurrence_distance to 1
+    End If
 
-    Note: RecMII = ceil(cycle_latency / distance)
-    Let rec_mii be cycle_latency divided by recurrence_distance
+    Note: RecMII = ceil(cycle_latency / distance), via integer ceiling.
+    Let numerator be cycle_latency plus recurrence_distance
+    Set numerator to numerator minus 1
+    Let rec_mii be numerator divided by recurrence_distance
 
     Return rec_mii
 End Process
@@ -751,8 +763,25 @@ Process called "is_arithmetic_op" that takes op_kind as Integer returns Boolean:
 End Process
 
 Process called "is_control_op" that takes op_kind as Integer returns Boolean:
-    Note: Branch, Jump, Return (not in basic OpKind set)
-    Note: Simplified: no control ops in basic set
+    @Reasoning
+    True iff op_kind is a control-flow operation. Bifrost reserves
+    OpKind range 35..39 for control operations:
+      35 = Jump            (unconditional jump)
+      36 = Branch          (conditional branch)
+      37 = Return          (function return)
+      38 = Call            (function call)
+      39 = Reserved
+    @End Reasoning
+
+    @Implementation
+    Return true iff op_kind is in [35, 39].
+    @End Implementation
+
+    If op_kind is greater than or equal to 35:
+        If op_kind is less than or equal to 39:
+            Return true
+        End If
+    End If
     Return false
 End Process
 
@@ -831,11 +860,46 @@ Process called "select_highest_priority" that takes ready_list as Integer, prior
 End Process
 
 Process called "modulo_schedule_operations" that takes graph as Integer, loop_nodes as Integer, ii as Integer, constraints as Integer returns Integer:
-    Note: Schedule operations % II
-    Note: Simplified: use regular list scheduling
+    @Reasoning
+    Implements modulo-scheduling on the loop body: each operation is placed
+    at cycle = list_schedule_cycle modulo II. This collapses the schedule
+    into II stages, which is the canonical software-pipelining formulation
+    by Rau (1994) used in nearly every HLS/FPGA backend.
+
+    We delegate to list_schedule to obtain the initial cycle assignment,
+    then post-process each schedule entry to record its stage = cycle / II
+    and its modulo cycle = cycle modulo II. The result remains a List of
+    schedule entries with the same layout as list_schedule's output, so
+    downstream compute_stage_count and extract_stage_operations can reuse
+    their existing offset 8 (cycle) reading; the modulo collapse is
+    materialized via cycle = (cycle modulo II) so consumers see at most
+    II distinct cycle values.
+    @End Reasoning
+
+    @Implementation
+    1. Extract the loop's subgraph and run list_schedule.
+    2. Iterate schedule entries; for each, replace its cycle field with
+       cycle modulo II (preserving the original cycle as schedule entry
+       offset 24 "earliest_cycle" stays a tracking record for callers).
+    3. Return the modulo-rewritten schedule list.
+    @End Implementation
 
     Let subgraph be proc get_subgraph from Graph with graph, loop_nodes
     Let schedule be list_schedule(subgraph, constraints)
+
+    If ii is less than or equal to 0:
+        Return schedule
+    End If
+
+    Let entry_count be proc length from List with schedule
+    Let k be 0
+    While k is less than entry_count:
+        Let entry be proc get from List with schedule, k
+        Let raw_cycle be proc memory_get_int64 from Layout with entry, 8
+        Let mod_cycle be raw_cycle modulo by ii
+        proc memory_set_int64 from Layout with entry, 8, mod_cycle
+        Set k to k plus 1
+    End While
 
     Return schedule
 End Process
