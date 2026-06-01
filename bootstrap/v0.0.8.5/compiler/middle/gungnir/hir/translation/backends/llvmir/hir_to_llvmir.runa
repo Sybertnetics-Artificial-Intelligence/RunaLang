@@ -53,6 +53,19 @@ Note: ==========================================================================
 Note: LLVM IR Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Single mutable context threaded through every generator proc so they
+share an emitter, an indent counter, and an error channel without
+having to plumb each one through every signature.
+@End Reasoning
+
+@Implementation:
+32-byte heap struct: emitter (offset 0), indent_level (offset 8),
+error_message (offset 16, null when no error), has_error (offset 24,
+boolean). The emitter is the only owned subobject; the error message
+is owned only after set_generation_error has run.
+@End Implementation
+
 Type called "LLVMIRGenContext":
     emitter as Integer          Note: LLVMIREmitter instance
     indent_level as Integer     Note: Current indentation level
@@ -63,6 +76,19 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Factory that allocates the context plus its child emitter atomically;
+if either allocation fails the partial state is torn down before
+returning so callers always see all-or-nothing semantics.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for the context struct; returns 0 on failure.
+Creates the LLVM IR emitter; on failure deallocates the context and
+returns 0. Otherwise writes the emitter pointer at offset 0, zeroes
+indent_level (8), error_message (16), and has_error (24).
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create LLVM IR generation context
@@ -88,6 +114,24 @@ Process called "create_generation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Lifecycle pair for create_generation_context. Frees the owned emitter
+and any owned error message, then the struct itself. Null-context
+guard returns 1 (success) because no work is needed.
+@End Reasoning
+
+@Implementation:
+Returns 1 if context is null. Reads the emitter pointer at offset 0
+and destroys it if non-null. Reads the error_message pointer at
+offset 16 and deallocates it if non-null. Finally deallocates the
+context.
+@End Implementation
+
+@Security_Scope:
+Caller must guarantee the context was produced by
+create_generation_context and has not already been destroyed.
+@End Security_Scope
 
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy generation context and free resources
@@ -115,6 +159,25 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Records an error condition for later inspection by the top-level
+entry. Stores an owned copy of the message string so the caller can
+free its own string without affecting the context.
+@End Reasoning
+
+@Implementation:
+Frees any pre-existing error message. Measures the new message
+length with string_length, allocates length+1 bytes, copies the
+message in, and NUL-terminates. Writes the pointer at offset 16 and
+sets has_error=1 at offset 24.
+@End Implementation
+
+@Security_Scope:
+Allocation failure leaves new_error null but still sets has_error=1
+so callers can detect the error condition without depending on the
+message being available.
+@End Security_Scope
+
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set generation error message
 
@@ -138,6 +201,11 @@ Process called "set_generation_error" takes context as Integer, message as Integ
     Return 1
 End Process
 
+@Reasoning:
+Boolean accessor for the error flag; used by the top-level generator
+to decide whether to return success or failure.
+@End Reasoning
+
 Process called "has_generation_error" takes context as Integer returns Integer:
     Note: Check if generation has error
 
@@ -149,6 +217,17 @@ End Process
 Note: ============================================================================
 Note: HIR Node Type Detection
 Note: ============================================================================
+
+@Reasoning:
+Type-tag predicate. The HIR node header stores the type at offset 0;
+this proc compares it against the cached DictionaryLiteral tag.
+@End Reasoning
+
+@Implementation:
+Null-node guard returns 0. Reads the node type tag at offset 0, asks
+HIR for the canonical DictionaryLiteral tag, returns 1 on match else
+0.
+@End Implementation
 
 Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a dictionary literal
@@ -167,6 +246,15 @@ Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Type-tag predicate for StringLiteral nodes.
+@End Reasoning
+
+@Implementation:
+Null-node guard returns 0. Reads the node type tag and compares
+against the cached StringLiteral tag.
+@End Implementation
+
 Process called "is_string_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a string literal
 
@@ -183,6 +271,15 @@ Process called "is_string_hir" takes hir_node as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Type-tag predicate for ListLiteral nodes.
+@End Reasoning
+
+@Implementation:
+Null-node guard returns 0. Reads the node type tag and compares
+against the cached ListLiteral tag.
+@End Implementation
 
 Process called "is_list_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a list literal
@@ -204,6 +301,29 @@ End Process
 Note: ============================================================================
 Note: HIR Dictionary Key Access
 Note: ============================================================================
+
+@Reasoning:
+Convenience accessor that resolves a key in an HIR dictionary AND
+requires the value to be a string literal in a single call. Returns
+0 (null) both when the key is absent and when the value is the wrong
+type, deliberately collapsing those two errors because every caller
+only cares about "did I get a usable string back".
+@End Reasoning
+
+@Implementation:
+Fetches the entries list from the dictionary; null entries returns 0.
+Walks entries by index; reads each entry's key (offset 0) and value
+(offset 8); compares the requested key against entry_key with
+strings_equal. On match, checks is_string_hir on the value; if true,
+returns get_string_literal_value, else returns 0. Returns 0 after the
+loop if no matching key.
+@End Implementation
+
+@Performance_Hints:
+O(n) in dictionary size. The dispatcher invokes this proc many times
+per HIR node; for very large dictionaries a hashed accessor would be
+faster, but n is typically small (<20) for LLVM IR nodes.
+@End Performance_Hints
 
 Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary by key
@@ -240,6 +360,21 @@ Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer
     Return 0  Note: Key not found
 End Process
 
+@Reasoning:
+Sibling of get_dict_string_value but returning the raw HIR value
+without enforcing a type. Used when the caller will type-dispatch on
+the value (e.g., it might be a list, dictionary, or string).
+@End Reasoning
+
+@Implementation:
+Walks the dictionary's entries list, comparing each entry_key to
+the requested key. Returns the raw entry_value on match, else 0.
+@End Implementation
+
+@Performance_Hints:
+O(n) in dictionary size; same characteristics as get_dict_string_value.
+@End Performance_Hints
+
 Process called "get_dict_hir_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get HIR node value from HIR dictionary by key
 
@@ -273,6 +408,16 @@ Note: ==========================================================================
 Note: Indentation
 Note: ============================================================================
 
+@Reasoning:
+Context-aware indent emission that reads the current indent_level
+from the shared context, removing that bookkeeping from every caller.
+@End Reasoning
+
+@Implementation:
+Reads the emitter pointer at context offset 0 and the indent_level
+at offset 8; delegates to the emitter's emit_indent with both values.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation for current level
 
@@ -284,6 +429,16 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Lets callers (e.g., generate_function on entering the function body)
+bump the indent level by one without poking the context layout
+directly.
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 8, writes back level+1.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -292,6 +447,16 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Pairs with increase_indent. Clamps at 0 because an indent count below
+zero is meaningless and would cause underflow in emit_indent.
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 8. If level > 0, writes back level-1;
+otherwise leaves it at 0. Always returns 1.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -309,13 +474,21 @@ Note: ==========================================================================
 Note: Module Generation
 Note: ============================================================================
 
+@Reasoning:
+Modules contain global declarations and function definitions. The
+module body is just a sequence of function definitions separated by
+blank lines; this proc walks them in source order.
+@End Reasoning
+
+@Implementation:
+Fetches the "functions" key from the module HIR. If absent or
+non-list, emits nothing. Otherwise walks the list, calling
+generate_function on each function HIR and emitting a separator
+newline between them.
+@End Implementation
+
 Process called "generate_module" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate LLVM IR module
-
-    @Reasoning:
-    Modules contain global declarations and function definitions.
-    We generate each function in sequence.
-    @End Reasoning
 
     Let functions be proc get_dict_hir_value with hir_node, "functions"
 
@@ -346,18 +519,27 @@ Note: ==========================================================================
 Note: Function Generation
 Note: ============================================================================
 
+@Reasoning:
+Emits a complete LLVM IR function definition in the canonical
+"define <ret> @name(<params>) { <bbs> }" form. Parameters are
+prefixed with '%' to mark them as registers (per LLVM SSA naming).
+@End Reasoning
+
+@Implementation:
+Emits "define ", then the return_type (if a string), a space, then
+the function name. Opens the parameter list with '('; if "parameters"
+is a list, walks each param HIR emitting "type %name" separated by
+", ". Emits ") {" then newline, increments indent, walks "basic_blocks"
+via generate_basic_block, decrements indent, emits "}" and newline.
+@End Implementation
+
+@Performance_Hints:
+O(p + b*i) where p = parameter count, b = basic block count, i =
+average instructions per basic block.
+@End Performance_Hints
+
 Process called "generate_function" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate LLVM IR function definition
-
-    @Reasoning:
-    Generates:
-    define return_type @function_name() {
-    basic_block1:
-      instructions
-    basic_block2:
-      instructions
-    }
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -465,16 +647,21 @@ Note: ==========================================================================
 Note: Basic Block Generation
 Note: ============================================================================
 
+@Reasoning:
+Basic blocks in LLVM IR are labeled regions of straight-line code;
+they begin with "label_name:" and contain a sequence of instructions
+where only the last is a terminator (br/ret/etc.). This proc emits
+both the label and the instruction body.
+@End Reasoning
+
+@Implementation:
+Reads the "label" string from the basic block HIR and emits
+"<indent>label_name:" plus newline if present. Then walks the
+"instructions" list, dispatching each entry into generate_instruction.
+@End Implementation
+
 Process called "generate_basic_block" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate LLVM IR basic block
-
-    @Reasoning:
-    Basic blocks have a label followed by instructions.
-    Format:
-    label_name:
-      instruction1
-      instruction2
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -514,16 +701,22 @@ Note: ==========================================================================
 Note: Instruction Generation
 Note: ============================================================================
 
+@Reasoning:
+Emits a single LLVM IR instruction with optional SSA result register.
+LLVM canonical formatting uses two leading spaces above the basic
+block indent, so the proc emits two extra spaces after the block
+indent before the instruction body.
+@End Reasoning
+
+@Implementation:
+Emits the block indent plus two extra spaces. If "result" is set,
+emits "<result> = ". Emits the opcode then a space, then walks the
+"operands" list emitting each via generate_operand separated by ", ".
+Terminates with a newline.
+@End Implementation
+
 Process called "generate_instruction" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate LLVM IR instruction
-
-    @Reasoning:
-    Instructions have optional result register, opcode, and operands.
-    Format:
-    %result = opcode type operand1, operand2
-    OR
-    opcode type operand1, operand2
-    @End Reasoning
 
     Let emitter be proc memory_get_int64 from Layout with context, 0
 
@@ -581,6 +774,23 @@ End Process
 Note: ============================================================================
 Note: Operand Generation
 Note: ============================================================================
+
+@Reasoning:
+Emits a single LLVM IR operand. Handles three shapes: bare string
+literals (e.g., a type string like "i32"), and structured dictionary
+operands with a "kind" tag (register, global, integer, float, label).
+Each kind has its own LLVM IR formatting rule.
+@End Reasoning
+
+@Implementation:
+If is_string_hir, emits the literal value and returns. Otherwise, if
+is_dictionary_hir, reads the "kind" string:
+- "register": emits "%" + name
+- "global": emits "@" + name
+- "integer"/"float": emits value verbatim
+- "label": emits "label %" + name
+Falls back to emitting the "value" string if no recognized kind.
+@End Implementation
 
 Process called "generate_operand" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate LLVM IR operand (type or value)
@@ -673,12 +883,35 @@ Note: ==========================================================================
 Note: Top-Level Generation
 Note: ============================================================================
 
+@Reasoning:
+Top-level entry point. Accepts either a complete module HIR or a
+bare function HIR (useful for tests that emit a single function in
+isolation). Owns the context lifecycle so callers never have to
+manage it.
+@End Reasoning
+
+@Implementation:
+Creates a context; returns 0 if creation failed. If hir_node is a
+dictionary, reads the "_type" tag. "llvm_module" dispatches to
+generate_module; "llvm_function" dispatches to generate_function;
+anything else produces empty output. After generation, checks
+has_generation_error - if set, destroys the context and returns 0
+(failure). Otherwise reads the emitter's output, destroys the
+context, and returns the output pointer.
+@End Implementation
+
+@Performance_Hints:
+Cold path - one call per HIR module. Dominated by the cost of the
+contained functions.
+@End Performance_Hints
+
+@Security_Scope:
+HIR input is trusted (produced by an upstream stage). Returned
+output pointer ownership follows the emitter's get_output contract.
+@End Security_Scope
+
 Process called "generate_llvmir" takes hir_node as Integer returns Integer:
     Note: Generate LLVM IR from HIR (top-level entry point)
-
-    @Reasoning:
-    Entry point for generating LLVM IR code from HIR representation.
-    @End Reasoning
 
     Let context be proc create_generation_context
 

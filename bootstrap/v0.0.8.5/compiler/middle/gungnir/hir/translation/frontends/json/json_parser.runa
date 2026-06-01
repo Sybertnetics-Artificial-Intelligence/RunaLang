@@ -62,6 +62,26 @@ Note: ==========================================================================
 Note: JSON AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+A single discriminated record for all seven JSON node kinds. Combining
+shape variants into one layout keeps the parser short and lets the
+translator dispatch on `node_type` alone. The `is_integer` flag plus the
+original `lexeme` is what lets json_to_hir round-trip floats without
+losing precision: integers can be carried as a 64-bit value, but floats
+preserve the exact source text for an authoritative HIR float literal.
+The keys/children parallel-list arrangement for objects preserves source
+order, which is observable.
+@End Reasoning
+
+@Implementation:
+Nine 64-bit slots in declared order: node_type tag, value_string ptr,
+value_int (integer value), is_integer flag (1 = use value_int, 0 = use
+lexeme), lexeme (original number text), children list, keys list (parallel
+to children for OBJECT), and line/column source position. Total size 72
+bytes; offsets 0/8/16/24/32/40/48/56/64 are referenced directly by
+create_json_node and every parse_* / translate_* call.
+@End Implementation
+
 Type called "JSONNode":
     node_type as Integer        Note: JSON node type constant
     value_string as Integer     Note: For STRING: pointer to string value
@@ -78,6 +98,20 @@ Note: ==========================================================================
 Note: Parser State Structure
 Note: ============================================================================
 
+@Reasoning:
+LL(1) recursive-descent parser state. Carrying `has_error` separately
+from `error_message` lets the parser flag failure without paying the
+allocate-and-copy cost when no message is set; an error can still be
+detected even if message allocation OOM'd.
+@End Reasoning
+
+@Implementation:
+Four 64-bit slots in declared order: lexer pointer (borrowed; caller
+owns), current_token pointer (next token to consume), error_message
+(owned heap string or 0), has_error boolean. Total size 32 bytes; offsets
+0/8/16/24 are referenced directly by every parser Process.
+@End Implementation
+
 Type called "JSONParser":
     lexer as Integer            Note: JSON lexer instance
     current_token as Integer    Note: Current token
@@ -89,13 +123,23 @@ Note: ==========================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Constructor that primes current_token with the first lexer output so the
+parse_value entry point can dispatch immediately without a "have we read
+any token yet" guard. Returning 0 on a null lexer is the same signal as
+allocation failure -- callers handle both as "parser construction
+failed".
+@End Reasoning
+
+@Implementation:
+Guard lexer!=0. Allocate the 32-byte JSONParser block; on OOM return 0.
+Write lexer at offset 0; zero current_token/error_message/has_error at
+offsets 8/16/24. Call Lexer.next_token to read the first token and store
+it at offset 8. Returns parser pointer.
+@End Implementation
+
 Process called "create_json_parser" takes lexer as Integer returns Integer:
     Note: Create JSON parser with lexer
-
-    @Reasoning:
-    Parser maintains current token and error state.
-    Initializes by reading first token from lexer.
-    @End Reasoning
 
     If lexer is equal to 0:
         Return 0
@@ -120,6 +164,18 @@ Process called "create_json_parser" takes lexer as Integer returns Integer:
 
     Return parser
 End Process
+
+@Reasoning:
+Cleanup. The parser does NOT own the lexer (the caller created it and
+freed it via destroy_json_lexer), and the current_token is the parser's
+borrowed reference into lexer storage, so we only free the error_message
+buffer here -- otherwise we'd double-free the lexer's resources.
+@End Reasoning
+
+@Implementation:
+If parser is 0, return 1. Read offset 16 (error_message); if non-zero,
+deallocate. Then deallocate the parser block. Always returns 1.
+@End Implementation
 
 Process called "destroy_json_parser" takes parser as Integer returns Integer:
     Note: Destroy JSON parser and free resources
@@ -147,6 +203,19 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Token cursor advance. The previous token's lifetime is shared with the
+lexer (the parser only borrows the pointer), so we never free it here;
+fetching the next token via Lexer.next_token automatically retires the
+old one. Returns the new token pointer for the (rare) caller that wants
+to inspect it immediately.
+@End Reasoning
+
+@Implementation:
+Read lexer at offset 0. Call Lexer.next_token to obtain the next token;
+store it at offset 8 of parser. Return the new token pointer.
+@End Implementation
+
 Process called "advance_parser" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -157,6 +226,20 @@ Process called "advance_parser" takes parser as Integer returns Integer:
 
     Return next_tok
 End Process
+
+@Reasoning:
+Non-consuming token predicate. Centralising the "null token" check (which
+appears when the lexer has returned 0 for an out-of-range read) lets
+every caller compare against a token type without re-implementing the
+guard. parse_object and parse_array use it to peek for the empty-
+collection case before committing to the iteration.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (current_token) of parser. If 0, return 0. Otherwise read
+offset 0 of the token (token_type) and compare; return 1 on match, 0
+otherwise.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
@@ -176,6 +259,19 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
     Return 0
 End Process
 
+@Reasoning:
+Match-or-error combinator. On a successful match the cursor advances;
+on mismatch the caller-supplied error message is recorded and the
+function returns 0. The grammar-level callers then propagate 0 back
+through the recursion so the failing token's location is preserved in
+the parser's state for diagnostics.
+@End Reasoning
+
+@Implementation:
+Call check_token_type. On match (1), call advance_parser and return 1.
+On mismatch (0), call set_parser_error with error_msg and return 0.
+@End Implementation
+
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect token of given type, set error if not match
 
@@ -194,6 +290,20 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Replaces any prior error_message with a heap-owned NUL-terminated copy
+of the supplied message and sets has_error=1. Owning the copy means the
+caller can pass string literals without worrying about lifetime; the
+parser releases the buffer on destroy.
+@End Reasoning
+
+@Implementation:
+Read offset 16 (error_message); if non-zero, deallocate. Compute
+msg_length via StringCore.string_length, allocate msg_length+1 bytes,
+memory_copy the message and NUL-terminate at offset msg_length. Store
+the new buffer at offset 16 and 1 at offset 24 (has_error). Returns 1.
+@End Implementation
 
 Process called "set_parser_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
@@ -224,6 +334,23 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Single factory for all seven JSONNode kinds. Zeroing every optional
+slot at construction means individual parsers only need to populate the
+slots their kind cares about, and the translator can safely test for
+"has X?" by comparing against 0 without each parser remembering to zero
+unused fields. Capturing line/column at construction binds the source
+position to the node permanently so diagnostics produced after the
+parser has advanced still report the right location.
+@End Reasoning
+
+@Implementation:
+Allocate 72 bytes (nine 64-bit fields); return 0 on OOM. Write
+node_type at offset 0, zero offsets 8/16/24/32/40/48 (value_string,
+value_int, is_integer, lexeme, children, keys), and write line/column
+at offsets 56/64.
+@End Implementation
+
 Process called "create_json_node" takes node_type as Integer, line as Integer, column as Integer returns Integer:
     Note: Create JSON AST node
 
@@ -252,13 +379,42 @@ Note: ==========================================================================
 Note: Recursive Descent Parsing
 Note: ============================================================================
 
+@Reasoning:
+The single value-position production in the JSON grammar:
+  value ::= object | array | string | number | "true" | "false" | "null"
+Every recursive descent (object members, array elements) eventually
+reaches this dispatcher, so it's the natural place to materialise string
+and number tokens into owned, NUL-terminated AST slots -- the source
+buffer's lifetime is shorter than the AST's, so the parser cannot rely
+on the lexer's interior pointers surviving downstream consumption.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (current_token); if 0, raise "Unexpected end of input".
+Read token_type, line, column from token offsets 0/24/32. Dispatch:
+  LBRACE              -> parse_object (recurse).
+  LBRACKET            -> parse_array  (recurse).
+  STRING              -> read lexeme/length at offsets 8/16, copy to a
+                         heap-owned NUL-terminated buffer, populate node
+                         at offset 8 (value_string), advance, return.
+  NUMBER              -> read is_integer at offset 56, value_int at
+                         offset 40, lexeme at 8, length at 16; create
+                         the JSON_NUMBER node, copy the lexeme buffer,
+                         set offsets 16/24/32 (value_int, is_integer,
+                         lexeme), advance, return.
+  TRUE/FALSE/NULL     -> create the matching node, advance, return.
+  TOKEN_ERROR         -> "Lexer error" -> 0.
+  Anything else       -> "Unexpected token" -> 0.
+@End Implementation
+
+@Security_Scope:
+Treats `parser` as a trusted parser pointer. Source text is untrusted;
+all length-bounded copies use the lexer's length field for slicing so a
+hostile literal cannot induce overread.
+@End Security_Scope
+
 Process called "parse_value" takes parser as Integer returns Integer:
     Note: Parse JSON value (entry point for recursive descent)
-
-    @Reasoning:
-    Dispatches to appropriate parser based on current token type.
-    value ::= object | array | string | number | "true" | "false" | "null"
-    @End Reasoning
 
     Let current_token be proc memory_get_int64 from Layout with parser, 8
 
@@ -361,14 +517,40 @@ Process called "parse_value" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Implements the object production:
+  object  ::= "{" members "}"
+  members ::= pair ("," pair)* | epsilon
+  pair    ::= string ":" value
+The keys list and the children list are kept parallel (keys[i] pairs
+with children[i]) so that downstream translators can iterate by index
+rather than maintaining a separate name -> value map; the parallel-
+list arrangement also preserves source order, which is required by the
+JSON spec's "members are ordered" interpretation that downstream
+tooling relies on.
+@End Reasoning
+
+@Implementation:
+Capture starting line/column from the current token. Consume `{` via
+expect_token; on failure return 0. Create the JSON_OBJECT node; on OOM
+report error and return 0. Allocate two backing Lists (keys, children)
+via List.create; on either OOM, set error and return 0 (destroying the
+first list if it succeeded). Bind them into the node's offsets 40/48.
+If the next token is `}`, advance and return the empty object. Otherwise
+loop:
+  - require a STRING key; on miss, set "Expected string key in object"
+    and return 0;
+  - copy the key bytes to a heap NUL-terminated buffer and advance;
+  - require `:` via expect_token;
+  - recurse via parse_value to obtain value_node; propagate failure;
+  - List.append the key to keys and the value to children;
+  - if next is `,`, advance and continue; otherwise break.
+After the loop, consume `}` via expect_token. Returns the populated
+JSON_OBJECT node.
+@End Implementation
+
 Process called "parse_object" takes parser as Integer returns Integer:
     Note: Parse JSON object
-
-    @Reasoning:
-    object ::= "{" members "}"
-    members ::= pair ("," pair)* | ε
-    pair ::= string ":" value
-    @End Reasoning
 
     Let current_token be proc memory_get_int64 from Layout with parser, 8
     Let line be proc memory_get_int64 from Layout with current_token, 24
@@ -475,13 +657,29 @@ Process called "parse_object" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Implements the array production:
+  array    ::= "[" elements "]"
+  elements ::= value ("," value)* | epsilon
+The children list preserves source order. No keys list is allocated
+since arrays are positional.
+@End Reasoning
+
+@Implementation:
+Capture starting line/column. Consume `[` via expect_token. Create the
+JSON_ARRAY node; on OOM report error and return 0. Allocate the children
+List via List.create; on OOM report error and return 0. Bind it at
+offset 40 of the node. If the next token is `]`, advance and return the
+empty array. Otherwise loop:
+  - recurse via parse_value to obtain value_node; propagate failure;
+  - List.append value_node to children;
+  - if next is `,`, advance and continue; otherwise break.
+After the loop, consume `]` via expect_token. Returns the populated
+JSON_ARRAY node.
+@End Implementation
+
 Process called "parse_array" takes parser as Integer returns Integer:
     Note: Parse JSON array
-
-    @Reasoning:
-    array ::= "[" elements "]"
-    elements ::= value ("," value)* | ε
-    @End Reasoning
 
     Let current_token be proc memory_get_int64 from Layout with parser, 8
     Let line be proc memory_get_int64 from Layout with current_token, 24
@@ -557,13 +755,35 @@ Note: ==========================================================================
 Note: Top-Level Parse Function
 Note: ============================================================================
 
+@Reasoning:
+The single public entry point. Owns the full lifetime of the lexer and
+parser so callers only deal with the AST. The trailing-content check
+after parse_value catches a class of bug where a document is technically
+parseable but the user actually concatenated two documents -- e.g.,
+"{}{}" -- which the spec considers invalid. By failing on trailing
+content we surface that to the user immediately rather than silently
+discarding the second document.
+@End Reasoning
+
+@Implementation:
+Guard source!=0. Create a Lexer via Lexer.create_json_lexer; on failure
+return 0. Create a parser via create_json_parser; on failure destroy the
+lexer and return 0. Call parse_value to obtain ast_root. If non-zero,
+inspect parser's current_token (offset 8) and its token_type (token
+offset 0): if not TOKEN_EOF, call set_parser_error with "Unexpected
+content after JSON value" and set ast_root to 0. Destroy parser, destroy
+lexer, return ast_root.
+@End Implementation
+
+@Security_Scope:
+`source` is treated as untrusted input. All bounds-checking is done by
+the lexer; this driver doesn't inspect the bytes directly. Resource
+cleanup is always run, even on parse failure, so a malformed input
+cannot leak the lexer or parser blocks.
+@End Security_Scope
+
 Process called "parse_json" takes source as Integer returns Integer:
     Note: Parse JSON source string and return AST root
-
-    @Reasoning:
-    Entry point for JSON parsing. Creates lexer and parser,
-    parses top-level value, and handles errors.
-    @End Reasoning
 
     If source is equal to 0:
         Return 0

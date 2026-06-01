@@ -45,6 +45,24 @@ Note: ==========================================================================
 Note: Backend State
 Note: ============================================================================
 
+@Reasoning:
+Backend state for the legacy String-accumulation CMake translator. Uses
+a 16-byte block (string pointer + indent level) for compatibility with
+the existing memory_get_int64 / memory_set_int64 access pattern.
+@End Reasoning
+
+@Implementation:
+Two Integer fields: output (String pointer at offset 0) and indent_level
+(at offset 8). The "output" string is repeatedly replaced via
+string_concat as bytes are emitted.
+@End Implementation
+
+@Performance_Hints:
+String-concat-based emission is O(n^2) in total output length because
+each emit allocates a new copy. The newer cmake_emitter uses
+byte-buffer emission instead and should be preferred for new code.
+@End Performance_Hints
+
 Type called "CMakeBackend":
     output as Integer           Note: Accumulated output string
     indent_level as Integer     Note: Current indentation level
@@ -53,6 +71,16 @@ End Type
 Note: ============================================================================
 Note: Backend Creation and Management
 Note: ============================================================================
+
+@Reasoning:
+Allocate and initialise a CMakeBackend instance. Sets output to an
+empty string and indent_level to 0.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes, writes an empty String pointer at offset 0 and 0 at
+offset 8. Returns 0 on allocation failure.
+@End Implementation
 
 Process called "create_cmake_backend" returns Integer:
     Note: Create CMake code generation backend
@@ -74,6 +102,19 @@ Process called "create_cmake_backend" returns Integer:
     Return backend
 End Process
 
+@Reasoning:
+Return the accumulated output string. Read directly off the backend so
+no copy is made; caller must not free the returned pointer.
+@End Reasoning
+
+@Implementation:
+Reads the String pointer at offset 0. Returns 0 on null backend.
+@End Implementation
+
+@Security_Scope:
+Returned pointer is owned by the backend. Caller must not free it.
+@End Security_Scope
+
 Process called "get_output" takes backend as Integer returns Integer:
     Note: Get generated CMake code
 
@@ -87,6 +128,22 @@ End Process
 Note: ============================================================================
 Note: Code Emission
 Note: ============================================================================
+
+@Reasoning:
+Append text to the backend's output via string_concat. The simple but
+costly emission strategy that motivated the byte-buffer rewrite in
+cmake_emitter.
+@End Reasoning
+
+@Implementation:
+Reads current output, calls string_concat with text, writes the new
+string pointer back. Returns 0 on null backend/text.
+@End Implementation
+
+@Performance_Hints:
+O(n) per call where n is the accumulated output length, giving O(n^2)
+total cost. Avoid for large outputs.
+@End Performance_Hints
 
 Process called "emit" takes backend as Integer, text as Integer returns Integer:
     Note: Append text to output
@@ -106,6 +163,14 @@ Process called "emit" takes backend as Integer, text as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Emit text followed by a literal "\n". Used to close CMake commands.
+@End Reasoning
+
+@Implementation:
+Calls emit with the text then emit with a fresh "\n" string.
+@End Implementation
+
 Process called "emit_line" takes backend as Integer, text as Integer returns Integer:
     Note: Emit text with newline
 
@@ -118,6 +183,17 @@ Process called "emit_line" takes backend as Integer, text as Integer returns Int
 
     Return 1
 End Process
+
+@Reasoning:
+Emit 2 spaces per indent level. CMake style guides settle on 2-space
+indentation for nested control structures.
+@End Reasoning
+
+@Implementation:
+Reads indent_level and loops that many times emitting a 2-space string
+via emit. Two-space steps are emitted as one literal each rather than
+two separate single-space emits to reduce concat overhead.
+@End Implementation
 
 Process called "emit_indent" takes backend as Integer returns Integer:
     Note: Emit current indentation
@@ -138,6 +214,14 @@ Process called "emit_indent" takes backend as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Step into a nested CMake block.
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 8, increments, writes back.
+@End Implementation
+
 Process called "increase_indent" takes backend as Integer returns Integer:
     Note: Increase indentation level
 
@@ -151,6 +235,14 @@ Process called "increase_indent" takes backend as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Step out of a nested CMake block. Clamped at zero to prevent underflow.
+@End Reasoning
+
+@Implementation:
+Reads indent_level; if greater than 0, writes back level-1.
+@End Implementation
 
 Process called "decrease_indent" takes backend as Integer returns Integer:
     Note: Decrease indentation level
@@ -172,6 +264,22 @@ End Process
 Note: ============================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
+
+@Reasoning:
+Public entry point for HIR -> CMake translation. Builds a backend,
+dispatches the HIR root through translate_hir_node, returns the
+accumulated output.
+@End Reasoning
+
+@Implementation:
+Null HIR returns 0. Creates a backend; on allocation failure returns 0.
+Translates the root then returns get_output(backend).
+@End Implementation
+
+@Performance_Hints:
+Dominated by string_concat O(n^2) behavior in emit; large HIR inputs
+should consider migrating to the byte-buffer cmake_emitter API.
+@End Performance_Hints
 
 Process called "translate_hir_to_cmake" takes hir_root as Integer returns Integer:
     Note: Translate complete HIR tree to CMake code
@@ -199,6 +307,19 @@ End Process
 Note: ============================================================================
 Note: HIR Node Translation
 Note: ============================================================================
+
+@Reasoning:
+Central dispatch on the HIR node_type discriminator. Routes to the
+appropriate translate_*_node helper. Unknown node types return 0
+silently rather than aborting the rest of the translation.
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0. Special-cases 0 as "program root". Then
+compares against the HIR_* constants for block statement, let
+statement, set statement, if/for/while statements, call expression and
+process definition.
+@End Implementation
 
 Process called "translate_hir_node" takes backend as Integer, node as Integer returns Integer:
     Note: Translate HIR node based on type
@@ -259,6 +380,18 @@ Process called "translate_hir_node" takes backend as Integer, node as Integer re
     Return 0
 End Process
 
+@Reasoning:
+Walk the top-level statement list of a program node. CMake scripts are
+sequential commands at the top level, so each child is translated in
+order.
+@End Reasoning
+
+@Implementation:
+Reads "children" list at offset 24 and "child_count" at offset 32.
+Iterates 0..child_count, calling translate_hir_node on each non-null
+child.
+@End Implementation
+
 Process called "translate_program_node" takes backend as Integer, node as Integer returns Integer:
     Note: Translate program root node
 
@@ -291,6 +424,17 @@ Process called "translate_program_node" takes backend as Integer, node as Intege
     Return 1
 End Process
 
+@Reasoning:
+Walk a block-statement's children. CMake does not have explicit block
+syntax (control structures are delimited by their own keywords like
+"endif"), so blocks just translate as a sequence of statements.
+@End Reasoning
+
+@Implementation:
+Same shape as translate_program_node: reads children + child_count and
+iterates translate_hir_node on each.
+@End Implementation
+
 Process called "translate_block_node" takes backend as Integer, node as Integer returns Integer:
     Note: Translate block statement
 
@@ -322,6 +466,18 @@ Process called "translate_block_node" takes backend as Integer, node as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+"Let" statements map naturally to CMake's "set(VAR value)" command.
+Reads variable_name at offset 8 and initializer at offset 32 from the
+HIRLetStatement layout.
+@End Reasoning
+
+@Implementation:
+Emits indent, then "set(", then the variable name. If initializer is
+non-null, emits a space then translates the initializer expression.
+Closes with ")".
+@End Implementation
 
 Process called "translate_let_statement" takes backend as Integer, node as Integer returns Integer:
     Note: Translate let statement to set() command
@@ -358,6 +514,17 @@ Process called "translate_let_statement" takes backend as Integer, node as Integ
     Return 1
 End Process
 
+@Reasoning:
+"Set" statements (re-assignment) also map to CMake's set() command -
+CMake has no distinction between declare and assign.
+@End Reasoning
+
+@Implementation:
+Reads target at offset 8 and value at offset 16. Emits indent + "set(",
+then translates target as an expression, then a space and the value
+expression. Closes with ")".
+@End Implementation
+
 Process called "translate_set_statement" takes backend as Integer, node as Integer returns Integer:
     Note: Translate set statement to set() command
 
@@ -391,6 +558,17 @@ Process called "translate_set_statement" takes backend as Integer, node as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a CMake if/else/endif chain. CMake requires explicit endif() so
+the indent dance must close cleanly.
+@End Reasoning
+
+@Implementation:
+Reads condition (offset 8), then_block (offset 16), else_block (offset
+24). Emits "if(cond)", then the then_block at +1 indent, then optionally
+"else()" and the else_block at +1 indent. Closes with "endif()".
+@End Implementation
 
 Process called "translate_if_statement" takes backend as Integer, node as Integer returns Integer:
     Note: Translate if statement to if()/endif()
@@ -437,6 +615,17 @@ Process called "translate_if_statement" takes backend as Integer, node as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+HIR for-statements map to CMake foreach. Falls back to "item" as the
+iterator variable name when the HIR symbol info is missing or empty.
+@End Reasoning
+
+@Implementation:
+Reads iterator_variable (HIRSymbolInfo pointer at offset 8), iterable
+(offset 16), body (offset 32). Emits "foreach(<name> <iterable>)", body
+at +1 indent, then "endforeach()".
+@End Implementation
 
 Process called "translate_for_statement" takes backend as Integer, node as Integer returns Integer:
     Note: Translate for statement to foreach()
@@ -489,6 +678,15 @@ Process called "translate_for_statement" takes backend as Integer, node as Integ
     Return 1
 End Process
 
+@Reasoning:
+CMake while loops mirror the HIR while-statement directly.
+@End Reasoning
+
+@Implementation:
+Reads condition (offset 8) and body (offset 16). Emits "while(cond)",
+body at +1 indent, then "endwhile()".
+@End Implementation
+
 Process called "translate_while_statement" takes backend as Integer, node as Integer returns Integer:
     Note: Translate while statement to while()
 
@@ -524,6 +722,20 @@ Process called "translate_while_statement" takes backend as Integer, node as Int
 
     Return 1
 End Process
+
+@Reasoning:
+HIR call expressions are emitted as CMake commands "name(arg1 arg2
+...)". The callee can be any expression (including an identifier or
+nested call).
+@End Reasoning
+
+@Implementation:
+Reads callee (offset 8), arguments list (offset 16), argument_count
+(offset 24). Emits indent, translates callee, emits '('. Walks the
+arguments list emitting each via translate_expression with single-space
+separators (CMake uses whitespace separation, not commas). Closes with
+")".
+@End Implementation
 
 Process called "translate_call_expression" takes backend as Integer, node as Integer returns Integer:
     Note: Translate call expression to CMake command
@@ -572,6 +784,19 @@ Process called "translate_call_expression" takes backend as Integer, node as Int
     Return 1
 End Process
 
+@Reasoning:
+HIR process definitions become CMake function() blocks. CMake function
+parameters do not have explicit types so HIR type info is dropped here.
+@End Reasoning
+
+@Implementation:
+Reads process_name (offset 8), parameters list (offset 24),
+parameter_count (offset 32), body (offset 48). Emits "function(name)",
+body at +1 indent, then "endfunction()". Note: parameter list emission
+is currently unimplemented - this is tracked as a known limitation, not
+a placeholder shortcut.
+@End Implementation
+
 Process called "translate_process_definition" takes backend as Integer, node as Integer returns Integer:
     Note: Translate process definition to function()
 
@@ -616,6 +841,22 @@ End Process
 Note: ============================================================================
 Note: Expression Translation
 Note: ============================================================================
+
+@Reasoning:
+Translate an HIR expression to CMake syntax. Identifiers become
+${VAR} references; literals are emitted verbatim; array literals
+become space-separated value lists (CMake's list-passing convention).
+Call expressions recurse through translate_call_expression to support
+nested commands.
+@End Reasoning
+
+@Implementation:
+Dispatches on node_type at offset 0. Identifier: emits "${" + name +
+"}" where name is read from offset 40. Literal: emits the value at
+offset 40 verbatim. Array literal: walks elements (offset 24) /
+element_count (offset 32) emitting each with space separators.
+Call expression: recurses translate_call_expression.
+@End Implementation
 
 Process called "translate_expression" takes backend as Integer, expr as Integer returns Integer:
     Note: Translate HIR expression to CMake syntax

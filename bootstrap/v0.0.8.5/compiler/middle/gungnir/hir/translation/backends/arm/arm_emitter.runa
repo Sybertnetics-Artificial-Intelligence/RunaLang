@@ -11,35 +11,146 @@ Import "../emitter_common.runa" as EmitterCommon
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
+@Reasoning:
+Mirror of the shared 24-byte raw emitter header so callers that want a typed
+view of the same memory can use it. The underlying allocation is owned and
+managed by the shared emitter_common primitives.
+@End Reasoning
+
+@Implementation:
+Three packed Integer fields (buffer pointer, capacity, current length) match
+the byte layout used by emitter_raw_* helpers at offsets 0, 8, 16. Do not
+add fields without updating EMITTER_HEADER_SIZE in emitter_common.runa.
+@End Implementation
+
 Type called "ArmEmitter":
     buffer as Integer
     capacity as Integer
     length as Integer
 End Type
 
+@Reasoning:
+Public constructor for the ARM emitter. Exists so callers do not need to
+know that the implementation is the shared raw byte buffer.
+@End Reasoning
+
+@Implementation:
+Delegates to emitter_raw_create which allocates a 24-byte header plus an
+initial-capacity backing buffer and returns the header pointer (0 on
+allocation failure).
+@End Implementation
+
 Process called "create_arm_emitter" returns Integer:
     Return proc emitter_raw_create from EmitterCommon
 End Process
+
+@Reasoning:
+Frees the emitter's backing buffer and header. Provided as a named wrapper
+so call sites have an ARM-specific name and so the underlying helper can be
+swapped without touching every backend.
+@End Reasoning
+
+@Implementation:
+Delegates to emitter_raw_destroy. Null emitter is safe (returns 1).
+@End Implementation
+
+@Security_Scope:
+Caller must not use the emitter after this call; the pointer becomes
+dangling. Backend code paths that hold the pointer must drop it.
+@End Security_Scope
 
 Process called "destroy_arm_emitter" takes emitter as Integer:
     proc emitter_raw_destroy from EmitterCommon with emitter
 End Process
 
+@Reasoning:
+Public capacity-reservation hook exposed for ARM-specific callers that emit
+large operand sequences and want to avoid intermediate reallocations.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_ensure_capacity which geometrically doubles capacity
+until the request fits.
+@End Implementation
+
 Process called "ensure_capacity" takes emitter as Integer, additional_bytes as Integer:
     proc emitter_raw_ensure_capacity from EmitterCommon with emitter, additional_bytes
 End Process
+
+@Reasoning:
+Thin wrapper around the memory primitive memcpy with argument order kept
+backwards (source first, dest second) to match the historical signature in
+this module. Used by ARM directive emission code that may need to splice
+external buffers.
+@End Reasoning
+
+@Implementation:
+Calls memory_copy with arguments reordered to (dest, source, size). Caller
+owns both buffers; no bounds checking is performed.
+@End Implementation
+
+@Security_Scope:
+Caller is responsible for ensuring both buffers are valid and at least
+`size` bytes long. Misuse causes memory corruption.
+@End Security_Scope
 
 Process called "copy_memory" takes source as Integer, dest as Integer, size as Integer:
     proc memory_copy from MemoryCore with dest, source, size
 End Process
 
+@Reasoning:
+Append a single ASCII byte to the emitter. Hot helper used for punctuation
+(spaces, commas, brackets) during ARM assembly generation.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_emit_byte which grows the buffer if needed and
+appends one byte.
+@End Implementation
+
+@Performance_Hints:
+Amortized O(1). On the hot path; do not add overhead here.
+@End Performance_Hints
+
 Process called "emit_char" takes emitter as Integer, char as Integer:
     proc emitter_raw_emit_byte from EmitterCommon with emitter, char
 End Process
 
+@Reasoning:
+Append a null-terminated string to the emitter. The most-used helper for
+mnemonics, register names, and identifiers.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_emit_string which measures the string length once,
+then bulk-copies bytes. Empty or null strings are no-ops.
+@End Implementation
+
+@Performance_Hints:
+O(n) in string length plus an amortized O(1) per growth-doubling.
+@End Performance_Hints
+
 Process called "emit_string" takes emitter as Integer, string as Integer:
     proc emitter_raw_emit_string from EmitterCommon with emitter, string
 End Process
+
+@Reasoning:
+Format an integer as a base-10 ASCII decimal and emit it to the buffer.
+ARM immediate operands and offsets are written as decimal so the binutils
+assembler treats them uniformly.
+@End Reasoning
+
+@Implementation:
+Special-cases negatives (emits '-' then negates) and zero (emits '0'
+directly). Otherwise builds the digit sequence into a 32-byte scratch
+buffer using modulo-10 / divide-by-10, then emits the digits in reverse
+order (most-significant first). Scratch buffer is freed before return.
+@End Implementation
+
+@Performance_Hints:
+O(log10(value)) digit decomposition plus the same number of emits. The
+32-byte scratch buffer is generous for 64-bit integers (max 20 digits).
+@End Performance_Hints
 
 Process called "emit_integer" takes emitter as Integer, value as Integer:
     Note: Emit an integer as decimal string. Handles negatives and zero.
@@ -73,9 +184,33 @@ Process called "emit_integer" takes emitter as Integer, value as Integer:
     proc deallocate from Layout with digits
 End Process
 
+@Reasoning:
+Newline emission is broken out so the same byte (LF = 10) can be retuned
+later (e.g. CRLF for Windows assemblers) in one place.
+@End Reasoning
+
+@Implementation:
+Emits a single LF (0x0A) byte via emitter_raw_emit_byte.
+@End Implementation
+
 Process called "emit_newline" takes emitter as Integer:
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
 End Process
+
+@Reasoning:
+ARM-specific indent helper. ARM assembly conventionally uses 4 columns per
+nesting level (e.g. inside function bodies, after label/directive headers).
+@End Reasoning
+
+@Implementation:
+Emits level * 4 ASCII spaces in a tight loop. Negative or zero level emits
+nothing.
+@End Implementation
+
+@Performance_Hints:
+O(level * 4) - tiny constant factor, fine on the hot path. Could be
+replaced with a precomputed indent string for very deep nesting.
+@End Performance_Hints
 
 Process called "emit_indent" takes emitter as Integer, level as Integer:
     Note: 4-space indentation per ARM assembly readability convention.
@@ -87,9 +222,34 @@ Process called "emit_indent" takes emitter as Integer, level as Integer:
     End While
 End Process
 
+@Reasoning:
+ARM mnemonic-vs-operand separation traditionally uses a hard tab so the
+operands align in a single column when viewed in a monospace editor.
+@End Reasoning
+
+@Implementation:
+Emits a single HT (0x09) byte.
+@End Implementation
+
 Process called "emit_tab" takes emitter as Integer:
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 9
 End Process
+
+@Reasoning:
+ARM assembly uses "@" (0x40) as the line-comment prefix. Centralising the
+prefix here lets ARMv7/ARMv8 dialects share emission code.
+@End Reasoning
+
+@Implementation:
+Emits "@", then a space, then the null-terminated comment text, then LF.
+Comment text is emitted verbatim - the caller must strip any embedded
+newlines that would break the single-line comment shape.
+@End Implementation
+
+@Security_Scope:
+Comment text passes through unchanged. Callers should not embed user-
+controlled input that could contain newlines without sanitising first.
+@End Security_Scope
 
 Process called "emit_comment" takes emitter as Integer, comment_text as Integer:
     Note: Emit ARM assembly comment using "@ " prefix and a trailing newline.
@@ -99,13 +259,49 @@ Process called "emit_comment" takes emitter as Integer, comment_text as Integer:
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
 End Process
 
+@Reasoning:
+Snapshot the emitter's buffer into a freshly allocated null-terminated
+copy. Used at end-of-translation to hand a stable string to the caller.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_get_output which allocates `length + 1` bytes,
+copies the buffer, and writes a trailing NUL. Returns 0 on allocation
+failure. Caller owns the returned pointer.
+@End Implementation
+
+@Security_Scope:
+Caller owns the returned allocation and must free it; the emitter retains
+its own buffer for further use or destruction.
+@End Security_Scope
+
 Process called "get_output" takes emitter as Integer returns Integer:
     Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
 
+@Reasoning:
+Expose the current write position so callers can mark and patch (e.g.
+back-patch branch targets or compute sizes of emitted sequences).
+@End Reasoning
+
+@Implementation:
+Returns the 8-byte length field stored in the raw header at offset 16.
+@End Implementation
+
 Process called "get_position" takes emitter as Integer returns Integer:
     Return proc emitter_raw_length from EmitterCommon with emitter
 End Process
+
+@Reasoning:
+Allow reuse of an existing emitter for a fresh translation without
+reallocating. Useful when several small translations are emitted in a
+loop and the caller wants to reuse the buffer.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_reset which zeros the length field while leaving
+the allocated buffer in place.
+@End Implementation
 
 Process called "reset" takes emitter as Integer:
     proc emitter_raw_reset from EmitterCommon with emitter

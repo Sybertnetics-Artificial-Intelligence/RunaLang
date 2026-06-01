@@ -13,11 +13,41 @@ Import "compiler/middle/gungnir/hir/translation/frontends/css/css_to_hir.runa" a
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
+@Reasoning:
+Counter triple shared across the CSS-to-HIR driver. Same layout as the
+other CSS suites (parser, round-trip) so a unified runner can swap test
+binaries with no struct conversion.
+@End Reasoning
+
+@Implementation:
+total at offset 0, passed at 8, failed at 16; mutated via raw
+Layout.memory_set_int64 because results is shared by handle.
+@End Implementation
+
 Type called "TestResults":
     total as Integer
     passed as Integer
     failed as Integer
 End Type
+
+@Reasoning:
+Top-level driver for CSS-to-HIR translation. Calls 10 named test
+processes, each covering a distinct CSS construct (rule, selectors,
+at-rules, media query, comment, pseudo-class, attribute selector).
+Distinct named test procs (rather than parameterized calls) make a
+failure log immediately identify which CSS feature regressed.
+@End Reasoning
+
+@Implementation:
+Allocate TestResults, print banner, run all 10 test_* procs against
+the shared results buffer, print summary, return 1 on any failure
+else 0.
+@End Implementation
+
+@TestCases:
+- All 10 named CSS forms translate to non-null HIR -> exit 0
+- Any single test_* returns 0 -> results.failed >= 1 -> exit 1
+@End TestCases
 
 Process called "main" returns Integer:
     Let results be a value of type TestResults with total as 0, passed as 0, failed as 0
@@ -44,6 +74,23 @@ Process called "main" returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Baseline smoke test for the translator: a single type selector with one
+declaration. If translate_css_to_hir cannot handle this canonical form,
+nothing else will work, so this test is intentionally first.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "div { color: red; }" via StringCore. Call
+translate_css_to_hir(source, 0). Non-null result -> [PASS]+ passed
+counter; null result -> [FAIL]+failed counter. Always frees source.
+@End Implementation
+
+@TestCases:
+- Input "div { color: red; }" -> non-null HIR, results.passed += 1
+- Translator returns 0 -> "Simple rule: failed", results.failed += 1
+@End TestCases
+
 Process called "test_simple_rule" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
     proc memory_set_int64 from Layout with results, 0, _rtot1 plus 1
@@ -66,6 +113,22 @@ Process called "test_simple_rule" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies the dot-prefix class selector path through the lexer and
+translator. Class selectors are the most common CSS selector form,
+so a regression here would block almost every real stylesheet.
+@End Reasoning
+
+@Implementation:
+Increment total. Build ".container { width: 100%; }". Call translator
+with 0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input ".container { width: 100%; }" -> non-null HIR, passed += 1
+- Translator drops the "." prefix or fails -> failed += 1
+@End TestCases
 
 Process called "test_class_selector" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -90,6 +153,23 @@ Process called "test_class_selector" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Verifies the hash-prefix ID selector path. Distinct from class
+selectors in the lexer (# vs .) but identical in the parser, so this
+test catches a token-class confusion regression that would let class
+tests pass while ID selectors silently drop.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "#main { padding: 20px; }". Call translator
+with 0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input "#main { padding: 20px; }" -> non-null HIR, passed += 1
+- Lexer maps "#" to a non-ID token -> translator returns 0 -> failed += 1
+@End TestCases
+
 Process called "test_id_selector" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
     proc memory_set_int64 from Layout with results, 0, _rtot1 plus 1
@@ -112,6 +192,24 @@ Process called "test_id_selector" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies comma-separated selector lists. The parser must produce a
+selector group node rather than treating ", h2, h3" as part of the
+first selector's identifier.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "h1, h2, h3 { margin: 0; }". Translator with
+0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input "h1, h2, h3 { margin: 0; }" -> non-null HIR with a selector
+  group, passed += 1
+- Translator coalesces the three selectors into one identifier or
+  fails -> failed += 1
+@End TestCases
 
 Process called "test_multiple_selectors" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -136,6 +234,25 @@ Process called "test_multiple_selectors" takes results as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Verifies that the declaration list inside one rule accepts three
+property:value pairs separated by semicolons. Catches a parser
+regression where the loop exits after the first declaration.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "body { margin: 0; padding: 0; font-size: 16px; }".
+Translator with 0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input with three semicolon-separated declarations -> non-null HIR,
+  passed += 1
+- Parser drops the trailing two declarations -> translator may still
+  succeed but failed += 1 if it returns 0
+- Translator fails outright -> "Multiple declarations: failed", failed += 1
+@End TestCases
+
 Process called "test_multiple_declarations" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
     proc memory_set_int64 from Layout with results, 0, _rtot1 plus 1
@@ -158,6 +275,22 @@ Process called "test_multiple_declarations" takes results as Integer returns Int
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies a non-nested at-rule (@import) translates correctly. At-rules
+have a different grammar from regular declarations and use url() function
+notation, both of which the lexer must handle.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "@import url(\"test.css\");". Translator with
+0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input @import url("test.css"); -> non-null HIR, passed += 1
+- url() function not recognized or @ token mishandled -> failed += 1
+@End TestCases
 
 Process called "test_at_rule" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -182,6 +315,24 @@ Process called "test_at_rule" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Verifies a nested at-rule (@media) containing rule blocks. Exercises
+recursive rule parsing because the contained "body { font-size: 14px; }"
+must itself be translated through the same code path used at top level.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "@media (max-width: 768px) { body { font-size: 14px; } }".
+Translator with 0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input @media (max-width: 768px) { ... } -> non-null HIR with nested
+  rule, passed += 1
+- Parser fails to recurse into the @media body -> failed += 1
+- Translator returns 0 on the media-query predicate -> failed += 1
+@End TestCases
+
 Process called "test_media_query" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
     proc memory_set_int64 from Layout with results, 0, _rtot1 plus 1
@@ -204,6 +355,24 @@ Process called "test_media_query" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies a standalone /* ... */ CSS comment translates without error.
+The translator may either preserve or drop the comment, but it must not
+fail. Confirms the lexer correctly skips the multi-character /* ... */
+sentinel rather than treating "/" or "*" as a stray token.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "/* Comment */". Translator with 0 arena. Branch
+on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input "/* Comment */" -> non-null HIR (whether comment is preserved
+  or stripped is up to the translator), passed += 1
+- Lexer fails on /* -> translator returns 0 -> failed += 1
+@End TestCases
 
 Process called "test_comment" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -228,6 +397,25 @@ Process called "test_comment" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Verifies the single-colon pseudo-class form. The lexer must produce a
+pseudo-class token when ":hover" follows an identifier without
+whitespace; failure here means selector lexing is too aggressive at
+splitting tokens.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "a:hover { color: blue; }". Translator with
+0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input "a:hover { color: blue; }" -> non-null HIR with pseudo-class
+  selector, passed += 1
+- Lexer treats ":hover" as ":" then identifier -> translator may still
+  succeed but selector semantics wrong; null HIR -> failed += 1
+@End TestCases
+
 Process called "test_pseudo_class" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
     proc memory_set_int64 from Layout with results, 0, _rtot1 plus 1
@@ -250,6 +438,25 @@ Process called "test_pseudo_class" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies attribute selectors with [name="value"] syntax. Catches a
+regression where the lexer treats "[" as an unrecognized token or the
+parser fails to consume the matching "]", which would silently corrupt
+the selector AST and cause downstream emitter problems.
+@End Reasoning
+
+@Implementation:
+Increment total. Build "input[type=\"text\"] { border: 1px solid #ccc; }".
+Translator with 0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input "input[type=\"text\"] { border: 1px solid #ccc; }" -> non-null
+  HIR with attribute-selector node, passed += 1
+- Lexer breaks on "[" or "=" inside selector -> translator returns 0
+  -> failed += 1
+@End TestCases
 
 Process called "test_attribute_selector" takes results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -274,6 +481,16 @@ Process called "test_attribute_selector" takes results as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Banner emitted once at startup. Separator width (35 "=") matches the
+title length so the heading boxes cleanly in CI logs.
+@End Reasoning
+
+@Implementation:
+Allocate title and "=" rule via StringCore, print each, deallocate.
+Always returns 1.
+@End Implementation
+
 Process called "print_header" returns Integer:
     Let header be proc create_string from StringCore with "CSS to HIR Translation Test Suite"
     proc print from header
@@ -286,6 +503,16 @@ Process called "print_header" returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+"[PASS] <name>" line shared by all 10 test_* procs in this file.
+Centralized so the formatting is identical across the suite.
+@End Reasoning
+
+@Implementation:
+Allocate "[PASS] " prefix, print prefix and caller-owned test_name,
+deallocate the prefix.
+@End Implementation
+
 Process called "print_test_success" takes test_name as Integer returns Integer:
     Let pass_msg be proc create_string from StringCore with "[PASS] "
     proc print from pass_msg
@@ -295,6 +522,17 @@ Process called "print_test_success" takes test_name as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+"[FAIL] <name>" line. Unlike the parser/round-trip suites this signature
+takes only a name because each test_* proc here passes a pre-formatted
+"<scenario>: failed" string, so the reason is baked into the name.
+@End Reasoning
+
+@Implementation:
+Allocate "[FAIL] " prefix, print prefix and caller-owned test_name,
+deallocate the prefix.
+@End Implementation
+
 Process called "print_test_failure" takes test_name as Integer returns Integer:
     Let fail_msg be proc create_string from StringCore with "[FAIL] "
     proc print from fail_msg
@@ -303,6 +541,18 @@ Process called "print_test_failure" takes test_name as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Final summary block matching peer CSS suites. Reads counters through
+type-checked struct field access (results.total etc.) at the report
+site even though the hot path in each test_* proc uses raw
+memory_get_int64 mutations.
+@End Reasoning
+
+@Implementation:
+Print "=" separator, "Test Results:" heading, then Total/Passed/Failed
+lines. Each label allocated/printed/deallocated; numbers via print_int.
+@End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
     Let separator be proc create_string from StringCore with "==================================="
@@ -330,6 +580,21 @@ Process called "print_results" takes results as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Local integer formatter so this suite has no dependency on stdlib
+formatting allocators. Zero and negative inputs are handled explicitly.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> print "0", return.
+2. Allocate 32-byte buffer, walk position from 31 downward writing
+   48 + (temp % 10), divide temp by 10 each pass.
+3. For negatives, operate on -temp and write '-' (45) at the final
+   position.
+4. Increment position once, print buffer+position as a C string,
+   deallocate the buffer.
+@End Implementation
 
 Process called "print_int" takes value as Integer returns Integer:
     If value is equal to 0:

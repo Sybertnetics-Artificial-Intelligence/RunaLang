@@ -11,6 +11,18 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
+@Reasoning:
+Regex parse trees are recursive (alternation of concatenations of quantified atoms); the top-level HIR envelope tags the document as a pattern and embeds the recursively translated root as its sole child.
+@End Reasoning
+
+@Implementation:
+Allocate a Dictionary tagged type=regex_pattern, translate the AST root via translate_node, and attach the result at key "pattern".
+@End Implementation
+
+@Security_Scope:
+Regex sources are typically user-supplied; the translator does no compilation, so adversarial patterns cannot trigger ReDoS at this stage. Backreferences may be present and must be validated downstream against the actual group count.
+@End Security_Scope
+
 Process called "translate_regex_to_hir" takes ast as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -21,6 +33,14 @@ Process called "translate_regex_to_hir" takes ast as Integer returns Integer:
     proc set from Dict with hir, pattern_key, pattern_value
     Return hir
 End Process
+
+@Reasoning:
+The regex AST encodes ten node kinds with the same physical layout but different semantic meanings; central dispatch keeps translate_regex_to_hir oblivious to the per-kind shape and lets every recursive call site share one entry point.
+@End Reasoning
+
+@Implementation:
+Read the tag at offset 0 and dispatch: 1->pattern, 2->alternation, 3->concatenation, 4->quantified, 5->group, 6->char_class, 7->literal, 8->anchor, 9->backreference, 10->dot. Null input or unknown tag returns 0.
+@End Implementation
 
 Process called "translate_node" takes node as Integer returns Integer:
     If node is equal to 0:
@@ -60,6 +80,14 @@ Process called "translate_node" takes node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+The REGEX_PATTERN wrapper node has exactly one meaningful child (the root expression); this helper unwraps the envelope so callers see the pattern body directly.
+@End Reasoning
+
+@Implementation:
+Read the children List from offset 32. If there is at least one child, recursively translate child[0] and return it. Otherwise return an empty Dictionary so callers do not see null.
+@End Implementation
+
 Process called "translate_pattern" takes node as Integer returns Integer:
     Let children be proc memory_get_int64 from Layout with node, 32
     Let child_count be proc size from List with children
@@ -69,6 +97,14 @@ Process called "translate_pattern" takes node as Integer returns Integer:
     End If
     Return proc create from Dict
 End Process
+
+@Reasoning:
+"a|b|c" forms an n-ary alternation rather than a left-leaning binary tree; emitting all branches as a flat list lets matchers build NFA epsilon-fans without re-walking nested OR structure.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=alternation. Walk the AST children, recursively translate each into a HIR sub-Dictionary, and append non-null results to a List attached at key "branches".
+@End Implementation
 
 Process called "translate_alternation" takes node as Integer returns Integer:
     Let hir be proc create from Dict
@@ -92,6 +128,14 @@ Process called "translate_alternation" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+"abc" forms an n-ary concatenation; an ordered List of elements preserves matching order without imposing a binary tree shape on downstream code generators.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=concatenation. Walk children, recursively translate each, and append non-null results to a List attached at key "elements".
+@End Implementation
+
 Process called "translate_concatenation" takes node as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -113,6 +157,14 @@ Process called "translate_concatenation" takes node as Integer returns Integer:
     proc set from Dict with hir, elements_key, elements
     Return hir
 End Process
+
+@Reasoning:
+The parser encodes the quantifier kind in a metadata field (8=*, 9=+, 10=?, 11=range {m,n}) and the inner sub-expression as the single child; translating the metadata into a recognisable string keeps the HIR self-describing.
+@End Reasoning
+
+@Implementation:
+Read metadata at offset 24. Map 8 to "*", 9 to "+", 10 to "?"; for 11 (range form) materialise the literal "{m,n}" lexeme from the node's value pointer. Attach the choice at key "quantifier". Translate the single inner child and attach it at key "element".
+@End Implementation
 
 Process called "translate_quantified" takes node as Integer returns Integer:
     Let hir be proc create from Dict
@@ -148,6 +200,14 @@ Process called "translate_quantified" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+Groups split into three flavours: capturing "(...)", non-capturing "(?:...)", and named "(?<name>...)"; the parser encodes the kind in metadata so the translator can lift it into a human-readable HIR string.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=group. Read metadata at offset 24: default "capturing", 17 -> "non_capturing", 18 -> "named"; attach at key "group_type". Translate the single child sub-expression and attach at key "contents".
+@End Implementation
+
 Process called "translate_group" takes node as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -174,6 +234,14 @@ Process called "translate_group" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+Character classes "[a-z]" carry their full bracketed lexeme in the parser node's value pointer; deferring expansion (range explosion, Unicode property lookup) to the matcher avoids encoding ISA-specific decisions in HIR.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=char_class. If the node's value pointer and length are non-zero, materialise the lexeme as a String and attach at key "value".
+@End Implementation
+
 Process called "translate_char_class" takes node as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -191,6 +259,14 @@ Process called "translate_char_class" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+A literal is the leaf case of the AST - a single matched character or escape sequence captured verbatim from the source.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=literal with the lexeme materialised from the node's value pointer/length and attached at key "value".
+@End Implementation
+
 Process called "translate_literal" takes node as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -203,6 +279,14 @@ Process called "translate_literal" takes node as Integer returns Integer:
     proc set from Dict with hir, value_key, value_str
     Return hir
 End Process
+
+@Reasoning:
+Anchors (^, $, \b, \B, \A, \z, ...) match zero-width positions; preserving the original anchor token as a string in HIR keeps the meaning explicit without imposing an enum.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=anchor with the anchor lexeme attached at key "value".
+@End Implementation
 
 Process called "translate_anchor" takes node as Integer returns Integer:
     Let hir be proc create from Dict
@@ -217,6 +301,18 @@ Process called "translate_anchor" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+Backreferences "\1", "\k<name>" reference an earlier capture group; the lexeme carries the group number or name as text, leaving validation against actual group count to later semantic analysis.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged type=backreference with the reference lexeme attached at key "value".
+@End Implementation
+
+@Security_Scope:
+Backreferences enable non-regular matching that can drive catastrophic backtracking; the consumer must reject or budget-cap them on untrusted patterns.
+@End Security_Scope
+
 Process called "translate_backreference" takes node as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -230,6 +326,14 @@ Process called "translate_backreference" takes node as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+The "." meta-character matches one character (modulo s-flag handling for newlines); it has no lexeme payload so the HIR node carries only the discriminator.
+@End Reasoning
+
+@Implementation:
+Return a Dictionary tagged type=dot with no further fields.
+@End Implementation
+
 Process called "translate_dot" takes node as Integer returns Integer:
     Let hir be proc create from Dict
     Let type_key be proc create_string_literal with "type"
@@ -237,6 +341,14 @@ Process called "translate_dot" takes node as Integer returns Integer:
     proc set from Dict with hir, type_key, type_value
     Return hir
 End Process
+
+@Reasoning:
+Centralising string-literal construction lets future intern-table changes touch a single call site instead of every key allocation in the translator.
+@End Reasoning
+
+@Implementation:
+Forward to StringCore.create_string_from_literal and return its pointer.
+@End Implementation
 
 Process called "create_string_literal" takes value as String returns Integer:
     Return proc create_string_from_literal from StringCore with value

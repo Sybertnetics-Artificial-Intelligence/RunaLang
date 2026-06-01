@@ -17,6 +17,31 @@ Note: ================================================================
 Note: LaTeX Source to HIR Translation
 Note: ================================================================
 
+@Reasoning:
+Forward leg of the LaTeX <-> HIR pipeline. Strict mode: returns 0 on
+any lex/parse/translate error so callers don't proceed with partial
+HIR. The `_with_errors` variant below preserves diagnostics for
+reporting.
+@End Reasoning
+
+@Implementation:
+Creates a fresh lexer over source_code, tokenizes, and bails on lexer
+errors. Creates a parser over the tokens, parses to AST, bails on
+parser errors. Creates a translator and produces HIR, bails if the
+translator reports has_errors. Otherwise returns the HIR module root.
+@End Implementation
+
+@Performance_Hints:
+Cold path - one full pipeline per source file. Allocates lexer, parser,
+translator, plus all intermediate token/AST/HIR structures.
+@End Performance_Hints
+
+@Security_Scope:
+Treats source_code as untrusted. All error conditions are funneled
+through stage-local error lists rather than crashing; null returns
+indicate "do not proceed" to the caller.
+@End Security_Scope
+
 Process called "latex_to_hir" that takes source_code as String returns Integer:
     Note: Step 1: Lexical analysis
     Let lexer_ptr be proc create_lexer from LaTeXLexer with source_code
@@ -64,6 +89,18 @@ Note: ================================================================
 Note: HIR to LaTeX Code Generation
 Note: ================================================================
 
+@Reasoning:
+Backend leg of the pipeline; converts HIR back to LaTeX source. Strict
+mode: returns empty string on any backend error so callers can detect
+failure without examining a separate error list.
+@End Reasoning
+
+@Implementation:
+Creates the HIR -> LaTeX backend, invokes translate, then checks the
+backend's has_errors flag. Returns the empty string on error,
+otherwise the generated LaTeX source.
+@End Implementation
+
 Process called "hir_to_latex" that takes hir_module as Integer returns String:
     Note: Create backend and generate LaTeX code
     Let backend_ptr be proc create_backend from HIRToLaTeX
@@ -84,6 +121,19 @@ Note: ================================================================
 Note: Round-Trip Translation (LaTeX -> HIR -> LaTeX)
 Note: ================================================================
 
+@Reasoning:
+End-to-end fidelity test entry point: ingest LaTeX source, lower to
+HIR, then regenerate LaTeX source from that HIR. Used by golden-output
+tests to verify that the LaTeX <-> HIR translation preserves meaning.
+Empty string on forward-leg failure prevents feeding null HIR to the
+backend.
+@End Reasoning
+
+@Implementation:
+Chains latex_to_hir then hir_to_latex. If latex_to_hir returned 0
+(failure), returns the empty string immediately.
+@End Implementation
+
 Process called "latex_roundtrip" that takes source_code as String returns String:
     Note: Translate to HIR
     Let hir_module be proc latex_to_hir from source_code
@@ -102,6 +152,37 @@ End Process
 Note: ================================================================
 Note: Error Reporting Helpers
 Note: ================================================================
+
+@Reasoning:
+Diagnostic-preserving variant of latex_to_hir. Unlike the strict form,
+this collects errors from every stage (lex, parse, translate) plus
+translator warnings into a single output list so the caller (CLI,
+LSP, golden test runner) can present them all to the user. Continues
+past lexer/parser errors when possible to maximize the diagnostic
+yield from a single run.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh List for the unified errors. Tokenizes; prefixes any
+lexer errors with "Lexer: " and appends them. Parses; prefixes any
+parser errors with "Parser: " and appends them. If lexer or parser
+errors were found, returns 0 (translation would be meaningless), but
+the errors list is still written out via the errors_out pointer.
+Otherwise translates, prefixes translator errors with "Translator: "
+and warnings with "Warning: ", and writes the unified list before
+returning the HIR module (or 0 if translation produced errors).
+@End Implementation
+
+@Performance_Hints:
+Cold path - one pipeline per source file. Extra cost over latex_to_hir
+is the string_concat per error/warning to add the stage prefix.
+@End Performance_Hints
+
+@Security_Scope:
+Treats source_code as untrusted. errors_out is a caller-provided
+output pointer; this proc writes the new error-list pointer at offset
+0 of that location. Caller owns the resulting list.
+@End Security_Scope
 
 Process called "latex_to_hir_with_errors" that takes source_code as String, errors_out as Integer returns Integer:
     Note: Step 1: Lexical analysis
@@ -187,6 +268,25 @@ Process called "latex_to_hir_with_errors" that takes source_code as String, erro
     Return hir_module
 End Process
 
+@Reasoning:
+Diagnostic-preserving variant of hir_to_latex. Collects backend errors
+into a unified list and writes them out via the errors_out pointer so
+the caller can present them.
+@End Reasoning
+
+@Implementation:
+Runs the backend, then iterates backend errors prefixing each with
+"Backend: " before adding to the unified list. Writes the list to
+errors_out, returns the empty string if any backend errors were found,
+otherwise the generated LaTeX source.
+@End Implementation
+
+@Security_Scope:
+errors_out is a caller-provided output pointer; this proc writes the
+new error-list pointer at offset 0 of that location. Caller owns the
+resulting list.
+@End Security_Scope
+
 Process called "hir_to_latex_with_errors" that takes hir_module as Integer, errors_out as Integer returns String:
     Let backend_ptr be proc create_backend from HIRToLaTeX
     Let latex_code be proc translate from HIRToLaTeX with backend_ptr, hir_module
@@ -221,6 +321,22 @@ Note: ================================================================
 Note: Validation and Formatting
 Note: ================================================================
 
+@Reasoning:
+Boolean syntactic-validity check: does the source lex and parse
+without errors? Does not invoke the translator because well-formedness
+is independent of HIR mapping coverage. Used by IDE tooling and the
+test runner for cheap validity gating.
+@End Reasoning
+
+@Implementation:
+Runs the lexer and bails with 0 on any lexer error. Runs the parser
+and bails with 0 on any parser error. Otherwise returns 1.
+@End Implementation
+
+@Performance_Hints:
+Roughly half the cost of latex_to_hir because it skips translation.
+@End Performance_Hints
+
 Process called "validate_latex" that takes source_code as String returns Integer:
     Note: Validate LaTeX by attempting to parse it
     Let lexer_ptr be proc create_lexer from LaTeXLexer with source_code
@@ -248,6 +364,19 @@ Process called "validate_latex" that takes source_code as String returns Integer
     Return 1
 End Process
 
+@Reasoning:
+Source reformatter implemented as a round-trip. Lowering to HIR
+discards optional whitespace/structural variations; regenerating from
+HIR produces a canonical form. Equivalent to running latex_roundtrip
+under a different name.
+@End Reasoning
+
+@Implementation:
+Forwards to latex_roundtrip; preserved as a separate entry for IDE
+tooling that wants a "format this file" command distinct from a
+"verify round-trip fidelity" command.
+@End Implementation
+
 Process called "format_latex" that takes source_code as String returns String:
     Note: Format LaTeX by round-trip translation
     Note: This normalizes the code structure
@@ -257,6 +386,19 @@ End Process
 Note: ================================================================
 Note: Utility Functions
 Note: ================================================================
+
+@Reasoning:
+Convenience extractor for the standard LaTeX preamble commands (\title,
+\author, \date). Useful for indexing tools and document-listing UIs
+that want a quick summary without rendering the full document.
+@End Reasoning
+
+@Implementation:
+Lowers source to HIR; on failure returns an empty list rather than 0
+so callers can iterate the result unconditionally. Allocates a list
+and walks the HIR with extract_metadata_from_hir to populate it with
+key/value pairs.
+@End Implementation
 
 Process called "get_document_info" that takes source_code as String returns Integer:
     Note: Extract document metadata (title, author, date, etc.) from LaTeX source
@@ -275,6 +417,27 @@ Process called "get_document_info" that takes source_code as String returns Inte
 
     Return info_dict
 End Process
+
+@Reasoning:
+Recursive HIR walker for get_document_info. Visits every node looking
+for command nodes whose name matches a known metadata command (title,
+author, date), extracting the content of each match into the
+caller-supplied dictionary.
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately on a null node. Reads the node type at offset 8
+and the command_name at offset 16. If the command_name is non-null and
+matches "title", "author", or "date", appends a (key, content) pair to
+info_dict. Then reads the children list pointer and recurses into each
+child by index.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the HIR node count. Tail-recursive over siblings but uses real
+recursion across parent/child boundaries; recursion depth is bounded
+by the document's nesting depth (typically <20).
+@End Performance_Hints
 
 Process called "extract_metadata_from_hir" that takes info_dict as Integer, node as Integer returns Integer:
     Note: Recursively traverse HIR to extract document metadata
@@ -327,6 +490,18 @@ Process called "extract_metadata_from_hir" that takes info_dict as Integer, node
     Return 1
 End Process
 
+@Reasoning:
+Helper used by metadata, citation, and label extractors to pull the
+text payload out of a LaTeX command HIR node. Centralizes the offset
+convention so future HIR layout changes only need to update this proc.
+@End Reasoning
+
+@Implementation:
+Reads the content_node pointer at offset 24; if null, returns the empty
+string. Otherwise reads the text string at offset 0 of the content
+node; returns it if non-null, else the empty string.
+@End Implementation
+
 Process called "get_command_content" that takes node as Integer returns String:
     Note: Extract text content from a LaTeX command node
     Let content_node be proc get_int_at_offset from Memory with node, 24
@@ -343,6 +518,17 @@ Process called "get_command_content" that takes node as Integer returns String:
     Return ""
 End Process
 
+@Reasoning:
+Builds a fixed-shape (key, value) record used to populate the metadata
+list. Inlined here rather than using a generic Pair type to keep the
+metadata storage layout predictable for downstream consumers.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes; writes the key string at offset 0 and the value
+string at offset 8. Caller owns the resulting pointer.
+@End Implementation
+
 Process called "create_pair" that takes key as String, value as String returns Integer:
     Note: Create a key-value pair structure
     Let pair be proc allocate from Memory with 16
@@ -350,6 +536,19 @@ Process called "create_pair" that takes key as String, value as String returns I
     proc set_string_at_offset from Memory with pair, 8, value
     Return pair
 End Process
+
+@Reasoning:
+Extracts every citation key referenced in a LaTeX document so callers
+(bibliography linters, cross-reference checkers) can verify them
+against a .bib file. Recognizes the five most common natbib/biblatex
+citation commands.
+@End Reasoning
+
+@Implementation:
+Lowers source to HIR; on failure returns an empty list rather than 0
+so callers can iterate unconditionally. Allocates a result list and
+walks the HIR with extract_citations_from_hir.
+@End Implementation
 
 Process called "extract_citations" that takes source_code as String returns Integer:
     Note: Extract all citation keys from LaTeX document
@@ -367,6 +566,24 @@ Process called "extract_citations" that takes source_code as String returns Inte
 
     Return citations
 End Process
+
+@Reasoning:
+Recursive HIR walker for extract_citations. Recognizes the natbib/
+biblatex command family (\cite, \citep, \citet, \citealt, \citealp);
+other custom citation commands would require extending this list.
+@End Reasoning
+
+@Implementation:
+Returns 0 on a null node. Reads command_name at offset 16; if it
+matches any of the five known citation commands, extracts the
+citation key via get_command_content and appends it to the result
+list. Recurses into the children list at the HIR-defined offset.
+@End Implementation
+
+@Performance_Hints:
+O(n) in HIR node count with a small constant per node (five string
+comparisons in the worst case).
+@End Performance_Hints
 
 Process called "extract_citations_from_hir" that takes citations as Integer, node as Integer returns Integer:
     Note: Recursively traverse HIR to find citation commands
@@ -427,6 +644,17 @@ Process called "extract_citations_from_hir" that takes citations as Integer, nod
     Return 1
 End Process
 
+@Reasoning:
+Counterpart to extract_citations for the \label command. Used by
+cross-reference checkers to ensure every \ref and \pageref points at
+a known label.
+@End Reasoning
+
+@Implementation:
+Lowers source to HIR; on failure returns an empty list. Allocates a
+result list and walks the HIR with extract_labels_from_hir.
+@End Implementation
+
 Process called "extract_labels" that takes source_code as String returns Integer:
     Note: Extract all label identifiers from LaTeX document
     Let hir_module be proc latex_to_hir from source_code
@@ -443,6 +671,22 @@ Process called "extract_labels" that takes source_code as String returns Integer
 
     Return labels
 End Process
+
+@Reasoning:
+Recursive HIR walker for extract_labels. Only the single command name
+"label" is recognized; LaTeX has no other standard label-declaring
+commands.
+@End Reasoning
+
+@Implementation:
+Returns 0 on a null node. Reads command_name at offset 16; if it
+equals "label", appends the label name (via get_command_content) to
+the result list. Recurses into children.
+@End Implementation
+
+@Performance_Hints:
+O(n) in HIR node count.
+@End Performance_Hints
 
 Process called "extract_labels_from_hir" that takes labels as Integer, node as Integer returns Integer:
     Note: Recursively traverse HIR to find label commands

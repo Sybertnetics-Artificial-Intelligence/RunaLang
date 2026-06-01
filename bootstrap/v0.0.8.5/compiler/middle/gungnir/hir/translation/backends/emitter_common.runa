@@ -58,6 +58,23 @@ Note:   errors          - List of emitter error messages
 Note:   warnings        - List of emitter warning messages
 Note:   had_error       - 1 if any error was recorded
 Note: ============================================================================
+@Reasoning:
+High-level emitter struct carrying a byte buffer plus formatting and
+diagnostic state. The byte buffer (first three fields) is byte-compatible
+with the raw header layout used by per-backend buffers, so both APIs can
+share buffer primitives.
+@End Reasoning
+
+@Implementation:
+Fields:
+  output_buffer / output_capacity / output_length - raw 24-byte header.
+  indent_level / indent_size / use_tabs - format style.
+  current_line / current_column - 1-based cursor for diagnostics.
+  line_start - 1 when next emit should re-apply indent.
+  errors / warnings - String lists of recorded diagnostics.
+  had_error - latched failure flag.
+@End Implementation
+
 Type called "EmitterContext":
     output_buffer as Integer
     output_capacity as Integer
@@ -80,6 +97,26 @@ Note: These operate on the 24-byte header layout described above and are
 Note: shared between the struct API (which embeds the header in EmitterContext)
 Note: and per-language byte-buffer emitters which use the layout directly.
 Note: ============================================================================
+
+@Reasoning:
+Geometric-growth allocator for the raw byte buffer. Doubling capacity
+provides amortized O(1) per byte appended across a long emission. The
+previous String-rebuilding approach was O(n^2) in accumulated output.
+@End Reasoning
+
+@Implementation:
+Reads current capacity and length, computes available bytes. If enough,
+returns 1 immediately. Otherwise doubles capacity (with linear growth as
+fallback when doubling is still too small) until the request fits.
+Allocates a new buffer, copies existing bytes if any, frees the old
+buffer, and updates the header's buffer-pointer and capacity fields.
+Returns 1 on success, 0 on allocation failure.
+@End Implementation
+
+@Performance_Hints:
+Amortized O(1) per byte appended thanks to geometric doubling. Single
+grow event is O(length) due to the memcpy.
+@End Performance_Hints
 
 Note: Grow a raw header so it has room for `needed` additional bytes beyond
 Note: the current length. Returns 1 on success, 0 on allocation failure.
@@ -120,6 +157,20 @@ Process called "emitter_raw_ensure_capacity" takes header as Integer, needed as 
     Return 1
 End Process
 
+@Reasoning:
+Lowest-level append operation - writes exactly one byte. All higher-level
+emit helpers (string, indent, line) reduce to a sequence of these calls.
+@End Reasoning
+
+@Implementation:
+Calls emitter_raw_ensure_capacity for one byte. If growth fails returns 0.
+Otherwise writes the byte at offset `length`, increments length, returns 1.
+@End Implementation
+
+@Performance_Hints:
+Amortized O(1).
+@End Performance_Hints
+
 Note: Append a single byte to the raw buffer. Returns 1 on success.
 Process called "emitter_raw_emit_byte" takes header as Integer, byte_value as Integer returns Integer:
     Let success be proc emitter_raw_ensure_capacity with header, 1
@@ -133,6 +184,27 @@ Process called "emitter_raw_emit_byte" takes header as Integer, byte_value as In
     proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH, length plus 1
     Return 1
 End Process
+
+@Reasoning:
+Bulk-copy a null-terminated string into the buffer. Avoids per-byte
+function call overhead by measuring length once and doing one memcpy.
+@End Reasoning
+
+@Implementation:
+Null str returns 1 (no-op). Measures length via string_length and returns
+1 for empty strings. Calls ensure_capacity for the full length. If growth
+fails returns 0. Otherwise computes dest = buffer + length and bulk
+copies str_length bytes, then bumps length.
+@End Implementation
+
+@Performance_Hints:
+O(str_length) for the memcpy plus amortized O(1) for the growth.
+@End Performance_Hints
+
+@Security_Scope:
+String must be null-terminated. Non-terminated input causes
+string_length to read out-of-bounds.
+@End Security_Scope
 
 Note: Append the bytes of a null-terminated string to the raw buffer.
 Note: A null str pointer or empty string is a no-op returning 1.
@@ -164,6 +236,18 @@ Process called "emitter_raw_emit_string" takes header as Integer, str as Integer
     Return 1
 End Process
 
+@Reasoning:
+Allocate and initialise a raw emitter header + backing buffer in a
+single call. Called by every per-language emitter that uses the raw API
+(c_emitter, bash_emitter, ...).
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes for the header. On failure returns 0. Allocates the
+initial-capacity backing buffer; on failure deallocates the header and
+returns 0. Writes (buffer, capacity, 0) into the three header slots.
+@End Implementation
+
 Note: Allocate and initialize a raw 24-byte header backed by a fresh
 Note: initial-capacity byte buffer. Returns the header pointer, 0 on failure.
 Process called "emitter_raw_create" returns Integer:
@@ -184,6 +268,20 @@ Process called "emitter_raw_create" returns Integer:
     Return header
 End Process
 
+@Reasoning:
+Release all storage owned by a raw header. Safe to call on null so
+cleanup code can be unconditional.
+@End Reasoning
+
+@Implementation:
+Null check returns 1. Otherwise reads the buffer pointer at offset 0,
+deallocates it if non-null, then deallocates the 24-byte header.
+@End Implementation
+
+@Security_Scope:
+Caller must drop the header pointer after this call.
+@End Security_Scope
+
 Note: Destroy a raw header by deallocating its byte buffer and the header
 Note: itself. Safe to call with a null header (returns 1).
 Process called "emitter_raw_destroy" takes header as Integer returns Integer:
@@ -199,6 +297,15 @@ Process called "emitter_raw_destroy" takes header as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Expose the current write position for back-patching and section-size
+computation. Null-safe so call sites do not need to guard.
+@End Reasoning
+
+@Implementation:
+Null header returns 0. Otherwise reads the int64 at offset 16.
+@End Implementation
+
 Note: Return the current byte length recorded in a raw header.
 Process called "emitter_raw_length" takes header as Integer returns Integer:
     If header is equal to 0:
@@ -206,6 +313,22 @@ Process called "emitter_raw_length" takes header as Integer returns Integer:
     End If
     Return proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH
 End Process
+
+@Reasoning:
+Snapshot the buffer into a fresh heap allocation. Returning a copy
+(rather than the live buffer) means the caller can continue emitting
+into the raw header or destroy it without invalidating the snapshot.
+@End Reasoning
+
+@Implementation:
+Null header returns 0. Otherwise reads buffer pointer and length,
+allocates length+1 bytes, copies the live bytes if length > 0, writes
+a trailing NUL.
+@End Implementation
+
+@Security_Scope:
+Caller owns the returned allocation and must free it.
+@End Security_Scope
 
 Note: Return a freshly allocated null-terminated copy of the bytes written
 Note: to the raw buffer. Caller owns the returned pointer. Returns 0 on
@@ -230,6 +353,16 @@ Process called "emitter_raw_get_output" takes header as Integer returns Integer:
     Return output
 End Process
 
+@Reasoning:
+Zero the length so the buffer can be reused without reallocating.
+Capacity is preserved so subsequent appends do not re-grow.
+@End Reasoning
+
+@Implementation:
+Null header returns 1. Otherwise writes 0 to the length field at
+offset 16.
+@End Implementation
+
 Note: Reset the byte length to 0, keeping the existing allocation. Safe with
 Note: a null header.
 Process called "emitter_raw_reset" takes header as Integer returns Integer:
@@ -243,6 +376,19 @@ End Process
 Note: ============================================================================
 Note: HIGH-LEVEL EMITTERCONTEXT CONSTRUCTOR
 Note: ============================================================================
+@Reasoning:
+Construct a struct-API context with sensible defaults (4-space indent,
+no tabs, cursor at line 1 column 1). Used by backends that want the
+richer typed API instead of the raw header.
+@End Reasoning
+
+@Implementation:
+Allocates the initial-capacity backing buffer. If allocation fails,
+capacity is forced to 0 so subsequent ensure_capacity calls trigger a
+fresh attempt rather than returning success against a null buffer.
+Then constructs the EmitterContext literal with all default fields.
+@End Implementation
+
 Note: Build a fresh EmitterContext with defaults suitable for most backends.
 Note: Default style: 4-space indentation, no tabs. The output buffer starts
 Note: at EMITTER_INITIAL_CAPACITY bytes and grows geometrically on demand.
@@ -273,6 +419,25 @@ End Process
 Note: ============================================================================
 Note: INTERNAL GROWTH HELPERS (struct API)
 Note: ============================================================================
+
+@Reasoning:
+Context-API counterpart to emitter_raw_ensure_capacity. Mutates the
+context's output_buffer and output_capacity fields directly. Failure
+returns 0; caller is expected to record the error on the context.
+@End Reasoning
+
+@Implementation:
+Computes available bytes. If sufficient, returns 1. Otherwise doubles
+capacity (with linear fallback when doubling is still insufficient) until
+the request fits. Allocates the new buffer, memcpys existing bytes,
+deallocates the old buffer, and updates the context's pointer and
+capacity fields. Returns 0 on allocation failure.
+@End Implementation
+
+@Performance_Hints:
+Same characteristics as emitter_raw_ensure_capacity: amortized O(1) per
+appended byte.
+@End Performance_Hints
 
 Note: Ensure the context's buffer has room for `needed` additional bytes.
 Note: Returns 1 on success, 0 on allocation failure. The caller is expected
@@ -308,6 +473,18 @@ Process called "emitter_ctx_ensure_capacity" takes ctx as EmitterContext, needed
     Return 1
 End Process
 
+@Reasoning:
+Append a single byte to the context buffer. Records error state on
+allocation failure so the caller can detect failure later via
+emitter_has_errors instead of checking per-byte.
+@End Reasoning
+
+@Implementation:
+Calls ensure_capacity for one byte. On failure sets ctx.had_error and
+appends an error message to ctx.errors. On success writes the byte and
+increments output_length.
+@End Implementation
+
 Note: Append a single byte to the context buffer, growing as needed.
 Process called "emitter_ctx_emit_byte" takes ctx as EmitterContext, byte_value as Integer:
     Let success be proc emitter_ctx_ensure_capacity with ctx, 1
@@ -325,10 +502,27 @@ Note: ==========================================================================
 Note: INDENTATION MANAGEMENT
 Note: ============================================================================
 
+@Reasoning:
+Step into a deeper nesting level.
+@End Reasoning
+
+@Implementation:
+Increments ctx.indent_level by 1.
+@End Implementation
+
 Note: Increase the nesting depth by 1.
 Process called "emitter_indent" takes ctx as EmitterContext:
     Set ctx.indent_level to ctx.indent_level plus 1
 End Process
+
+@Reasoning:
+Step out of the current nesting level. Clamped at 0 so misordered
+indent/dedent calls cannot produce negative levels.
+@End Reasoning
+
+@Implementation:
+If indent_level > 0, decrements by 1.
+@End Implementation
 
 Note: Decrease the nesting depth by 1, clamped at 0.
 Process called "emitter_dedent" takes ctx as EmitterContext:
@@ -336,6 +530,18 @@ Process called "emitter_dedent" takes ctx as EmitterContext:
         Set ctx.indent_level to ctx.indent_level minus 1
     End If
 End Process
+
+@Reasoning:
+Emit indentation for the current nesting depth. Respects use_tabs and
+indent_size so backends with different conventions share this code.
+@End Reasoning
+
+@Implementation:
+If use_tabs is 1, emits indent_level tab bytes and bumps column by
+indent_level. Otherwise emits (indent_level * indent_size) space bytes
+and bumps column by the same amount. Clears line_start since the line
+now has content.
+@End Implementation
 
 Note: Emit the indentation prefix for the current nesting depth using the
 Note: byte buffer. Respects use_tabs and indent_size.
@@ -363,6 +569,24 @@ End Process
 Note: ============================================================================
 Note: TEXT EMISSION
 Note: ============================================================================
+
+@Reasoning:
+Primary text emission entry point. Handles automatic indent on
+fresh lines and updates the line/column cursors so diagnostics stay
+accurate.
+@End Reasoning
+
+@Implementation:
+If line_start is 1 emits indent first. Returns on null/empty text.
+Grows the buffer for text_len bytes; on failure records the error and
+returns. Bulk copies the bytes via memory_copy. Walks the text once to
+update current_line (on each LF) and current_column (on each non-LF),
+tracking line_start accordingly.
+@End Implementation
+
+@Performance_Hints:
+O(text_len) for the memcpy plus O(text_len) for the newline scan.
+@End Performance_Hints
 
 Note: Append raw text to the output buffer. If line_start is set, emits
 Note: indentation first. Updates current_line/current_column by scanning the
@@ -408,12 +632,31 @@ Process called "emitter_emit" takes ctx as EmitterContext, text as String:
     End While
 End Process
 
+@Reasoning:
+Convenience that emits text then a newline. Used for line-oriented
+languages (most of them) so callers can write one statement per call.
+@End Reasoning
+
+@Implementation:
+Calls emitter_emit then emitter_emit_newline.
+@End Implementation
+
 Note: Append text followed by a newline. Equivalent to emit(text) +
 Note: emit_newline.
 Process called "emitter_emit_line" takes ctx as EmitterContext, text as String:
     proc emitter_emit with ctx, text
     proc emitter_emit_newline with ctx
 End Process
+
+@Reasoning:
+Emit LF and update line tracking. Centralised so the line terminator
+can be retuned (e.g. CRLF) in one place.
+@End Reasoning
+
+@Implementation:
+Emits the LF byte via emitter_ctx_emit_byte, increments current_line,
+resets current_column to 1, sets line_start to 1.
+@End Implementation
 
 Note: Append a newline byte. Updates the line counter and sets line_start
 Note: so the next emit re-applies indentation.
@@ -424,12 +667,30 @@ Process called "emitter_emit_newline" takes ctx as EmitterContext:
     Set ctx.line_start to 1
 End Process
 
+@Reasoning:
+Emit a single space and advance the column. Used for token separators.
+@End Reasoning
+
+@Implementation:
+Emits SP via emitter_ctx_emit_byte, bumps current_column, clears
+line_start.
+@End Implementation
+
 Note: Append a single space byte without affecting line state.
 Process called "emitter_emit_space" takes ctx as EmitterContext:
     proc emitter_ctx_emit_byte with ctx, EMITTER_SPACE_BYTE
     Set ctx.current_column to ctx.current_column plus 1
     Set ctx.line_start to 0
 End Process
+
+@Reasoning:
+Emit a blank line for visual separation between top-level declarations.
+@End Reasoning
+
+@Implementation:
+Delegates to emitter_emit_newline. Wrapper exists so call sites can
+express intent ("blank line") distinct from "end of statement".
+@End Implementation
 
 Note: Append a blank line (bare newline with no preceding indent). Useful
 Note: between top-level declarations.
@@ -441,11 +702,29 @@ Note: ==========================================================================
 Note: ERROR AND WARNING TRACKING
 Note: ============================================================================
 
+@Reasoning:
+Record a fatal codegen error. Latched - subsequent emits may continue
+but the context's had_error remains true until reset.
+@End Reasoning
+
+@Implementation:
+Appends message to ctx.errors and sets ctx.had_error to 1.
+@End Implementation
+
 Note: Record an error message. Sets had_error.
 Process called "emitter_error" takes ctx as EmitterContext, message as String:
     proc list_append from ListCore with ctx.errors, message
     Set ctx.had_error to 1
 End Process
+
+@Reasoning:
+Record a non-fatal warning. Does not set had_error so subsequent code
+treats the translation as successful but readable diagnostics survive.
+@End Reasoning
+
+@Implementation:
+Appends message to ctx.warnings.
+@End Implementation
 
 Note: Record a non-fatal warning. Does not set had_error.
 Process called "emitter_warning" takes ctx as EmitterContext, message as String:
@@ -455,6 +734,22 @@ End Process
 Note: ============================================================================
 Note: OUTPUT ACCESS
 Note: ============================================================================
+
+@Reasoning:
+Snapshot the context buffer into a fresh null-terminated string. Called
+once at end-of-translation.
+@End Reasoning
+
+@Implementation:
+Returns "" if output_buffer is null. Otherwise allocates output_length+1
+bytes, copies the live buffer if non-empty, writes a trailing NUL.
+Returns "" on allocation failure to keep the return type stable; callers
+that need to distinguish should check had_error.
+@End Implementation
+
+@Security_Scope:
+Caller owns the returned allocation.
+@End Security_Scope
 
 Note: Return the accumulated output as a null-terminated String. The
 Note: returned pointer is freshly allocated and owned by the caller.
@@ -475,15 +770,48 @@ Process called "emitter_get_output" takes ctx as EmitterContext returns String:
     Return output
 End Process
 
+@Reasoning:
+Predicate over the context's latched error flag. Lets callers decide
+whether to use the emitted output or discard it.
+@End Reasoning
+
+@Implementation:
+Returns ctx.had_error directly.
+@End Implementation
+
 Note: True if any error was recorded.
 Process called "emitter_has_errors" takes ctx as EmitterContext returns Integer:
     Return ctx.had_error
 End Process
 
+@Reasoning:
+Expose the accumulated error list for diagnostics rendering.
+@End Reasoning
+
+@Implementation:
+Returns ctx.errors directly (no copy). The list is owned by the context.
+@End Implementation
+
+@Security_Scope:
+Caller must not free the returned list; it is owned by the context.
+@End Security_Scope
+
 Note: Return the recorded error list.
 Process called "emitter_get_errors" takes ctx as EmitterContext returns List[String]:
     Return ctx.errors
 End Process
+
+@Reasoning:
+Expose the accumulated warning list for diagnostics rendering.
+@End Reasoning
+
+@Implementation:
+Returns ctx.warnings directly (no copy).
+@End Implementation
+
+@Security_Scope:
+Caller must not free the returned list; it is owned by the context.
+@End Security_Scope
 
 Note: Return the recorded warning list.
 Process called "emitter_get_warnings" takes ctx as EmitterContext returns List[String]:
@@ -493,6 +821,24 @@ End Process
 Note: ============================================================================
 Note: RESET
 Note: ============================================================================
+
+@Reasoning:
+Recycle an EmitterContext for another translation without reallocating
+the byte buffer. Useful when running many small translations in a loop.
+@End Reasoning
+
+@Implementation:
+Zeros output_length and indent_level. Resets current_line to 1,
+current_column to 1, line_start to 1, had_error to 0. Replaces
+errors/warnings with fresh empty lists (the old lists are leaked if the
+caller did not hold them - callers expecting to retain diagnostics
+should snapshot them before reset).
+@End Implementation
+
+@Security_Scope:
+The previous errors/warnings lists become inaccessible after reset.
+Snapshot before reset if they are needed.
+@End Security_Scope
 
 Note: Reset all state in-place so a single context can be reused across
 Note: multiple translation invocations without reallocating the byte buffer.

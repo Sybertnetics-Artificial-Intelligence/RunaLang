@@ -35,6 +35,25 @@ Note: ==========================================================================
 Note: Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Top-level driver from raw MongoDB shell source to a HIR-representable
+dictionary tree. The `options` parameter is reserved for future
+strict/loose translation modes (e.g., should NumberLong wrap or saturate);
+it is accepted now to keep the public signature stable as those modes
+land. Parse failure short-circuits the whole pipeline.
+@End Reasoning
+
+@Implementation:
+Call Parser.parse_mongodb(source) to get an AST root; if 0, return 0.
+Otherwise dispatch the AST via translate_node and return its HIR result.
+@End Implementation
+
+@Security_Scope:
+`source` is treated as untrusted MongoDB shell input from disk or network;
+the parser performs syntactic validation. `options` is currently unused
+but still must be a valid pointer or 0 -- callers should not pass garbage.
+@End Security_Scope
+
 Process called "translate_mongodb_to_hir" takes source as Integer, options as Integer returns Integer:
     Note: Translate MongoDB source to HIR
 
@@ -52,6 +71,30 @@ End Process
 Note: ============================================================================
 Note: Node Translation
 Note: ============================================================================
+
+@Reasoning:
+Type-switch over the 10 MONGO_* AST node tags (200..209). Centralising the
+dispatch here means recursive children -- e.g. nested documents inside an
+update filter -- all flow back through one switch, so adding a new node
+type is a single-call insertion rather than touching each translator.
+Unknown node types return 0 (treated as "skip") so partial AST corruption
+fails closed.
+@End Reasoning
+
+@Implementation:
+Guard node!=0. Read node_type at offset 0. Dispatch:
+  200 MONGO_DOCUMENT          -> translate_document
+  201 MONGO_ARRAY             -> translate_array
+  202 MONGO_FIELD             -> translate_field
+  203 MONGO_OPERATOR          -> translate_operator
+  204 MONGO_VALUE             -> translate_value
+  205 MONGO_QUERY_OPERATION   -> translate_query_operation
+  206 MONGO_UPDATE_OPERATION  -> translate_update_operation
+  207 MONGO_INSERT_OPERATION  -> translate_insert_operation
+  208 MONGO_DELETE_OPERATION  -> translate_delete_operation
+  209 MONGO_AGGREGATE_OPERATION -> translate_aggregate_operation
+Returns 0 on null input or unknown tag.
+@End Implementation
 
 Process called "translate_node" takes node as Integer returns Integer:
     Note: Translate AST node to HIR
@@ -119,6 +162,23 @@ Note: ==========================================================================
 Note: Document Translation
 Note: ============================================================================
 
+@Reasoning:
+A MongoDB document is rendered as a tagged HIR dictionary {type:
+"document", fields: [...]} rather than a flat field map. The tag lets
+downstream HIR consumers cheaply distinguish documents (which preserve
+key order) from generic dictionaries, and the fields list preserves the
+original field ordering -- significant for MongoDB write semantics where
+$set ordering can matter.
+@End Reasoning
+
+@Implementation:
+Create empty dict; set "type" to "document". Read child_count at offset
+32 and the children pointer-array at offset 24. Allocate a list, then for
+each i in [0, child_count) read children[i] via memory_get_int64
+with byte offset i*8, recurse via translate_node, and append non-zero HIR
+results to the fields list. Bind "fields" -> list, return dict.
+@End Implementation
+
 Process called "translate_document" takes node as Integer returns Integer:
     Note: Translate MONGO_DOCUMENT to HIR Dictionary
 
@@ -153,6 +213,21 @@ Process called "translate_document" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+MongoDB arrays are heterogeneous and order-significant, matching HIR
+List semantics directly; no wrapping dictionary is needed because there
+is no ambiguity between a "value array" and a "document array" at this
+layer. Element translation is recursive: arrays of arrays, arrays of
+documents, and arrays of literals all use the same translate_node fanout.
+@End Reasoning
+
+@Implementation:
+Create an empty list. Read child_count at offset 32 and the children
+pointer-array at offset 24. Loop i from 0 to child_count, read
+children[i] (i*8 byte offset), recurse via translate_node, and append
+non-zero results. Returns the populated list.
+@End Implementation
+
 Process called "translate_array" takes node as Integer returns Integer:
     Note: Translate MONGO_ARRAY to HIR List
 
@@ -175,6 +250,22 @@ Process called "translate_array" takes node as Integer returns Integer:
 
     Return list
 End Process
+
+@Reasoning:
+A MongoDB document field carries a name (the source string slice stored
+at offset 8) and exactly one value child (the first AST child). Rendering
+it as {"name": ..., "value": ...} rather than collapsing into the parent
+document preserves the source-position locality of the name string and
+lets the consumer treat name as opaque (it may already include path
+operators like "a.b").
+@End Reasoning
+
+@Implementation:
+Create empty dict; read name pointer at offset 8 and bind "name" -> name
+(no copy). Read child_count at offset 32. If child_count > 0, read
+children[0] from the offset-24 children array, recurse via translate_node
+to produce value_hir, bind "value" -> value_hir. Returns the dict.
+@End Implementation
 
 Process called "translate_field" takes node as Integer returns Integer:
     Note: Translate MONGO_FIELD to HIR Dictionary
@@ -200,6 +291,21 @@ Process called "translate_field" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+A $-operator AST node carries the operator name (e.g., "$eq") at offset 8
+plus one value child (the operand). Rendering as {"operator": ...,
+"value": ...} keeps the operator name separable from its operand so HIR
+consumers can pattern-match on the operator first without descending into
+the operand subtree.
+@End Reasoning
+
+@Implementation:
+Create empty dict; read operator_name pointer at offset 8 and bind
+"operator" -> operator_name. Read child_count at offset 32. If
+child_count > 0, read children[0] from offset 24, recurse via
+translate_node, and bind "value" -> value_hir. Returns the dict.
+@End Implementation
+
 Process called "translate_operator" takes node as Integer returns Integer:
     Note: Translate MONGO_OPERATOR to HIR Dictionary
 
@@ -224,6 +330,18 @@ Process called "translate_operator" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+MONGO_VALUE nodes are produced by the parser for terminals (strings,
+numbers, booleans, null); the parser has already classified the type and
+parked the canonical value pointer at offset 16. At HIR level we keep the
+original value pointer without rewrapping -- HIR's literal types accept
+the raw byte slice and downstream passes interpret it.
+@End Reasoning
+
+@Implementation:
+Read value pointer at offset 16; return it directly. No allocation.
+@End Implementation
+
 Process called "translate_value" takes node as Integer returns Integer:
     Note: Translate MONGO_VALUE to HIR literal (string)
 
@@ -234,6 +352,25 @@ End Process
 Note: ============================================================================
 Note: MongoDB Operation Translation
 Note: ============================================================================
+
+@Reasoning:
+find() and findOne() take a mandatory query document plus an optional
+projection document. The HIR shape {type:"query", operation:..., query:...,
+projection:...} keeps the operation name explicit so downstream codegen
+can distinguish "return cursor" from "return first" without re-inspecting
+the source. Projection is omitted from the dict (not set to null) when
+absent, so downstream code's "has projection?" check is a dictionary
+contains-key probe.
+@End Reasoning
+
+@Implementation:
+Create empty dict; bind "type" -> "query". Read op_name at offset 8 and
+bind "operation" -> op_name. Read child_count (offset 32) and children
+(offset 24). If child_count > 0, recurse on children[0] (byte offset 0)
+to produce query_hir and bind "query" -> query_hir. If child_count > 1,
+recurse on children[1] (byte offset 8) to produce proj_hir and bind
+"projection" -> proj_hir. Returns the dict.
+@End Implementation
 
 Process called "translate_query_operation" takes node as Integer returns Integer:
     Note: Translate find() or findOne() operation to HIR
@@ -276,6 +413,21 @@ Process called "translate_query_operation" takes node as Integer returns Integer
     Return dict
 End Process
 
+@Reasoning:
+aggregate() takes a single pipeline-array argument (the list of stages).
+The HIR shape {type:"aggregate", operation:..., pipeline:[...]} keeps the
+pipeline first-class so optimizer passes can fuse adjacent $match/$project
+stages or detect anti-patterns without re-parsing.
+@End Reasoning
+
+@Implementation:
+Create empty dict; bind "type" -> "aggregate". Read op_name at offset 8
+and bind "operation" -> op_name. Read child_count (offset 32) and children
+(offset 24); if child_count > 0, recurse on children[0] to produce the
+pipeline_hir (typically a List from translate_array) and bind "pipeline"
+-> pipeline_hir. Returns the dict.
+@End Implementation
+
 Process called "translate_aggregate_operation" takes node as Integer returns Integer:
     Note: Translate aggregate() operation to HIR
     Note: Returns: {type: "aggregate", pipeline: [...]}
@@ -306,6 +458,24 @@ Process called "translate_aggregate_operation" takes node as Integer returns Int
 
     Return dict
 End Process
+
+@Reasoning:
+The three update-family operations all take (filter, update, [options]).
+A single translator handles them because they share the HIR shape; the
+operation name distinguishes the semantics. Each component is recursed
+independently so that, e.g., update.$set's nested document still flows
+through translate_document and update operators ($inc, $push, etc.) still
+flow through translate_operator.
+@End Reasoning
+
+@Implementation:
+Create empty dict; bind "type" -> "update" and "operation" -> op_name at
+offset 8. Read child_count (offset 32), children (offset 24). On
+child_count >= 1, recurse on children[0] (byte 0) -> filter, bind "filter".
+On child_count >= 2, recurse on children[1] (byte 8) -> update, bind
+"update". On child_count >= 3, recurse on children[2] (byte 16) -> options,
+bind "options". Returns the dict.
+@End Implementation
 
 Process called "translate_update_operation" takes node as Integer returns Integer:
     Note: Translate updateOne(), updateMany(), or replaceOne() to HIR
@@ -357,6 +527,21 @@ Process called "translate_update_operation" takes node as Integer returns Intege
     Return dict
 End Process
 
+@Reasoning:
+insertOne() and insertMany() differ only in the cardinality of the
+"documents" payload (single document vs array); both feed through one
+HIR shape where consumers branch on operation. The first child is the
+documents payload (a document for insertOne, an array for insertMany) and
+recursion handles the distinction structurally.
+@End Reasoning
+
+@Implementation:
+Create empty dict; bind "type" -> "insert" and "operation" -> op_name at
+offset 8. Read child_count (offset 32) and children (offset 24). If
+child_count > 0, recurse on children[0] to produce docs_hir, bind
+"documents" -> docs_hir. Returns the dict.
+@End Implementation
+
 Process called "translate_insert_operation" takes node as Integer returns Integer:
     Note: Translate insertOne() or insertMany() to HIR
     Note: Returns: {type: "insert", operation: "...", documents: ...}
@@ -387,6 +572,19 @@ Process called "translate_insert_operation" takes node as Integer returns Intege
 
     Return dict
 End Process
+
+@Reasoning:
+deleteOne() and deleteMany() take a single filter document; cardinality
+of the deletion is encoded only in the operation name. One translator
+handles both; downstream code branches on operation.
+@End Reasoning
+
+@Implementation:
+Create empty dict; bind "type" -> "delete" and "operation" -> op_name at
+offset 8. Read child_count (offset 32) and children (offset 24). If
+child_count > 0, recurse on children[0] to produce filter_hir, bind
+"filter" -> filter_hir. Returns the dict.
+@End Implementation
 
 Process called "translate_delete_operation" takes node as Integer returns Integer:
     Note: Translate deleteOne() or deleteMany() to HIR
@@ -423,6 +621,24 @@ Note: ==========================================================================
 Note: Dictionary and List Utilities
 Note: ============================================================================
 
+@Reasoning:
+Local 4-field dictionary implementation rather than calling out to the
+shared Dictionary primitive: this translator emits HIR objects that are
+already in the HIR ownership domain (the parent HIR builder will manage
+them), so a small fixed-capacity store keeps the translation step free of
+dependency on Dictionary's growth/rehash policy. Initial capacity 10 is
+sized to the largest MongoDB operation shape (update with filter + update
++ options + 6-7 misc options) without rehashing.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes for the 4-field dict header (size=0, capacity=10,
+keys=0, values=0). Then allocate two 80-byte (10*8) backing arrays for
+keys and values and store their pointers at offsets 16 and 24. Returns 0
+on OOM at the header allocation; the backing arrays are not separately
+guarded -- if they fail to allocate, dict_set will write to a null base.
+@End Implementation
+
 Process called "create_dictionary" returns Integer:
     Note: Create empty dictionary
 
@@ -448,6 +664,27 @@ Process called "create_dictionary" returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+Append-only setter for the local dictionary -- the translation pipeline
+only ever writes each key once per dict so dedup/lookup are not needed.
+The append form is O(1) and preserves insertion order, which matters
+because MongoDB document field order is observable from the HIR.
+@End Reasoning
+
+@Implementation:
+Read current size (offset 0), keys ptr (offset 16), values ptr (offset
+24). Write key into keys[size] and value into values[size] via byte
+offset size*8. Increment size and store back at offset 0. Returns 1. No
+capacity check -- caller must keep total entries within the initial 10.
+@End Implementation
+
+@Performance_Hints:
+O(1) per call but fixed capacity of 10 (set in create_dictionary). The
+deepest current consumer (translate_update_operation) writes exactly 5
+entries; bumping the initial allocation would be required before adding
+denser shapes.
+@End Performance_Hints
+
 Process called "dict_set" takes dict as Integer, key as Integer, value as Integer returns Integer:
     Note: Set dictionary key-value pair
 
@@ -463,6 +700,19 @@ Process called "dict_set" takes dict as Integer, key as Integer, value as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Companion to create_dictionary -- a small fixed-capacity ordered list for
+holding translated child HIR nodes. Same rationale as the dictionary:
+keeps the translation step independent of the shared List primitive's
+growth/refcount policy.
+@End Reasoning
+
+@Implementation:
+Allocate 24 bytes for the 3-field list header (size=0, capacity=10,
+items=0). Allocate the 80-byte (10*8) backing array and store its pointer
+at offset 16. Returns 0 on OOM at the header allocation.
+@End Implementation
 
 Process called "create_list" returns Integer:
     Note: Create empty list
@@ -485,6 +735,20 @@ Process called "create_list" returns Integer:
 
     Return list
 End Process
+
+@Reasoning:
+Append-only setter for the local list. Same constraints as dict_set --
+no capacity check, fixed 10-entry budget; the deepest current consumer
+(translate_document) writes one entry per source field, so a long document
+with > 10 fields would overflow. Future work: add a grow path when this
+becomes a real constraint.
+@End Reasoning
+
+@Implementation:
+Read current size (offset 0) and items ptr (offset 16). Write item into
+items[size] via byte offset size*8. Increment size and store back at
+offset 0. Returns 1.
+@End Implementation
 
 Process called "list_append" takes list as Integer, item as Integer returns Integer:
     Note: Append item to list

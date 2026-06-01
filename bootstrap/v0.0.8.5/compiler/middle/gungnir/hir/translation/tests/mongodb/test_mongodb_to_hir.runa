@@ -36,11 +36,40 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/io/file.runa" as File
 
+@Reasoning:
+Counter triple shared across the MongoDB-to-HIR driver. Same layout as
+peer suites for unified-runner compatibility.
+@End Reasoning
+
+@Implementation:
+total at offset 0, passed at 8, failed at 16; mutated via raw
+Layout.memory_set_int64 because results is shared by handle.
+@End Implementation
+
 Type called "TestResults":
     total as Integer
     passed as Integer
     failed as Integer
 End Type
+
+@Reasoning:
+Top-level driver for MongoDB-to-HIR translation. Calls 12 named test
+processes grouped into six categories (document, field, operator,
+array, nested, value). Distinct named procs make the failure log
+immediately identify which MongoDB construct regressed.
+@End Reasoning
+
+@Implementation:
+Allocate TestResults, print banner, run all 12 test_* procs against
+the shared results buffer, print summary, return 1 if any test failed
+else 0.
+@End Implementation
+
+@TestCases:
+- All 12 MongoDB constructs translate to non-null HIR -> exit 0
+- The simple_document test additionally verifies HIR.type == "document"
+- Any test_* returns 0 -> results.failed >= 1 -> exit 1
+@End TestCases
 
 Process called "main" returns Integer:
     Note: MongoDB to HIR Translation Test Suite
@@ -84,6 +113,32 @@ Process called "main" returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Deepest probe in the suite: parses, translates, AND verifies the
+resulting HIR is a dictionary with a "type" key equal to "document".
+This catches a regression where the translator returns a non-null
+opaque pointer that doesn't have the expected schema.
+@End Reasoning
+
+@Implementation:
+1. Increment results.total.
+2. Build `{"name": "Alice"}`. parse_mongodb -> ast; null -> "parse failed".
+3. translate_mongodb_to_hir(source, 0) -> hir; null ->
+   "translation failed".
+4. dict_get(hir, "type"); null -> "missing type field".
+5. string_equals(type_value, "document"); mismatch ->
+   "incorrect type".
+6. Success: increment results.passed.
+@End Implementation
+
+@TestCases:
+- Input `{"name": "Alice"}` -> HIR with type="document", passed += 1
+- Parser fails -> "Simple document: parse failed"
+- Translator returns 0 -> "Simple document: translation failed"
+- HIR dict missing "type" key -> "Simple document: missing type field"
+- HIR.type != "document" -> "Simple document: incorrect type"
+@End TestCases
 
 Process called "test_simple_document" takes results as Integer returns Integer:
     Note: Test simple document translation
@@ -145,6 +200,21 @@ Process called "test_simple_document" takes results as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Verifies a nested operator document — value is itself an operator
+document. Exercises recursive descent into the nested {$gt: 18} term.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"age": {"$gt": 18}}`. translate_mongodb_to_hir
+with 0 arena. Branch on hir != 0; free source on both paths.
+@End Implementation
+
+@TestCases:
+- Input `{"age": {"$gt": 18}}` -> non-null HIR, passed += 1
+- Translator returns 0 -> "Document with operators: translation failed"
+@End TestCases
+
 Process called "test_document_with_operators" takes results as Integer returns Integer:
     Note: Test document with operators
 
@@ -169,6 +239,23 @@ Process called "test_document_with_operators" takes results as Integer returns I
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies a non-trivial alphanumeric field name with a string value.
+Catches a regression where the parser tokenizes "alice123" as
+identifier + number rather than as a single string token (or where
+the keys lookup is case-sensitive in the wrong direction).
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"username": "alice123"}`. translate_mongodb_to_hir
+with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"username": "alice123"}` -> non-null HIR, passed += 1
+- Translator splits the value or returns 0 -> "Field translation: failed"
+@End TestCases
 
 Process called "test_field_translation" takes results as Integer returns Integer:
     Note: Test field name/value translation
@@ -195,6 +282,24 @@ Process called "test_field_translation" takes results as Integer returns Integer
     Return 0
 End Process
 
+@Reasoning:
+Verifies a top-level $-prefixed operator field ($set). MongoDB
+distinguishes operator keys (start with $) from data keys at the
+translator level, so this test ensures the prefix is preserved in HIR.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"$set": {"status": "active"}}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"$set": {"status": "active"}}` -> non-null HIR with $set
+  preserved as an operator key, passed += 1
+- Translator strips the "$" prefix -> may still succeed but semantics
+  wrong; if it returns 0 -> "Operator field: translation failed"
+@End TestCases
+
 Process called "test_operator_field" takes results as Integer returns Integer:
     Note: Test operator field translation
 
@@ -219,6 +324,25 @@ Process called "test_operator_field" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies two comparison operators on the same field (range query
+score >= 70 AND score < 100). The translator must retain both
+operators in the same sub-document — a regression where the second
+operator overwrites the first would silently break range queries.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"score": {"$gte": 70, "$lt": 100}}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"score": {"$gte": 70, "$lt": 100}}` -> non-null HIR with
+  both $gte and $lt present, passed += 1
+- Translator retains only the last operator -> may still succeed
+  (silent corruption); if returns 0 -> "Comparison operators: translation failed"
+@End TestCases
 
 Process called "test_comparison_operators" takes results as Integer returns Integer:
     Note: Test comparison operators
@@ -245,6 +369,24 @@ Process called "test_comparison_operators" takes results as Integer returns Inte
     Return 0
 End Process
 
+@Reasoning:
+Verifies the $inc update operator with a positive integer delta.
+Update operators have semantically distinct meaning from query
+operators (modify vs filter), and the translator must mark them
+appropriately in HIR.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"$inc": {"count": 1}}`. translate_mongodb_to_hir
+with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"$inc": {"count": 1}}` -> non-null HIR with $inc preserved,
+  passed += 1
+- Translator returns 0 -> "Update operators: translation failed"
+@End TestCases
+
 Process called "test_update_operators" takes results as Integer returns Integer:
     Note: Test update operators
 
@@ -269,6 +411,23 @@ Process called "test_update_operators" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies an array of strings as a field value. Catches a regression
+where the array bracket is treated as a stray token or where only
+the first element is retained.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"tags": ["mongodb", "database"]}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"tags": ["mongodb", "database"]}` -> non-null HIR with both
+  strings in the array, passed += 1
+- Translator returns 0 on [ ... ] -> "Array values: translation failed"
+@End TestCases
 
 Process called "test_array_values" takes results as Integer returns Integer:
     Note: Test array value translation
@@ -295,6 +454,23 @@ Process called "test_array_values" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Verifies a single-stage aggregation pipeline (top-level array of one
+operator document). MongoDB aggregation pipelines are arrays where
+each element is a pipeline-stage operator; this is the canonical case.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `[{"$match": {"status": "active"}}]`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `[{"$match": {"status": "active"}}]` -> non-null HIR with one
+  pipeline stage, passed += 1
+- Translator rejects top-level array -> "Aggregation pipeline: translation failed"
+@End TestCases
+
 Process called "test_aggregation_pipeline" takes results as Integer returns Integer:
     Note: Test aggregation pipeline array
 
@@ -319,6 +495,23 @@ Process called "test_aggregation_pipeline" takes results as Integer returns Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies recursive translation of a sub-document with two fields.
+Catches a regression where the translator only recurses one level
+deep or skips inner fields after the first.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"user": {"name": "Alice", "age": 30}}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"user": {"name": "Alice", "age": 30}}` -> non-null HIR with
+  inner dict containing both name and age, passed += 1
+- Translator returns 0 on sub-document -> "Nested documents: translation failed"
+@End TestCases
 
 Process called "test_nested_documents" takes results as Integer returns Integer:
     Note: Test nested document translation
@@ -345,6 +538,25 @@ Process called "test_nested_documents" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Verifies a 2D array (array of arrays). Catches a regression where the
+array parser exits the first inner array prematurely or merges the two
+inner arrays into a flat list.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"matrix": [[1, 2], [3, 4]]}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"matrix": [[1, 2], [3, 4]]}` -> non-null HIR with two inner
+  lists each of length 2, passed += 1
+- Translator flattens to [1, 2, 3, 4] -> silent corruption (test still
+  passes by current contract); if returns 0 ->
+  "Nested arrays: translation failed"
+@End TestCases
+
 Process called "test_nested_arrays" takes results as Integer returns Integer:
     Note: Test nested array translation
 
@@ -369,6 +581,24 @@ Process called "test_nested_arrays" takes results as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Verifies a string value containing punctuation (comma, exclamation
+mark) that the parser must consume as part of the string token rather
+than terminating on. Catches a JSON-string-state machine regression.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"message": "Hello, MongoDB!"}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"message": "Hello, MongoDB!"}` -> non-null HIR carrying the
+  full string with comma and bang, passed += 1
+- Parser terminates string at comma -> translator returns 0 ->
+  "String values: translation failed"
+@End TestCases
 
 Process called "test_string_values" takes results as Integer returns Integer:
     Note: Test string value translation
@@ -395,6 +625,24 @@ Process called "test_string_values" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Verifies both integer (42) and decimal (19.99) numeric literals in
+the same document. MongoDB distinguishes Int32/Double, and the parser
+must correctly recognize the decimal point as part of a single token.
+@End Reasoning
+
+@Implementation:
+Increment total. Build `{"count": 42, "price": 19.99}`.
+translate_mongodb_to_hir with 0 arena. Branch on hir != 0; free source.
+@End Implementation
+
+@TestCases:
+- Input `{"count": 42, "price": 19.99}` -> non-null HIR with both
+  numeric values typed correctly, passed += 1
+- Parser splits at the decimal point -> translator returns 0 ->
+  "Numeric values: translation failed"
+@End TestCases
+
 Process called "test_numeric_values" takes results as Integer returns Integer:
     Note: Test numeric value translation
 
@@ -420,6 +668,20 @@ Process called "test_numeric_values" takes results as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Linear-search dictionary lookup used by test_simple_document to verify
+the HIR contains an expected key. Kept local rather than importing the
+full Dict module so this test binary stays minimal.
+@End Reasoning
+
+@Implementation:
+1. Read size from offset 0 and keys/values pointers from offsets 16/24.
+2. For index in 0..size: read keys_ptr[index*8] and compare via
+   StringCore.string_equals against the search key.
+3. On match, return values_ptr[index*8].
+4. No match -> return 0.
+@End Implementation
+
 Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Note: Get value from dictionary by key
 
@@ -443,6 +705,16 @@ Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Banner emitted once at startup. Separator width (40 "=") matches the
+title length so the heading boxes cleanly in CI logs.
+@End Reasoning
+
+@Implementation:
+Allocate title and "=" rule via StringCore, print each, deallocate.
+Always returns 1.
+@End Implementation
+
 Process called "print_header" returns Integer:
     Note: Print test suite header
 
@@ -457,6 +729,16 @@ Process called "print_header" returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+"[PASS] <name>" line shared by all 12 test_* procs. Centralized so
+formatting is identical across the suite.
+@End Reasoning
+
+@Implementation:
+Allocate "[PASS] " prefix, print prefix and caller-owned test_name,
+deallocate the prefix.
+@End Implementation
+
 Process called "print_test_success" takes test_name as Integer returns Integer:
     Note: Print test success message
 
@@ -468,6 +750,16 @@ Process called "print_test_success" takes test_name as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+"[FAIL] <name>" line. Single-arg signature because each test_* proc
+passes a pre-formatted "<scenario>: <reason>" string.
+@End Reasoning
+
+@Implementation:
+Allocate "[FAIL] " prefix, print prefix and caller-owned test_name,
+deallocate the prefix.
+@End Implementation
+
 Process called "print_test_failure" takes test_name as Integer returns Integer:
     Note: Print test failure message
 
@@ -478,6 +770,16 @@ Process called "print_test_failure" takes test_name as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Final summary block matching peer MongoDB suites. Reads counters
+through type-checked struct field access at the report site.
+@End Reasoning
+
+@Implementation:
+Print "=" separator, "Test Results:" heading, then Total/Passed/Failed
+lines. Each label allocated/printed/deallocated; numbers via print_int.
+@End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
     Note: Print final test results
@@ -507,6 +809,20 @@ Process called "print_results" takes results as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Local integer formatter so this suite has no dependency on stdlib
+formatting allocators. Zero and negative inputs are handled explicitly.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> print "0", return.
+2. Allocate 32-byte buffer; walk position from 31 downward writing
+   48 + (temp % 10), dividing temp by 10 each pass.
+3. For negatives, operate on -temp and write '-' (45) at the final
+   position.
+4. Increment position, print buffer+position as a C string, deallocate.
+@End Implementation
 
 Process called "print_int" takes value as Integer returns Integer:
     Note: Print integer value

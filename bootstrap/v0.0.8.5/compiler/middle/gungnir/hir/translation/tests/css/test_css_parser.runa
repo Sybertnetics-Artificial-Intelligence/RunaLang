@@ -14,11 +14,43 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/io/file.runa" as File
 
+@Reasoning:
+Counter triple shared across the CSS parser driver. Same layout as the
+other language test suites so a future unified runner can consume any
+of them without struct conversion.
+@End Reasoning
+
+@Implementation:
+total at offset 0, passed at 8, failed at 16; mutated via
+Layout.memory_set_int64 because results is shared by handle.
+@End Implementation
+
 Type called "TestResults":
     total as Integer
     passed as Integer
     failed as Integer
 End Type
+
+@Reasoning:
+Top-level driver for the CSS parser corpus. Exercises six stylesheets
+that together cover the CSS surface area most prone to lexer/parser
+regression: basic declarations, selector complexity, layout, color
+notation, animations, and at-rules. Returning 1 on any failure makes
+this binary CI-friendly.
+@End Reasoning
+
+@Implementation:
+Allocate TestResults, print header, call test_parse_file for each of
+the six .css fixtures, print_results, then return 1 if results.failed
+> 0 else 0.
+@End Implementation
+
+@TestCases:
+- All six stylesheets parse to AST with root node type 200 (CSS_STYLESHEET) -> exit 0
+- Any stylesheet fails to read -> "Failed to read file", exit 1
+- Parser returns null on a valid file -> "Parser returned null AST", exit 1
+- AST root node type != 200 -> "Invalid root node type", exit 1
+@End TestCases
 
 Process called "main" returns Integer:
     Let results be a value of type TestResults with total as 0, passed as 0, failed as 0
@@ -40,6 +72,28 @@ Process called "main" returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Per-file parse probe used by main. Pulled out so the counter mutation
+and root-tag check live in exactly one place; the only thing that
+varies between corpus files is the path argument.
+@End Reasoning
+
+@Implementation:
+1. Increment results.total.
+2. read_file(file_path); null -> "Failed to read file" failure.
+3. parse_css(content); null -> free content, "Parser returned null AST".
+4. Verify memory_get_int64(ast, 0) equals 200 (CSS_STYLESHEET tag);
+   otherwise free content, "Invalid root node type".
+5. On success print [PASS], free content, increment results.passed.
+@End Implementation
+
+@TestCases:
+- stylesheets/basic_styles.css -> AST root tag 200, results.passed += 1
+- Non-existent path -> read_file == 0 -> failure with "Failed to read file"
+- Lexer regression on selectors.css -> ast == 0 -> "Parser returned null AST"
+- Parser builds AST but tags wrong root -> "Invalid root node type"
+@End TestCases
 
 Process called "test_parse_file" takes file_path as Integer, results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -82,6 +136,16 @@ Process called "test_parse_file" takes file_path as Integer, results as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Suite banner printed once at startup. Separator width (23 "=") matches
+the title length so the heading visually aligns in CI logs.
+@End Reasoning
+
+@Implementation:
+Allocate title via StringCore, print via runtime primitive, deallocate;
+same for the "=" rule. Always returns 1.
+@End Implementation
+
 Process called "print_header" returns Integer:
     Let header be proc create_string from StringCore with "CSS Parser Test Suite"
     proc print from header
@@ -94,6 +158,18 @@ Process called "print_header" returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Emits "[PASS] <path>" line. Splits from print_test_failure so grep on
+"[FAIL]" cleanly isolates regressions in CI output. file_path doubles
+as both the corpus identifier and the human label here because each
+stylesheet name uniquely identifies the test.
+@End Reasoning
+
+@Implementation:
+Allocate "[PASS] " prefix, print prefix, print caller-owned file_path,
+deallocate the prefix. file_path is not freed (caller-owned).
+@End Implementation
+
 Process called "print_test_success" takes file_path as Integer returns Integer:
     Let pass_msg be proc create_string from StringCore with "[PASS] "
     proc print from pass_msg
@@ -102,6 +178,18 @@ Process called "print_test_success" takes file_path as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Emits "[FAIL] <path>: <reason>" line. reason is one of "Failed to read
+file", "Parser returned null AST", "Invalid root node type" so the
+failure log shows the exact phase that broke (I/O vs lex/parse vs
+structural tag check) without grepping upstream context.
+@End Reasoning
+
+@Implementation:
+Allocate "[FAIL] " prefix, print prefix/file_path/": "/reason in order,
+then deallocate the prefix. file_path and reason are caller-owned.
+@End Implementation
 
 Process called "print_test_failure" takes file_path as Integer, reason as Integer returns Integer:
     Let fail_msg be proc create_string from StringCore with "[FAIL] "
@@ -113,6 +201,18 @@ Process called "print_test_failure" takes file_path as Integer, reason as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Final summary block. Reads counters through type-checked struct field
+access (results.total etc.) at the report site even though the hot
+path in test_parse_file uses raw memory_get_int64 for uniform handle
+semantics.
+@End Reasoning
+
+@Implementation:
+Print "=" rule, "Test Results:" heading, then Total/Passed/Failed lines.
+Each label allocated/printed/deallocated; numbers go through print_int.
+@End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
     Let separator be proc create_string from StringCore with "======================="
@@ -140,6 +240,24 @@ Process called "print_results" takes results as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Local integer formatter kept in each test file so the suite has no
+dependency on stdlib formatting (which pulls in allocators not yet
+bound at this layer of the bootstrap). Zero and negative values are
+handled explicitly so single-digit and sign edge cases don't fall
+through the divmod loop.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> print "0", return.
+2. Allocate 32-byte buffer; walk position 31 downward, writing
+   48 + (temp % 10), dividing temp by 10 each pass.
+3. For negative values: operate on -temp during the loop, then write
+   '-' (45) at the final position.
+4. Increment position once to land on the first written byte, print
+   buffer+position as a C string, deallocate the buffer.
+@End Implementation
 
 Process called "print_int" takes value as Integer returns Integer:
     If value is equal to 0:

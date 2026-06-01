@@ -72,6 +72,22 @@ Note:   offset 56: has_error
 Note:   offset 64: arena
 Note: ============================================================================
 
+@Reasoning:
+72-byte F# emitter state. First 24 bytes overlay the shared raw header
+so byte-buffer primitives work directly. Trailing 48 bytes hold
+F#-specific formatting state (indent, expression-mode flag, line length
+tracker), latched error state, and an arena for transient allocations.
+@End Reasoning
+
+@Implementation:
+Fields at offsets 0/8/16 are buffer/capacity/length (raw header). Offset
+24 is indent_level. Offset 32 is in_expression (1 when inside an
+expression context so emitters use parenthesisation rules). Offset 40
+is line_length used by wrap decisions. Offset 48/56 are
+error_message/has_error. Offset 64 is an arena pointer for temporary
+buffers freed in destroy_fsharp_emitter.
+@End Implementation
+
 Type called "FSharpEmitter":
     buffer as Integer
     capacity as Integer
@@ -87,6 +103,19 @@ End Type
 Note: ============================================================================
 Note: Emitter Creation and Management
 Note: ============================================================================
+
+@Reasoning:
+Allocate and initialise the 72-byte F# emitter state with a fresh
+4096-byte backing buffer and a fresh 4096-byte arena. Cannot reuse
+emitter_raw_create because the state extends beyond the shared header.
+@End Reasoning
+
+@Implementation:
+Allocates 72 bytes for the state. On failure returns 0. Allocates the
+4096-byte buffer; on failure cleans up state and returns 0. Writes
+initial values for all nine fields then creates the arena and stores
+it at offset 64.
+@End Implementation
 
 Process called "create_fsharp_emitter" returns Integer:
     Note: Create F# code emitter instance with byte-buffer-backed output.
@@ -118,6 +147,21 @@ Process called "create_fsharp_emitter" returns Integer:
     Return emitter
 End Process
 
+@Reasoning:
+Free the emitter's buffer, arena, and state block. Null emitter is a
+safe no-op.
+@End Reasoning
+
+@Implementation:
+Null check returns 1. Otherwise reads buffer at offset 0 and arena at
+offset 64, frees each if non-null (via deallocate / arena_destroy),
+then frees the state.
+@End Implementation
+
+@Security_Scope:
+Caller must drop the emitter pointer after this call.
+@End Security_Scope
+
 Process called "destroy_fsharp_emitter" takes emitter as Integer returns Integer:
     Note: Destroy F# emitter and free resources.
 
@@ -143,6 +187,16 @@ Note: ==========================================================================
 Note: Code Generation Utilities
 Note: ============================================================================
 
+@Reasoning:
+Append text to the buffer and update line_length tracking. Line length
+is used by higher-level emitters that wrap long F# constructs.
+@End Reasoning
+
+@Implementation:
+Calls emitter_raw_emit_string to do the actual byte append. Measures
+the text length and adds it to the line_length field at offset 40.
+@End Implementation
+
 Process called "emit_string" takes emitter as Integer, text as Integer returns Integer:
     Note: Append text bytes to the buffer (amortized O(1)) and track line
     Note: length so callers can make wrapping decisions.
@@ -156,12 +210,31 @@ Process called "emit_string" takes emitter as Integer, text as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Emit LF and reset line_length. Resetting at newlines is what makes the
+wrap-detection counter meaningful per-line.
+@End Reasoning
+
+@Implementation:
+Emits LF (byte 10) and writes 0 to line_length at offset 40.
+@End Implementation
+
 Process called "emit_newline" takes emitter as Integer returns Integer:
     Note: Emit a newline byte and reset the line-length counter.
     proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
     proc memory_set_int64 from MemoryCore with emitter, 40, 0
     Return 1
 End Process
+
+@Reasoning:
+F# convention is 4-space indentation. Emits indent_level groups of four
+spaces using emit_string so line_length stays in sync.
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 24, loops that many times emitting a
+4-space string.
+@End Implementation
 
 Process called "emit_indent" takes emitter as Integer returns Integer:
     Note: Emit indent_level x 4 spaces (F# convention).
@@ -174,11 +247,27 @@ Process called "emit_indent" takes emitter as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Step into a deeper F# block.
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 24, increments, writes back.
+@End Implementation
+
 Process called "increase_indent" takes emitter as Integer returns Integer:
     Let indent_level be proc memory_get_int64 from MemoryCore with emitter, 24
     proc memory_set_int64 from MemoryCore with emitter, 24, indent_level plus 1
     Return 1
 End Process
+
+@Reasoning:
+Step out of a deeper F# block. Clamped at zero.
+@End Reasoning
+
+@Implementation:
+Reads indent_level; if greater than 0, writes back level-1.
+@End Implementation
 
 Process called "decrease_indent" takes emitter as Integer returns Integer:
     Let indent_level be proc memory_get_int64 from MemoryCore with emitter, 24
@@ -192,14 +281,23 @@ Note: ==========================================================================
 Note: HIR Expression Code Generation
 Note: ============================================================================
 
+@Reasoning:
+Top-level F# expression dispatcher. F# expressions span literals,
+identifiers, function calls, lambdas, conditionals, matches, and
+constructors. Each routes to a specialised emitter that handles F#'s
+expression-oriented syntax.
+@End Reasoning
+
+@Implementation:
+Reads node_type via get_hir_node_type. Probes against the ~17 F# node
+types (integer/float/string/char/boolean/null/unit literals, variable
+references, calls, lambdas, binary/unary/member/index expressions, if,
+match, list/array/record/tuple constructors). Routes to the matching
+emit_* helper. Unknown types call set_emitter_error and return 0.
+@End Implementation
+
 Process called "emit_expression" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# code for HIR expression
-
-    @Reasoning:
-    F# expressions include literals, identifiers, function calls, lambdas,
-    conditionals, and more. Each type requires specific F# syntax generation
-    while maintaining proper precedence and associativity.
-    @End Reasoning
 
     If hir_node is equal to 0:
         Return 1
@@ -307,6 +405,15 @@ Process called "emit_expression" takes emitter as Integer, hir_node as Integer r
     Return 0
 End Process
 
+@Reasoning:
+Emit an F# integer literal in plain decimal form. No type suffix is
+emitted; F# infers integer width from context.
+@End Reasoning
+
+@Implementation:
+Reads the HIR node value, stringifies via integer_to_string, emits.
+@End Implementation
+
 Process called "emit_integer_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# integer literal
 
@@ -316,6 +423,15 @@ Process called "emit_integer_literal" takes emitter as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# float literal. F# floats use the same decimal notation as
+Runa source.
+@End Reasoning
+
+@Implementation:
+Reads the HIR node value, stringifies via float_to_string, emits.
+@End Implementation
+
 Process called "emit_float_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# float literal
 
@@ -324,6 +440,19 @@ Process called "emit_float_literal" takes emitter as Integer, hir_node as Intege
     proc emit_string with emitter, value_str
     Return 1
 End Process
+
+@Reasoning:
+Emit a double-quoted F# string literal.
+@End Reasoning
+
+@Implementation:
+Emits ", then the value verbatim, then ".
+@End Implementation
+
+@Security_Scope:
+Value is emitted verbatim. Caller is responsible for escaping embedded
+quotes and backslashes.
+@End Security_Scope
 
 Process called "emit_string_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# string literal
@@ -335,6 +464,14 @@ Process called "emit_string_literal" takes emitter as Integer, hir_node as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# character literal using single-quote delimiters.
+@End Reasoning
+
+@Implementation:
+Emits ', then the value, then '.
+@End Implementation
+
 Process called "emit_char_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# char literal
 
@@ -344,6 +481,16 @@ Process called "emit_char_literal" takes emitter as Integer, hir_node as Integer
     proc emit_string with emitter, "'"
     Return 1
 End Process
+
+@Reasoning:
+Emit an F# boolean literal as "true" or "false". F# uses lowercase
+keywords (not True/False as Python does).
+@End Reasoning
+
+@Implementation:
+Reads value via get_hir_node_value. Emits "true" when value == 1,
+"false" otherwise.
+@End Implementation
 
 Process called "emit_boolean_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# boolean literal
@@ -357,6 +504,15 @@ Process called "emit_boolean_literal" takes emitter as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# variable reference. F# bare identifiers do not need any
+prefix; the value is emitted verbatim.
+@End Reasoning
+
+@Implementation:
+Reads the HIR node value (the identifier name) and emits it.
+@End Implementation
+
 Process called "emit_variable_reference" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# variable reference
 
@@ -364,6 +520,20 @@ Process called "emit_variable_reference" takes emitter as Integer, hir_node as I
     proc emit_string with emitter, variable_name
     Return 1
 End Process
+
+@Reasoning:
+Emit an F# function call. F# uses space-separated juxtaposition (not
+parenthesised argument lists), so "f a b c" is the canonical form.
+Arguments that need protection from juxtaposition (e.g. binary
+expressions) are emitted with explicit parentheses.
+@End Reasoning
+
+@Implementation:
+Reads the call node's callee (offset 8), arguments list (offset 16),
+arg_count (offset 24). Emits the callee then iterates arguments
+space-separated. For each argument calls expression_needs_parentheses;
+wraps the argument in "(...)" if needed.
+@End Implementation
 
 Process called "emit_call_expression" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# function call
@@ -403,6 +573,17 @@ Process called "emit_call_expression" takes emitter as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# lambda "fun p1 p2 ... -> body". F# lambdas use "fun" then
+space-separated parameter patterns then "->" then the body expression.
+@End Reasoning
+
+@Implementation:
+Reads lambda data (offset 8 parameters list, offset 16 param_count,
+offset 24 body). Emits "fun " then each parameter via emit_pattern with
+space separators, then " -> ", then the body via emit_expression.
+@End Implementation
+
 Process called "emit_lambda_expression" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# lambda expression
 
@@ -430,6 +611,18 @@ Process called "emit_lambda_expression" takes emitter as Integer, hir_node as In
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "left op right" with conditional parenthesisation based on
+operator precedence relative to surrounding context.
+@End Reasoning
+
+@Implementation:
+Reads operator, left, right from offsets 8/16/24. Wraps left in parens
+if expression_needs_parentheses returns 1. Emits the operator via
+emit_binary_operator (which surrounds with spaces). Same parenthesise
+logic for right.
+@End Implementation
 
 Process called "emit_binary_expression" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# binary expression
@@ -467,6 +660,18 @@ Process called "emit_binary_expression" takes emitter as Integer, hir_node as In
     Return 1
 End Process
 
+@Reasoning:
+Emit F# "if cond then a else b". F# if is an expression (returns a
+value), so this is used in both statement and expression positions.
+@End Reasoning
+
+@Implementation:
+Reads condition, then_branch, else_branch from the conditional data
+struct. Emits "if " + condition + " then " + then_branch. Always emits
+else clause; F# requires both arms in expression position. Branches
+recurse via emit_expression.
+@End Implementation
+
 Process called "emit_if_expression" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# if expression
 
@@ -487,6 +692,18 @@ Process called "emit_if_expression" takes emitter as Integer, hir_node as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Emit an F# "match expr with | pattern -> body | ..." block. Match arms
+are written as separate lines with consistent indentation.
+@End Reasoning
+
+@Implementation:
+Reads the matched expression and arms list. Emits "match " + expr +
+" with" + LF. For each arm emits indent + "| " + pattern via
+emit_pattern, optional "when" clause via emit_when_clause, then "->"
+and the body via emit_expression.
+@End Implementation
 
 Process called "emit_match_expression" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# match expression
@@ -515,6 +732,16 @@ Process called "emit_match_expression" takes emitter as Integer, hir_node as Int
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# list literal "[a; b; c]". F# uses semicolons (not commas) as
+the element separator in list literals, distinguishing them from tuples.
+@End Reasoning
+
+@Implementation:
+Emits "[", iterates the elements list emitting each via
+emit_expression with "; " separators, emits "]".
+@End Implementation
+
 Process called "emit_list_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# list literal
 
@@ -537,6 +764,15 @@ Process called "emit_list_literal" takes emitter as Integer, hir_node as Integer
     proc emit_string with emitter, "]"
     Return 1
 End Process
+
+@Reasoning:
+Emit an F# array literal "[|a; b; c|]". F# arrays use pipe-brackets to
+distinguish them from lists.
+@End Reasoning
+
+@Implementation:
+Emits "[|", iterates elements with "; " separators, emits "|]".
+@End Implementation
 
 Process called "emit_array_literal" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# array literal
@@ -561,6 +797,16 @@ Process called "emit_array_literal" takes emitter as Integer, hir_node as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# record literal "{ Field1 = a; Field2 = b }". Used to
+construct values of named-field types.
+@End Reasoning
+
+@Implementation:
+Emits "{ ", iterates each (field_name, value) pair emitting
+"FieldName = value" with "; " separators, emits " }".
+@End Implementation
+
 Process called "emit_record_constructor" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# record constructor
 
@@ -583,6 +829,15 @@ Process called "emit_record_constructor" takes emitter as Integer, hir_node as I
     proc emit_string with emitter, " }"
     Return 1
 End Process
+
+@Reasoning:
+Emit an F# tuple literal "(a, b, c)". Tuples use commas (in contrast to
+lists which use semicolons).
+@End Reasoning
+
+@Implementation:
+Emits "(", iterates the elements with ", " separators, emits ")".
+@End Implementation
 
 Process called "emit_tuple_constructor" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# tuple constructor
@@ -610,6 +865,19 @@ End Process
 Note: ============================================================================
 Note: HIR Statement Code Generation
 Note: ============================================================================
+
+@Reasoning:
+Statement-level dispatcher. Many F# constructs (if, match) work as both
+statements and expressions; this dispatcher routes statement-position
+HIR to the appropriate emitter.
+@End Reasoning
+
+@Implementation:
+Reads node_type, then probes the known statement HIR kinds (let, for,
+while, expression-statement, return). For expression-statement, the
+inner expression is emitted then a newline. For return, emits the
+expression directly (F# uses tail position rather than explicit return).
+@End Implementation
 
 Process called "emit_statement" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# code for HIR statement
@@ -661,6 +929,17 @@ Process called "emit_statement" takes emitter as Integer, hir_node as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Emit "let name = value" or "let mutable name = value" depending on the
+HIR is_mutable flag.
+@End Reasoning
+
+@Implementation:
+Reads variable_name (offset 8), initializer (offset 32), is_mutable
+(offset 40). Emits "let ", optional "mutable ", the variable name,
+" = ", and the initializer via emit_expression.
+@End Implementation
+
 Process called "emit_let_statement" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# let binding
 
@@ -681,6 +960,17 @@ Process called "emit_let_statement" takes emitter as Integer, hir_node as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Emit an F# for loop. F# supports both for-in (iterator) and for-to
+(numeric range) forms; this generator emits the for-in form.
+@End Reasoning
+
+@Implementation:
+Reads iterator_var, iterable, body. Emits "for " + var + " in " +
+iterable + " do" + LF, body via emit_statement at +1 indent, then
+"done" at the outer indent.
+@End Implementation
 
 Process called "emit_for_statement" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# for loop
@@ -710,6 +1000,15 @@ Process called "emit_for_statement" takes emitter as Integer, hir_node as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# while loop "while cond do body done".
+@End Reasoning
+
+@Implementation:
+Reads condition and body. Emits "while " + condition + " do" + LF, body
+at +1 indent, then "done" at outer indent.
+@End Implementation
+
 Process called "emit_while_statement" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# while loop
 
@@ -738,8 +1037,19 @@ Note: ==========================================================================
 Note: HIR Declaration Code Generation
 Note: ============================================================================
 
+@Reasoning:
+Top-level declaration dispatcher. Routes module/namespace/import/
+function/type declarations to their specialised emitters.
+@End Reasoning
+
+@Implementation:
+Reads node_type and probes the declaration HIR kinds, then dispatches.
+Unknown declaration types are silently ignored to allow partial-HIR
+emission.
+@End Implementation
+
 Process called "emit_declaration" takes emitter as Integer, hir_node as Integer returns Integer:
-    Note: Generate F# code for HIR declaration
+    Note:Generate F# code for HIR declaration
 
     If hir_node is equal to 0:
         Return 1
@@ -781,6 +1091,15 @@ Process called "emit_declaration" takes emitter as Integer, hir_node as Integer 
     Return 0
 End Process
 
+@Reasoning:
+Emit an F# "module Name" declaration at the top of a file. F# modules
+are the primary organising construct for top-level definitions.
+@End Reasoning
+
+@Implementation:
+Reads the module name, emits "module " + name + LF + LF.
+@End Implementation
+
 Process called "emit_module_declaration" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# module declaration
 
@@ -811,6 +1130,15 @@ Process called "emit_module_declaration" takes emitter as Integer, hir_node as I
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# "namespace X.Y.Z" declaration. Namespaces group modules and
+are placed at the top of a file before any module declaration.
+@End Reasoning
+
+@Implementation:
+Reads the namespace name, emits "namespace " + name + LF + LF.
+@End Implementation
+
 Process called "emit_namespace_declaration" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# namespace declaration
 
@@ -836,6 +1164,15 @@ Process called "emit_namespace_declaration" takes emitter as Integer, hir_node a
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# "open X.Y.Z" statement (analogous to "using" in C# or
+"import" elsewhere).
+@End Reasoning
+
+@Implementation:
+Reads the module path, emits "open " + path + LF.
+@End Implementation
+
 Process called "emit_import_statement" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# open statement
 
@@ -848,6 +1185,19 @@ End Process
 Note: ============================================================================
 Note: HIR Pattern Code Generation
 Note: ============================================================================
+
+@Reasoning:
+Emit an F# pattern (used in match arms, let bindings, lambda
+parameters). Patterns include wildcards, identifiers, literals, tuple
+patterns, and constructor patterns.
+@End Reasoning
+
+@Implementation:
+Reads pattern node_type. Wildcard: emits "_". Identifier: emits the
+name. Tuple: emits "(p1, p2, ...)" with comma-separated children
+patterns. Constructor: emits "ConstructorName arg" with the argument
+pattern.
+@End Implementation
 
 Process called "emit_pattern" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# pattern code
@@ -891,6 +1241,15 @@ Process called "emit_pattern" takes emitter as Integer, hir_node as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+Emit an F# "when condition" guard on a match arm. Optional;
+emit_match_expression calls this only when the arm has a guard.
+@End Reasoning
+
+@Implementation:
+Reads the guard expression, emits " when " + expression.
+@End Implementation
+
 Process called "emit_when_clause" takes emitter as Integer, hir_node as Integer returns Integer:
     Note: Generate F# when clause (match arm)
 
@@ -918,6 +1277,18 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Predicate over HIR expressions: returns 1 when the expression must be
+parenthesised in argument or operand position to disambiguate parsing.
+@End Reasoning
+
+@Implementation:
+Returns 1 for HIR_BINARY_EXPRESSION, HIR_UNARY_EXPRESSION,
+HIR_LAMBDA_EXPRESSION, HIR_IF_STATEMENT, HIR_MATCH_STATEMENT.
+Atomic shapes (literals, identifiers, fully-parenthesised
+constructors) return 0.
+@End Implementation
+
 Process called "expression_needs_parentheses" takes hir_node as Integer returns Integer:
     Note: Determine if expression needs parentheses for precedence
 
@@ -938,6 +1309,18 @@ Process called "expression_needs_parentheses" takes hir_node as Integer returns 
 
     Return 0
 End Process
+
+@Reasoning:
+Emit a binary operator with surrounding spaces. Maps Runa operator
+identifiers to F# syntax (e.g. "and" -> "&&", "or" -> "||", "eq" ->
+"=").
+@End Reasoning
+
+@Implementation:
+Switches on the operator value and emits the F# spelling surrounded by
+spaces. Unknown operators emit a placeholder that will fail to parse,
+making the issue visible.
+@End Implementation
 
 Process called "emit_binary_operator" takes emitter as Integer, operator as Integer returns Integer:
     Note: Generate F# binary operator
@@ -997,20 +1380,52 @@ Process called "emit_binary_operator" takes emitter as Integer, operator as Inte
     Return 1
 End Process
 
+@Reasoning:
+Record a fatal codegen error on the emitter. Latched - the has_error
+flag stays set until the emitter is destroyed.
+@End Reasoning
+
+@Implementation:
+Writes the message pointer to offset 48 and sets has_error at offset 56
+to 1.
+@End Implementation
+
 Process called "set_emitter_error" takes emitter as Integer, message as Integer returns Integer:
-    Note: Record an error message and set the has_error flag.
+Note: Record an error message and set the has_error flag.
     proc memory_set_int64 from MemoryCore with emitter, 48, message
     proc memory_set_int64 from MemoryCore with emitter, 56, 1
     Return 1
 End Process
 
+@Reasoning:
+Predicate over the latched error flag.
+@End Reasoning
+
+@Implementation:
+Reads the has_error field at offset 56.
+@End Implementation
+
 Process called "has_emitter_error" takes emitter as Integer returns Integer:
-    Note: Returns 1 if any error was recorded, 0 otherwise.
+Note: Returns 1 if any error was recorded, 0 otherwise.
     Return proc memory_get_int64 from MemoryCore with emitter, 56
 End Process
 
+@Reasoning:
+Snapshot the emitter's buffer into a fresh null-terminated copy that
+the caller owns.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_get_output (safe because the first 24 bytes of
+the F# state overlay the raw header).
+@End Implementation
+
+@Security_Scope:
+Caller owns the returned allocation.
+@End Security_Scope
+
 Process called "get_generated_code" takes emitter as Integer returns Integer:
-    Note: Returns a freshly-allocated null-terminated copy of the emitted F# source.
+Note: Returns a freshly-allocated null-terminated copy of the emitted F# source.
     Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
 
@@ -1018,8 +1433,19 @@ Note: ==========================================================================
 Note: Main F# Code Generation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Public driver for HIR -> F# translation. Owns the emitter lifetime and
+returns a freshly allocated F# source string.
+@End Reasoning
+
+@Implementation:
+Creates an emitter, dispatches the root HIR through emit_declaration
+or emit_statement based on its shape, then returns get_generated_code.
+Destroys the emitter before returning.
+@End Implementation
+
 Process called "generate_fsharp_code" takes hir_root as Integer returns Integer:
-    Note: Main entry point for generating F# code from HIR
+Note: Main entry point for generating F# code from HIR
 
     @Reasoning:
     This function coordinates the complete code generation process from

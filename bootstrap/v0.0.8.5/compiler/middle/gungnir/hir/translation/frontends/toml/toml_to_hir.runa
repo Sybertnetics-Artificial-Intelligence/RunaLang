@@ -56,6 +56,14 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+TOML to HIR conversion runs through multiple translators and needs to bubble first-encountered errors up to the caller; bundling the error message, an error flag, and the current source position into a context object lets every translator share a single error-reporting channel.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields: pointer to a heap-allocated error message string (or 0 if none), has_error boolean flag, and current source line/column for diagnostics.
+@End Implementation
+
 Type called "TOMLToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -66,6 +74,14 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Translation context must start with no error and a zero line/column so callers detect freshly-produced errors rather than stale ones from a previous translation.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes; null-check; initialise error_message=0, has_error=0, line=0, column=0.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create TOML to HIR translation context
@@ -85,6 +101,14 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+The context owns any heap-allocated error message; destruction must release it to avoid leaking when translation fails and the context is torn down.
+@End Reasoning
+
+@Implementation:
+Null-check the context. Read the error_message pointer; if non-null deallocate it. Then deallocate the context block.
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -108,6 +132,18 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Recording an error requires owning a copy of the message text, since the caller's message buffer may be transient; allocating a fresh heap copy and storing it in the context decouples the lifetimes.
+@End Reasoning
+
+@Implementation:
+Read the existing error_message; if non-null deallocate it. Measure the new message length, allocate length+1 bytes, copy the message bytes in, write a null terminator. Store the new pointer at offset 0 and set has_error=1 at offset 8.
+@End Implementation
+
+@Security_Scope:
+Error messages typically come from internal callers, but the message-length-driven copy guards against arbitrary lengths so an attacker-controlled message would only consume bounded memory.
+@End Security_Scope
 
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
@@ -138,13 +174,16 @@ Note: ==========================================================================
 Note: TOML Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+TOML nodes come in nine kinds (document, table, array, inline_table, string, integer, float, boolean, datetime); central dispatch lets each translator stay focused on one shape and shares position-update bookkeeping in one place.
+@End Reasoning
+
+@Implementation:
+Null-check the input. Read the node tag at offset 0 and the source line/column at offsets 64/72. Copy them into the context for diagnostics. Dispatch on tag to the matching translate_toml_* helper. Unknown tags record an error and return 0.
+@End Implementation
+
 Process called "translate_toml_node_to_hir" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on TOML node type.
-    Creates corresponding HIR literal or data structure node.
-    @End Reasoning
 
     If toml_node is equal to 0:
         proc set_translation_error with context, "Null TOML node"
@@ -201,13 +240,20 @@ Process called "translate_toml_node_to_hir" takes context as Integer, toml_node 
     Return 0
 End Process
 
+@Reasoning:
+A TOML document is a top-level key/value mapping (with optional [table] sections); lowering it to an HIR dictionary literal preserves the structure and lets downstream code read the configuration as native Runa Dictionary values.
+@End Reasoning
+
+@Implementation:
+Read the children and keys lists from the parser node (offsets 40 / 48); error out if either is null. Allocate an HIR dictionary literal. For each (key, value) pair in parallel: validate non-null, recursively translate the value, then add the entry via HIR.add_dictionary_entry.
+@End Implementation
+
+@Performance_Hints:
+O(n) in number of top-level entries plus the cost of nested translations.
+@End Performance_Hints
+
 Process called "translate_toml_document" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML document to HIR dictionary
-
-    @Reasoning:
-    TOML documents are essentially top-level key-value mappings,
-    optionally with table sections. We translate to a Runa Dictionary.
-    @End Reasoning
 
     Note: Get children and keys
     Let children be proc memory_get_int64 from Layout with toml_node, 40
@@ -267,12 +313,32 @@ Process called "translate_toml_document" takes context as Integer, toml_node as 
     Return hir_dict
 End Process
 
+@Reasoning:
+A TOML table "[section]" has the same structural shape as a document - a list of key/value pairs - so it can be translated by delegating to translate_toml_document with no shape change.
+@End Reasoning
+
+@Implementation:
+Forward to translate_toml_document with the same context and node pointer.
+@End Implementation
+
 Process called "translate_toml_table" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML table to HIR dictionary
 
     Note: Tables are similar to documents - they're dictionaries
     Return proc translate_toml_document with context, toml_node
 End Process
+
+@Reasoning:
+TOML arrays "[a, b, c]" become ordered HIR list literals; each element gets recursively translated so heterogeneous arrays produce correctly-typed children.
+@End Reasoning
+
+@Implementation:
+Read the children list from offset 40; error out if null. Allocate an HIR list literal. For each child: null-check, recursively translate via translate_toml_node_to_hir, attach via HIR.add_list_element.
+@End Implementation
+
+@Performance_Hints:
+O(n) in array length plus nested translation cost; one HIR allocation per element.
+@End Performance_Hints
 
 Process called "translate_toml_array" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML array to HIR list
@@ -323,12 +389,28 @@ Process called "translate_toml_array" takes context as Integer, toml_node as Int
     Return hir_list
 End Process
 
+@Reasoning:
+TOML inline tables "{ a = 1, b = 2 }" carry the same key/value shape as documents and named tables; reusing translate_toml_document is correct and avoids duplicated translation logic.
+@End Reasoning
+
+@Implementation:
+Forward to translate_toml_document with the same context and node pointer.
+@End Implementation
+
 Process called "translate_toml_inline_table" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML inline table to HIR dictionary
 
     Note: Inline tables are dictionaries
     Return proc translate_toml_document with context, toml_node
 End Process
+
+@Reasoning:
+TOML strings carry the resolved (escape-processed) text in the parser node's value_string slot at offset 8; lifting them directly into an HIR string literal preserves their content without re-parsing.
+@End Reasoning
+
+@Implementation:
+Read the resolved string pointer at offset 8; if null record an error and return 0. Otherwise allocate and return an HIR string literal wrapping that string.
+@End Implementation
 
 Process called "translate_toml_string" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML string to HIR string literal
@@ -350,6 +432,14 @@ Process called "translate_toml_string" takes context as Integer, toml_node as In
     Return hir_string
 End Process
 
+@Reasoning:
+TOML integers are pre-decoded by the parser into a 64-bit value at offset 16; the translator just lifts that integer into an HIR integer literal without re-parsing.
+@End Reasoning
+
+@Implementation:
+Read the integer value at offset 16, build an HIR integer literal, error-out if HIR allocation fails.
+@End Implementation
+
 Process called "translate_toml_integer" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML integer to HIR integer literal
 
@@ -365,13 +455,16 @@ Process called "translate_toml_integer" takes context as Integer, toml_node as I
     Return hir_int
 End Process
 
+@Reasoning:
+TOML floats are preserved in the parser node as the source string form so that special values (inf, nan, scientific notation) and arbitrary precision survive intact; the HIR float literal constructor consumes the string and performs its own conversion.
+@End Reasoning
+
+@Implementation:
+Read the string pointer at offset 8; error-out if null. Pass it to HIR.create_hir_float_literal; error-out if allocation fails.
+@End Implementation
+
 Process called "translate_toml_float" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML float to HIR representation
-
-    @Reasoning:
-    We create an HIR float literal from the string representation.
-    The HIR float literal constructor accepts the string form and handles conversion.
-    @End Reasoning
 
     Let value_string be proc memory_get_int64 from Layout with toml_node, 8
 
@@ -391,6 +484,14 @@ Process called "translate_toml_float" takes context as Integer, toml_node as Int
     Return hir_float
 End Process
 
+@Reasoning:
+TOML booleans "true"/"false" are stored by the parser as 1/0 in the integer-value slot at offset 16; the translator forwards that to HIR.create_hir_boolean_literal which interprets the integer as true/false.
+@End Reasoning
+
+@Implementation:
+Read the integer value at offset 16, build an HIR boolean literal; error-out if HIR allocation fails.
+@End Implementation
+
 Process called "translate_toml_boolean" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML boolean to HIR boolean literal
 
@@ -406,14 +507,16 @@ Process called "translate_toml_boolean" takes context as Integer, toml_node as I
     Return hir_bool
 End Process
 
+@Reasoning:
+TOML supports four datetime sub-forms (offset datetime, local datetime, local date, local time); preserving the original RFC 3339 string keeps the format distinction visible to consumers without committing HIR to a specific datetime type.
+@End Reasoning
+
+@Implementation:
+Read the value string pointer at offset 8; error-out if null. Wrap it in an HIR string literal so that downstream stages can parse the format as needed.
+@End Implementation
+
 Process called "translate_toml_datetime" takes context as Integer, toml_node as Integer returns Integer:
     Note: Translate TOML datetime to HIR string literal
-
-    @Reasoning:
-    DateTime values are stored as RFC 3339 formatted strings.
-    We preserve the exact format from the source for maximum fidelity.
-    Formats supported: Offset DateTime, Local DateTime, Local Date, Local Time.
-    @End Reasoning
 
     Let value_string be proc memory_get_int64 from Layout with toml_node, 8
 
@@ -437,13 +540,20 @@ Note: ==========================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
 
+@Reasoning:
+Public entry point that hides the parse + translate + cleanup orchestration; failures at any stage bubble through a single error-reporting channel attached to the higher-level Translation context.
+@End Reasoning
+
+@Implementation:
+Null-check source_code. Create an internal translation context; on OOM report to the Translation context and return 0. Parse the source via Parser.parse_toml; on failure report and return 0. Recursively translate the AST root. If the internal context's has_error flag is set after translation, forward the error message to the outer Translation context. Destroy the internal context and return the HIR root (or 0 on error).
+@End Implementation
+
+@Security_Scope:
+Consumes untrusted TOML source. Error messages from the parser pass through unchanged to the outer Translation context; the cleanup path always runs to prevent context leaks on failure.
+@End Security_Scope
+
 Process called "translate_toml_to_hir" takes source_code as Integer, translation_context as Integer returns Integer:
     Note: Translate TOML source code to Runa HIR
-
-    @Reasoning:
-    Entry point for TOML→HIR translation. Parses TOML, translates to HIR,
-    handles errors, and reports to Translation context.
-    @End Reasoning
 
     If source_code is equal to 0:
         proc add_translation_error from Translation with translation_context, "Null source code"

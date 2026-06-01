@@ -72,6 +72,22 @@ Note: ==========================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
+@Reasoning:
+The MongoDB query language is a strict subset of JSON-with-extensions, so a
+single linear cursor over a UTF-8 byte buffer suffices: we never need to
+look back, and the only state we must carry between tokens is "where are
+we" and "where am I in error-reporting coordinates". Caching source_length
+avoids re-walking the byte buffer on every EOF check during scanning of
+deeply nested aggregation pipelines.
+@End Reasoning
+
+@Implementation:
+Five 64-bit slots in declared order: source pointer, source length cached
+at construction, byte position, 1-indexed line and column. Total size 40
+bytes; field offsets 0/8/16/24/32 are referenced directly by every other
+Process in this file via memory_get_int64 / memory_set_int64.
+@End Implementation
+
 Type called "Lexer":
     source as Integer
     source_length as Integer
@@ -83,6 +99,23 @@ End Type
 Note: ============================================================================
 Note: Token Structure
 Note: ============================================================================
+
+@Reasoning:
+Tokens are produced into a flat ownership scheme: the parser owns each
+Token, but the byte slice `text` points back into the lexer's immutable
+source buffer rather than being copied. This keeps lexing allocation-light
+on aggregation pipelines that can carry hundreds of operator tokens, and
+gives the parser O(1) substring access for keyword/operator comparisons.
+@End Reasoning
+
+@Implementation:
+Six 64-bit slots in declared order: token_type tag (matches the TOKEN_*
+constants above), `text` interior pointer into source, `length` of the
+slice in bytes, 1-indexed line/column captured at the START of the token,
+and an opaque `value` slot reserved for parser-side annotations (always 0
+on emit). Total size 48 bytes; offsets 0/8/16/24/32/40 are used directly
+by create_token.
+@End Implementation
 
 Type called "Token":
     token_type as Integer
@@ -96,6 +129,26 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation
 Note: ============================================================================
+
+@Reasoning:
+Constructor for the per-translation lexer state. Allocating once at parse
+entry and threading the pointer through every scanner call lets us avoid
+re-deriving source_length (an O(n) StringCore call) on each EOF test.
+A null return signals OOM upstream; callers must check.
+@End Reasoning
+
+@Implementation:
+Compute source_length once via StringCore.string_length, allocate the 40
+byte Lexer block, then write the five fields at their offsets: source ptr,
+length, position=0, line=1, column=1. Returns the Lexer pointer, or 0 if
+allocation fails.
+@End Implementation
+
+@Security_Scope:
+`source` is treated as a trusted, NUL-terminated UTF-8 buffer owned by the
+caller; the lexer never writes to it and never frees it. Lifetime of the
+returned Lexer must not outlive `source`.
+@End Security_Scope
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create a new lexer for MongoDB query source
@@ -123,6 +176,17 @@ Note: ==========================================================================
 Note: Character Access
 Note: ============================================================================
 
+@Reasoning:
+Every scanner needs a one-character lookahead without mutating cursor or
+line/column state. Returning 0 at EOF lets scanners use a single equality
+test as the loop sentinel instead of carrying a separate bounds check.
+@End Reasoning
+
+@Implementation:
+Read position (offset 16) and source_length (offset 8); if exhausted
+return 0; otherwise dereference source[position] via memory_get_byte.
+@End Implementation
+
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -138,6 +202,20 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+The single mutating cursor primitive. Centralising line/column update
+here guarantees newline accounting is consistent across every scanner --
+miss it once and downstream error reports drift by the rest of the file.
+@End Reasoning
+
+@Implementation:
+Capture the current byte via peek_char. On newline (0x0A) increment line
+and reset column to 1; otherwise increment column. Always increment
+position by exactly one byte (single-byte advance; UTF-8 continuation
+bytes are skipped past byte-by-byte by the scanners that handle them).
+Returns the byte that was just consumed.
+@End Implementation
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
@@ -167,6 +245,19 @@ Note: ==========================================================================
 Note: Whitespace Handling
 Note: ============================================================================
 
+@Reasoning:
+MongoDB shell input is whitespace-permissive between tokens but not within
+them, so the tokenizer eagerly consumes runs of space/tab/CR/LF before
+each token attempt. Centralising this avoids per-scanner whitespace
+handling and ensures newline accounting flows through advance_char.
+@End Reasoning
+
+@Implementation:
+Loop peeking the next byte; while it is space (0x20), tab (0x09), LF
+(0x0A) or CR (0x0D), call advance_char to consume it; break on any other
+byte (including EOF, which peek_char reports as 0). Always returns 1.
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -194,6 +285,20 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Single allocation point for Token objects keeps token lifetime auditable:
+every Token returned by a scanner originated here, and the parser owns
+freeing it. Returning 0 on OOM lets scanners propagate failure without a
+distinct error code.
+@End Reasoning
+
+@Implementation:
+Allocate 48 bytes for the six-field Token layout, then write the six
+arguments into offsets 0/8/16/24/32/40 in declared order. No copying of
+the text bytes occurs -- `text` is an interior pointer into the lexer
+source buffer; the token only borrows it.
+@End Implementation
+
 Process called "create_token" takes token_type as Integer, text as Integer, length as Integer, line as Integer, column as Integer, value as Integer returns Integer:
     Note: Create a new token
 
@@ -217,6 +322,20 @@ End Process
 Note: ============================================================================
 Note: Character Classification
 Note: ============================================================================
+
+@Reasoning:
+Identifier start-character predicate. MongoDB shell identifiers follow the
+JavaScript-ish identifier rule for the leading byte (ASCII letter or
+underscore), so this is the gate for entering scan_identifier. Hot path:
+called once per top-level token plus once per identifier-body byte via
+is_alphanumeric.
+@End Reasoning
+
+@Implementation:
+Three ASCII range checks: 0x41-0x5A (A-Z), 0x61-0x7A (a-z), and equality
+with 0x5F (underscore). Returns 1 on hit, 0 otherwise. No locale or
+Unicode handling -- BSON identifiers are ASCII by spec.
+@End Implementation
 
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic or underscore
@@ -243,6 +362,19 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII decimal-digit predicate. Used both as the leading-character test for
+scan_number (after the optional minus sign) and as the body test inside
+the fractional / exponent loops; correctness in scan_number's three
+sub-scans depends entirely on this returning exactly 1 for 0x30-0x39 and
+0 for everything else.
+@End Reasoning
+
+@Implementation:
+Single nested range check 0x30 <= char <= 0x39. Returns 1 inside the
+range, 0 outside.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit
 
@@ -254,6 +386,18 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Identifier continuation predicate -- the body bytes of an identifier or a
+$-operator name. Defined as the union of is_alpha (letters + underscore)
+and is_digit, matching the MongoDB shell's accepted identifier grammar.
+@End Reasoning
+
+@Implementation:
+Call is_alpha first; if 1, return 1 immediately. Otherwise return the
+result of is_digit. Short-circuited so letters do not pay for the digit
+range check.
+@End Implementation
 
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric or underscore
@@ -270,6 +414,25 @@ End Process
 Note: ============================================================================
 Note: Identifier and Operator Scanning
 Note: ============================================================================
+
+@Reasoning:
+Scans the maximal run of identifier-body bytes starting at the current
+position and emits a token whose type is decided by check_keyword. The
+distinction between TOKEN_IDENTIFIER and the BSON-constructor keywords
+(ObjectId, ISODate, NumberLong, etc.) is resolved here rather than at
+parse time so the parser can dispatch on type alone.
+@End Reasoning
+
+@Implementation:
+Snapshot start_position and the starting line/column at entry (before any
+advance), then loop calling is_alphanumeric on peek_char and advancing
+while it succeeds. After the loop, derive length = end_position -
+start_position and text_ptr = source + start_position; pass the slice to
+check_keyword to choose between TOKEN_BOOLEAN, TOKEN_NULL, TOKEN_OBJECTID,
+TOKEN_ISODATE, TOKEN_NUMBERLONG, TOKEN_NUMBERDECIMAL, TOKEN_REGEX, or
+TOKEN_IDENTIFIER. Emit the token via create_token at the captured
+line/column.
+@End Implementation
 
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
@@ -300,6 +463,32 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
 
     Return proc create_token with token_type, text_ptr, length, line, column, 0
 End Process
+
+@Reasoning:
+Length-prefiltered keyword recognizer. MongoDB has a small fixed set of
+reserved identifier-shaped keywords (true, false, null, ObjectId,
+ISODate, NumberLong, NumberDecimal, RegEx, RegExp); dispatching by length
+first keeps the comparison cost at O(1) per token by avoiding repeated
+StringCore allocations for keywords whose length cannot possibly match.
+Anything that fails every check falls through to TOKEN_IDENTIFIER.
+@End Reasoning
+
+@Implementation:
+Switch on `length`: 4 tries "true"/"null", 5 tries "false"/"RegEx", 6
+tries "RegExp", 7 tries "ISODate", 8 tries "ObjectId", 10 tries
+"NumberLong", 13 tries "NumberDecimal". For each candidate, build a
+heap-allocated comparison String via StringCore.create_string, compare via
+string_equals_range against the source slice, then deallocate before the
+next candidate to keep the working set bounded. Returns the first matching
+TOKEN_* constant, or TOKEN_IDENTIFIER if none match.
+@End Implementation
+
+@Performance_Hints:
+O(length) per matched keyword (one byte-compare loop in
+string_equals_range). Allocates and frees a small comparison String per
+candidate -- worth caching as a future optimisation if profiling shows
+keyword recognition dominating tokenization time.
+@End Performance_Hints
 
 Process called "check_keyword" takes text as Integer, length as Integer returns Integer:
     Note: Check if identifier is a keyword
@@ -394,6 +583,20 @@ Process called "check_keyword" takes text as Integer, length as Integer returns 
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Local byte-range equality helper used by check_keyword. Defined locally
+because the StringCore equivalents either require both arguments to be
+NUL-terminated Strings (we have an unterminated slice) or do not let the
+caller specify a starting offset into the first operand.
+@End Reasoning
+
+@Implementation:
+Walk index from 0 to length-1, comparing str1[start + index] against
+str2[index] via memory_get_byte. Return 0 on the first mismatch, 1 if the
+loop completes. No NUL-terminator inspection -- the caller is responsible
+for guaranteeing length is the exact prefix length to compare.
+@End Implementation
+
 Process called "string_equals_range" takes str1 as Integer, str2 as Integer, start as Integer, length as Integer returns Integer:
     Note: Compare string range for equality
 
@@ -412,6 +615,21 @@ Process called "string_equals_range" takes str1 as Integer, str2 as Integer, sta
 
     Return 1
 End Process
+
+@Reasoning:
+MongoDB query, update, and aggregation operators all share the $-prefix
+form ($eq, $set, $match, $group, ...). Treating the entire prefix-plus-name
+as one token keeps the parser uniform: it sees TOKEN_OPERATOR and routes
+on the slice contents rather than reassembling two tokens.
+@End Reasoning
+
+@Implementation:
+Capture start_position (pointing at the `$`) and the starting line/column;
+advance once to consume the `$`; then loop advancing while
+is_alphanumeric(peek_char) holds. The resulting slice [start_position,
+end_position) includes the leading `$`, so callers can compare against
+operator names verbatim. Emit a TOKEN_OPERATOR token.
+@End Implementation
 
 Process called "scan_operator" takes lexer as Integer returns Integer:
     Note: Scan MongoDB operator ($eq, $set, $match, etc.)
@@ -445,6 +663,30 @@ End Process
 Note: ============================================================================
 Note: String Literal Scanning
 Note: ============================================================================
+
+@Reasoning:
+The MongoDB shell accepts both single-quoted and double-quoted string
+literals, so quote_char is passed in by next_token and used as the loop
+sentinel. Escape sequences are not decoded at lex time -- the parser /
+higher layer is responsible for interpreting `\n`, `\"`, etc.; here we
+only ensure the backslash skip-pair stays inside one token.
+@End Reasoning
+
+@Implementation:
+Capture start_position and the starting line/column; advance past the
+opening quote; loop on peek_char with three exit conditions: EOF (0)
+breaks the loop without consuming further; the matching quote_char
+consumes it and breaks; a backslash (0x5C) consumes two bytes (the
+backslash plus the next, unconditional, to preserve `\"`); anything else
+consumes one byte. Emit TOKEN_STRING over the inclusive-of-quotes slice.
+@End Implementation
+
+@Security_Scope:
+Unterminated strings (EOF before the closing quote) are accepted silently
+here -- the parser detects the missing terminator via the token text not
+ending in the expected quote. Embedded NULs inside the literal are also
+accepted (the lexer EOFs only when source_length is reached).
+@End Security_Scope
 
 Process called "scan_string" takes lexer as Integer, quote_char as Integer returns Integer:
     Note: Scan string literal (single or double quoted)
@@ -487,6 +729,26 @@ End Process
 Note: ============================================================================
 Note: Numeric Literal Scanning
 Note: ============================================================================
+
+@Reasoning:
+Recognises the lexical shape of an Int/Long/Double literal: optional
+leading minus, integer part, optional fractional part, optional decimal
+exponent. The distinction between Int, Long, and Double is left to the
+parser (decided by the presence of the fractional/exponent parts plus any
+NumberLong/NumberDecimal wrapper); the lexer's job is only to bound the
+character span.
+@End Reasoning
+
+@Implementation:
+Capture start_position and starting line/column. (1) If the leading byte
+is `-` (0x2D), consume it. (2) Consume digits while is_digit holds. (3) If
+the next byte is `.` (0x2E), consume it and the following digit run. (4)
+If the next byte is `e` (0x65) or `E` (0x45), consume it plus an optional
+sign (`+` 0x2B / `-` 0x2D) plus the following digit run. Emit
+TOKEN_NUMBER over the resulting slice. Note: no value is parsed into the
+token's `value` slot at lex time -- the parser converts the textual slice
+later.
+@End Implementation
 
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal (Int, Long, Double)
@@ -588,6 +850,45 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+The main tokenizer entry. Dispatches on the leading byte after whitespace
+skipping; the ordering is deliberate -- $-operators before identifiers
+(so `$set` is not lexed as identifier "set"), numbers before signs (so a
+positive literal is not held up), and finally single-character punctuation
+for the JSON-ish structure characters. Unknown bytes are silently skipped
+to keep tokenization total in the presence of typos -- the parser will
+recover from the resulting token gap.
+@End Reasoning
+
+@Implementation:
+Skip whitespace, then peek the leading byte. Dispatch order:
+  0x00            -> emit TOKEN_EOF with the current line/column.
+  0x24 `$`        -> scan_operator.
+  is_alpha        -> scan_identifier (resolves to keywords too).
+  is_digit OR 0x2D `-` -> scan_number (negative-prefix shortcut).
+  0x22 `"`        -> scan_string with double-quote sentinel.
+  0x27 `'`        -> scan_string with single-quote sentinel.
+  0x7B 0x7D 0x5B 0x5D 0x3A 0x2C  ({ } [ ] : ,)
+                  -> advance one byte and emit the matching single-char
+                     structure token (LBRACE/RBRACE/LBRACKET/RBRACKET/
+                     COLON/COMMA) carrying a 1-byte text slice.
+  Anything else   -> advance one byte and tail-recurse to skip.
+@End Implementation
+
+@Performance_Hints:
+O(1) per emitted token excluding the inner scanner cost. The unknown-byte
+tail-recursion case is a tail call but is not currently TCO'd; pathological
+input full of unknown bytes can deepen the stack -- acceptable for query
+input which is bounded in length.
+@End Performance_Hints
+
+@Security_Scope:
+Treats `lexer` as a trusted, well-formed Lexer pointer. The unknown-byte
+silent-skip means malformed input never crashes the lexer, but does
+result in tokens being produced at later positions than the caller might
+expect -- the parser is responsible for surfacing this to the user.
+@End Security_Scope
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from lexer

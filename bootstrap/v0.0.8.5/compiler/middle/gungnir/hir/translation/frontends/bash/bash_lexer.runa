@@ -173,6 +173,20 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Tracks line and column in addition to byte position so the bash lexer can
+emit token coordinates suitable for error reporting and diagnostics. The
+cached current_char avoids re-reading the source byte on every classifier
+call inside the inner tokenisation loops.
+@End Reasoning
+
+@Implementation:
+Six 8-byte fields at offsets 0/8/16/24/32/40: source pointer, source length,
+current byte position, 1-based line number, 1-based column number, and the
+current character value (or -1 sentinel for EOF). Total record size 40
+bytes (LEXER_SIZE).
+@End Implementation
+
 Type called "BashLexer":
     source as Integer          Note: Source code string
     length as Integer          Note: Source code length
@@ -185,6 +199,19 @@ End Type
 Note: ============================================================================
 Note: Token Structure
 Note: ============================================================================
+
+@Reasoning:
+Each Token carries its source coordinates so downstream phases can emit
+precise diagnostics without re-walking the source. Token value holds a
+pointer to a freshly allocated lexeme string (not a slice into source) so
+tokens can outlive the source buffer.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields at offsets 0/8/16/24: token type discriminator, value
+pointer to a copied lexeme string, line number, column number. Total record
+size 32 bytes (TOKEN_SIZE).
+@End Implementation
 
 Type called "Token":
     type as Integer            Note: Token type constant
@@ -199,6 +226,24 @@ Note: ==========================================================================
 
 Constant LEXER_SIZE as Integer is 40  Note: 5 fields × 8 bytes
 Constant TOKEN_SIZE as Integer is 32  Note: 4 fields × 8 bytes
+
+@Reasoning:
+Initialises a Bash lexer over a NUL-terminated source string, pre-caching
+the first character so the inner scanning helpers can branch on
+current_char without an extra memory load on the first iteration.
+@End Reasoning
+
+@Implementation:
+Computes source length once via StringCore. Allocates LEXER_SIZE (40) bytes.
+Writes source pointer, length, position=0, line=1, column=1. If the source
+is non-empty, reads byte 0 into current_char at offset 40; otherwise stores
+-1 as the EOF sentinel. Returns the lexer handle, or 0 if allocation failed.
+@End Implementation
+
+@Security_Scope:
+Trusts caller to pass a valid source pointer. The lexer must be released
+via destroy_bash_lexer to avoid leaking the 40-byte record.
+@End Security_Scope
 
 Process called "create_bash_lexer" takes source as Integer returns Integer:
     Note: Create Bash lexer from source code
@@ -228,6 +273,17 @@ Process called "create_bash_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+The lexer is a flat 40-byte record that owns no nested handles (tokens are
+returned to the caller and owned individually), so cleanup is a single
+deallocate.
+@End Reasoning
+
+@Implementation:
+Null-safe (returns 1 on 0 input). Calls Layout.deallocate on the lexer
+record. Always returns 1 to signal success.
+@End Implementation
+
 Process called "destroy_bash_lexer" takes lexer as Integer returns Integer:
     Note: Destroy Bash lexer
 
@@ -243,6 +299,25 @@ End Process
 Note: ============================================================================
 Note: Character Operations
 Note: ============================================================================
+
+@Reasoning:
+Single source of truth for forward cursor movement and line/column tracking.
+Centralising line/column updates here means scanners do not have to remember
+to bump them; they just call advance.
+@End Reasoning
+
+@Implementation:
+Reads position, length, source, and current_char. If current_char was 10
+(newline), increments line and resets column to 1; otherwise increments
+column. Advances position by 1, writes it back. If the new position is at
+or past length, stores -1 in current_char and returns -1 (EOF). Otherwise
+reads the byte at the new position, caches it in current_char, and returns
+it.
+@End Implementation
+
+@Performance_Hints:
+O(1). Hot path - called once per source byte.
+@End Performance_Hints
 
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Advance to next character
@@ -276,6 +351,22 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return next_char
 End Process
 
+@Reasoning:
+Bash has many two- and three-character operators (||, &&, >>, <<-, <<<,
+<<EOF, etc.). The scanners need to look ahead without committing the
+cursor, hence a read-only peek that returns the byte at position+offset.
+@End Reasoning
+
+@Implementation:
+Computes peek_pos = position + offset. If peek_pos is at or past length,
+returns -1. Otherwise reads the byte at peek_pos from source and returns
+it. Does not modify lexer state.
+@End Implementation
+
+@Performance_Hints:
+O(1). Hot path.
+@End Performance_Hints
+
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character at position + offset
 
@@ -297,6 +388,17 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Bash treats newline as a statement terminator, so the inter-token
+whitespace classifier must explicitly exclude '\n'. Tab, space, and CR are
+the only horizontal whitespace bash recognises in source.
+@End Reasoning
+
+@Implementation:
+Returns 1 for 0x20 (space), 0x09 (tab), or 0x0D (CR), else 0. Note that
+0x0A (LF) is intentionally absent.
+@End Implementation
+
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace (but not newline)
 
@@ -314,6 +416,17 @@ Process called "is_whitespace" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Identifiers and keywords use ASCII letters plus underscore. Including '_'
+in is_alpha rather than only in is_word_char matches bash's identifier
+grammar (which permits underscore as a starting character).
+@End Reasoning
+
+@Implementation:
+Returns 1 for ASCII A-Z (0x41-0x5A), a-z (0x61-0x7A), or underscore (0x5F).
+Otherwise 0.
+@End Implementation
 
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
@@ -337,6 +450,15 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII-only digit recognition. Used by scan_number and by is_word_char as
+part of the word/identifier classifier.
+@End Reasoning
+
+@Implementation:
+Returns 1 for ASCII 0x30..0x39, otherwise 0.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit
 
@@ -348,6 +470,19 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Bash 'words' (command names, arguments, filenames) accept a broader set
+than C-style identifiers: alphanumerics plus '_', '-', '/', '.', '*', '?',
+etc. depending on context. This helper accepts the unquoted set needed by
+scan_word, including filename punctuation.
+@End Reasoning
+
+@Implementation:
+Returns 1 if is_alpha, is_digit, or the char equals 0x5F ('_'), 0x2D ('-'),
+0x2F ('/'), or 0x2E ('.'). Otherwise 0. The path and dash extensions allow
+common filename and command-flag fragments to lex as a single word.
+@End Implementation
 
 Process called "is_word_char" takes char as Integer returns Integer:
     Note: Check if character is valid in word/identifier
@@ -385,6 +520,17 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Constructor for Token records. Centralising the 32-byte layout writes keeps
+the field offsets in one place so a schema change only requires editing the
+Type definition and this proc.
+@End Reasoning
+
+@Implementation:
+Allocates TOKEN_SIZE (32) bytes. Returns 0 on allocation failure. Writes
+type/value/line/column at offsets 0/8/16/24. Returns the token handle.
+@End Implementation
+
 Process called "create_token" takes type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Note: Create token with given type and value
 
@@ -401,6 +547,22 @@ Process called "create_token" takes type as Integer, value as Integer, line as I
 
     Return token
 End Process
+
+@Reasoning:
+Tokens own their value string (it is allocated, not a slice into source),
+so destruction must free both the value buffer and the record itself.
+Null-safe so callers can blindly destroy on error-recovery paths.
+@End Reasoning
+
+@Implementation:
+Returns 1 immediately on 0 input. Reads value at offset 8; if non-zero,
+deallocates the value buffer. Deallocates the token record. Always returns 1.
+@End Implementation
+
+@Security_Scope:
+Must be called exactly once per token. Double-free of the value buffer
+would be the most likely failure mode if called twice.
+@End Security_Scope
 
 Process called "destroy_token" takes token as Integer returns Integer:
     Note: Destroy token and free value string
@@ -424,6 +586,22 @@ Note: ==========================================================================
 Note: Whitespace Skipping
 Note: ============================================================================
 
+@Reasoning:
+Newlines are statement separators in bash and must not be consumed by the
+whitespace skipper. This proc burns through consecutive spaces/tabs/CR
+between tokens but stops at any other character (including '\n').
+@End Reasoning
+
+@Implementation:
+Reads current_char. Loops: ask is_whitespace; if 0, break; otherwise call
+advance which updates current_char and line/column tracking. Always returns
+1 once the loop exits.
+@End Implementation
+
+@Performance_Hints:
+O(k) over consecutive whitespace bytes.
+@End Performance_Hints
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters (but not newlines)
 
@@ -441,6 +619,22 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Bash comments run from '#' to end-of-line. The newline is intentionally NOT
+consumed because the parser uses it as a statement terminator; the
+lexer's main loop will pick it up on the next call to next_token.
+@End Reasoning
+
+@Implementation:
+Reads current_char. Loops until current_char is 10 (newline) or -1 (EOF),
+calling advance each iteration. Returns 1 once the loop exits, leaving the
+newline as the current character.
+@End Implementation
+
+@Performance_Hints:
+O(L) where L is comment length.
+@End Performance_Hints
 
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip comment (from # to end of line)
@@ -470,6 +664,21 @@ Process called "check_bash_keyword" takes text as Integer, length as Integer ret
     Bash has many keywords for control flow and variable operations.
     We check length first for efficiency, then compare strings.
     @End Reasoning
+
+    @Implementation:
+    Branches on the lexeme length and runs string_equals_range against each
+    candidate keyword of that length. Returns the matching TOKEN_* constant
+    (TOKEN_IF, TOKEN_FOR, TOKEN_THEN, TOKEN_DONE, etc.) on hit, or 0 on miss
+    so the caller can treat the lexeme as a regular word. Each candidate
+    keyword string is allocated then immediately deallocated after the
+    comparison.
+    @End Implementation
+
+    @Performance_Hints:
+    O(K) where K is the number of keywords at the matching length (small).
+    Hot path during tokenisation; the length partition avoids comparing
+    against the full keyword list every time.
+    @End Performance_Hints
 
     If length is equal to 2:
         Let if_str be proc create_string from StringCore with "if"
@@ -646,6 +855,31 @@ Note: ==========================================================================
 Note: String Literals
 Note: ============================================================================
 
+@Reasoning:
+Single-quoted strings in bash are literal - no escape processing, no
+variable expansion. Scanning is therefore a strict search for the closing
+quote with no nested grammar to consider. Returns the bytes between the
+quotes as a fresh allocation; the quotes themselves are excluded.
+@End Reasoning
+
+@Implementation:
+Captures start_pos before the opening quote. Calls advance to step past
+the opening 0x27 ("'"). Loops until current_char is 0x27 (closing quote)
+or -1 (EOF, returns 0 to signal unterminated string). Calls advance to
+step past the closing quote, computes end_pos and str_length = end - start
+- 2 (clamped to 0), then materialises the literal via StringCore.substring
+from start_pos+1 with str_length bytes.
+@End Implementation
+
+@Performance_Hints:
+O(L) over literal length.
+@End Performance_Hints
+
+@Security_Scope:
+Untrusted source input. Unterminated string returns 0 instead of running
+past EOF.
+@End Security_Scope
+
 Process called "scan_single_quoted_string" takes lexer as Integer returns Integer:
     Note: Scan single-quoted string 'text'
 
@@ -674,6 +908,31 @@ Process called "scan_single_quoted_string" takes lexer as Integer returns Intege
 
     Return value
 End Process
+
+@Reasoning:
+Double-quoted strings allow backslash escapes (e.g. \", \\, \$) and may
+contain expansion forms ($var, ${var}, $(cmd), $((expr))). At the lexing
+level we only need to recognise the boundaries; expansion parsing happens
+later. The escape rule means a backslash inside the string consumes the
+following byte even if it is the closing quote.
+@End Reasoning
+
+@Implementation:
+Captures start_pos before the opening quote. Calls advance past the opening
+0x22 ('"'). Loops until current_char is 0x22 or -1. On 0x5C ('\\'), calls
+advance once to skip the escaped byte. Each iteration calls advance to step
+forward. On EOF returns 0 (unterminated). On normal exit, calls advance past
+the closing quote, computes str_length = end_pos - start_pos - 2 (clamped
+to 0), then returns the bytes between the quotes via StringCore.substring.
+@End Implementation
+
+@Performance_Hints:
+O(L) over literal length.
+@End Performance_Hints
+
+@Security_Scope:
+Untrusted input. Unterminated string returns 0 instead of running past EOF.
+@End Security_Scope
 
 Process called "scan_double_quoted_string" takes lexer as Integer returns Integer:
     Note: Scan double-quoted string "text" (allows escapes and expansions)
@@ -719,6 +978,27 @@ Process called "scan_command_substitution" takes lexer as Integer returns Intege
     Command substitution $() or `` executes a command and substitutes its output.
     We scan until we find the matching closing delimiter, tracking nesting.
     @End Reasoning
+
+    @Implementation:
+    Captures start_pos at the byte after the opening '('. Maintains a depth
+    counter (starts at 1) and an in_string flag. Walks the source byte by
+    byte: outside strings, '(' increments depth and ')' decrements it,
+    breaking when depth reaches 0; both 0x22 and 0x27 transition into the
+    in_string state. Inside a string, the matching quote (when not preceded
+    by a 0x5C backslash, as checked via peek(-1)) closes the string. EOF
+    inside the substitution returns 0 (unterminated). After the closing
+    ')' is found, advance is called once and the content (excluding the
+    closing paren) is returned via StringCore.substring.
+    @End Implementation
+
+    @Performance_Hints:
+    O(L) where L is content length. Hot path on shell scripts.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Untrusted input. Unterminated substitutions return 0 rather than
+    over-reading the source buffer.
+    @End Security_Scope
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
@@ -783,6 +1063,30 @@ Process called "scan_command_substitution" takes lexer as Integer returns Intege
     Return value
 End Process
 
+@Reasoning:
+The legacy backtick form does not nest (you cannot put a backtick inside
+another backtick without quoting), so the scan is simpler than the $()
+form: walk to the next backtick, honouring backslash escapes which may
+include backslash-escaped backticks.
+@End Reasoning
+
+@Implementation:
+Captures start_pos. Loops: stop on 0x60 (closing backtick); on -1 (EOF)
+returns 0; on 0x5C (backslash) calls advance twice (skipping the backslash
+and the escaped character) and re-reads current_char; otherwise calls
+advance once. After the closing backtick advance is called to step past
+it; the content (excluding the closing backtick) is returned via
+StringCore.substring.
+@End Implementation
+
+@Performance_Hints:
+O(L) over content length.
+@End Performance_Hints
+
+@Security_Scope:
+Untrusted input; unterminated backtick returns 0.
+@End Security_Scope
+
 Process called "scan_command_substitution_backtick" takes lexer as Integer returns Integer:
     Note: Scan backtick command substitution `...`
 
@@ -826,6 +1130,23 @@ Process called "scan_arithmetic_expansion" takes lexer as Integer returns Intege
     Arithmetic expansion $(()) evaluates arithmetic expressions.
     We scan until we find )), tracking nesting for nested $(()).
     @End Reasoning
+
+    @Implementation:
+    Initialises depth to 2 to model the two leading parens '(('. Walks the
+    source: '(' increments depth, ')' decrements; depth reaching 0 means
+    we hit the closing '))' pair. The break happens at the inner closing
+    ')', and advance is called once more to step past the outer ')'.
+    Returns the content via StringCore.substring; EOF mid-expansion
+    returns 0 (unterminated).
+    @End Implementation
+
+    @Performance_Hints:
+    O(L) over expression length.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Untrusted input. Unbalanced parens return 0 rather than overshooting.
+    @End Security_Scope
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
@@ -877,6 +1198,22 @@ Process called "scan_parameter_expansion" takes lexer as Integer returns Integer
     We scan until closing }, tracking nesting.
     @End Reasoning
 
+    @Implementation:
+    Captures start_pos at the byte after the opening '{'. depth=1. Walks
+    the source: '{' (0x7B) increments depth, '}' (0x7D) decrements; depth=0
+    breaks the loop. EOF mid-expansion returns 0. advance is called once
+    after the matching '}' to step past it; the content (excluding the
+    closing brace) is returned via StringCore.substring.
+    @End Implementation
+
+    @Performance_Hints:
+    O(L) over content length.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Untrusted input; unbalanced braces return 0.
+    @End Security_Scope
+
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
     Let current_char be proc memory_get_int64 from Layout with lexer, 40
@@ -924,6 +1261,26 @@ Process called "scan_here_document" takes lexer as Integer, delimiter as Integer
     until a line contains only the delimiter. If strip_tabs is true (<<-),
     leading tabs are stripped from each line.
     @End Reasoning
+
+    @Implementation:
+    Computes delimiter_len. First phase: scan to the end of the introducer
+    line (the line that contained '<<EOF'); on EOF returns 0. Second phase:
+    iterates line by line. For each line, if strip_tabs is 1 advance past
+    leading 0x09 (tab) bytes; then compare the next delimiter_len bytes
+    against the delimiter. A match followed by '\n' or EOF ends the
+    here-doc; otherwise advance to the next newline and continue. Returns
+    the body content via StringCore.substring.
+    @End Implementation
+
+    @Performance_Hints:
+    O(N*D) worst case where N is the number of lines and D is delimiter
+    length. Hot path on scripts using here-docs.
+    @End Performance_Hints
+
+    @Security_Scope:
+    Untrusted input. EOF before the delimiter returns 0; never overshoots
+    the source buffer.
+    @End Security_Scope
 
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_pos be proc memory_get_int64 from Layout with lexer, 16
@@ -1026,6 +1383,23 @@ Note: ==========================================================================
 Note: Word and Identifier Scanning
 Note: ============================================================================
 
+@Reasoning:
+A bash word is an unquoted, contiguous sequence of word characters (letters,
+digits, '_', '-', '/', '.'). The classifier set is defined by is_word_char.
+This proc consumes the longest such run and returns it as a freshly
+allocated string for the token's value.
+@End Reasoning
+
+@Implementation:
+Captures start_pos. Loops while is_word_char(current_char) returns 1,
+calling advance each iteration. After the loop, computes word_length =
+end_pos - start_pos and returns the substring of source.
+@End Implementation
+
+@Performance_Hints:
+O(L) over word length. Hot path on most shell tokens.
+@End Performance_Hints
+
 Process called "scan_word" takes lexer as Integer returns Integer:
     Note: Scan shell word (command, argument, etc.)
 
@@ -1050,6 +1424,22 @@ Process called "scan_word" takes lexer as Integer returns Integer:
 
     Return value
 End Process
+
+@Reasoning:
+Bash numeric literals at the lexer level are just runs of ASCII digits.
+Base prefixes (0x, octal 0, base#nn) are handled by the parser/arithmetic
+layer, not here; this proc only needs to delimit the digit run.
+@End Reasoning
+
+@Implementation:
+Captures start_pos. Loops while is_digit(current_char) returns 1, calling
+advance each iteration. Computes num_length = end_pos - start_pos and
+returns the substring.
+@End Implementation
+
+@Performance_Hints:
+O(L) over digit count.
+@End Performance_Hints
 
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal
@@ -1079,6 +1469,37 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+Top-level dispatcher for Bash tokenisation. Bash has a rich operator
+vocabulary (||, &&, ;;, ;;&, |&, &>, >>, <<-, <<<, [[, ]], etc.) so this
+proc does multi-character lookahead via peek to disambiguate longest-match
+prefixes before falling through to one-character operators, then to
+strings/expansions/words/numbers/keywords.
+@End Reasoning
+
+@Implementation:
+Skips inter-token whitespace, then snapshots current_char/line/column.
+Dispatches in priority order: EOF (-1) -> TOKEN_EOF; newline (0x0A) ->
+TOKEN_NEWLINE; '#' -> skip_comment then recurse for the next token;
+single/double quotes -> scan_single/double_quoted_string; multi-char
+operators by peeking 1-2 bytes ahead (||, &&, &>, &>>, ;;&, ;;, ;&, <<,
+<<-, <<<, >>, ==, !=, <=, >=, [[, ]], (( )) ); single-char operators;
+'$'-prefixed expansions (parameter, command sub, arithmetic);
+keyword/word/number dispatch via the is_alpha/is_digit/is_word_char
+classifiers; the keyword path consults check_bash_keyword for known
+control-flow tokens. Unknown bytes return TOKEN_ERROR.
+@End Implementation
+
+@Performance_Hints:
+O(1) excluding the dispatched scanner. Hot path; per-token cost dominates
+overall lexer time.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes attacker-controlled source. Every dispatched scanner is
+EOF-safe, so malformed input cannot drive the lexer past source_length.
+@End Security_Scope
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from lexer

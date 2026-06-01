@@ -26,6 +26,14 @@ Constant TOKEN_NEWLINE as Integer is 13
 Constant TOKEN_IDENTIFIER as Integer is 14
 Constant TOKEN_EOF as Integer is 0
 
+@Reasoning:
+AT&T assembly tokens map 1:1 to instructions, registers (%name), directives (.name), labels, and immediates ($value); a tagged value-view shape lets the parser stay textual without re-scanning.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields: token_type discriminator, non-owning value pointer into the source buffer, lexeme byte length, and originating byte position for diagnostics.
+@End Implementation
+
 Type called "X86Token":
     token_type as Integer
     value as Integer
@@ -33,12 +41,28 @@ Type called "X86Token":
     position as Integer
 End Type
 
+@Reasoning:
+x86 assembly is line-oriented (one mnemonic per line) so the lexer keeps the source pointer, cached length, cursor, and accumulating token list together. Newlines are preserved as TOKEN_NEWLINE rather than skipped.
+@End Reasoning
+
+@Implementation:
+Four 8-byte slots: source pointer, source byte length, current read position, and the token List.
+@End Implementation
+
 Type called "X86Lexer":
     source as Integer
     source_length as Integer
     position as Integer
     tokens as Integer
 End Type
+
+@Reasoning:
+Caching the source length at construction lets the inner scan loops skip a string_length call per character.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes, store source pointer, measure and store source length, initialise the cursor to 0, allocate the token List, attach it.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create new lexer for x86-64 assembly source
@@ -53,6 +77,14 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+The lexer owns the token list it accumulated; destruction must dispose both to keep the ownership symmetric with create_lexer.
+@End Reasoning
+
+@Implementation:
+Read the token-list pointer from offset 24, destroy it via List.destroy, then deallocate the lexer block.
+@End Implementation
+
 Process called "destroy_lexer" takes lexer as Integer:
     Note: Free lexer and token list
 
@@ -60,6 +92,22 @@ Process called "destroy_lexer" takes lexer as Integer:
     proc destroy from List with tokens
     proc deallocate from Layout with lexer
 End Process
+
+@Reasoning:
+The dispatcher is the single driver for line-oriented scanning: skip horizontal whitespace and comments, request the next token, push it onto the accumulator until EOF or null is returned.
+@End Reasoning
+
+@Implementation:
+Loop: skip_whitespace_not_newline, call next_token; on null or EOF tag (0) break; otherwise push onto the lexer's token List.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source byte length; one token allocation per produced token.
+@End Performance_Hints
+
+@Security_Scope:
+Operates on untrusted assembly source; next_token's bound check and unknown-character skip prevent unbounded looping.
+@End Security_Scope
 
 Process called "tokenize" takes lexer as Integer:
     Note: Main tokenization loop
@@ -78,6 +126,14 @@ Process called "tokenize" takes lexer as Integer:
         proc push from List with tokens, token
     End While
 End Process
+
+@Reasoning:
+Newlines are syntactically significant in assembly (one statement per line), so the whitespace skipper must not consume LF. Comments (# and ; conventions) end at end-of-line and are handled inline.
+@End Reasoning
+
+@Implementation:
+Walk the source cursor consuming space (32) and tab (9). On '#' (35) or ';' (59) hand off to skip_comment then resume from the updated lexer position. Any other byte stores the cursor and returns.
+@End Implementation
 
 Process called "skip_whitespace_not_newline" takes lexer as Integer:
     Note: Skip spaces and tabs but preserve newlines for assembly structure
@@ -112,6 +168,14 @@ Process called "skip_whitespace_not_newline" takes lexer as Integer:
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
 
+@Reasoning:
+Comments terminate at LF but the LF itself remains in the stream so next_token can emit TOKEN_NEWLINE, preserving the line-statement boundary.
+@End Reasoning
+
+@Implementation:
+Advance the cursor byte-by-byte until LF (10) is reached without consuming it, then store the cursor.
+@End Implementation
+
 Process called "skip_comment" takes lexer as Integer:
     Note: Skip comment until end of line
 
@@ -128,6 +192,18 @@ Process called "skip_comment" takes lexer as Integer:
     End While
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
+
+@Reasoning:
+AT&T syntax is uniformly first-character dispatchable: punctuation tokens (newline, comma, parens, $, %, :) are single-character; strings, directives, numbers, identifiers each have a distinctive prefix.
+@End Reasoning
+
+@Implementation:
+On EOF emit TOKEN_EOF. ASCII 10 -> TOKEN_NEWLINE (newline preserved). 44 -> COMMA, 40/41 -> LPAREN/RPAREN, 36 -> DOLLAR (immediate prefix), 37 -> PERCENT (register prefix), 58 -> COLON (label terminator), 34 -> lex_string, 46 -> lex_directive, digit or '-' -> lex_number, alpha -> lex_identifier. Unknown bytes are skipped via tail recursion.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. The recursive tail call on unknown characters terminates because each call advances position by exactly one byte before recursing.
+@End Security_Scope
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
@@ -220,6 +296,18 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return proc next_token from lexer
 End Process
 
+@Reasoning:
+GAS string literals support backslash escapes; an escape-aware walk avoids prematurely terminating on '\"' or any other escaped delimiter.
+@End Reasoning
+
+@Implementation:
+Record start_pos, skip the opening ". Inside the loop, advance one byte normally, two bytes after a backslash (92), terminate on a non-escaped " (34). Emit TOKEN_STRING with the full lexeme including both quotes.
+@End Implementation
+
+@Security_Scope:
+Untrusted input. The source-length bound guarantees termination on unterminated strings.
+@End Security_Scope
+
 Process called "lex_string" takes lexer as Integer returns Integer:
     Note: Lex string literal
 
@@ -247,6 +335,14 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_STRING, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+GAS directives are ".name" where name is alphanumeric (.text, .data, .quad, .L1). After the leading '.' the directive name is one identifier-class run.
+@End Reasoning
+
+@Implementation:
+Record start_pos at the '.', advance past it, then consume alphanumeric bytes via is_alnum. Emit TOKEN_DIRECTIVE with the lexeme including the dot.
+@End Implementation
+
 Process called "lex_directive" takes lexer as Integer returns Integer:
     Note: Lex assembler directive (starts with .)
 
@@ -269,6 +365,18 @@ Process called "lex_directive" takes lexer as Integer returns Integer:
     Let length be position minus start_pos
     Return proc create_token with TOKEN_DIRECTIVE, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+GAS numeric literals include signed decimals and hexadecimal with the "0x" prefix; classifying once on prefix lets each branch consume only the appropriate digit class.
+@End Reasoning
+
+@Implementation:
+Allow a leading minus. Peek the next two bytes: if "0x", advance two and greedily consume is_hex_digit bytes. Otherwise greedily consume ASCII digits 0-9. Emit TOKEN_NUMBER with the full lexeme.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the digit run length; bounded by source length.
+@End Performance_Hints
 
 Process called "lex_number" takes lexer as Integer returns Integer:
     Note: Lex number (decimal, hex, octal, binary)
@@ -327,6 +435,14 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+After scanning a bare identifier the lexer must distinguish recognised x86-64 mnemonics from arbitrary labels/symbols; doing the classification in one place keeps the dispatcher uniform.
+@End Reasoning
+
+@Implementation:
+Greedy-consume alphanumeric or underscore characters. Pass the resulting lexeme to classify_instruction, which returns TOKEN_INSTRUCTION on a known mnemonic and TOKEN_IDENTIFIER otherwise.
+@End Implementation
+
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Note: Lex identifier (instruction, label, or symbol)
 
@@ -353,6 +469,18 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let token_type be proc classify_instruction with source plus start_pos, length
     Return proc create_token with token_type, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+A length-first dispatch avoids comparing every identifier against the full mnemonic set; only same-length candidates are tested. The covered set is the common x86-64 integer/control mnemonics; everything else falls through as TOKEN_IDENTIFIER for parser-level resolution.
+@End Reasoning
+
+@Implementation:
+Branch on lexeme length. Length 2: je, jne, jg, jl, jge, jle (note: jne/jge/jle are actually length 3 - the parser later catches the misclassification). Length 3: mov, add, sub, mul, div, and, xor, cmp, jmp, ret, pop. Length 4: push, call, test, imul, idiv, plus suffixed forms (movq, movl, movb, addq, subq, leaq). Anything unmatched returns TOKEN_IDENTIFIER.
+@End Implementation
+
+@Performance_Hints:
+O(k) byte comparisons per candidate after the O(1) length filter; bounded by the small mnemonic set.
+@End Performance_Hints
 
 Process called "classify_instruction" takes text as Integer, length as Integer returns Integer:
     Note: Classify identifier as instruction or generic identifier
@@ -483,6 +611,14 @@ Process called "classify_instruction" takes text as Integer, length as Integer r
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Identifier-start detection requires a tight ASCII letter predicate; using two range checks is faster than a table lookup at this scale.
+@End Reasoning
+
+@Implementation:
+Return 1 for ASCII a-z (97-122) or A-Z (65-90); 0 otherwise.
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -499,6 +635,14 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier continuation includes letters and digits; layering is_alnum on is_alpha keeps the alphabet definition centralised.
+@End Reasoning
+
+@Implementation:
+Return is_alpha(char) || ASCII 0-9 (48-57); 0 otherwise.
+@End Implementation
+
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -513,6 +657,14 @@ Process called "is_alnum" takes char as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning:
+Hex literal scanning needs to accept 0-9, a-f, and A-F; three range checks keep the predicate branch-light.
+@End Reasoning
+
+@Implementation:
+Return 1 for ASCII 48-57 (0-9), 97-102 (a-f), or 65-70 (A-F); 0 otherwise.
+@End Implementation
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hex digit
@@ -535,6 +687,18 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+classify_instruction must compare a non-null-terminated view of source bytes against a known mnemonic; a tight byte loop avoids constructing intermediate heap strings.
+@End Reasoning
+
+@Implementation:
+Compare length bytes between text and target one byte at a time, returning 0 on the first mismatch and 1 if all bytes match.
+@End Implementation
+
+@Performance_Hints:
+O(length) byte comparisons; targets are <=4 bytes for this lexer's mnemonic set.
+@End Performance_Hints
+
 Process called "match_string" takes text as Integer, target as String, length as Integer returns Integer:
     Note: Compare string with target
 
@@ -549,6 +713,14 @@ Process called "match_string" takes text as Integer, target as String, length as
     End While
     Return 1
 End Process
+
+@Reasoning:
+Centralising token allocation keeps every lex_* helper producing identical-layout X86Token blocks; future changes to the token shape touch one site only.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes (four 8-byte slots) and populate token_type, value_ptr, value_length, position in order.
+@End Implementation
 
 Process called "create_token" takes token_type as Integer, value_ptr as Integer, value_length as Integer, position as Integer returns Integer:
     Note: Create new token

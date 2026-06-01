@@ -23,6 +23,20 @@ Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
+@Reasoning:
+40-byte CMake emitter state. The first 24 bytes intentionally overlay
+emitter_common's raw header so the shared byte-buffer primitives can be
+called directly on this pointer. The trailing 16 bytes hold CMake-specific
+indent tracking.
+@End Reasoning
+
+@Implementation:
+Fields at offsets 0/8/16 are buffer pointer / capacity / length (managed
+by emitter_common). Offset 24 is indent_level (2 spaces per level by
+CMake convention). Offset 32 is at_line_start (1 when next emit should
+apply indent).
+@End Implementation
+
 Type called "CMakeEmitter":
     buffer as Integer
     capacity as Integer
@@ -34,6 +48,18 @@ End Type
 Note: ============================================================================
 Note: Emitter Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocate a fresh CMake emitter. Cannot reuse emitter_raw_create directly
+because CMake needs the trailing 16 bytes of indent state in the same
+allocation.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes for the state, then a 4096-byte initial buffer, then
+manually populates the layout (buffer, 4096, 0, 0, 1). On allocation
+failure cleans up partial state and returns 0.
+@End Implementation
 
 Process called "create_cmake_emitter" returns Integer:
     Note: Allocate the 40-byte CMake state, then delegate the first 24 bytes
@@ -58,6 +84,21 @@ Process called "create_cmake_emitter" returns Integer:
     Return emitter
 End Process
 
+@Reasoning:
+Free the CMake emitter's buffer and state block. Null emitter is a safe
+no-op (returns 0, distinguishing from "happy path 1" for callers that
+care).
+@End Reasoning
+
+@Implementation:
+Null check returns 0. Otherwise reads buffer pointer at offset 0, frees
+it if non-null, then frees the 40-byte state.
+@End Implementation
+
+@Security_Scope:
+Caller must drop the emitter pointer after this call.
+@End Security_Scope
+
 Process called "destroy_cmake_emitter" takes emitter as Integer returns Integer:
     Note: Release the buffer and the 40-byte state in one shot. The raw
     Note: header lives at offset 0/8/16 of `emitter`, so we can use the
@@ -79,10 +120,35 @@ Note: ==========================================================================
 Note: Output Management
 Note: ============================================================================
 
+@Reasoning:
+Snapshot the buffer into a heap-allocated null-terminated copy. Safe
+because the first 24 bytes of the CMake state are byte-compatible with
+the raw header layout.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_get_output.
+@End Implementation
+
 Process called "get_output" takes emitter as Integer returns Integer:
     Note: Returns a fresh null-terminated copy of the emitted bytes.
     Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
+
+@Reasoning:
+Compute the current 1-based line number in the emitted output. Useful
+for diagnostics that report the location of a CMake construct.
+@End Reasoning
+
+@Implementation:
+Scans the buffer from start to length counting LF (byte 10) bytes plus
+one. O(length) scan; called rarely for diagnostics so not on the hot
+path.
+@End Implementation
+
+@Performance_Hints:
+O(length). Call sparingly - do not invoke in tight emission loops.
+@End Performance_Hints
 
 Process called "get_line_number" takes emitter as Integer returns Integer:
     Note: Scan the byte buffer for newline characters to determine the
@@ -111,6 +177,24 @@ End Process
 Note: ============================================================================
 Note: Basic Emission
 Note: ============================================================================
+
+@Reasoning:
+Emit text with automatic indentation. CMake formatting needs indentation
+on every line, so emit_string is the indent-aware entry point used by all
+higher-level emitters in this file.
+@End Reasoning
+
+@Implementation:
+If at_line_start and the text does not begin with LF, emits indentation
+via emit_indent_internal and clears at_line_start. Then bulk emits the
+text. After emission, scans the text for LF bytes and sets at_line_start
+to 1 if any were emitted (so the next call re-applies indent).
+@End Implementation
+
+@Performance_Hints:
+O(text_len) - one pass through the text to detect newlines after
+emission. Avoids the cost by short-circuiting empty text.
+@End Performance_Hints
 
 Process called "emit_string" takes emitter as Integer, text as Integer returns Integer:
     Note: Emit text bytes to the buffer, applying indentation if we are at
@@ -151,6 +235,17 @@ Process called "emit_string" takes emitter as Integer, text as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Emit a complete line: text plus terminating newline. Sets at_line_start
+so the next emit re-applies indentation.
+@End Reasoning
+
+@Implementation:
+Calls emit_string when text is non-null, then emits a raw LF byte
+(bypassing emit_string's indent logic since we just emitted the line
+body). Sets at_line_start to 1.
+@End Implementation
+
 Process called "emit_line" takes emitter as Integer, text as Integer returns Integer:
     Note: Emit text followed by a newline. Newline marks at_line_start so
     Note: subsequent emits re-apply indentation.
@@ -165,6 +260,16 @@ Process called "emit_line" takes emitter as Integer, text as Integer returns Int
 
     Return 1
 End Process
+
+@Reasoning:
+Emit one byte without indent logic. For punctuation that should appear
+exactly as written, regardless of indent state.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_emit_byte. Sets at_line_start to 1 if the byte
+was LF, otherwise to 0 (so the indent state stays accurate).
+@End Implementation
 
 Process called "emit_char" takes emitter as Integer, char_code as Integer returns Integer:
     Note: Emit a single byte. Bypasses the indent-on-line-start logic so
@@ -188,6 +293,16 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+Internal helper invoked by emit_string when at_line_start is true.
+Centralises CMake's 2-space indent convention.
+@End Reasoning
+
+@Implementation:
+Reads indent_level from offset 24 and emits two space bytes per level
+via emitter_raw_emit_byte.
+@End Implementation
+
 Process called "emit_indent_internal" takes emitter as Integer returns Integer:
     Note: Emit two spaces per level. CMake convention is two-space indent.
     If emitter is equal to 0:
@@ -205,6 +320,15 @@ Process called "emit_indent_internal" takes emitter as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Step into a deeper CMake block. Called before emitting the body of
+if/foreach/function.
+@End Reasoning
+
+@Implementation:
+Reads indent_level at offset 24, increments, writes back.
+@End Implementation
+
 Process called "increase_indent" takes emitter as Integer returns Integer:
     If emitter is equal to 0:
         Return 0
@@ -214,6 +338,15 @@ Process called "increase_indent" takes emitter as Integer returns Integer:
     proc memory_set_int64 from MemoryCore with emitter, 24, indent_level
     Return 1
 End Process
+
+@Reasoning:
+Step out of a CMake block. Clamps at zero so misordered emit calls do
+not underflow.
+@End Reasoning
+
+@Implementation:
+Reads indent_level. If greater than 0, writes back level-1.
+@End Implementation
 
 Process called "decrease_indent" takes emitter as Integer returns Integer:
     If emitter is equal to 0:
@@ -227,6 +360,16 @@ Process called "decrease_indent" takes emitter as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Force the indent depth to a specific value. Used when emission code
+needs to insert a partial block whose nesting depth is computed
+externally.
+@End Reasoning
+
+@Implementation:
+Clamps negative levels to zero, then writes the value to offset 24.
+@End Implementation
+
 Process called "set_indent_level" takes emitter as Integer, level as Integer returns Integer:
     If emitter is equal to 0:
         Return 0
@@ -238,6 +381,15 @@ Process called "set_indent_level" takes emitter as Integer, level as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Read the current indent level. Pairs with set_indent_level so callers
+can save/restore around inline emissions.
+@End Reasoning
+
+@Implementation:
+Returns the int64 at offset 24, or 0 if emitter is null.
+@End Implementation
+
 Process called "get_indent_level" takes emitter as Integer returns Integer:
     If emitter is equal to 0:
         Return 0
@@ -248,6 +400,16 @@ End Process
 Note: ============================================================================
 Note: CMake-Specific Formatting
 Note: ============================================================================
+
+@Reasoning:
+Emit a CMake comment line "# text". CMake comments are line-oriented;
+multi-line block comments are not supported by CMake itself.
+@End Reasoning
+
+@Implementation:
+Emits "# ", then the comment text via emit_string, then a literal "\n"
+through emit_string so at_line_start is updated correctly.
+@End Implementation
 
 Process called "emit_comment" takes emitter as Integer, comment_text as Integer returns Integer:
     Note: Emit a CMake "# comment" line terminated by a newline.
@@ -268,6 +430,15 @@ Process called "emit_comment" takes emitter as Integer, comment_text as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Open a CMake command invocation by emitting "command_name(". Paired with
+emit_command_end which closes the parenthesis.
+@End Reasoning
+
+@Implementation:
+Emits the command name (if non-null) via emit_string, then "(".
+@End Implementation
+
 Process called "emit_command_start" takes emitter as Integer, command_name as Integer returns Integer:
     Note: Emit "command_name(" prefix.
     If emitter is equal to 0:
@@ -284,6 +455,15 @@ Process called "emit_command_start" takes emitter as Integer, command_name as In
     Return 1
 End Process
 
+@Reasoning:
+Close a CMake command invocation with ")" and a newline so the next
+command starts on a fresh line.
+@End Reasoning
+
+@Implementation:
+Calls emit_line with ")" which emits the literal ")" then the LF.
+@End Implementation
+
 Process called "emit_command_end" takes emitter as Integer returns Integer:
     Note: Emit ")" followed by a newline.
     If emitter is equal to 0:
@@ -295,6 +475,17 @@ Process called "emit_command_end" takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a single CMake argument inside a command's parenthesised list. The
+is_last flag controls whether a trailing space separator is emitted -
+suppressing it on the last argument avoids "trailing whitespace before )".
+@End Reasoning
+
+@Implementation:
+Emits the argument string if non-null, then emits a space if is_last is
+0. is_last == 1 means "this is the final argument, no separator needed".
+@End Implementation
 
 Process called "emit_command_argument" takes emitter as Integer, argument as Integer, is_last as Integer returns Integer:
     Note: Emit a CMake command argument with optional trailing space.
@@ -313,6 +504,14 @@ Process called "emit_command_argument" takes emitter as Integer, argument as Int
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "${VAR}" - CMake's standard variable expansion syntax.
+@End Reasoning
+
+@Implementation:
+Emits "${", then the variable name, then "}".
+@End Implementation
 
 Process called "emit_variable_reference" takes emitter as Integer, var_name as Integer returns Integer:
     Note: Emit ${VAR}.
@@ -333,6 +532,15 @@ Process called "emit_variable_reference" takes emitter as Integer, var_name as I
     Return 1
 End Process
 
+@Reasoning:
+Emit "$<EXPR>" - CMake's generator expression syntax used in target
+properties and source-file flags.
+@End Reasoning
+
+@Implementation:
+Emits "$<", then the expression string, then ">".
+@End Implementation
+
 Process called "emit_generator_expression" takes emitter as Integer, expr as Integer returns Integer:
     Note: Emit $<EXPR>.
     If emitter is equal to 0:
@@ -352,6 +560,21 @@ Process called "emit_generator_expression" takes emitter as Integer, expr as Int
     Return 1
 End Process
 
+@Reasoning:
+Emit a double-quoted CMake string. Used for message arguments and any
+argument containing embedded whitespace or special characters.
+@End Reasoning
+
+@Implementation:
+Emits ", then the string body, then ". Quotes are emitted via
+emit_string so they participate in indent tracking.
+@End Implementation
+
+@Security_Scope:
+The string body is emitted verbatim - any embedded " or backslash must
+be escaped by the caller.
+@End Security_Scope
+
 Process called "emit_quoted_string" takes emitter as Integer, str as Integer returns Integer:
     Note: Emit "str" with literal double-quote delimiters.
     If emitter is equal to 0:
@@ -370,6 +593,15 @@ Process called "emit_quoted_string" takes emitter as Integer, str as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+Emit an empty line for visual separation between command groups.
+@End Reasoning
+
+@Implementation:
+Emits a literal "\n" via emit_string so at_line_start tracking stays
+correct.
+@End Implementation
+
 Process called "emit_blank_line" takes emitter as Integer returns Integer:
     Note: Emit a bare newline for visual separation.
     If emitter is equal to 0:
@@ -385,6 +617,17 @@ End Process
 Note: ============================================================================
 Note: High-Level CMake Command Emission
 Note: ============================================================================
+
+@Reasoning:
+Emit the standard CMakeLists.txt header line that sets the minimum
+CMake version. Required as the first non-comment line of any CMake
+script.
+@End Reasoning
+
+@Implementation:
+Emits "cmake_minimum_required(" then "VERSION " then the version string,
+then closes with ").\n".
+@End Implementation
 
 Process called "emit_cmake_minimum_required" takes emitter as Integer, version as Integer returns Integer:
     Note: Emit cmake_minimum_required(VERSION version).
@@ -407,6 +650,15 @@ Process called "emit_cmake_minimum_required" takes emitter as Integer, version a
     Return 1
 End Process
 
+@Reasoning:
+Emit a project(name) declaration. CMake conventionally requires this
+right after cmake_minimum_required.
+@End Reasoning
+
+@Implementation:
+Emits "project(" then the project name then ")\n" via emit_command_end.
+@End Implementation
+
 Process called "emit_project" takes emitter as Integer, project_name as Integer returns Integer:
     Note: Emit project(project_name).
     If emitter is equal to 0:
@@ -424,6 +676,15 @@ Process called "emit_project" takes emitter as Integer, project_name as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "set(VAR value)" - CMake's variable assignment command.
+@End Reasoning
+
+@Implementation:
+Emits "set(", the variable name (not-last argument, so trailing space),
+the value (last argument, no trailing space), then ")\n".
+@End Implementation
 
 Process called "emit_set_command" takes emitter as Integer, var_name as Integer, value as Integer returns Integer:
     Note: Emit set(VAR value).
@@ -447,6 +708,15 @@ Process called "emit_set_command" takes emitter as Integer, var_name as Integer,
     Return 1
 End Process
 
+@Reasoning:
+Emit "message(STATUS \"text\")". STATUS-level messages are visible during
+configure-time but do not error out.
+@End Reasoning
+
+@Implementation:
+Emits "message(", "STATUS ", quoted text, ")\n".
+@End Implementation
+
 Process called "emit_message" takes emitter as Integer, message_text as Integer returns Integer:
     Note: Emit message(STATUS "message").
     If emitter is equal to 0:
@@ -468,6 +738,15 @@ Process called "emit_message" takes emitter as Integer, message_text as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Emit "if(condition)" and step indent in one notch so subsequent body
+lines are correctly indented. Paired with emit_endif.
+@End Reasoning
+
+@Implementation:
+Emits "if(", the condition string, ")\n", then increases indent_level.
+@End Implementation
+
 Process called "emit_if_start" takes emitter as Integer, condition as Integer returns Integer:
     Note: Emit if(condition) and increase indent.
     If emitter is equal to 0:
@@ -487,6 +766,16 @@ Process called "emit_if_start" takes emitter as Integer, condition as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Emit "else()" between if-body and else-body. The else keyword itself
+must be at the if's indent level, but the following body needs the
+deeper indent - hence the decrease/emit/increase dance.
+@End Reasoning
+
+@Implementation:
+Decreases indent, emits "else()", then increases indent again.
+@End Implementation
+
 Process called "emit_else" takes emitter as Integer returns Integer:
     Note: Emit else() with proper indent dance.
     If emitter is equal to 0:
@@ -502,6 +791,14 @@ Process called "emit_else" takes emitter as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Close an if block with "endif()" at the if's outer indent level.
+@End Reasoning
+
+@Implementation:
+Decreases indent first, then emits "endif()".
+@End Implementation
+
 Process called "emit_endif" takes emitter as Integer returns Integer:
     Note: Emit endif() and decrease indent.
     If emitter is equal to 0:
@@ -515,6 +812,16 @@ Process called "emit_endif" takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "foreach(var items)" header and step indent in. Paired with
+emit_endforeach.
+@End Reasoning
+
+@Implementation:
+Emits "foreach(", var name (not-last argument => trailing space), items
+string verbatim, ")\n", then increases indent.
+@End Implementation
 
 Process called "emit_foreach_start" takes emitter as Integer, var_name as Integer, items as Integer returns Integer:
     Note: Emit foreach(var items) and increase indent.
@@ -539,6 +846,14 @@ Process called "emit_foreach_start" takes emitter as Integer, var_name as Intege
     Return 1
 End Process
 
+@Reasoning:
+Close a foreach loop with "endforeach()" at the outer indent.
+@End Reasoning
+
+@Implementation:
+Decreases indent then emits "endforeach()".
+@End Implementation
+
 Process called "emit_endforeach" takes emitter as Integer returns Integer:
     Note: Emit endforeach() and decrease indent.
     If emitter is equal to 0:
@@ -552,6 +867,15 @@ Process called "emit_endforeach" takes emitter as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "function(name)" header and step indent in. Paired with
+emit_endfunction.
+@End Reasoning
+
+@Implementation:
+Emits "function(", the function name, ")\n", then increases indent.
+@End Implementation
 
 Process called "emit_function_start" takes emitter as Integer, func_name as Integer returns Integer:
     Note: Emit function(name) and increase indent.
@@ -571,6 +895,14 @@ Process called "emit_function_start" takes emitter as Integer, func_name as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+Close a function definition with "endfunction()" at the outer indent.
+@End Reasoning
+
+@Implementation:
+Decreases indent then emits "endfunction()".
+@End Implementation
 
 Process called "emit_endfunction" takes emitter as Integer returns Integer:
     Note: Emit endfunction() and decrease indent.

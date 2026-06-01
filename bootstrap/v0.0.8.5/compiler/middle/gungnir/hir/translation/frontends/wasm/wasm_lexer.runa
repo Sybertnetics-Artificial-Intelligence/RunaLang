@@ -20,6 +20,14 @@ Constant TOKEN_NUMBER as Integer is 7
 Constant TOKEN_STRING as Integer is 8
 Constant TOKEN_EOF as Integer is 0
 
+@Reasoning:
+Tokens carry a tag, a non-owning view into the source buffer (pointer + length), and the originating byte offset so downstream diagnostics can resolve back to source coordinates without re-scanning.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields: type discriminator, value pointer into source, value byte length, originating source byte position.
+@End Implementation
+
 Type called "WasmToken":
     token_type as Integer
     value as Integer
@@ -27,12 +35,28 @@ Type called "WasmToken":
     position as Integer
 End Type
 
+@Reasoning:
+WAT lexing is a single pass over a contiguous source buffer; the lexer keeps the input pointer, its length, the read cursor, and an accumulating token list together for cache locality.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields: source buffer pointer, source length, current byte cursor, and pointer to a List of WasmToken pointers populated by tokenize.
+@End Implementation
+
 Type called "WasmLexer":
     source as Integer
     source_length as Integer
     position as Integer
     tokens as Integer
 End Type
+
+@Reasoning:
+Initialising the source-length up front lets the hot path use the cached value at offset 8 without re-measuring the string each token.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes, store source pointer and measured length, initialise cursor to 0, allocate the token List, and return the lexer pointer.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Let lexer be proc allocate from Layout with 32
@@ -45,11 +69,35 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+The lexer owns the token list it accumulated; releasing the lexer must also release that List to keep ownership symmetric with create_lexer.
+@End Reasoning
+
+@Implementation:
+Pop the token list pointer from offset 24, dispose it via List.destroy, then deallocate the 32-byte lexer block.
+@End Implementation
+
 Process called "destroy_lexer" takes lexer as Integer:
     Let tokens be proc memory_get_int64 from Layout with lexer, 24
     proc destroy from List with tokens
     proc deallocate from Layout with lexer
 End Process
+
+@Reasoning:
+A single dispatcher loop drives the lexer to completion so callers do not have to interleave whitespace-skip and token-fetch logic themselves.
+@End Reasoning
+
+@Implementation:
+Loop: skip whitespace and comments, request next_token; bail on null or EOF tag; otherwise push the token onto the lexer's accumulator list.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source byte length; one token allocation per produced token.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes untrusted WAT source. next_token only advances the cursor on valid prefixes, so malformed input terminates cleanly without unbounded looping.
+@End Security_Scope
 
 Process called "tokenize" takes lexer as Integer:
     While 1 is equal to 1:
@@ -66,6 +114,18 @@ Process called "tokenize" takes lexer as Integer:
         proc push from List with tokens, token
     End While
 End Process
+
+@Reasoning:
+WAT treats spaces, tabs, CR, LF, and semicolon line-comments as separators; consolidating them in a dedicated pass keeps next_token branch-free of whitespace decisions.
+@End Reasoning
+
+@Implementation:
+Walk the source cursor: characters 32 (space), 9 (tab), 10 (LF), 13 (CR) each advance one byte. Semicolon (59) triggers skip_comment. Any other character stores the cursor and returns.
+@End Implementation
+
+@Performance_Hints:
+O(w) in whitespace span; one byte read per inspected character.
+@End Performance_Hints
 
 Process called "skip_whitespace" takes lexer as Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
@@ -100,6 +160,14 @@ Process called "skip_whitespace" takes lexer as Integer:
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
 
+@Reasoning:
+WAT line-comments run from ";" to end-of-line; consuming through LF (10) lets skip_whitespace fall back to whitespace handling on the next iteration.
+@End Reasoning
+
+@Implementation:
+Advance the cursor byte-by-byte until LF (10) is observed or source ends; consume the LF itself so subsequent whitespace consolidation starts on the next line.
+@End Implementation
+
 Process called "skip_comment" takes lexer as Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     Let source_length be proc memory_get_int64 from Layout with lexer, 8
@@ -114,6 +182,18 @@ Process called "skip_comment" takes lexer as Integer:
     End While
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
+
+@Reasoning:
+A first-character dispatch covers WAT's lexical alphabet with no backtracking: parens, strings ("\""), dollar-identifiers, numbers (digits or leading minus), and bare keywords/instructions.
+@End Reasoning
+
+@Implementation:
+On EOF emit an EOF token. ASCII 40/41 yield LPAREN/RPAREN single-byte tokens. 34 -> lex_string. 36 -> lex_identifier. 48..57 or 45 -> lex_number. All else -> lex_keyword_or_instruction.
+@End Implementation
+
+@Security_Scope:
+Operates on untrusted source; the position bound check on entry prevents reading past the source buffer end.
+@End Security_Scope
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
@@ -152,6 +232,18 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return proc lex_keyword_or_instruction from lexer
 End Process
 
+@Reasoning:
+WAT string literals are delimited by " with backslash-escape sequences (\\, \", \xx); a minimal escape-aware walk avoids prematurely terminating on an escaped quote.
+@End Reasoning
+
+@Implementation:
+Record start_pos, skip the opening ". Advance one byte normally, two bytes after a backslash (92) to swallow the escape, terminate on a closing " (34) after consuming it. The lexeme spans start_pos through position (inclusive of both quotes).
+@End Implementation
+
+@Security_Scope:
+Untrusted input. The source-length bound on the inner loop guarantees termination even when a closing quote is missing.
+@End Security_Scope
+
 Process called "lex_string" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     Let source be proc memory_get_int64 from Layout with lexer, 0
@@ -175,6 +267,14 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_STRING, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+WAT identifiers begin with $ and are followed by identifier-class characters; sharing is_identifier_char with keyword scanning keeps the alphabet centrally defined.
+@End Reasoning
+
+@Implementation:
+Record the position of the leading $, advance past it, then consume identifier characters via is_identifier_char until a non-identifier byte. Emit TOKEN_IDENTIFIER with the full lexeme including the $.
+@End Implementation
+
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     Let source be proc memory_get_int64 from Layout with lexer, 0
@@ -193,6 +293,18 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let length be position minus start_pos
     Return proc create_token with TOKEN_IDENTIFIER, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+WAT numeric literals are flexible: integers, signed values, decimals, and 0xNN hex; the lexer scans the maximal run of acceptable characters and leaves semantic interpretation (overflow, format) to the parser.
+@End Reasoning
+
+@Implementation:
+Accept digits 0-9, decimal point (46), minus (45), and lowercase x (120) - the latter present to admit "0x" hex prefixes. All other bytes break the run.
+@End Implementation
+
+@Security_Scope:
+No validation of well-formed numbers happens here; the consumer must reject malformed lexemes during parse. The source-length bound protects against runaway scanning.
+@End Security_Scope
 
 Process called "lex_number" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
@@ -230,6 +342,14 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+WAT does not pre-allocate distinct token classes for keywords vs instructions; first lex a generic identifier-like word, then classify based on the lexeme bytes.
+@End Reasoning
+
+@Implementation:
+Greedy-consume identifier-class characters, then hand the buffer to classify_keyword, which returns TOKEN_KEYWORD, TOKEN_TYPE, or falls back to TOKEN_INSTRUCTION.
+@End Implementation
+
 Process called "lex_keyword_or_instruction" takes lexer as Integer returns Integer:
     Let position be proc memory_get_int64 from Layout with lexer, 16
     Let source be proc memory_get_int64 from Layout with lexer, 0
@@ -248,6 +368,18 @@ Process called "lex_keyword_or_instruction" takes lexer as Integer returns Integ
     Let token_type be proc classify_keyword with source plus start_pos, length
     Return proc create_token with token_type, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+Length-first dispatch avoids a string compare against every keyword for every identifier; only words whose byte count matches a known keyword are tested further.
+@End Reasoning
+
+@Implementation:
+Bucket on length and test specific WAT keywords (module, memory, global, export, import, func, type, param, local, table, result) returning TOKEN_KEYWORD; primitive type names (i32, i64, f32, f64) return TOKEN_TYPE. Anything else is treated as an instruction mnemonic.
+@End Implementation
+
+@Performance_Hints:
+O(k) byte comparisons where k is the keyword length, after an O(1) length filter.
+@End Performance_Hints
 
 Process called "classify_keyword" takes text as Integer, length as Integer returns Integer:
     If length is equal to 6:
@@ -323,6 +455,14 @@ Process called "classify_keyword" takes text as Integer, length as Integer retur
     Return TOKEN_INSTRUCTION
 End Process
 
+@Reasoning:
+The identifier alphabet for WAT lexemes is the union of ASCII letters, digits, dot, and underscore - a tight, hardcoded predicate is faster than a table lookup at this scale.
+@End Reasoning
+
+@Implementation:
+Return 1 for ASCII a-z (97-122), A-Z (65-90), 0-9 (48-57), '.' (46), or '_' (95); 0 for anything else.
+@End Implementation
+
 Process called "is_identifier_char" takes char as Integer returns Integer:
     If char is greater than or equal to 97:
         If char is less than or equal to 122:
@@ -348,6 +488,18 @@ Process called "is_identifier_char" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+classify_keyword needs byte-for-byte equality against the lexeme view in the source buffer; using a tight byte-loop avoids materialising the lexeme as a heap string.
+@End Reasoning
+
+@Implementation:
+Compare length bytes of text and target one byte at a time, short-circuiting to 0 on the first mismatch; return 1 if the full span matches.
+@End Implementation
+
+@Performance_Hints:
+O(length) bytes; intended for length <= 8 so loop overhead dominates other costs.
+@End Performance_Hints
+
 Process called "match_string" takes text as Integer, target as String, length as Integer returns Integer:
     Let i be 0
     While i is less than length:
@@ -360,6 +512,14 @@ Process called "match_string" takes text as Integer, target as String, length as
     End While
     Return 1
 End Process
+
+@Reasoning:
+Token allocation is centralised so every lex_* helper produces tokens in the same memory shape (matching WasmToken's four-field layout).
+@End Reasoning
+
+@Implementation:
+Reserve 32 bytes (four 8-byte slots), populate token_type / value_ptr / value_length / position in order, and return the raw pointer.
+@End Implementation
 
 Process called "create_token" takes token_type as Integer, value_ptr as Integer, value_length as Integer, position as Integer returns Integer:
     Let token be proc allocate from Layout with 32

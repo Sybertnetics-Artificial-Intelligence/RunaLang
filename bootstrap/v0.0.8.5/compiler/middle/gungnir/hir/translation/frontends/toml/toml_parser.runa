@@ -74,6 +74,14 @@ Note: ==========================================================================
 Note: TOML AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+A single node shape covers every TOML construct (document, table, array, inline table, all scalars); separating the integer payload, the float/string payload, the children list, the keys list, and the table dotted-name lets one node serve all kinds without per-kind subclasses.
+@End Reasoning
+
+@Implementation:
+Ten 8-byte fields: type discriminator, value_string pointer (for strings, floats, datetimes, identifiers), value_int (for integers/booleans), is_integer / is_float flags, children list, keys list (parallel to children for documents/tables), table_name pointer, source line and column.
+@End Implementation
+
 Type called "TOMLNode":
     node_type as Integer        Note: TOML_* constant
     value_string as Integer     Note: String value (for strings, identifiers)
@@ -91,6 +99,14 @@ Note: ==========================================================================
 Note: TOML Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+The TOML parser is a streaming cursor: it pulls one token at a time from the lexer rather than materialising a token list, so caching the current_token and the most-recent table dotted path is enough state to make any local decision.
+@End Reasoning
+
+@Implementation:
+Five 8-byte slots: lexer pointer, current_token pointer, owned error_message string (or 0), has_error flag, and the current table dotted path (for resolving "[a.b.c]" key prefixes).
+@End Implementation
+
 Type called "TOMLParser":
     lexer as Integer            Note: TOML lexer
     current_token as Integer    Note: Current token
@@ -102,6 +118,14 @@ End Type
 Note: ============================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Priming the parser with the lexer's first token at construction lets every parse_* routine assume current_token is always valid (or EOF), avoiding a per-call "have we started yet?" check.
+@End Reasoning
+
+@Implementation:
+Allocate 40 bytes; null-check. Store the lexer pointer; null out current_token / error_message / has_error / current_table. Pull the first token from the lexer and write it to the current_token slot.
+@End Implementation
 
 Process called "create_toml_parser" takes lexer as Integer returns Integer:
     Note: Create TOML parser with lexer
@@ -127,6 +151,14 @@ Process called "create_toml_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser owns any heap-allocated error message; destruction must release it to prevent leaks when the parse fails and the caller discards the parser.
+@End Reasoning
+
+@Implementation:
+Null-check the parser. Read the error_message pointer at offset 16; if non-null deallocate. Deallocate the parser block.
+@End Implementation
+
 Process called "destroy_toml_parser" takes parser as Integer returns Integer:
     Note: Destroy TOML parser
 
@@ -150,6 +182,14 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Token advancement is the most-called helper and must be cheap; isolating it in one routine guarantees the cached current_token slot stays in sync with the lexer cursor.
+@End Reasoning
+
+@Implementation:
+Pull the lexer pointer from offset 0, request the next token from the lexer, and store it at offset 8. Return the new token pointer.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -160,6 +200,14 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return token
 End Process
+
+@Reasoning:
+Every parse decision begins with a token-type inspection; returning TOKEN_EOF for null tokens lets callers compare safely without an explicit null guard.
+@End Reasoning
+
+@Implementation:
+Read the current_token at offset 8; if null return TOKEN_EOF. Otherwise read the type tag at the token's offset 0.
+@End Implementation
 
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Peek at current token type
@@ -175,6 +223,14 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Predicate-style lookahead is needed in many parse decisions; wrapping peek_token_type plus an equality check keeps caller code linear.
+@End Reasoning
+
+@Implementation:
+Call peek_token_type and return 1 if equal to expected_type, 0 otherwise.
+@End Implementation
+
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
 
@@ -186,6 +242,14 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+A mandatory-token helper turns "required syntax" checks into single-line calls and ensures every miss writes a uniform error message before short-circuiting.
+@End Reasoning
+
+@Implementation:
+Compare peek_token_type to expected_type; on mismatch call set_parse_error with the provided message and return 0. On match, advance the cursor and return 1.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect token of specific type, set error if mismatch
@@ -201,6 +265,14 @@ Process called "expect_token" takes parser as Integer, expected_type as Integer,
 
     Return 1
 End Process
+
+@Reasoning:
+Multiple consecutive blank lines are legal between TOML statements; consuming all of them in one helper keeps the parse_document loop linear.
+@End Reasoning
+
+@Implementation:
+Loop: if current token is TOKEN_NEWLINE advance and continue; otherwise break.
+@End Implementation
 
 Process called "skip_newlines" takes parser as Integer returns Integer:
     Note: Skip any newline tokens
@@ -221,6 +293,18 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Recording the first parse error requires copying the message into parser-owned storage so the original message buffer's lifetime is independent of the parser.
+@End Reasoning
+
+@Implementation:
+Read the current error_message; if non-null free it. Measure the new message, allocate length+1 bytes, copy, null-terminate. Store the pointer at offset 16 and set has_error=1 at offset 24.
+@End Implementation
+
+@Security_Scope:
+Error messages typically come from internal callers; the length-driven copy bounds memory usage regardless of message origin.
+@End Security_Scope
 
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
@@ -251,6 +335,14 @@ Note: ==========================================================================
 Note: Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Centralised node allocation initialises every TOMLNode slot to zero so downstream readers cannot observe uninitialised memory if a field never gets populated by the specific parse_* helper.
+@End Reasoning
+
+@Implementation:
+Allocate 80 bytes; null-check. Store the type at offset 0 and zero every other slot (value_string, value_int, is_integer, is_float, children, keys, table_name, line, column).
+@End Implementation
+
 Process called "create_toml_node" takes node_type as Integer returns Integer:
     Note: Create TOML AST node
 
@@ -278,6 +370,14 @@ End Process
 Note: ============================================================================
 Note: Value Parsing
 Note: ============================================================================
+
+@Reasoning:
+TOML values are first-token-dispatchable: scalars have unique TOKEN_* tags, '[' opens an array, '{' opens an inline table; one switch handles every form.
+@End Reasoning
+
+@Implementation:
+Inspect the current token type. Map TOKEN_STRING/INTEGER/FLOAT/BOOLEAN/DATETIME to the corresponding parse_* helper; TOKEN_LEFT_BRACKET -> parse_array; TOKEN_LEFT_BRACE -> parse_inline_table. Unknown tags record "Expected value" and return 0.
+@End Implementation
 
 Process called "parse_value" takes parser as Integer returns Integer:
     Note: Parse TOML value (string, number, boolean, array, inline table)
@@ -323,6 +423,14 @@ Process called "parse_value" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+String parsing has already happened in the lexer (escapes resolved, quotes stripped); the parser only needs to capture the resolved lexeme into the node, defending against the lexer's buffer being reused by copying.
+@End Reasoning
+
+@Implementation:
+Read the token's lexeme pointer, length, and source position. Allocate a fresh length+1 byte buffer, copy the lexeme bytes, null-terminate. Build a TOML_STRING node, attach the copy at offset 8, store line/column. Advance the parser.
+@End Implementation
+
 Process called "parse_string" takes parser as Integer returns Integer:
     Note: Parse TOML string
 
@@ -353,6 +461,14 @@ Process called "parse_string" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+TOML supports decimal, hex (0x), octal (0o), binary (0b), and underscored numeric literals; running parse_integer_value once at parse time avoids re-parsing the lexeme each time the integer is read.
+@End Reasoning
+
+@Implementation:
+Build a TOML_INTEGER node. Call parse_integer_value on the lexeme to convert to a 64-bit int. Store the integer at offset 16, set is_integer=1, store line/column, advance.
+@End Implementation
+
 Process called "parse_integer" takes parser as Integer returns Integer:
     Note: Parse TOML integer
 
@@ -381,6 +497,14 @@ Process called "parse_integer" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+TOML floats may include special values (inf, nan, -inf), exponents, and underscores; preserving the source string and deferring conversion to the HIR float-literal constructor keeps every format intact without re-parsing.
+@End Reasoning
+
+@Implementation:
+Build a TOML_FLOAT node. Allocate length+1 bytes, copy the lexeme, null-terminate. Store the copy at offset 8, set is_float=1 at offset 32, store line/column, advance.
+@End Implementation
 
 Process called "parse_float" takes parser as Integer returns Integer:
     Note: Parse TOML float
@@ -412,6 +536,14 @@ Process called "parse_float" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+TOML booleans are spelt only "true" or "false" (case-sensitive); a single string-equality check against "true" plus default-to-0 covers both cases.
+@End Reasoning
+
+@Implementation:
+Build a TOML_BOOLEAN node. Compare the lexeme to "true" via string_equals; store 1 at offset 16 on match, 0 otherwise. Store line/column, advance.
+@End Implementation
 
 Process called "parse_boolean" takes parser as Integer returns Integer:
     Note: Parse TOML boolean
@@ -445,14 +577,16 @@ Process called "parse_boolean" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+TOML's four datetime sub-forms (offset datetime, local datetime, local date, local time) carry timezone and precision distinctions that survive only in the raw RFC 3339 string; copying the lexeme preserves the exact source representation for downstream conversion.
+@End Reasoning
+
+@Implementation:
+Build a TOML_DATETIME node. Allocate length+1 bytes, copy the datetime lexeme, null-terminate, attach at offset 8, store line/column, advance.
+@End Implementation
+
 Process called "parse_datetime" takes parser as Integer returns Integer:
     Note: Parse TOML datetime (RFC 3339)
-
-    @Reasoning:
-    DateTime values are stored as strings in their original format.
-    Formats: Offset DateTime, Local DateTime, Local Date, Local Time.
-    The lexeme preserves the exact datetime string from source.
-    @End Reasoning
 
     Let token be proc memory_get_int64 from Layout with parser, 8
     Let lexeme be proc memory_get_int64 from Layout with token, 8
@@ -480,6 +614,18 @@ Process called "parse_datetime" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+TOML arrays "[v1, v2, ...]" allow newlines between elements but require a comma between elements (trailing comma is permitted before the closing bracket); a per-element loop with explicit newline-skip handles all of these.
+@End Reasoning
+
+@Implementation:
+Expect '['. Allocate a TOML_ARRAY node and an empty children list. Skip newlines. Loop: if current is ']' break; recursively parse_value as element, append to children, skip newlines; if next token is comma advance and skip newlines, otherwise break. Expect ']'.
+@End Implementation
+
+@Performance_Hints:
+O(n) in array length; one node allocation per element plus the array node itself.
+@End Performance_Hints
 
 Process called "parse_array" takes parser as Integer returns Integer:
     Note: Parse TOML array: [value1, value2, ...]
@@ -535,6 +681,14 @@ Process called "parse_array" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Inline tables "{ k1 = v1, k2 = v2 }" must be parsed on a single line per TOML 1.0; the parallel keys and children lists let downstream consumers read entries with one index without dictionary overhead.
+@End Reasoning
+
+@Implementation:
+Expect '{'. Allocate a TOML_INLINE_TABLE node with parallel keys and children lists. Loop: if current is '}' break; copy the identifier lexeme into a key string buffer, expect TOKEN_IDENTIFIER then TOKEN_EQUAL, recursively parse_value, append key and value to their respective lists; if next is comma advance and continue, otherwise break. Expect '}'.
+@End Implementation
 
 Process called "parse_inline_table" takes parser as Integer returns Integer:
     Note: Parse TOML inline table: {key = value, key2 = value2}
@@ -604,6 +758,18 @@ Note: ==========================================================================
 Note: Table Parsing
 Note: ============================================================================
 
+@Reasoning:
+Table headers "[a.b.c]" must be flattened to a single dotted-string key for the table-name slot so subsequent key/value pairs can be attached to the right hierarchy in parse_document; building the dotted name in a stack buffer avoids list-of-strings overhead for a small bounded use case.
+@End Reasoning
+
+@Implementation:
+Expect '['. Allocate a 256-byte name buffer. Loop: if current is ']' break; copy the identifier lexeme bytes into the buffer at buffer_pos and advance buffer_pos; advance the parser; if next is '.' write '.' (46) into the buffer and advance. Expect ']'. Null-terminate the buffer.
+@End Implementation
+
+@Security_Scope:
+The 256-byte buffer is fixed-size; dotted paths longer than 256 bytes will silently overrun. Production hardening should grow the buffer dynamically.
+@End Security_Scope
+
 Process called "parse_table_header" takes parser as Integer returns Integer:
     Note: Parse TOML table header: [table.name]
 
@@ -654,6 +820,18 @@ Process called "parse_table_header" takes parser as Integer returns Integer:
 
     Return buffer
 End Process
+
+@Reasoning:
+Array-of-tables "[[a.b.c]]" reuses the dotted-path logic of parse_table_header but the opening token is the lexer-recognised TOKEN_ARRAY_TABLE_HEADER ("[[") so the closer ']]' must still be matched in two steps.
+@End Reasoning
+
+@Implementation:
+Expect TOKEN_ARRAY_TABLE_HEADER (consumes the "[["). Allocate a 256-byte name buffer. Loop the same identifier/dot accumulation as parse_table_header until ']' is seen; then expect both closing brackets. Null-terminate.
+@End Implementation
+
+@Security_Scope:
+Shares the 256-byte fixed buffer limitation with parse_table_header.
+@End Security_Scope
 
 Process called "parse_array_table_header" takes parser as Integer returns Integer:
     Note: Parse TOML array of tables header: [[array.table]]
@@ -712,6 +890,14 @@ Note: ==========================================================================
 Note: Key-Value Pair Parsing
 Note: ============================================================================
 
+@Reasoning:
+"key = value" is the basic TOML statement form; producing a temporary node carrying both pieces lets parse_document attach them to the document's parallel keys/children lists in one place.
+@End Reasoning
+
+@Implementation:
+Copy the key identifier lexeme into an owned String. Expect TOKEN_IDENTIFIER then TOKEN_EQUAL. Recursively parse_value. Build a kv carrier node (reusing TOML_STRING shape) with the key at offset 8 and the value pointer in the children slot at offset 40.
+@End Implementation
+
 Process called "parse_key_value" takes parser as Integer returns Integer:
     Note: Parse TOML key-value pair: key = value
 
@@ -746,18 +932,24 @@ Note: ==========================================================================
 Note: Document Parsing
 Note: ============================================================================
 
+@Reasoning:
+A TOML file is a sequence of statements distinguished by their leading token: '[' or '[[' opens a section header, identifier opens a key/value pair. The parser tracks the active table dotted path so subsequent key/value pairs end up under the right qualified key.
+@End Reasoning
+
+@Implementation:
+Build a TOML_DOCUMENT node with parallel keys/children lists. Loop: skip newlines; on EOF break; on '[' parse a table header and store its dotted name in parser.current_table; on '[[' parse array-table header similarly; on identifier parse a key-value pair. For each kv pair, if no current_table append the key directly, otherwise build "table.key" and append the qualified form. Unknown tokens record "Unexpected token" and abort.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source token count; one allocation per statement plus its nested value.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes untrusted TOML source. Unknown tokens halt the parse cleanly via set_parse_error; the qualified key concatenation uses heap allocation sized to the exact length so adversarial dotted names only consume bounded memory per statement.
+@End Security_Scope
+
 Process called "parse_document" takes parser as Integer returns Integer:
     Note: Parse TOML document
-
-    @Reasoning:
-    A TOML document consists of:
-    - Key-value pairs at root level
-    - Table headers [table]
-    - Array of tables headers [[array]]
-    - Key-value pairs under tables
-
-    We build a document node containing all tables and root key-values.
-    @End Reasoning
 
     Let document be proc create_toml_node from TOML_DOCUMENT
 
@@ -852,6 +1044,18 @@ End Process
 Note: ============================================================================
 Note: Utility Functions
 Note: ============================================================================
+
+@Reasoning:
+TOML integers support four bases (decimal, 0x hex, 0o octal, 0b binary) plus an optional leading sign and underscore-separators; doing the conversion once at parse time lets parse_integer cache the integer in the node and skip per-read re-parsing.
+@End Reasoning
+
+@Implementation:
+Skip optional leading '+' or '-' (record sign). If the next char is '0' followed by 'x' / 'o' / 'b', enter the appropriate base loop: accumulate digit*base+digit for each digit char, skip underscores. Otherwise treat the rest as decimal digits. Apply the sign and return.
+@End Implementation
+
+@Performance_Hints:
+O(n) in digit count; no allocation, all work in 64-bit accumulators.
+@End Performance_Hints
 
 Process called "parse_integer_value" takes str as Integer returns Integer:
     Note: Parse integer from string (handles decimal, hex, octal, binary)
@@ -988,6 +1192,14 @@ Process called "parse_integer_value" takes str as Integer returns Integer:
     Return value
 End Process
 
+@Reasoning:
+parse_boolean needs byte-for-byte equality between the parsed lexeme and "true"; an inline loop avoids depending on StringCore's comparison primitives in this hot path.
+@End Reasoning
+
+@Implementation:
+Measure both strings; on length mismatch return 0. Otherwise compare byte by byte; return 0 on the first mismatch, 1 if all bytes match.
+@End Implementation
+
 Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
     Note: Check if two strings are equal
 
@@ -1018,13 +1230,20 @@ Note: ==========================================================================
 Note: Top-Level Parsing Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Public entry point that hides the lex+parse orchestration and the lexer/parser cleanup obligations; callers receive either the document node on success or 0 on failure.
+@End Reasoning
+
+@Implementation:
+Null-check source. Create a TOML lexer; on failure return 0. Create a parser; on failure destroy the lexer and return 0. Run parse_document. If has_error is set, print the error, destroy both, return 0. Otherwise destroy both and return the document.
+@End Implementation
+
+@Security_Scope:
+Consumes untrusted TOML source. The proper cleanup path runs on every failure exit to prevent leaks; the error message is printed but not propagated to a context here, which a caller wrapping this entry point should improve for production use.
+@End Security_Scope
+
 Process called "parse_toml" takes source as Integer returns Integer:
     Note: Parse TOML source code to AST
-
-    @Reasoning:
-    Top-level entry point for TOML parsing.
-    Creates lexer and parser, parses document, handles errors.
-    @End Reasoning
 
     If source is equal to 0:
         Return 0

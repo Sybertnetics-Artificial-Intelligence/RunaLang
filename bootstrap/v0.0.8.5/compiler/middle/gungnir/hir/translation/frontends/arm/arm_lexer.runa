@@ -29,6 +29,19 @@ Constant TOKEN_EXCLAIM as Integer is 16
 Constant TOKEN_SHIFT as Integer is 17
 Constant TOKEN_EOF as Integer is 0
 
+@Reasoning:
+A token is a 4-field heap record so the lexer and parser can share token objects
+without copying. We pack into 32 bytes (4 * 8) so allocation aligns to the layout
+allocator's slot size and reads avoid unaligned access on ARMv7.
+@End Reasoning
+
+@Implementation:
+Plain struct: token_type is the TOKEN_* discriminator at offset 0, value is the
+byte pointer into the source buffer at offset 8, value_length is the lexeme
+length at offset 16, position is the byte offset of the lexeme's start at
+offset 24. All fields stay as Integer to permit the field-as-handle pattern.
+@End Implementation
+
 Type called "ArmToken":
     token_type as Integer
     value as Integer
@@ -36,12 +49,50 @@ Type called "ArmToken":
     position as Integer
 End Type
 
+@Reasoning:
+The lexer carries the source slice, current cursor, and the token output list
+together so every scanning helper can operate on a single handle instead of
+threading four arguments. Source is held as a pointer (not copied) because the
+caller still owns the buffer.
+@End Reasoning
+
+@Implementation:
+Fields are stored at byte offsets 0, 8, 16, 24 inside a 32-byte allocation.
+source is a pointer to the source bytes, source_length is the byte count,
+position is the read cursor that advances during tokenization, tokens is a
+List handle owning the produced ArmToken objects.
+@End Implementation
+
 Type called "ArmLexer":
     source as Integer
     source_length as Integer
     position as Integer
     tokens as Integer
 End Type
+
+@Reasoning:
+Constructor for ArmLexer. Source length is computed once with string_length so
+the scanning loops can compare against a cached value and never re-walk the
+source buffer.
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte ArmLexer record, writes the source pointer, source length,
+the initial position of 0, and a freshly created List handle to receive tokens.
+Returns the lexer handle to the caller.
+@End Implementation
+
+@Performance_Hints:
+O(n) on the source length because StringCore.string_length walks until NUL.
+Cold path: called once per translation unit.
+@End Performance_Hints
+
+@Security_Scope:
+Trusts caller to pass a valid NUL-terminated source pointer. No bounds checks
+on the source buffer itself; source ownership remains with the caller. The
+returned lexer handle must be released via destroy_lexer to avoid leaking the
+underlying List.
+@End Security_Scope
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create new lexer for ARM assembly source
@@ -56,6 +107,24 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Lexer owns its token list but not the source; destroy_lexer must therefore
+release the list before freeing the lexer record itself, otherwise the List
+handle is leaked.
+@End Reasoning
+
+@Implementation:
+Reads the token list pointer from offset 24, calls List.destroy on it, then
+deallocates the 32-byte lexer record. Source buffer is intentionally left for
+the caller to free.
+@End Implementation
+
+@Security_Scope:
+Frees memory that the lexer owns and must not be called twice on the same
+handle. After this call, every ArmToken pointer previously pushed into the
+list is also invalid (tokens are owned by the list).
+@End Security_Scope
+
 Process called "destroy_lexer" takes lexer as Integer:
     Note: Free lexer and token list
 
@@ -63,6 +132,30 @@ Process called "destroy_lexer" takes lexer as Integer:
     proc destroy from List with tokens
     proc deallocate from Layout with lexer
 End Process
+
+@Reasoning:
+Drives lexical analysis to completion by repeatedly skipping inter-token
+whitespace, fetching one token, and appending it to the lexer's list. Stops
+on a NUL token (next_token's EOF sentinel) or on a token with token_type 0,
+matching create_token's failure encoding.
+@End Reasoning
+
+@Implementation:
+Infinite While guarded by two exit conditions: token equal to 0 (allocation
+failure) and token_type equal to 0 (EOF). Whitespace skipping preserves
+newlines because ARM line structure (one instruction per line) is significant.
+@End Implementation
+
+@Performance_Hints:
+O(n) over the source where n is the byte length. Each iteration does at most
+constant scanning work plus one List append. Hot path during translation.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes attacker-supplied source. Relies on next_token and skip_whitespace
+to keep the cursor within source_length. Side effect: appends to the lexer's
+token list.
+@End Security_Scope
 
 Process called "tokenize" takes lexer as Integer:
     Note: Main tokenization loop
@@ -81,6 +174,25 @@ Process called "tokenize" takes lexer as Integer:
         proc push from List with tokens, token
     End While
 End Process
+
+@Reasoning:
+ARM assembly is line-oriented (one instruction per line), so newlines are
+significant tokens; this helper exists to skip only horizontal whitespace and
+comments while leaving '\n' for next_token to emit as TOKEN_NEWLINE. Recognises
+both ';' (GAS) and '@' (ARM ADS) line-comment markers.
+@End Reasoning
+
+@Implementation:
+Reads position/source/source_length from the lexer, then walks bytes: 0x20
+(space) and 0x09 (tab) advance the cursor by 1; 0x3B (';') and 0x40 ('@')
+delegate to skip_comment which advances to end-of-line; any other byte stops
+the loop and writes the current cursor back to lexer offset 16.
+@End Implementation
+
+@Performance_Hints:
+O(k) where k is the number of consecutive whitespace/comment bytes. Tight
+inner loop; called once per token request.
+@End Performance_Hints
 
 Process called "skip_whitespace_not_newline" takes lexer as Integer:
     Note: Skip spaces and tabs but preserve newlines for ARM assembly structure
@@ -115,6 +227,18 @@ Process called "skip_whitespace_not_newline" takes lexer as Integer:
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
 
+@Reasoning:
+Comments in ARM assembly run to end-of-line. Pulled out of
+skip_whitespace_not_newline so both ';' and '@' comment-start markers can
+share one implementation.
+@End Reasoning
+
+@Implementation:
+Walks bytes from the lexer cursor until it hits 0x0A ('\n'); the newline is
+intentionally left for next_token so line boundaries remain visible. Writes
+the final cursor back to offset 16.
+@End Implementation
+
 Process called "skip_comment" takes lexer as Integer:
     Note: Skip comment until end of line
 
@@ -131,6 +255,36 @@ Process called "skip_comment" takes lexer as Integer:
     End While
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
+
+@Reasoning:
+Central dispatcher producing one ArmToken per call. Implements ARM-specific
+one-byte tokens directly (newline, comma, brackets, braces, '#', '!', ':')
+and dispatches longer tokens (strings, directives, numbers, identifiers) to
+specialised helpers. Assumes skip_whitespace_not_newline has positioned the
+cursor at the start of a real token or at EOF.
+@End Reasoning
+
+@Implementation:
+Returns an EOF token (token_type 0) when position is at or past source_length.
+Otherwise inspects the byte at the cursor and routes: 0x0A -> NEWLINE,
+0x2C -> COMMA, 0x5B/5D -> LBRACKET/RBRACKET, 0x7B/7D -> LBRACE/RBRACE,
+0x23 -> HASH (immediate prefix), 0x21 -> EXCLAIM (writeback indicator),
+0x3A -> COLON (label terminator), 0x22 -> lex_string, 0x2E -> lex_directive,
+ASCII digit or '-' -> lex_number, alphabetic -> lex_identifier. Unknown bytes
+advance the cursor and recurse.
+@End Implementation
+
+@Performance_Hints:
+O(1) per token excluding the dispatched helpers. Hot path: called once per
+token in tokenize.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes attacker-controlled source. The recursive case for unknown bytes is
+bounded because the cursor advances by 1 before recursing, so recursion depth
+is at most the number of unknown bytes between two real tokens; this is finite
+but stack-noisy on adversarial input, which the parser layer rate-limits.
+@End Security_Scope
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
@@ -234,6 +388,29 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return proc next_token from lexer
 End Process
 
+@Reasoning:
+Strings appear in ARM assembly only in directive operands (e.g. .ascii "hi").
+We scan past the opening quote and consume bytes until the matching close
+quote, honouring '\' as a one-byte escape so escaped quotes don't terminate
+the literal early.
+@End Reasoning
+
+@Implementation:
+Records start_pos, steps past the opening 0x22, then walks bytes: 0x22 closes
+the literal and advances past it; 0x5C (backslash) consumes two bytes
+(escape sequence); any other byte consumes one. Produces a TOKEN_STRING whose
+value pointer is source+start_pos and length covers both quotes.
+@End Implementation
+
+@Performance_Hints:
+O(L) where L is literal length. Single linear pass.
+@End Performance_Hints
+
+@Security_Scope:
+Untrusted input. Unterminated strings are bounded by source_length (the loop
+condition); the token will simply extend to EOF rather than over-read.
+@End Security_Scope
+
 Process called "lex_string" takes lexer as Integer returns Integer:
     Note: Lex string literal
 
@@ -261,6 +438,23 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_STRING, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+ARM (GAS-style) directives are an introducer '.' followed by alphanumeric
+characters (.text, .global, .word, .ascii). Recognising them as a single
+token keeps directive parsing cheap.
+@End Reasoning
+
+@Implementation:
+Records start_pos at the '.', skips past it, then consumes the contiguous
+run of alphanumeric bytes via is_alnum. Emits TOKEN_DIRECTIVE whose lexeme
+includes the leading dot so downstream code can dispatch by full directive
+name.
+@End Implementation
+
+@Performance_Hints:
+O(L) in the directive name length. Each iteration calls is_alnum.
+@End Performance_Hints
+
 Process called "lex_directive" takes lexer as Integer returns Integer:
     Note: Lex assembler directive (starts with .)
 
@@ -283,6 +477,24 @@ Process called "lex_directive" takes lexer as Integer returns Integer:
     Let length be position minus start_pos
     Return proc create_token with TOKEN_DIRECTIVE, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+ARM immediates appear as plain decimal, signed decimal ('-1'), or hex ('0x1F').
+Decoding only validates the lexeme; numeric conversion is deferred to the
+parser so the lexer stays one-pass.
+@End Reasoning
+
+@Implementation:
+Captures start_pos. If the first byte is '-' (0x2D), advances one byte to
+absorb the sign. Then peeks two bytes for a "0x" hex prefix; if present,
+consumes the prefix and the trailing run of hex digits (is_hex_digit).
+Otherwise consumes a run of ASCII decimal digits (0x30..0x39). Emits
+TOKEN_NUMBER with the full lexeme.
+@End Implementation
+
+@Performance_Hints:
+O(L) over the digit run. Hot path on numeric-heavy assembly.
+@End Performance_Hints
 
 Process called "lex_number" takes lexer as Integer returns Integer:
     Note: Lex number (decimal, hex, octal, binary)
@@ -341,6 +553,25 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+Identifiers are the dominant token class in assembly (instructions, registers,
+shift names, labels, and user symbols). One scan extracts the lexeme; a
+follow-up classify_token call assigns the final TOKEN_* discriminator so the
+parser can switch on it directly.
+@End Reasoning
+
+@Implementation:
+Reads bytes while is_alnum returns 1 or the byte equals 0x5F (underscore).
+The terminating byte is left for next_token. The lexeme is handed to
+classify_token, which returns TOKEN_INSTRUCTION, TOKEN_REGISTER, TOKEN_SHIFT,
+or TOKEN_IDENTIFIER.
+@End Implementation
+
+@Performance_Hints:
+O(L) over identifier length followed by an O(table) classify_token call. Hot
+path.
+@End Performance_Hints
+
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Note: Lex identifier (instruction, register, label, or symbol)
 
@@ -367,6 +598,27 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let token_type be proc classify_token with source plus start_pos, length
     Return proc create_token with token_type, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+After lex_identifier captures a lexeme we still need to decide whether it is
+a register (r0..r15, sp, lr, pc, fp), an ARMv7 mnemonic (mov, add, ldr, str,
+bl, bx, etc.), a shift name (LSL, LSR, ASR, ROR), or just a label/symbol.
+We branch first on lexeme length so the longer mnemonic comparisons only run
+when the length matches.
+@End Reasoning
+
+@Implementation:
+Reads bytes via memory_get_byte and uses match_string to compare against a
+hand-coded list of register/shift/instruction names organised by length. The
+register check for r0..r15 special-cases the 'r' prefix and verifies the
+trailing byte is an ASCII digit. Returns TOKEN_INSTRUCTION, TOKEN_REGISTER,
+TOKEN_SHIFT, or TOKEN_IDENTIFIER (fallthrough).
+@End Implementation
+
+@Performance_Hints:
+O(M) where M is the number of mnemonic comparisons at the matching length
+band (at most a few dozen). Each match_string is O(L).
+@End Performance_Hints
 
 Process called "classify_token" takes text as Integer, length as Integer returns Integer:
     Note: Classify identifier as instruction, register, shift, or generic identifier
@@ -552,6 +804,17 @@ Process called "classify_token" takes text as Integer, length as Integer returns
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Hand-rolled isalpha to keep the lexer self-contained (no libc) and to match
+ASCII semantics precisely. Avoiding the C runtime keeps the bootstrap chain
+deterministic across hosts.
+@End Reasoning
+
+@Implementation:
+Returns 1 if the byte is in [0x61..0x7A] (a..z) or [0x41..0x5A] (A..Z),
+otherwise 0. No locale handling - assembly is strictly ASCII.
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -568,6 +831,17 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Used while scanning identifiers and directives. Built on is_alpha so the
+alphabetic case is shared and a single source of truth governs ASCII class
+membership.
+@End Reasoning
+
+@Implementation:
+Delegates to is_alpha for the alphabetic case. Otherwise returns 1 for ASCII
+digits 0x30..0x39, else 0.
+@End Implementation
+
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -582,6 +856,16 @@ Process called "is_alnum" takes char as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning:
+Used specifically by lex_number to consume the body of a 0x... hex literal.
+Accepts both upper- and lower-case hex letters per ARM/GAS conventions.
+@End Reasoning
+
+@Implementation:
+Returns 1 for 0x30..0x39 (0..9), 0x61..0x66 (a..f), or 0x41..0x46 (A..F),
+else 0.
+@End Implementation
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hex digit
@@ -604,6 +888,22 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+classify_token compares many candidate mnemonics against the captured lexeme
+without copying or NUL-terminating it. This helper does a byte-wise compare
+of exactly 'length' bytes so we can match against a literal Runa String
+without allocating a copy.
+@End Reasoning
+
+@Implementation:
+Linear byte-by-byte compare via memory_get_byte for both sides. Returns 0 at
+the first mismatch, 1 if all length bytes match.
+@End Implementation
+
+@Performance_Hints:
+O(length). Called many times during classify_token.
+@End Performance_Hints
+
 Process called "match_string" takes text as Integer, target as String, length as Integer returns Integer:
     Note: Compare string with target
 
@@ -618,6 +918,18 @@ Process called "match_string" takes text as Integer, target as String, length as
     End While
     Return 1
 End Process
+
+@Reasoning:
+Allocates an ArmToken record matching the type's 32-byte layout. Centralising
+the layout writes here means changes to the ArmToken shape only need to be
+made in two places (this constructor and the type definition).
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes via Layout.allocate, writes token_type at offset 0,
+value_ptr at offset 8, value_length at offset 16, and position at offset 24.
+Returns the token pointer for the lexer to push into its token list.
+@End Implementation
 
 Process called "create_token" takes token_type as Integer, value_ptr as Integer, value_length as Integer, position as Integer returns Integer:
     Note: Create new token

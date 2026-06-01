@@ -46,6 +46,25 @@ Note: ========================================
 Note: OpenAPI Parser
 Note: ========================================
 
+@Reasoning:
+OpenAPI specifications are written in either YAML or JSON; both reduce to
+the same structural tree. We delegate physical parsing to the YAML
+parser (which also accepts JSON since JSON is a YAML subset), then run
+the semantic OpenAPI shape validation on top. Splitting these phases lets
+us reuse the YAML parser unchanged across the JSON dialect.
+@End Reasoning
+
+@Implementation:
+Call YAML.parse_yaml(source); if it returns 0 (parse error), propagate 0.
+Otherwise call validate_openapi_structure on the YAML AST and return its
+result.
+@End Implementation
+
+@Security_Scope:
+`source` is treated as untrusted user input -- the underlying YAML parser
+performs bounds checking; this driver does no direct byte inspection.
+@End Security_Scope
+
 Process called "parse_openapi" takes source as Integer returns Integer:
     Note: Parse OpenAPI specification from YAML/JSON source
     Note: Returns: OpenAPI AST (semantic representation)
@@ -66,6 +85,32 @@ End Process
 Note: ========================================
 Note: OpenAPI Structure Validation
 Note: ========================================
+
+@Reasoning:
+This is the OpenAPI 3.x shape gate -- it enforces the three required
+top-level fields (openapi, info, paths), validates that the root is a
+YAML mapping, and dispatches per-section parsers for the optional
+sections. Failure on any required field returns 0 rather than producing
+a partially-valid document, so downstream code can trust a non-zero
+result to be a well-formed OpenAPI AST.
+@End Reasoning
+
+@Implementation:
+Read node_type at offset 0 of yaml_node; if not 3 (YAML_MAPPING), return 0.
+Allocate a fresh Dict and tag it with "type" -> "openapi_document". Read
+the YAML mapping payload at offset 8. For each required section, fetch
+via Dict.get; if missing return 0, otherwise either store as-is (openapi
+version) or run the matching parse_*_object subparser and store the
+result. Optional sections (servers, components, security, tags,
+externalDocs) only attach when present in the source. Returns the
+populated openapi_doc Dict.
+@End Implementation
+
+@Security_Scope:
+`yaml_node` is trusted to be a YAML parser output; null/non-mapping inputs
+return 0 instead of dereferencing further. No fixed string interning, so
+adversarial inputs with thousands of keys allocate proportionally.
+@End Security_Scope
 
 Process called "validate_openapi_structure" takes yaml_node as Integer returns Integer:
     Note: Validate YAML structure conforms to OpenAPI 3.x specification
@@ -171,6 +216,20 @@ Note: ========================================
 Note: Info Object Parsing
 Note: ========================================
 
+@Reasoning:
+The info object is a flat metadata Dict. Both `title` and `version` are
+required by the OpenAPI spec; missing either invalidates the document.
+We don't reshape the dict beyond validation because every field type is
+already string-or-string, so direct reuse keeps memory traffic low.
+@End Reasoning
+
+@Implementation:
+Convert the YAML mapping to a Dict via yaml_node_to_dict; return 0 if
+not a mapping. Verify "title" and "version" are both present (Dict.get
+returns non-zero); return 0 on either missing. Otherwise return the
+dict unchanged.
+@End Implementation
+
 Process called "parse_info_object" takes yaml_node as Integer returns Integer:
     Note: Parse OpenAPI info object (title, version, description, etc.)
 
@@ -202,6 +261,21 @@ End Process
 Note: ========================================
 Note: Servers Array Parsing
 Note: ========================================
+
+@Reasoning:
+Each server entry must carry a non-empty `url`; entries without it are
+silently dropped because the spec requires URL to be present and the
+strict-fail-on-missing rule would reject otherwise-valid documents that
+happened to include a partially-edited server stanza. Optional fields
+(description, variables) are preserved as-is.
+@End Reasoning
+
+@Implementation:
+Convert the YAML sequence to a List via yaml_node_to_list. If the input
+isn't a list, return an empty List. Iterate over each server entry,
+convert to a Dict, and include it in parsed_servers only when "url" is
+present.
+@End Implementation
 
 Process called "parse_servers_array" takes yaml_node as Integer returns Integer:
     Note: Parse servers array (each with url, description, variables)
@@ -240,6 +314,20 @@ Note: ========================================
 Note: Paths Object Parsing
 Note: ========================================
 
+@Reasoning:
+The paths object is a Dict keyed by path template strings (e.g.
+"/users/{id}"). We rebuild it into a fresh Dict whose values are
+sub-parsed path-items so that each entry's HTTP operations are already
+unwrapped, eliminating a second traversal in the translator.
+@End Reasoning
+
+@Implementation:
+Convert the YAML mapping to a Dict; on type mismatch return an empty
+fresh Dict. Enumerate keys via Dict.keys; for each path_key fetch the
+path_item_node, convert to Dict, run parse_path_item to produce the
+parsed item, and bind path_key -> parsed_path_item on parsed_paths.
+@End Implementation
+
 Process called "parse_paths_object" takes yaml_node as Integer returns Integer:
     Note: Parse paths object (API endpoints with operations)
 
@@ -270,6 +358,24 @@ Process called "parse_paths_object" takes yaml_node as Integer returns Integer:
 
     Return parsed_paths
 End Process
+
+@Reasoning:
+A path item carries up to eight HTTP-method operations plus a shared
+parameters list. Rather than iterating user-supplied keys, we iterate
+the *canonical* RFC 9110 method set so misspelled or extension methods
+don't accidentally produce a parsed operation. The parameters key, if
+present, is forwarded as-is because parse_parameters_array runs at the
+operation level too.
+@End Reasoning
+
+@Implementation:
+Build a List containing the eight standard HTTP method strings. For
+each method_key, look it up in path_item_dict; if present, convert the
+value to a Dict and run parse_operation; bind the resulting
+parsed_operation under method_key in parsed_item. After methods, copy
+the optional "parameters" entry as-is into parsed_item if present.
+Returns parsed_item.
+@End Implementation
 
 Process called "parse_path_item" takes path_item_dict as Integer returns Integer:
     Note: Parse path item (operations: get, post, put, delete, etc.)
@@ -320,6 +426,23 @@ End Process
 Note: ========================================
 Note: Operation Parsing
 Note: ========================================
+
+@Reasoning:
+An operation object's fields fall into three classes: dispatched
+(parameters, requestBody, responses, each of which has its own subparser)
+and pass-through (summary, description, operationId, tags, etc.). We
+iterate every key so unknown extensions (`x-*`) and future spec fields
+survive into the AST without us having to enumerate them; the dispatch
+table is the only place where field-specific behaviour lives.
+@End Reasoning
+
+@Implementation:
+Enumerate keys via Dict.keys. For each key, compare its NUL-terminated
+form against "parameters", "requestBody", and "responses" via the local
+string_equals helper. Route matches to parse_parameters_array /
+parse_request_body / parse_responses respectively; everything else is
+copied verbatim into parsed_operation. Returns parsed_operation.
+@End Implementation
 
 Process called "parse_operation" takes operation_dict as Integer returns Integer:
     Note: Parse operation object (summary, parameters, requestBody, responses)
@@ -373,6 +496,21 @@ Note: ========================================
 Note: Parameters Array Parsing
 Note: ========================================
 
+@Reasoning:
+Per the OpenAPI spec each parameter must declare both `name` (the
+parameter's identifier) and `in` (its location: query/path/header/cookie).
+Parameters missing either are dropped silently because the operation can
+still be validly described by the surviving parameters; a hard fail
+would block authoring documents one parameter at a time.
+@End Reasoning
+
+@Implementation:
+Convert the YAML sequence to a List via yaml_node_to_list; if not a list,
+return an empty fresh List. Iterate each entry, convert to Dict, fetch
+"name" and "in" via Dict.get; include the dict in parsed_params only if
+both are non-zero. Returns parsed_params.
+@End Implementation
+
 Process called "parse_parameters_array" takes yaml_node as Integer returns Integer:
     Note: Parse parameters array (query, path, header, cookie parameters)
 
@@ -415,6 +553,19 @@ Note: ========================================
 Note: Request Body Parsing
 Note: ========================================
 
+@Reasoning:
+The OpenAPI request body object's only required field is `content` -- a
+Dict from media-type to media-type-object. A request body without
+content is meaningless, so we drop it (return an empty Dict) rather than
+propagating an invalid body shape into the AST.
+@End Reasoning
+
+@Implementation:
+Convert the YAML mapping to a Dict; on non-mapping input return an empty
+Dict. Verify "content" is present via Dict.get; if absent, return an
+empty Dict. Otherwise return the dict unchanged.
+@End Implementation
+
 Process called "parse_request_body" takes yaml_node as Integer returns Integer:
     Note: Parse request body object (content, description, required)
 
@@ -438,6 +589,21 @@ End Process
 Note: ========================================
 Note: Responses Parsing
 Note: ========================================
+
+@Reasoning:
+The responses object maps HTTP status codes (or "default") to response
+objects. Each response must carry a `description`; the spec is firm on
+this because clients use the description to render error messages.
+Entries missing description are dropped from the parsed result.
+@End Reasoning
+
+@Implementation:
+Convert the YAML mapping to a Dict; on type mismatch return an empty
+Dict. Enumerate keys via Dict.keys; for each status_key fetch the
+response_node, convert to Dict, fetch "description" via Dict.get, and
+bind status_key -> response_dict on parsed_responses only when
+description is present.
+@End Implementation
 
 Process called "parse_responses" takes yaml_node as Integer returns Integer:
     Note: Parse responses object (status codes mapped to response objects)
@@ -479,6 +645,21 @@ Note: ========================================
 Note: Components Object Parsing
 Note: ========================================
 
+@Reasoning:
+The components section holds reusable definitions (schemas, parameters,
+responses, securitySchemes, etc.); each sub-section is itself a dict of
+named definitions. Because every sub-section has the same dict-of-dicts
+shape and is referenced indirectly via $ref, we can keep the components
+object as a flat dict without recursively shape-validating each entry --
+the per-reference validation happens at resolution time, not parse time.
+@End Reasoning
+
+@Implementation:
+Convert the YAML mapping to a Dict via yaml_node_to_dict. If the input
+isn't a mapping, return an empty Dict. Otherwise return the dict
+unchanged.
+@End Implementation
+
 Process called "parse_components_object" takes yaml_node as Integer returns Integer:
     Note: Parse components object (schemas, responses, parameters, etc.)
 
@@ -499,6 +680,18 @@ Note: ========================================
 Note: Security Array Parsing
 Note: ========================================
 
+@Reasoning:
+A security requirement is an array of Dicts, each Dict mapping security
+scheme names to scope arrays. Since the inner shape is free-form
+(scopes depend on the referenced scheme defined in components), we
+preserve the list as-is for the translator to interpret per-scheme.
+@End Reasoning
+
+@Implementation:
+Convert the YAML sequence to a List via yaml_node_to_list. If not a list,
+return an empty List. Otherwise return the list unchanged.
+@End Implementation
+
 Process called "parse_security_array" takes yaml_node as Integer returns Integer:
     Note: Parse security requirements array
 
@@ -515,6 +708,19 @@ End Process
 Note: ========================================
 Note: Tags Array Parsing
 Note: ========================================
+
+@Reasoning:
+Tags require a non-empty `name` per the OpenAPI spec since the name is
+the cross-reference key from operation.tags[i] back to the global tag
+metadata. Tags without name are useless and are dropped.
+@End Reasoning
+
+@Implementation:
+Convert the YAML sequence to a List; if not a list, return an empty
+List. Iterate each tag entry, convert to a Dict, fetch "name" via
+Dict.get, and include in parsed_tags only when name is non-zero.
+Returns parsed_tags.
+@End Implementation
 
 Process called "parse_tags_array" takes yaml_node as Integer returns Integer:
     Note: Parse tags array (name, description, externalDocs)
@@ -553,6 +759,21 @@ Note: ========================================
 Note: YAML Node Conversion Helpers
 Note: ========================================
 
+@Reasoning:
+Conversion between YAML AST nodes (typed wrappers) and bare Dicts. The
+input can either be a YAML_MAPPING wrapper (in which case the Dict
+payload lives at offset 8) or an already-converted Dict produced by an
+earlier recursive parser; the duck-test via Dict.keys catches the
+second case without requiring a separate kind tag.
+@End Reasoning
+
+@Implementation:
+Guard null. Read node_type at offset 0; if 3 (YAML_MAPPING), return the
+Dict pointer at offset 8. Otherwise call Dict.keys; if it returns a
+non-zero list (the input is already a Dict), return yaml_node unchanged.
+Otherwise return 0.
+@End Implementation
+
 Process called "yaml_node_to_dict" takes yaml_node as Integer returns Integer:
     Note: Convert YAML mapping node to dictionary
 
@@ -575,6 +796,19 @@ Process called "yaml_node_to_dict" takes yaml_node as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Mirror of yaml_node_to_dict for sequence nodes. Same dual-input idea:
+either a YAML_SEQUENCE wrapper or an already-extracted List from earlier
+recursion. The List.size duck-test distinguishes the second case.
+@End Reasoning
+
+@Implementation:
+Guard null. Read node_type at offset 0; if 2 (YAML_SEQUENCE), return the
+List pointer at offset 8. Otherwise call List.size; if the result is
+non-negative (i.e. the input is already a List), return yaml_node
+unchanged. Otherwise return 0.
+@End Implementation
 
 Process called "yaml_node_to_list" takes yaml_node as Integer returns Integer:
     Note: Convert YAML sequence node to list
@@ -603,6 +837,19 @@ Note: ========================================
 Note: Helper Functions
 Note: ========================================
 
+@Reasoning:
+Local NUL-terminated equality helper used by parse_operation to choose
+between the three dispatched field handlers. Inlined here so the
+operation parser doesn't pay a cross-module call into StringCore for
+each key compare; the loop body is short enough that inlining wins.
+@End Reasoning
+
+@Implementation:
+Walk index from 0 by memory_get_byte on both strings. On mismatch return
+0; on a matched 0 byte (joint NUL terminator) return 1; otherwise
+increment index and continue.
+@End Implementation
+
 Process called "string_equals" takes str1 as String, str2 as String returns Integer:
     Note: Compare two null-terminated C strings for equality
 
@@ -625,6 +872,18 @@ Process called "string_equals" takes str1 as String, str2 as String returns Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Thin wrapper around StringCore.create_from_literal kept in this file so
+the long list of `proc create_string_literal with "..."` call sites
+above read cleanly. StringCore.create_from_literal is itself an O(1)
+identity transform on the literal pointer (Runa string literals are
+already valid Strings), so this wrapper costs nothing at runtime.
+@End Reasoning
+
+@Implementation:
+Return StringCore.create_string_from_literal(value).
+@End Implementation
 
 Process called "create_string_literal" takes value as String returns Integer:
     Note: Create string from string literal

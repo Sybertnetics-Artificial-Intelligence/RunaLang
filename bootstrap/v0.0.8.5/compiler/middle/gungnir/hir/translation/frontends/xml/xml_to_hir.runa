@@ -60,6 +60,14 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+XML translation needs the same first-error capture and source position as TOML/JSON, plus a boolean toggle for whether to preserve comments and processing instructions in the output - some callers want round-trip fidelity, others want a clean data-only view.
+@End Reasoning
+
+@Implementation:
+Five 8-byte fields: heap-allocated error_message pointer, has_error flag, current source line/column, and preserve_comments flag (0 by default, set by callers that want comments and PIs to survive translation).
+@End Implementation
+
 Type called "XMLToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -71,6 +79,14 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+A fresh context must default to "no error, no preserved comments" so callers wanting fidelity must explicitly set preserve_comments after construction; this safe default produces minimal HIR output.
+@End Reasoning
+
+@Implementation:
+Allocate 40 bytes; null-check. Initialise error_message=0, has_error=0, line=0, column=0, preserve_comments=0.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create XML to HIR translation context
@@ -91,6 +107,14 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+The context owns its error_message buffer; teardown must release it to prevent the standard "translation failed and context discarded" leak path.
+@End Reasoning
+
+@Implementation:
+Null-check the context. Read the error_message pointer; if non-null deallocate. Deallocate the context block.
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -114,6 +138,14 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Translation must record only the first error and own a copy of the message; allocating fresh storage decouples the message lifetime from the caller's buffer.
+@End Reasoning
+
+@Implementation:
+Read existing error_message; if non-null free it. Measure new message length, allocate length+1 bytes, copy message bytes, null-terminate. Store at offset 0 and set has_error=1 at offset 8.
+@End Implementation
 
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
@@ -144,13 +176,16 @@ Note: ==========================================================================
 Note: XML Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+XML has six AST kinds (document, element, text, CDATA, comment, processing instruction); central dispatch lets each translator stay focused on one shape and shares position-update bookkeeping.
+@End Reasoning
+
+@Implementation:
+Null-check; record an error and return 0 on null. Read the node tag at offset 0 and the source line/column at offsets 40/48 into the context. Dispatch on tag to the matching translate_xml_* helper. Unknown tags record an error and return 0.
+@End Implementation
+
 Process called "translate_xml_node_to_hir" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on XML node type.
-    Creates corresponding HIR dictionary or literal node.
-    @End Reasoning
 
     If xml_node is equal to 0:
         proc set_translation_error with context, "Null XML node"
@@ -195,14 +230,16 @@ Process called "translate_xml_node_to_hir" takes context as Integer, xml_node as
     Return 0
 End Process
 
+@Reasoning:
+The XML root document wraps the actual document element along with prologue PIs and comments; HIR should return the root element directly so consumers see the meaningful tree without having to peel one layer of envelope.
+@End Reasoning
+
+@Implementation:
+Read the children list at offset 32; error-out if null or empty. Walk children looking for the first child with tag XML_ELEMENT - that is the document element. Error-out if none found. Forward to translate_xml_element on that node.
+@End Implementation
+
 Process called "translate_xml_document" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML document to HIR
-
-    @Reasoning:
-    The document node contains the root element and possibly comments/PIs.
-    We return just the root element's HIR representation, or a list if
-    there are multiple top-level nodes.
-    @End Reasoning
 
     Note: Get children list
     Let children be proc memory_get_int64 from Layout with xml_node, 32
@@ -244,16 +281,20 @@ Process called "translate_xml_document" takes context as Integer, xml_node as In
     Return proc translate_xml_element with context, root_element
 End Process
 
+@Reasoning:
+XML elements become Runa Dictionaries with reserved underscore-prefixed keys ("_tag", "_attributes", "_children") plus a "flat" copy of attributes as direct dictionary entries so Runa code can read attr.name without typing element["_attributes"]["name"].
+@End Reasoning
+
+@Implementation:
+Build a HIR dictionary. Read element_name, attributes, and children from offsets 8/24/32. Insert "_tag" -> string literal of element_name. If attributes present, iterate keys: insert each into a fresh "_attributes" subdict and also into the outer dict directly. If children present and non-empty, recursively translate each child via translate_xml_node_to_hir, append non-null results to a list literal, attach under "_children".
+@End Implementation
+
+@Performance_Hints:
+O(n) in attribute count + child count, plus recursive cost over all descendants; two HIR string allocations per attribute (one for "_attributes" subdict, one for direct dictionary access).
+@End Performance_Hints
+
 Process called "translate_xml_element" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML element to HIR dictionary
-
-    @Reasoning:
-    XML elements map to Runa Dictionary with special keys:
-    - "_tag": element name
-    - "_attributes": dictionary of attributes
-    - "_children": list of child nodes
-    - Individual attribute keys for direct access
-    @End Reasoning
 
     Note: Get element properties
     Let element_name be proc memory_get_int64 from Layout with xml_node, 8
@@ -326,6 +367,14 @@ Process called "translate_xml_element" takes context as Integer, xml_node as Int
     Return hir_dict
 End Process
 
+@Reasoning:
+XML text nodes carry their decoded character data (entity references resolved by the parser); lifting them straight into HIR string literals preserves content without further interpretation.
+@End Reasoning
+
+@Implementation:
+Read the text value pointer at offset 16. Error-out if null. Wrap it in an HIR string literal.
+@End Implementation
+
 Process called "translate_xml_text" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML text to HIR string literal
 
@@ -348,13 +397,16 @@ Process called "translate_xml_text" takes context as Integer, xml_node as Intege
     Return hir_string
 End Process
 
+@Reasoning:
+CDATA sections "<![CDATA[...]]>" exist in XML purely as an escape-bypass for character data; once the parser has stripped the delimiters they are functionally identical to text content, so HIR represents them as plain string literals.
+@End Reasoning
+
+@Implementation:
+Read the CDATA value pointer at offset 16; error-out if null. Wrap in an HIR string literal.
+@End Implementation
+
 Process called "translate_xml_cdata" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML CDATA to HIR string literal
-
-    @Reasoning:
-    CDATA sections are essentially text content that should not be escaped.
-    We represent them as plain strings in HIR.
-    @End Reasoning
 
     Note: Get CDATA value
     Let cdata_value be proc memory_get_int64 from Layout with xml_node, 16
@@ -375,13 +427,16 @@ Process called "translate_xml_cdata" takes context as Integer, xml_node as Integ
     Return hir_string
 End Process
 
+@Reasoning:
+Comments carry semantic intent in some XML dialects (e.g., XSLT, configuration files); the preserve_comments flag lets callers opt in to round-trip fidelity while default callers strip comments to get clean data.
+@End Reasoning
+
+@Implementation:
+Read context.preserve_comments at offset 32; return 0 if disabled (skip the comment). Otherwise read the comment value at offset 16; if null return 0. Build an HIR dictionary with a single "_comment" entry holding the comment text as a string literal.
+@End Implementation
+
 Process called "translate_xml_comment" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML comment to HIR dictionary
-
-    @Reasoning:
-    Comments are preserved as dictionaries with "_comment" key.
-    This allows round-trip translation to preserve comments.
-    @End Reasoning
 
     Let preserve_comments be proc memory_get_int64 from Layout with context, 32
 
@@ -405,12 +460,16 @@ Process called "translate_xml_comment" takes context as Integer, xml_node as Int
     Return hir_dict
 End Process
 
+@Reasoning:
+Processing instructions like "<?xml-stylesheet ...?>" can carry critical document metadata; preserve_comments governs both comments and PIs since they share the same "structural metadata, not data" character.
+@End Reasoning
+
+@Implementation:
+Read context.preserve_comments; return 0 if disabled. Otherwise read the PI value at offset 16; if null return 0. Build an HIR dictionary with a single "_pi" entry holding the PI text as a string literal.
+@End Implementation
+
 Process called "translate_xml_pi" takes context as Integer, xml_node as Integer returns Integer:
     Note: Translate XML processing instruction to HIR dictionary
-
-    @Reasoning:
-    Processing instructions are preserved as dictionaries with "_pi" key.
-    @End Reasoning
 
     Let preserve_comments be proc memory_get_int64 from Layout with context, 32
 
@@ -438,13 +497,20 @@ Note: ==========================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
 
+@Reasoning:
+Public entry point hides the parse+translate+cleanup orchestration; failures at any stage bubble through a single error-reporting channel attached to the higher-level Translation context.
+@End Reasoning
+
+@Implementation:
+Null-check source_code; report and return 0. Create an internal translation context; on OOM report and return 0. Parse the source via Parser.parse_xml; on failure report and clean up. Recursively translate the AST root. On translation error forward the message to the outer context. Always destroy the internal context before returning.
+@End Implementation
+
+@Security_Scope:
+Consumes untrusted XML source. The parser is expected to reject malformed XML; this translator only adds the HIR shape and cannot itself introduce parsing vulnerabilities.
+@End Security_Scope
+
 Process called "translate_xml_to_hir" takes source_code as Integer, translation_context as Integer returns Integer:
     Note: Translate XML source code to Runa HIR
-
-    @Reasoning:
-    Entry point for XML→HIR translation. Parses XML, translates to HIR,
-    handles errors, and reports to Translation context.
-    @End Reasoning
 
     If source_code is equal to 0:
         proc add_translation_error from Translation with translation_context, "Null source code"

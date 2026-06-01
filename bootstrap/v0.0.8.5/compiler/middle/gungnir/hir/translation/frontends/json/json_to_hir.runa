@@ -53,6 +53,21 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Per-translation context object threaded through every translator. Carrying
+the latest source line/column on the context lets translate_json_node_to_hir
+update it as it descends so any error message produced from a deeper call
+already references the correct token position without each translator
+having to plumb position through its parameter list.
+@End Reasoning
+
+@Implementation:
+Four 64-bit slots in declared order: error_message (owned, heap-allocated
+NUL-terminated string, or 0 if unset), has_error boolean, line and column
+of the current JSON node being translated. Total size 32 bytes; offsets
+0/8/16/24 are referenced directly by the helper Processes.
+@End Implementation
+
 Type called "JSONToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -63,6 +78,18 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocates the per-translation context with all fields zeroed -- importantly
+error_message=0 (no leak risk in destroy if never set) and has_error=0 (so
+translate_json_to_hir's terminal has_error check is correct on the success
+path without explicit setting on every Process).
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes for the JSONToHIRContext layout, return 0 on OOM.
+Otherwise zero all four 64-bit fields at offsets 0/8/16/24.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create JSON to HIR translation context
@@ -82,6 +109,18 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Owns the cleanup of context.error_message so callers can drop the context
+in one call regardless of whether an error path was ever taken. Idempotent
+for null context to keep callers simple.
+@End Reasoning
+
+@Implementation:
+If context is 0, return 1. Otherwise read offset 0 (error_message); if
+non-zero, deallocate that buffer. Finally deallocate the context block
+itself. Always returns 1.
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -105,6 +144,29 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Replaces any previous error message with a freshly heap-copied NUL-
+terminated buffer so the context owns the lifetime independently of the
+caller's literal. Always sets has_error=1 so the terminal check in
+translate_json_to_hir trips on the success path even if individual
+translator returns happen to be 0 for legitimate reasons (none currently).
+@End Reasoning
+
+@Implementation:
+Read offset 0 (error_message); if non-zero, deallocate to free the prior
+message. Compute msg_length via StringCore.string_length. Allocate
+msg_length+1 bytes; on success, memory_copy the message and write a 0
+terminator at msg_length. Write the new buffer pointer into offset 0 and
+1 into offset 8 (has_error). Returns 1.
+@End Implementation
+
+@Security_Scope:
+`message` is assumed to be a trusted, NUL-terminated string from the
+translator (callers pass string literals). If allocation fails the
+context will have error_message=0 but has_error=1, which the higher
+layers handle as "error without message".
+@End Security_Scope
 
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
@@ -135,13 +197,29 @@ Note: ==========================================================================
 Note: JSON Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+Type-switch over the seven JSON AST node tags. Centralising the dispatch
+here keeps the translators acyclic from the caller's perspective: every
+recursive descent into objects/arrays goes back through this single entry
+so context.line/column tracking is updated uniformly, and so a single
+"unknown JSON node type" guard catches AST corruption regardless of which
+recursion arm produced it.
+@End Reasoning
+
+@Implementation:
+Read node_type at offset 0 and source position at offsets 56/64. Write
+line and column into context offsets 16/24 so any error raised by a
+recursive translator references the right source location. Then dispatch
+on node_type matching Parser's JSON_OBJECT/ARRAY/STRING/NUMBER/TRUE/FALSE/
+NULL constants; objects and arrays recurse via translate_json_object /
+translate_json_array, strings/numbers via the dedicated translators,
+true/false/null short-circuit to HIR.create_hir_boolean_literal /
+create_hir_null_literal. Returns 0 (with a translation error set) on null
+input or unknown type.
+@End Implementation
+
 Process called "translate_json_node_to_hir" takes context as Integer, json_node as Integer returns Integer:
     Note: Translate JSON AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on JSON node type.
-    Creates corresponding HIR literal or data structure node.
-    @End Reasoning
 
     If json_node is equal to 0:
         proc set_translation_error with context, "Null JSON node"
@@ -190,13 +268,28 @@ Process called "translate_json_node_to_hir" takes context as Integer, json_node 
     Return 0
 End Process
 
+@Reasoning:
+JSON objects translate to a HIR dictionary literal because Runa's
+Dictionary[String, Value] is the structural analogue with key order
+preservation matching how the parser stored the two parallel lists. We
+walk keys[i] and children[i] in lockstep to guarantee that key i pairs
+with value i -- the parser's invariant -- rather than relying on any
+ordering of a single combined list.
+@End Reasoning
+
+@Implementation:
+Read children at offset 40 and keys at offset 48 of the JSON object node;
+guard both for null. Allocate a HIR dictionary literal via
+HIR.create_hir_dictionary_literal. Loop index from 0 to List.size(children),
+fetching key_ptr from keys[index] and value_node from children[index];
+guard both. Recurse on value_node via translate_json_node_to_hir; on a
+non-zero HIR value, append via HIR.add_dictionary_entry(hir_dict, key_ptr,
+hir_value). Returns the populated HIR dictionary, or 0 (with translation
+error set) on any missing slot.
+@End Implementation
+
 Process called "translate_json_object" takes context as Integer, json_node as Integer returns Integer:
     Note: Translate JSON object to HIR dictionary literal
-
-    @Reasoning:
-    JSON objects map to Runa Dictionary types.
-    Creates HIR dictionary literal with key-value pairs.
-    @End Reasoning
 
     Note: Get children and keys lists
     Let children be proc memory_get_int64 from Layout with json_node, 40
@@ -259,13 +352,25 @@ Process called "translate_json_object" takes context as Integer, json_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+JSON arrays translate to a HIR list literal because Runa's List[Value]
+preserves element order and supports heterogeneous typing -- both required
+to round-trip arbitrary JSON. We do NOT pre-infer element types or attempt
+homogenisation here; type unification is a later HIR pass that owns the
+heterogeneous-collection inference rules.
+@End Reasoning
+
+@Implementation:
+Read children at offset 40 of the array node; guard null. Allocate a HIR
+list literal via HIR.create_hir_list_literal. Loop index from 0 to
+List.size(children), fetching element_node from children[index]; guard
+null. Recurse via translate_json_node_to_hir and append the resulting
+hir_element via HIR.add_list_element. Returns the populated HIR list, or
+0 (with translation error set) on any missing slot or recursion failure.
+@End Implementation
+
 Process called "translate_json_array" takes context as Integer, json_node as Integer returns Integer:
     Note: Translate JSON array to HIR list literal
-
-    @Reasoning:
-    JSON arrays map to Runa List types.
-    Creates HIR list literal with elements.
-    @End Reasoning
 
     Note: Get children list
     Let children be proc memory_get_int64 from Layout with json_node, 40
@@ -314,6 +419,20 @@ Process called "translate_json_array" takes context as Integer, json_node as Int
     Return hir_list
 End Process
 
+@Reasoning:
+The parser has already validated and de-escaped the JSON string into
+offset-8 `value_string`, so translation is a structural relabel from
+"JSON string node" to "HIR string literal". No re-decoding is done here
+because the parser is the only correct authority on JSON's escape
+semantics (e.g. \uXXXX surrogate pairs).
+@End Reasoning
+
+@Implementation:
+Read value at offset 8; guard null with a translation error. Wrap into a
+HIR string literal via HIR.create_hir_string_literal and return; guard
+its construction with a second translation error.
+@End Implementation
+
 Process called "translate_json_string" takes context as Integer, json_node as Integer returns Integer:
     Note: Translate JSON string to HIR string literal
 
@@ -336,14 +455,27 @@ Process called "translate_json_string" takes context as Integer, json_node as In
     Return hir_string
 End Process
 
+@Reasoning:
+JSON has a single Number production but Runa distinguishes Integer from
+Float; the parser disambiguates at scan time by tracking whether the
+literal contains a `.` or exponent and setting is_integer accordingly.
+Integers can be carried as a parsed value, but floats are kept as their
+original lexeme so HIR.create_hir_float_literal can round-trip the exact
+textual representation -- avoiding precision loss from re-parsing through
+a fixed-width float type when the JSON specified more digits.
+@End Reasoning
+
+@Implementation:
+Read value_int at offset 16, is_integer at offset 24, and lexeme at
+offset 32. If is_integer==1, wrap value_int into a HIR integer literal
+via HIR.create_hir_integer_literal and return; on construction failure,
+set a translation error and return 0. Otherwise (float), guard lexeme!=0
+and pass it to HIR.create_hir_float_literal, returning the result or
+setting an error and returning 0 on failure.
+@End Implementation
+
 Process called "translate_json_number" takes context as Integer, json_node as Integer returns Integer:
     Note: Translate JSON number to HIR integer or float literal
-
-    @Reasoning:
-    JSON numbers can be integers or floats. We use the is_integer flag to determine
-    which HIR literal type to create. For floats, we use the preserved lexeme to
-    create an accurate float representation.
-    @End Reasoning
 
     Note: Get number properties
     Let value_int be proc memory_get_int64 from Layout with json_node, 16
@@ -383,13 +515,33 @@ Note: ==========================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
 
+@Reasoning:
+Top-level driver: source_code -> JSON AST -> HIR. Creating and destroying
+the context here, rather than passing one in, ensures every translation
+gets a fresh error state and that ownership of the context error buffer
+is local to this call. The has_error post-check is the canonical place
+where a recursive translator's deeper failure is surfaced to the caller
+as a single "Return 0".
+@End Reasoning
+
+@Implementation:
+Guard source_code!=0. Allocate context via create_translation_context;
+parse the source via Parser.parse_json -- on parse failure destroy context
+and return 0. Translate the root AST via translate_json_node_to_hir; then
+read has_error at offset 8 of the context. If has_error==1, destroy the
+context and return 0; otherwise destroy the context and return the
+HIR root.
+@End Implementation
+
+@Security_Scope:
+`source_code` is treated as untrusted JSON input from disk or network --
+the parser is responsible for syntactic validation and bounds checks;
+this function only orchestrates and never inspects the source bytes
+directly.
+@End Security_Scope
+
 Process called "translate_json_to_hir" takes source_code as Integer returns Integer:
     Note: Translate JSON source code to Runa HIR
-
-    @Reasoning:
-    Entry point for JSON→HIR translation. Parses JSON, translates to HIR,
-    and returns the HIR root node.
-    @End Reasoning
 
     If source_code is equal to 0:
         Return 0

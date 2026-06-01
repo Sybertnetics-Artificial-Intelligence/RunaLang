@@ -46,6 +46,21 @@ Note: ==========================================================================
 Note: Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+72-byte C++ codegen context tracking output buffer, indentation,
+namespace/class/template nesting state, required #include tracking,
+and forward declarations. Multi-pass C++ codegen needs all of these
+because emission of e.g. a member function reference requires the
+parent class context, and using a custom type may require an additional
+#include.
+@End Reasoning
+
+@Implementation:
+Nine 8-byte fields at offsets 0..64: output_buffer, indent_level,
+current_namespace, template_context, class_context, includes (List),
+forward_decls (List), error_message, has_error.
+@End Implementation
+
 Type called "CppCodeGenContext":
     output_buffer as Integer      Note: String buffer for generated code
     indent_level as Integer       Note: Current indentation level
@@ -62,13 +77,21 @@ Note: ==========================================================================
 Note: Context Management
 Note: ============================================================================
 
+@Reasoning:
+Allocate and initialise a CppCodeGenContext. Performs all allocations
+(context, string buffer, lists) at once so callers see a fully-built
+context or null on any failure.
+@End Reasoning
+
+@Implementation:
+Allocates 72 bytes for the context, a 16KB string buffer, an empty
+includes list, and an empty forward_decls list. On any failure, frees
+all previously-allocated pieces and returns 0. Otherwise writes the
+nine pointer/value fields and returns the context pointer.
+@End Implementation
+
 Process called "create_cpp_codegen_context" returns Integer:
     Note: Create code generation context
-
-    @Reasoning:
-    Initialize context for C++ code generation including output buffer,
-    indentation tracking, namespace/class contexts, and dependency tracking.
-    @End Reasoning
 
     Let context_size be 72  Note: CppCodeGenContext: 9 fields × 8 bytes
     Let context be proc allocate from Layout with context_size
@@ -114,6 +137,22 @@ Process called "create_cpp_codegen_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+Free all resources owned by a CppCodeGenContext: the output buffer,
+the includes list, the forward_decls list, the error message if any,
+and the context itself.
+@End Reasoning
+
+@Implementation:
+Null check returns 1. Otherwise reads each owned pointer from its
+offset and frees via the appropriate destructor (StringCore for the
+buffer, List for the two lists, Layout for the message and context).
+@End Implementation
+
+@Security_Scope:
+Caller must drop the context pointer after this call.
+@End Security_Scope
+
 Process called "destroy_cpp_codegen_context" takes context as Integer returns Integer:
     Note: Destroy code generation context
 
@@ -150,6 +189,19 @@ End Process
 Note: ============================================================================
 Note: Main Code Generation Entry Point
 Note: ============================================================================
+
+@Reasoning:
+Top-level translator: emits a C++ source file from a HIR program node.
+Generates the file header, walks top-level declarations, and renders
+any accumulated #include statements.
+@End Reasoning
+
+@Implementation:
+Emits the file header banner via emit_cpp_file_header. Iterates the
+program's declaration list and dispatches each through
+generate_cpp_declaration. Final pass collects required headers and
+emits them as #include statements at the top of the buffer.
+@End Implementation
 
 Process called "generate_cpp_from_hir" takes context as Integer, hir_program as Integer returns Integer:
     Note: Generate complete C++ source from HIR program
@@ -203,6 +255,19 @@ Process called "generate_cpp_from_hir" takes context as Integer, hir_program as 
 
     Return 1
 End Process
+
+@Reasoning:
+Top-level declaration dispatcher. C++ allows classes, templates,
+functions, variables, namespaces, type aliases, and using-declarations
+at file scope. This routes each HIR declaration to its specialised
+generator.
+@End Reasoning
+
+@Implementation:
+Reads the declaration's _type discriminator and probes against the
+known shapes (class, template, function, variable, namespace, ...),
+dispatching to generate_cpp_class, generate_cpp_template, etc.
+@End Implementation
 
 Process called "generate_cpp_declaration" takes context as Integer, decl_hir as Integer returns Integer:
     Note: Generate C++ declaration from HIR
@@ -270,6 +335,19 @@ Note: ==========================================================================
 Note: Class Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit a C++ class definition. Handles the class header (class name +
+base list), access-specifier sections, and members. Pushes the class
+context so member emitters can reference it.
+@End Reasoning
+
+@Implementation:
+Saves the previous class_context, sets it to this class. Emits
+"class Name" + base specifiers + " {". Calls generate_cpp_class_members
+which interleaves public/protected/private sections. Closes with "};"
+and restores the previous class_context.
+@End Implementation
+
 Process called "generate_cpp_class" takes context as Integer, class_hir as Integer returns Integer:
     Note: Generate C++ class declaration/definition
 
@@ -323,6 +401,18 @@ Process called "generate_cpp_class" takes context as Integer, class_hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a class's members grouped under public/protected/private access
+specifier sections. Only emits a section if it has any members, so
+empty access sections are not printed.
+@End Reasoning
+
+@Implementation:
+Walks the class's member list and bucket-sorts by access level. For
+each non-empty bucket, emits the "public:" / "protected:" / "private:"
+keyword then iterates the bucket calling generate_cpp_class_member.
+@End Implementation
 
 Process called "generate_cpp_class_members" takes context as Integer, class_hir as Integer:
     Note: Generate class members organized by access level
@@ -433,6 +523,17 @@ Process called "generate_cpp_class_members" takes context as Integer, class_hir 
     proc destroy from List with private_members
 End Process
 
+@Reasoning:
+Emit a single class member (field, method, constructor, destructor,
+operator overload, or nested type).
+@End Reasoning
+
+@Implementation:
+Reads the member's _type discriminator. Methods/constructors/operators
+dispatch to function emission. Fields emit "type name [= init];".
+Nested types recurse into the appropriate declaration emitter.
+@End Implementation
+
 Process called "generate_cpp_class_member" takes context as Integer, member_hir as Integer:
     Note: Generate individual class member
 
@@ -472,6 +573,18 @@ Note: ==========================================================================
 Note: Template Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit a C++ template declaration "template<P1, P2, ...> X" where X is
+the templated class, function, or alias.
+@End Reasoning
+
+@Implementation:
+Saves the previous template_context, sets it to this template. Calls
+generate_cpp_template_declaration to emit "template<...>". Recurses
+into the templated body (class/function/alias). Restores the previous
+template_context.
+@End Implementation
+
 Process called "generate_cpp_template" takes context as Integer, template_hir as Integer returns Integer:
     Note: Generate C++ template declaration
 
@@ -495,6 +608,16 @@ Process called "generate_cpp_template" takes context as Integer, template_hir as
     Return 1
 End Process
 
+@Reasoning:
+Emit the "template<P1, P2, ...>" prefix. Each parameter (type, value,
+template-template) is rendered by generate_cpp_template_parameter.
+@End Reasoning
+
+@Implementation:
+Emits "template<", iterates the parameter list calling
+generate_cpp_template_parameter with comma separators, emits ">".
+@End Implementation
+
 Process called "generate_cpp_template_declaration" takes context as Integer, params_hir as Integer:
     Note: Generate template parameter list
 
@@ -517,6 +640,19 @@ Process called "generate_cpp_template_declaration" takes context as Integer, par
     proc emit_cpp_code with context, ">"
     proc emit_cpp_newline from context
 End Process
+
+@Reasoning:
+Emit one template parameter declaration. C++ template parameters come
+in three shapes: type ("typename T"), value ("int N"), and
+template-template ("template<class> class TT").
+@End Reasoning
+
+@Implementation:
+Reads the parameter's kind and dispatches. Type parameters emit
+"typename " + name (or "class " if requested). Value parameters emit
+the parameter type + " " + name. Default values are emitted as
+"= default_expr" when present.
+@End Implementation
 
 Process called "generate_cpp_template_parameter" takes context as Integer, param_hir as Integer:
     Note: Generate individual template parameter
@@ -571,6 +707,18 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Translate any HIR expression into a C++ expression. C++ expressions
+span literals, identifiers, member access, function calls, lambdas,
+arithmetic/logical/comparison operators, new/delete, and casts.
+@End Reasoning
+
+@Implementation:
+Reads the expression's _type and dispatches to the matching emitter
+(literal, identifier, member, call, lambda, binary, unary, cast, new,
+delete). Unknown expression types record an error and emit a stub.
+@End Implementation
+
 Process called "generate_cpp_expression" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate C++ expression from HIR
 
@@ -621,6 +769,17 @@ Process called "generate_cpp_expression" takes context as Integer, expr_hir as I
     Note: Fall back to base expression generation
     Return proc generate_base_cpp_expression with context, expr_hir
 End Process
+
+@Reasoning:
+Emit a C++ lambda "[capture](params) -> ret { body }". Captures default
+to "[]" (no captures) unless the HIR specifies a capture mode.
+@End Reasoning
+
+@Implementation:
+Reads capture mode, parameter list, return type, and body. Emits "[",
+capture clause, "](", parameter list, ") -> ", return type, " {",
+body via generate_cpp_block, "}".
+@End Implementation
 
 Process called "generate_cpp_lambda" takes context as Integer, lambda_hir as Integer returns Integer:
     Note: Generate C++ lambda expression
@@ -675,12 +834,30 @@ Note: ==========================================================================
 Note: Code Emission Utilities
 Note: ============================================================================
 
+@Reasoning:
+Append raw code text to the output buffer. Used by all higher-level
+emitters as the lowest-level emission primitive.
+@End Reasoning
+
+@Implementation:
+Forwards to StringCore's buffer_append on the context's output_buffer.
+@End Implementation
+
 Process called "emit_cpp_code" takes context as Integer, code as Integer:
     Note: Emit code to output buffer
 
     Let output_buffer be proc memory_get_int64 from Layout with context, 0
     proc append_to_string_buffer from StringCore with output_buffer, code
 End Process
+
+@Reasoning:
+Emit a line terminator plus the indent prefix for the next line so
+subsequent emit_cpp_code calls land at the correct column.
+@End Reasoning
+
+@Implementation:
+Appends "\n", then appends indent_level * 4 spaces (C++ convention).
+@End Implementation
 
 Process called "emit_cpp_newline" takes context as Integer:
     Note: Emit newline with proper indentation
@@ -698,12 +875,30 @@ Process called "emit_cpp_newline" takes context as Integer:
     End While
 End Process
 
+@Reasoning:
+Step into a nested C++ block. Called before emitting a function body,
+class body, or any braced compound.
+@End Reasoning
+
+@Implementation:
+Reads the indent_level field, increments, writes back.
+@End Implementation
+
 Process called "increment_cpp_indent" takes context as Integer:
     Note: Increase indentation level
 
     Let current_indent be proc memory_get_int64 from Layout with context, 8
     proc memory_set_int64 from Layout with context, 8, current_indent plus 1
 End Process
+
+@Reasoning:
+Step out of a nested C++ block. Clamped at zero so emit-failures
+do not underflow the indent.
+@End Reasoning
+
+@Implementation:
+Reads indent_level; writes back level-1 if greater than zero.
+@End Implementation
 
 Process called "decrement_cpp_indent" takes context as Integer:
     Note: Decrease indentation level
@@ -713,6 +908,17 @@ Process called "decrement_cpp_indent" takes context as Integer:
         proc memory_set_int64 from Layout with context, 8, current_indent minus 1
     End If
 End Process
+
+@Reasoning:
+Emit a standard banner comment at the top of every generated C++ file.
+Marks output as generated and warns against hand-editing.
+@End Reasoning
+
+@Implementation:
+Emits a "/* ... */" block declaring the file as auto-generated from
+HIR. Closes with a blank line so the first declaration is visually
+separated.
+@End Implementation
 
 Process called "emit_cpp_file_header" takes context as Integer:
     Note: Generate file header comment
@@ -724,6 +930,17 @@ Process called "emit_cpp_file_header" takes context as Integer:
     proc emit_cpp_newline from context
 End Process
 
+@Reasoning:
+Record a fatal codegen error on the context. Once latched, the
+has_error flag remains set until destroy_cpp_codegen_context.
+@End Reasoning
+
+@Implementation:
+Frees any previously-stored message string, copies the new message
+into a fresh allocation, stores it at offset 56, and sets has_error
+at offset 64 to 1.
+@End Implementation
+
 Process called "set_cpp_codegen_error" takes context as Integer, message as Integer:
     Note: Set code generation error
 
@@ -732,6 +949,21 @@ Process called "set_cpp_codegen_error" takes context as Integer, message as Inte
     Let error_copy be proc copy_string from StringCore with message
     proc memory_set_int64 from Layout with context, 56, error_copy
 End Process
+
+@Reasoning:
+Extract the accumulated C++ source as a String for return to the
+caller. Called once at end-of-translation.
+@End Reasoning
+
+@Implementation:
+Returns the output_buffer's accumulated content via
+StringCore.string_from_buffer. Caller takes ownership of the returned
+String.
+@End Implementation
+
+@Security_Scope:
+Caller owns the returned String.
+@End Security_Scope
 
 Process called "get_cpp_generated_code" takes context as Integer returns Integer:
     Note: Get final generated C++ code
@@ -743,6 +975,18 @@ End Process
 Note: ============================================================================
 Note: Public API
 Note: ============================================================================
+
+@Reasoning:
+Public one-call driver: build context, generate, extract output,
+destroy context, return string.
+@End Reasoning
+
+@Implementation:
+Creates a context. On failure returns 0. Calls generate_cpp_from_hir.
+On codegen error returns 0 after destroying the context. Otherwise
+extracts the generated code, destroys the context, and returns the
+output string.
+@End Implementation
 
 Process called "hir_to_cpp" takes hir_program as Integer returns Integer:
     Note: Main public API - convert HIR to C++ source code

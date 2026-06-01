@@ -51,12 +51,35 @@ Note: ==========================================================================
 Note: Generator Context
 Note: ============================================================================
 
+@Reasoning:
+Context carried through every generate_* call so each emitter helper can
+inspect the current indentation level without threading it as an explicit
+parameter through deep recursion.
+@End Reasoning
+
+@Implementation:
+Two Integer fields: emitter pointer (offset 0) and current indent depth
+(offset 8). Total size CONTEXT_SIZE (16 bytes), allocated on the heap so
+mutation through pointer is visible across recursive calls.
+@End Implementation
+
 Type called "BashGeneratorContext":
     emitter as Integer          Note: Bash emitter
     indent_level as Integer     Note: Current indentation level
 End Type
 
 Constant CONTEXT_SIZE as Integer is 16  Note: 2 fields × 8 bytes
+
+@Reasoning:
+Allocate and initialise a BashGeneratorContext with the provided emitter
+and indent depth zero. Returned as a raw pointer for compatibility with
+the raw-pointer dispatch model used by the rest of the backend.
+@End Reasoning
+
+@Implementation:
+Allocates CONTEXT_SIZE bytes via Layout.allocate, writes the emitter
+pointer at offset 0 and zero at offset 8. Returns 0 if allocation fails.
+@End Implementation
 
 Process called "create_generator_context" takes emitter as Integer returns Integer:
     Note: Create generator context
@@ -73,6 +96,16 @@ Process called "create_generator_context" takes emitter as Integer returns Integ
     Return context
 End Process
 
+@Reasoning:
+Paired destructor for create_generator_context. The emitter referenced by
+the context is owned separately and is NOT freed here.
+@End Reasoning
+
+@Implementation:
+Null context returns 1 (safe no-op). Otherwise deallocates the 16-byte
+allocation.
+@End Implementation
+
 Process called "destroy_generator_context" takes context as Integer returns Integer:
     Note: Destroy generator context
 
@@ -85,6 +118,16 @@ Process called "destroy_generator_context" takes context as Integer returns Inte
     Return 1
 End Process
 
+@Reasoning:
+In-place increment of the context's indent depth. Called when entering a
+nested block (function body, while body, then/else branch).
+@End Reasoning
+
+@Implementation:
+Loads the indent level from offset 8, adds 1, writes back. No upper
+bound; deeper nesting just consumes more leading whitespace per line.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -93,6 +136,17 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Paired decrement of the indent depth. Clamped at zero to prevent
+underflow when generators are called in an unexpected order (e.g. error
+recovery skipping an opening block).
+@End Reasoning
+
+@Implementation:
+Reads indent at offset 8; if greater than 0, writes back level-1. Calls
+on zero are silent no-ops.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -110,11 +164,30 @@ Note: ==========================================================================
 Note: HIR Access Helpers (REAL IMPLEMENTATIONS)
 Note: ============================================================================
 
+@Reasoning:
+Named alias for the dictionary lookup primitive so call sites read clearly
+as "get a string value from HIR". Same underlying call as get_dict_hir_value
+because HIR stores both strings and sub-dicts as opaque pointers.
+@End Reasoning
+
+@Implementation:
+Single forward to Dict.hashtable_get.
+@End Implementation
+
 Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary using real hashtable_get
 
     Return proc hashtable_get from Dict with dict, key
 End Process
+
+@Reasoning:
+Named alias retrieving a sub-HIR-dictionary value. Distinguished from
+get_dict_string_value only at the call site for readability.
+@End Reasoning
+
+@Implementation:
+Single forward to Dict.hashtable_get.
+@End Implementation
 
 Process called "get_dict_hir_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get HIR value from HIR dictionary using real hashtable_get
@@ -122,11 +195,29 @@ Process called "get_dict_hir_value" takes dict as Integer, key as Integer return
     Return proc hashtable_get from Dict with dict, key
 End Process
 
+@Reasoning:
+Wrap List.list_length so call sites use a name that matches the semantic
+of "this HIR field stores a list of children".
+@End Reasoning
+
+@Implementation:
+Forward to List.list_length.
+@End Implementation
+
 Process called "get_list_count" takes list as Integer returns Integer:
     Note: Get HIR list count using real list_length
 
     Return proc list_length from List with list
 End Process
+
+@Reasoning:
+Named accessor for indexed children of an HIR list.
+@End Reasoning
+
+@Implementation:
+Forward to List.list_get. No bounds checking; caller guards with
+get_list_count.
+@End Implementation
 
 Process called "get_list_item" takes list as Integer, index as Integer returns Integer:
     Note: Get HIR list item using real list_get
@@ -137,6 +228,18 @@ End Process
 Note: ============================================================================
 Note: Word and Literal Generation
 Note: ============================================================================
+
+@Reasoning:
+Lowest-level operand emission - emits the "value" field verbatim for any
+node that has one. Used by generate_command for argument emission and by
+several other generators for embedded operand emission.
+@End Reasoning
+
+@Implementation:
+Reads node_type as a sanity check and returns 1 if absent. Then reads the
+"value" field and forwards it to emit_string. Quoting / escaping is
+expected to be already baked into the value by the parser.
+@End Implementation
 
 Process called "generate_word" takes context as Integer, hir as Integer returns Integer:
     Note: Generate word/string/number literal
@@ -162,6 +265,17 @@ Process called "generate_word" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Emit Bash $() command substitution. Used inside other commands and inside
+arithmetic/parameter contexts. The substituted command body is treated as
+a pre-formatted string and not recursively generated.
+@End Reasoning
+
+@Implementation:
+Emits '$', '(', the "command" string verbatim, then ')'. Missing command
+key emits "$()", which is syntactically valid but evaluates to empty.
+@End Implementation
+
 Process called "generate_command_substitution" takes context as Integer, hir as Integer returns Integer:
     Note: Generate command substitution $()
 
@@ -183,6 +297,17 @@ Process called "generate_command_substitution" takes context as Integer, hir as 
 
     Return 1
 End Process
+
+@Reasoning:
+Emit Bash $(()) arithmetic expansion. The expression body is treated as
+opaque pre-formatted text so this generator does not need an arithmetic
+expression sub-grammar.
+@End Reasoning
+
+@Implementation:
+Emits '$', '(', '(' then the "expression" string verbatim, then ')' ')'.
+Missing expression key produces "$(())" which evaluates to zero.
+@End Implementation
 
 Process called "generate_arithmetic_expansion" takes context as Integer, hir as Integer returns Integer:
     Note: Generate arithmetic expansion $(())
@@ -208,6 +333,18 @@ Process called "generate_arithmetic_expansion" takes context as Integer, hir as 
     Return 1
 End Process
 
+@Reasoning:
+Emit Bash ${} parameter expansion. The expansion expression (which can
+include length operators, substring, alternates, etc.) is pre-formatted
+in HIR.
+@End Reasoning
+
+@Implementation:
+Emits '$', '{', then the "expansion" string verbatim, then '}'. Missing
+expansion key emits "${}" which is a Bash syntax error - upstream HIR
+validation is expected to prevent this.
+@End Implementation
+
 Process called "generate_parameter_expansion" takes context as Integer, hir as Integer returns Integer:
     Note: Generate parameter expansion ${}
 
@@ -230,6 +367,23 @@ Process called "generate_parameter_expansion" takes context as Integer, hir as I
     Return 1
 End Process
 
+@Reasoning:
+Emit a double-quoted Bash string literal. Double-quoted is chosen so
+variable expansions inside the body still apply, matching the most
+common case in generated scripts.
+@End Reasoning
+
+@Implementation:
+Emits '"', the value string verbatim, then '"'. The caller is responsible
+for escaping embedded double quotes or backslashes in the value.
+@End Implementation
+
+@Security_Scope:
+Value is emitted verbatim - if it contains an unescaped double quote or
+command substitution that should be neutralised, the caller (parser)
+must do the escaping. This function does not defend against injection.
+@End Security_Scope
+
 Process called "generate_string_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate string literal with quotes
 
@@ -246,6 +400,18 @@ Process called "generate_string_literal" takes context as Integer, hir as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a bare Bash variable reference ($name). Use when the variable is in
+a context where parameter-expansion braces ${name} are not required.
+@End Reasoning
+
+@Implementation:
+Emits '$' then the "name" field verbatim. Caller is responsible for
+choosing this over generate_parameter_expansion based on the surrounding
+context (e.g. immediately before a literal letter where $name${suffix}
+would otherwise ambiguate).
+@End Implementation
 
 Process called "generate_variable_reference" takes context as Integer, hir as Integer returns Integer:
     Note: Generate variable reference $var
@@ -267,6 +433,17 @@ Note: ==========================================================================
 Note: Command Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit a single redirection suffix on a command. Currently only stdout
+redirection (" > target") is generated; the HIR shape leaves room for
+operator + fd via extra fields if those become needed.
+@End Reasoning
+
+@Implementation:
+Emits space, '>', space, then recurses into generate_word on the target
+sub-HIR. Always returns 1.
+@End Implementation
+
 Process called "generate_redirection" takes context as Integer, hir as Integer returns Integer:
     Note: Generate redirection
 
@@ -285,6 +462,18 @@ Process called "generate_redirection" takes context as Integer, hir as Integer r
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a simple command line: "name arg1 arg2 [> redir]...". Building block
+of pipelines, lists, and script bodies.
+@End Reasoning
+
+@Implementation:
+Emits indent, then the command name via generate_word, then each
+argument prefixed with a single space. After arguments, walks the
+"redirections" list emitting each via generate_redirection. Each part is
+optional; an empty command emits just indentation.
+@End Implementation
 
 Process called "generate_command" takes context as Integer, hir as Integer returns Integer:
     Note: Generate simple command
@@ -334,6 +523,19 @@ Process called "generate_command" takes context as Integer, hir as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+Emit a Bash pipeline ("cmd1 | cmd2 | cmd3"). Each pipeline starts at the
+current indent level, but subsequent pipe-separated commands are emitted
+without additional indent so they remain on the same logical line.
+@End Reasoning
+
+@Implementation:
+Emits leading indent, then walks the "commands" list. Between commands
+emits " | " (space, pipe, space). For each command, indent_level is
+temporarily zeroed so generate_command does not re-indent inside the
+pipeline, then restored before the next iteration.
+@End Implementation
+
 Process called "generate_pipeline" takes context as Integer, hir as Integer returns Integer:
     Note: Generate pipeline (cmd1 | cmd2 | cmd3)
 
@@ -374,6 +576,18 @@ Process called "generate_pipeline" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+Emit a sequence of commands separated by semicolons and newlines.
+Equivalent to multiple statements at the same indent level. The HIR
+intentionally does not carry &&/|| operators yet; this generator emits
+the simplest semicolon-separated form.
+@End Reasoning
+
+@Implementation:
+Walks the "items" list calling generate_node on each. Inserts ";" + LF
+between items but not after the last. Empty list emits nothing.
+@End Implementation
+
 Process called "generate_command_list" takes context as Integer, hir as Integer returns Integer:
     Note: Generate command list (&&, ||, ;, &)
 
@@ -408,6 +622,20 @@ End Process
 Note: ============================================================================
 Note: Control Structure Generation
 Note: ============================================================================
+
+@Reasoning:
+Emit Bash if/then/else/fi. The single-branch form is the only supported
+shape today; elif chains are flattened to else at HIR construction time
+because the HIR shape does not carry elif arms.
+@End Reasoning
+
+@Implementation:
+Emits "if " at current indent, then the condition with indent temporarily
+zeroed so it stays on the same line. Closes with "; then\n". Body is
+emitted with increased indent. If a "branches" list exists and is
+non-empty, emits "else\n" plus the first branch as the else-body. Closes
+with "fi" at the outer indent.
+@End Implementation
 
 Process called "generate_if_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate if-then-else-fi statement
@@ -464,6 +692,16 @@ Process called "generate_if_statement" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Emit Bash "while condition; do body; done". Same single-line-condition,
+indented-body shape used by generate_until_loop.
+@End Reasoning
+
+@Implementation:
+Emits "while " then condition with indent temporarily zero, then "; do",
+LF, body at +1 indent, LF, then "done" at original indent.
+@End Implementation
+
 Process called "generate_while_loop" takes context as Integer, hir as Integer returns Integer:
     Note: Generate while-do-done loop
 
@@ -500,6 +738,17 @@ Process called "generate_while_loop" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+Emit Bash "until condition; do body; done". Mirrors generate_while_loop
+with the "until" keyword.
+@End Reasoning
+
+@Implementation:
+Same shape as generate_while_loop: condition on the header line with
+indent suppressed, body indented one level, closing "done" at original
+indent.
+@End Implementation
+
 Process called "generate_until_loop" takes context as Integer, hir as Integer returns Integer:
     Note: Generate until-do-done loop
 
@@ -535,6 +784,18 @@ Process called "generate_until_loop" takes context as Integer, hir as Integer re
 
     Return 1
 End Process
+
+@Reasoning:
+Emit the Bash "for var in word1 word2 ...; do body; done" form. The
+C-style (( ; ; )) form is not produced here - those are kept as
+arithmetic_expansion nodes wrapped in a while loop at HIR construction.
+@End Reasoning
+
+@Implementation:
+Emits "for " + variable name + " in ", walks the "words" list emitting
+each via generate_word with space separators, closes with "; do" + LF,
+body at +1 indent, LF, "done" at the original indent.
+@End Implementation
 
 Process called "generate_for_loop" takes context as Integer, hir as Integer returns Integer:
     Note: Generate for-do-done loop
@@ -590,6 +851,18 @@ Process called "generate_for_loop" takes context as Integer, hir as Integer retu
     Return 1
 End Process
 
+@Reasoning:
+Emit one "pattern1 | pattern2)" arm inside a case statement, including
+its commands and the ";;" terminator. Extracted so generate_case_statement
+stays focused on the outer wrapping syntax.
+@End Reasoning
+
+@Implementation:
+Emits indent, walks the "patterns" list joined with '|', then closes with
+')' + LF. Increases indent, emits the "commands" sub-HIR via generate_node,
+then LF, decreases indent. Closes with indent + ";;".
+@End Implementation
+
 Process called "generate_case_item" takes context as Integer, hir as Integer returns Integer:
     Note: Generate case pattern item
 
@@ -636,6 +909,18 @@ Process called "generate_case_item" takes context as Integer, hir as Integer ret
 
     Return 1
 End Process
+
+@Reasoning:
+Emit Bash "case word in ... esac" outer structure. Each pattern arm is
+delegated to generate_case_item.
+@End Reasoning
+
+@Implementation:
+Emits "case " then the "word" HIR via generate_word, then " in" + LF.
+Increases indent, walks the "items" list calling generate_case_item on
+each (newline between), decreases indent. Closes with "esac" at the
+original indent.
+@End Implementation
 
 Process called "generate_case_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate case-in-esac statement
@@ -685,6 +970,17 @@ Note: ==========================================================================
 Note: Function and Compound Command Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit a Bash function definition in the portable "name() { ... }" form.
+The keyword-prefixed "function name { ... }" form is not used because the
+former is portable to sh-style shells too.
+@End Reasoning
+
+@Implementation:
+Emits indent + name + "() {" + LF, then body with +1 indent + LF, then
+indent + "}".
+@End Implementation
+
 Process called "generate_function_definition" takes context as Integer, hir as Integer returns Integer:
     Note: Generate function definition
 
@@ -720,6 +1016,16 @@ Process called "generate_function_definition" takes context as Integer, hir as I
     Return 1
 End Process
 
+@Reasoning:
+Emit a Bash brace-group "{ commands; }". A brace group runs commands in
+the current shell, in contrast to subshell parens. Used as a body for
+constructs that need to chain multiple statements.
+@End Reasoning
+
+@Implementation:
+Emits indent + '{' + LF, body at +1 indent + LF, then indent + '}'.
+@End Implementation
+
 Process called "generate_compound_command" takes context as Integer, hir as Integer returns Integer:
     Note: Generate compound command { commands; }
 
@@ -747,6 +1053,15 @@ Process called "generate_compound_command" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit a Bash subshell "( commands )". The subshell runs in a forked
+process so variable mutations are isolated. Used for isolation idioms.
+@End Reasoning
+
+@Implementation:
+Emits indent + '(' + LF, body at +1 indent + LF, then indent + ')'.
+@End Implementation
+
 Process called "generate_subshell" takes context as Integer, hir as Integer returns Integer:
     Note: Generate subshell ( commands )
 
@@ -773,6 +1088,23 @@ Process called "generate_subshell" takes context as Integer, hir as Integer retu
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a Bash variable assignment "name=value" (no spaces around '='). Used
+both for top-level assignments and for command-prefixed environment
+overrides.
+@End Reasoning
+
+@Implementation:
+Emits indent + variable name + '='. The value is emitted by recursing
+through generate_node so it can be any expression shape (literal, $(),
+${}, $((...))).
+@End Implementation
+
+@Security_Scope:
+Bash assignment is sensitive to whitespace around '='; emitter takes
+care to emit no spaces. Value comes from HIR and is emitted verbatim.
+@End Security_Scope
 
 Process called "generate_variable_assignment" takes context as Integer, hir as Integer returns Integer:
     Note: Generate variable assignment
@@ -802,6 +1134,24 @@ End Process
 Note: ============================================================================
 Note: Main Generation Dispatcher
 Note: ============================================================================
+
+@Reasoning:
+Top-level HIR node dispatcher. Centralises the node_type -> generator
+function mapping. Unknown node types are silently accepted so missing
+HIR shapes do not abort emission of the rest of the script.
+@End Reasoning
+
+@Implementation:
+Reads node_type, then probes each known node_type string with
+StringCore.string_equals. Compares are done via heap-allocated
+literal strings that must be deallocated after the comparison to avoid
+leaks during long-running translations. Order of probes is roughly
+frequency-sorted: script, command, pipeline, list, then expansions.
+@End Implementation
+
+@Performance_Hints:
+O(k) string compares per node where k is the number of dispatch arms.
+@End Performance_Hints
 
 Process called "generate_node" takes context as Integer, hir as Integer returns Integer:
     Note: Main HIR node generation dispatcher
@@ -882,6 +1232,18 @@ Process called "generate_node" takes context as Integer, hir as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Emit a top-level Bash script - shebang plus a list of top-level commands.
+Used as the root case of generate_node when the HIR root is a "script"
+node.
+@End Reasoning
+
+@Implementation:
+Emits "#!/bin/bash" + LF + LF (one blank line after shebang). Then walks
+the "commands" list calling generate_node on each, with one LF between
+commands.
+@End Implementation
+
 Process called "generate_script" takes context as Integer, hir as Integer returns Integer:
     Note: Generate complete script
 
@@ -914,13 +1276,27 @@ Process called "generate_script" takes context as Integer, hir as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Public driver for the HIR -> Bash backend. Owns emitter and context
+lifetimes so callers only need to pass an HIR root and receive a freshly
+allocated Bash script string.
+@End Reasoning
+
+@Implementation:
+Creates the emitter, then the generator context. On context allocation
+failure the emitter is destroyed and 0 is returned. Otherwise dispatches
+the root HIR via generate_node, snapshots the emitter output into a
+caller-owned null-terminated string, destroys both context and emitter,
+and returns the output pointer.
+@End Implementation
+
+@Performance_Hints:
+O(N) in HIR node count plus O(B) in emitted bytes (amortised). Single
+final allocation for the output snapshot.
+@End Performance_Hints
+
 Process called "generate_bash_from_hir" takes hir as Integer returns Integer:
     Note: Main entry point for Bash code generation
-
-    @Reasoning:
-    This is the main entry point for generating Bash script code from HIR.
-    Creates an emitter and generator context, then generates the complete script.
-    @End Reasoning
 
     Let emitter be proc create_bash_emitter from Emitter
 

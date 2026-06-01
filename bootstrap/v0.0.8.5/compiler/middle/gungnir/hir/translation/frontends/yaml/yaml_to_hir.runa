@@ -56,6 +56,14 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+YAML supports anchors (&id) and aliases (*id) - the same anchored node can be referenced multiple times in one document, so the translator must memoise the YAML-node -> HIR-node mapping to avoid duplicating subtrees and to preserve identity for downstream sharing.
+@End Reasoning
+
+@Implementation:
+Five 8-byte fields: error_message string pointer, has_error flag, current source line/column for diagnostics, and an anchor_mapping Dictionary keyed by YAML-node pointer (stringified) to the already-translated HIR node.
+@End Implementation
+
 Type called "YAMLToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -67,6 +75,14 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Translation context must start error-free and with an empty anchor map so any anchors discovered during the first traversal can be registered without colliding with stale state.
+@End Reasoning
+
+@Implementation:
+Allocate 40 bytes; null-check. Zero error_message / has_error / line / column. Allocate a fresh Dictionary for anchor_mapping and attach at offset 32.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create YAML to HIR translation context
@@ -90,6 +106,14 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+The context owns both the error_message buffer and the anchor_mapping Dictionary; destruction must release both to avoid leaks on the failure path.
+@End Reasoning
+
+@Implementation:
+Null-check the context. Read error_message; if non-null deallocate. Read anchor_mapping at offset 32; if non-null destroy via Dict.destroy. Deallocate the context block.
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -121,6 +145,14 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Translation must record only the first error and own a copy of the message so the original buffer's lifetime is independent of the context.
+@End Reasoning
+
+@Implementation:
+Read existing error_message; if non-null free it. Measure new message length, allocate length+1 bytes, copy, null-terminate. Store at offset 0 and set has_error=1 at offset 8.
+@End Implementation
+
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
 
@@ -150,6 +182,14 @@ Note: ==========================================================================
 Note: Anchor Management
 Note: ============================================================================
 
+@Reasoning:
+After translating a mapping/sequence whose YAML node was anchored, subsequent aliases referring to the same anchor must return the same HIR node; recording the YAML-to-HIR pair here makes that lookup O(1).
+@End Reasoning
+
+@Implementation:
+Read the anchor_mapping at offset 32; if 0 fail-soft return 0. Convert the YAML node pointer to its decimal string form, use that as the key, and store the HIR node value in the Dictionary.
+@End Implementation
+
 Process called "register_anchor_translation" takes context as Integer, yaml_node as Integer, hir_node as Integer returns Integer:
     Note: Register YAML node to HIR node mapping for anchors
 
@@ -166,6 +206,14 @@ Process called "register_anchor_translation" takes context as Integer, yaml_node
     Return 1
 End Process
 
+@Reasoning:
+Before traversing into any node the translator must check whether an earlier alias already produced the HIR equivalent; returning the cached node preserves identity required for "&id" / "*id" referential transparency.
+@End Reasoning
+
+@Implementation:
+Read the anchor_mapping; if 0 return 0. Convert the YAML node pointer to a decimal string, look it up in the Dictionary, and return the cached HIR node pointer (or 0 if not present).
+@End Implementation
+
 Process called "get_anchor_translation" takes context as Integer, yaml_node as Integer returns Integer:
     Note: Get HIR node for previously translated anchored YAML node
 
@@ -181,13 +229,20 @@ Process called "get_anchor_translation" takes context as Integer, yaml_node as I
     Return hir_node
 End Process
 
+@Reasoning:
+The anchor map uses pointers (Integers) as identity keys but Dict keys are Strings; converting the pointer to its decimal representation gives a stable string that maps 1:1 to each pointer value.
+@End Reasoning
+
+@Implementation:
+Special-case 0 -> "0". Otherwise record the sign, take the absolute value, and repeatedly extract the least-significant digit by mod 10 / div 10 into a 32-byte buffer (digits written least-significant first). Append a '-' for negative. Reverse the buffer in place to produce the conventional most-significant-first form, then null-terminate.
+@End Implementation
+
+@Performance_Hints:
+O(d) in digit count (<=19 for any 64-bit Integer); one fixed 32-byte allocation per call.
+@End Performance_Hints
+
 Process called "integer_to_string" takes value as Integer returns Integer:
     Note: Convert integer to string for use as dictionary key
-
-    @Reasoning:
-    Simple integer to string conversion for anchor mapping keys.
-    Handles positive and negative numbers.
-    @End Reasoning
 
     Let buffer_size be 32
     Let buffer be proc allocate from Layout with buffer_size
@@ -250,14 +305,16 @@ Note: ==========================================================================
 Note: YAML Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+YAML has four AST kinds (mapping, sequence, scalar, alias); central dispatch handles them all and short-circuits when an anchored node has already been translated so aliases share HIR identity.
+@End Reasoning
+
+@Implementation:
+Null-check the YAML node. Look up the anchor map; if a translation exists, return it. Read the node tag at offset 0 and the source line/column at offsets 64/72 into the context. Dispatch on tag: YAML_MAPPING / YAML_SEQUENCE translate and (if the node carries an anchor pointer at offset 48) register the result; YAML_SCALAR translates directly; YAML_ALIAS forwards to translate_yaml_alias. Unknown tag records an error and returns 0.
+@End Implementation
+
 Process called "translate_yaml_node_to_hir" takes context as Integer, yaml_node as Integer returns Integer:
     Note: Translate YAML AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on YAML node type.
-    Handles anchors by checking if node was previously translated.
-    Creates corresponding HIR literal or data structure node.
-    @End Reasoning
 
     If yaml_node is equal to 0:
         proc set_translation_error with context, "Null YAML node"
@@ -319,13 +376,20 @@ Process called "translate_yaml_node_to_hir" takes context as Integer, yaml_node 
     Return 0
 End Process
 
+@Reasoning:
+YAML mappings translate to HIR Dictionary literals; the parser provides parallel keys and children lists so iteration is a single index walk rather than a key/value zigzag.
+@End Reasoning
+
+@Implementation:
+Read the parallel keys (offset 40) and children (offset 32) lists; error-out if either is missing. Allocate an HIR Dictionary. For each index i: validate key and value pointers, recursively translate the value, attach key->translated_value via HIR.add_dictionary_entry. Return the dictionary.
+@End Implementation
+
+@Performance_Hints:
+O(n) in mapping size plus the cost of each value's recursive translation.
+@End Performance_Hints
+
 Process called "translate_yaml_mapping" takes context as Integer, yaml_node as Integer returns Integer:
     Note: Translate YAML mapping to HIR dictionary literal
-
-    @Reasoning:
-    YAML mappings map to Runa Dictionary types.
-    Creates HIR dictionary literal with key-value pairs.
-    @End Reasoning
 
     Note: Get children and keys lists
     Let children be proc memory_get_int64 from Layout with yaml_node, 32
@@ -388,13 +452,20 @@ Process called "translate_yaml_mapping" takes context as Integer, yaml_node as I
     Return hir_dict
 End Process
 
+@Reasoning:
+YAML sequences "- a\n- b" translate to HIR list literals; each element is recursively translated so heterogeneous sequences produce correctly-typed children.
+@End Reasoning
+
+@Implementation:
+Read the children list at offset 32; error-out if null. Allocate an HIR list literal. For each child: null-check, recursively translate via translate_yaml_node_to_hir, attach via HIR.add_list_element.
+@End Implementation
+
+@Performance_Hints:
+O(n) in sequence length plus the cost of each element's recursive translation.
+@End Performance_Hints
+
 Process called "translate_yaml_sequence" takes context as Integer, yaml_node as Integer returns Integer:
     Note: Translate YAML sequence to HIR list literal
-
-    @Reasoning:
-    YAML sequences map to Runa List types.
-    Creates HIR list literal with elements.
-    @End Reasoning
 
     Note: Get children list
     Let children be proc memory_get_int64 from Layout with yaml_node, 32
@@ -443,13 +514,16 @@ Process called "translate_yaml_sequence" takes context as Integer, yaml_node as 
     Return hir_list
 End Process
 
+@Reasoning:
+YAML scalars use the type-resolution rule "Failsafe + JSON + Core schema": untagged strings that match int/float/bool/null patterns are interpreted as those types, others stay as strings. The parser has pre-classified integers (setting is_integer at offset 24); the translator only needs to disambiguate booleans, nulls, and strings.
+@End Reasoning
+
+@Implementation:
+Read value_string at offset 8; error-out if null. If is_integer (offset 24) is 1, read the integer payload at offset 16 and produce an HIR integer literal. Otherwise compare value_string against "true" / "false" / "null" / "~" and produce the corresponding HIR boolean or null literal. Default fallback: produce an HIR string literal from value_string.
+@End Implementation
+
 Process called "translate_yaml_scalar" takes context as Integer, yaml_node as Integer returns Integer:
     Note: Translate YAML scalar to HIR literal
-
-    @Reasoning:
-    YAML scalars can be strings, integers, floats, booleans, or null.
-    Infers type from content and creates appropriate HIR literal.
-    @End Reasoning
 
     Note: Get scalar value
     Let value_string be proc memory_get_int64 from Layout with yaml_node, 8
@@ -511,6 +585,14 @@ Process called "translate_yaml_scalar" takes context as Integer, yaml_node as In
     Return hir_string
 End Process
 
+@Reasoning:
+translate_yaml_scalar must match value_string against several literal forms ("true", "false", "null", "~"); an inline byte loop keeps the comparison fast and self-contained.
+@End Reasoning
+
+@Implementation:
+Measure both strings; on length mismatch return 0. Otherwise compare byte by byte; return 0 on the first mismatch, 1 if all bytes match.
+@End Implementation
+
 Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
     Note: Check if two strings are equal
 
@@ -537,6 +619,14 @@ Process called "string_equals" takes str1 as Integer, str2 as Integer returns In
     Return 1
 End Process
 
+@Reasoning:
+YAML aliases "*id" reference an anchor "&id" defined elsewhere in the document; resolving aliases requires the parser to have set a link from the alias node to the anchored node, which the translator then re-resolves through the anchor-mapping cache.
+@End Reasoning
+
+@Implementation:
+Read the alias_target pointer from offset 56 of the alias node; if null record an error. Look up the target in get_anchor_translation; if found return the cached HIR node, otherwise translate the target now and rely on translate_yaml_node_to_hir to register it.
+@End Implementation
+
 Process called "translate_yaml_alias" takes context as Integer, yaml_node as Integer returns Integer:
     Note: Translate YAML alias to HIR node reference
 
@@ -557,6 +647,18 @@ End Process
 Note: ============================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
+
+@Reasoning:
+Public entry point that hides the parse + translate + cleanup orchestration; failures at any stage bubble through a single error-reporting channel attached to the outer Translation context.
+@End Reasoning
+
+@Implementation:
+Null-check source_code; report and return 0. Create the internal translation context; on OOM report and return 0. Parse via Parser.parse_yaml; on failure report and clean up. Translate the AST root recursively. If the internal context has_error is set after translation, forward the message. Destroy the internal context and return the HIR root (or 0 on error).
+@End Implementation
+
+@Security_Scope:
+Consumes untrusted YAML source. The parser is expected to reject malformed input; the translator preserves the anchor/alias graph which could in pathological cases produce shared subtrees - downstream passes that mutate HIR must observe this aliasing.
+@End Security_Scope
 
 Process called "translate_yaml_to_hir" takes source_code as Integer, translation_context as Integer returns Integer:
     Note: Translate YAML source code to Runa HIR

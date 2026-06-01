@@ -2,6 +2,14 @@ Note: Ruby to HIR Translator for Translation Translation System
 Note: Converts Ruby AST to High-level Intermediate Representation
 
 Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_parser.runa" as RubyParser
+@Reasoning:
+Ruby's translation needs three stacked context pointers (class / method / block) so nested defs, methods inside blocks, and closures can be linked back to their enclosing scope without re-walking the AST.
+@End Reasoning
+
+@Implementation:
+Six 8-byte fields: symbol table dictionary, current lexical scope, accumulator list of HIR nodes, plus the three context pointers (class_context, method_context, block_context) used as a manual scope stack during translation.
+@End Implementation
+
 Type called "RubyToHIRTranslator":
     symbol_table as Integer  Note: Maps symbols to HIR nodes
     current_scope as Integer  Note: Current scope context
@@ -10,6 +18,14 @@ Type called "RubyToHIRTranslator":
     method_context as Integer  Note: Current method being translated
     block_context as Integer  Note: Current block being translated
 End Type
+
+@Reasoning:
+The translator must start in the "global" lexical scope with all three context pointers nulled so the first class/method/block entered initialises them rather than inheriting stale state.
+@End Reasoning
+
+@Implementation:
+Construct a RubyToHIRTranslator with an empty symbol-table dict, a fresh "global"-named scope, an empty hir_nodes accumulator, and class_context / method_context / block_context all set to 0.
+@End Implementation
 
 Process called "create_ruby_to_hir_translator" returns Integer:
     Note: Create new Ruby to HIR translator instance
@@ -24,6 +40,14 @@ Process called "create_ruby_to_hir_translator" returns Integer:
 
     Return translator
 End Process
+
+@Reasoning:
+Ruby's AST has 40+ node kinds covering classes, modules, methods, control flow, exceptions, metaprogramming, and literals; a single dispatcher keeps every recursive call site funnel through one entry point.
+@End Reasoning
+
+@Implementation:
+Match on ast.node_type and route to the corresponding translate_* helper. Unknown tags fall through to create_hir_unknown so unsupported constructs survive as inspectable placeholders rather than silently disappearing.
+@End Implementation
 
 Process called "translate_ruby_to_hir" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby AST to HIR with complete feature support
@@ -120,6 +144,14 @@ Process called "translate_ruby_to_hir" takes translator as Integer, ast as Integ
     End Match
 End Process
 
+@Reasoning:
+The Ruby AST_PROGRAM root is the entire .rb file; lifting it into an HIR module node with body="main" gives downstream consumers a uniform module-shaped envelope regardless of source.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=module with name="main". Iterate every top-level child via translate_ruby_to_hir, push non-null results into the body statements List, attach at "body".
+@End Implementation
+
 Process called "translate_program" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby program to HIR module
 
@@ -148,6 +180,18 @@ Process called "translate_program" takes translator as Integer, ast as Integer r
 
     Return hir_module
 End Process
+
+@Reasoning:
+Ruby classes carry a name, optional superclass, mixins (include/extend), and a body whose own statements may further nest classes; saving and restoring class_context implements lexical-class tracking through arbitrarily deep nesting.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=class. Copy the name attribute, recurse into the optional superclass. Save the current class_context, set it to this class, push a "class" lexical scope. Walk body children translating each; then extract include/extend statements via extract_mixins. Pop the scope and restore class_context.
+@End Implementation
+
+@Performance_Hints:
+O(n) in class body length plus the cost of every nested translation; one allocation per HIR node.
+@End Performance_Hints
 
 Process called "translate_class" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby class with inheritance and mixins to HIR
@@ -201,6 +245,14 @@ Process called "translate_class" takes translator as Integer, ast as Integer ret
     Return hir_class
 End Process
 
+@Reasoning:
+Ruby modules act as namespaces and mixin containers - structurally similar to classes but without inheritance or instantiation - so HIR represents them with a "module" tag distinct from class.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=module. Copy the name attribute, push a "module" lexical scope, recursively translate body children into the body List, pop the scope.
+@End Implementation
+
 Process called "translate_module" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby module to HIR
 
@@ -237,6 +289,14 @@ Process called "translate_module" takes translator as Integer, ast as Integer re
 
     Return hir_module
 End Process
+
+@Reasoning:
+Ruby methods need parameter list lowering (positional + splat + double-splat + block + defaults), implicit-return wrapping, and proper method_context tracking so nested yields and blocks resolve to the right enclosing method.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=function with name and translated parameters. Save method_context, set it to this method, push a "method" scope. Translate body children, attach as "body". Run ensure_implicit_return to wrap the last statement in an implicit "return" node. Restore scope and method_context.
+@End Implementation
 
 Process called "translate_method" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby method with blocks and metaprogramming features
@@ -290,6 +350,14 @@ Process called "translate_method" takes translator as Integer, ast as Integer re
     Return hir_method
 End Process
 
+@Reasoning:
+Ruby parameters come in five flavours that must be distinguished in HIR for correct call-site lowering: regular, splat (*args), double_splat (**kwargs), block (&blk), and optional defaults.
+@End Reasoning
+
+@Implementation:
+For each parameter, create a Dictionary with name, then check the parser-set attributes splat/double_splat/block in order and tag the parameter with the first match (or "regular"). If a default value exists, recursively translate it and attach at "default".
+@End Implementation
+
 Process called "translate_method_parameters" takes translator as Integer, params as Integer returns Integer:
     Note: Translate Ruby method parameters including splats and defaults
 
@@ -330,6 +398,14 @@ Process called "translate_method_parameters" takes translator as Integer, params
     Return hir_params
 End Process
 
+@Reasoning:
+A Ruby method call binds an optional receiver, a method name, an argument list, and an optional trailing block; capturing all four as discrete HIR fields lets the lowering stage dispatch send/call mechanics uniformly.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=call. If the call node has a first child, translate it as receiver. Copy ast.value into "method". If arguments attribute present, translate via translate_arguments. If block attribute present, recursively translate as the block payload.
+@End Implementation
+
 Process called "translate_method_call" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby method call with receivers, arguments, and blocks
 
@@ -363,6 +439,14 @@ Process called "translate_method_call" takes translator as Integer, ast as Integ
 
     Return hir_call
 End Process
+
+@Reasoning:
+Ruby blocks "{|x| ...}" / "do |x| ... end" carry their own parameter list and capture the enclosing local scope; recording block_context lets nested yields and the new lexical scope cooperate correctly.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=block. Map each parameter name into a small "name"-only Dictionary attached at "parameters". Save block_context, set it to this block, push a "block" scope. Translate body children. Restore block_context and pop scope.
+@End Implementation
 
 Process called "translate_block" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby block with parameters and closure semantics
@@ -420,6 +504,14 @@ Process called "translate_block" takes translator as Integer, ast as Integer ret
     Return hir_block
 End Process
 
+@Reasoning:
+Ruby's if/elsif/else chains an arbitrary number of elsif clauses; capturing each elsif separately rather than nesting if-else in HIR preserves the source structure for back-translation and error reporting.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=conditional with translated condition. Translate then_body via translate_statement_list. For each elsif clause, recursively translate and append to the elsif_clauses List. If an else_body attribute exists, translate it via translate_statement_list and attach.
+@End Implementation
+
 Process called "translate_if" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby if statement with elsif and else clauses
 
@@ -463,6 +555,14 @@ Process called "translate_if" takes translator as Integer, ast as Integer return
     Return hir_if
 End Process
 
+@Reasoning:
+Ruby assignment is uniform across regular "=", compound ("+=", "||=", etc.), and multiple-assignment forms; storing the operator text plus translated LHS/RHS lets a single HIR shape cover all of them.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=assignment with operator copied from ast.value. Translate children[0] as "target", children[1] as "value".
+@End Implementation
+
 Process called "translate_assignment" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby assignment with various operators
 
@@ -490,6 +590,14 @@ Process called "translate_assignment" takes translator as Integer, ast as Intege
     Return hir_assign
 End Process
 
+@Reasoning:
+Ruby array literals "[a, b, c]" carry their elements as direct children; the HIR shape mirrors that with a "node_type=array_literal" envelope and a children list of translated elements.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=array_literal. Recursively translate every child and append to the elements List attached at "elements".
+@End Implementation
+
 Process called "translate_array" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby array literal to HIR
 
@@ -511,6 +619,14 @@ Process called "translate_array" takes translator as Integer, ast as Integer ret
 
     Return hir_array
 End Process
+
+@Reasoning:
+The parser flattens hash literals "{k => v, ...}" into a child list of alternating key/value nodes; the translator reconstitutes them into discrete key/value pair Dictionaries so HIR consumers do not need to know the flattening trick.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=hash_literal. Iterate children in steps of two; pair index/index+1 as key/value, recursively translate both, and append a Dictionary with key/value keys to the pairs List.
+@End Implementation
 
 Process called "translate_hash" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby hash literal to HIR
@@ -546,6 +662,14 @@ Process called "translate_hash" takes translator as Integer, ast as Integer retu
     Return hir_hash
 End Process
 
+@Reasoning:
+Ruby symbols ":foo" are interned immutable identifiers; preserving them as a distinct HIR kind (rather than collapsing to strings) keeps optimisation passes able to leverage their identity-equality property.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=symbol with the symbol's lexeme copied to "value".
+@End Implementation
+
 Process called "translate_symbol" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby symbol to HIR
 
@@ -555,6 +679,18 @@ Process called "translate_symbol" takes translator as Integer, ast as Integer re
 
     Return hir_symbol
 End Process
+
+@Reasoning:
+Ruby interpolated strings ""hello #{expr}"" mix literal text and embedded expressions; lifting them into a parts list with text/expression sub-nodes lets lowering emit appropriate string-build calls.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=interpolated_string. Parse the raw value via parse_interpolation_parts into alternating text/expression parts. For each part: text -> wrap in a string_literal Dictionary; expression -> reparse via parse_ruby_expression and recursively translate. Attach the resulting list at "parts".
+@End Implementation
+
+@Security_Scope:
+Re-parsing embedded expressions requires that parse_ruby_expression treat its input as untrusted source code; misuse can let an attacker who controls the string trigger arbitrary parser behaviour.
+@End Security_Scope
 
 Process called "translate_interpolated_string" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby interpolated string to HIR
@@ -594,6 +730,14 @@ Process called "translate_interpolated_string" takes translator as Integer, ast 
     Return hir_interp
 End Process
 
+@Reasoning:
+"yield" hands control to the block attached to the surrounding method call; HIR records the optional argument list so that the lowering stage can wire it to the block's parameters.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=yield. If an arguments attribute is present, translate via translate_arguments and attach.
+@End Implementation
+
 Process called "translate_yield" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby yield statement to HIR
 
@@ -610,6 +754,14 @@ Process called "translate_yield" takes translator as Integer, ast as Integer ret
     Return hir_yield
 End Process
 
+@Reasoning:
+"super" dispatches to the same-named method on the superclass; HIR captures only the arguments (the method name and receiver are implicit), since downstream lowering must reconstruct them from the lexical context.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=super_call. If arguments attribute present, translate via translate_arguments and attach.
+@End Implementation
+
 Process called "translate_super_call" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby super call to HIR
 
@@ -625,6 +777,14 @@ Process called "translate_super_call" takes translator as Integer, ast as Intege
 
     Return hir_super
 End Process
+
+@Reasoning:
+Ruby treats most "operators" as method calls on the LHS, but they appear in the AST as binary_op nodes; HIR keeps them tagged distinctly to let constant-folding and arithmetic-lowering passes match on operator text directly.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=binary_operation with operator copied from ast.value. If at least two children exist, recursively translate children[0] as "left" and children[1] as "right".
+@End Implementation
 
 Process called "translate_binary_op" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby binary operation to HIR
@@ -648,6 +808,14 @@ Process called "translate_binary_op" takes translator as Integer, ast as Integer
 
     Return hir_binop
 End Process
+
+@Reasoning:
+In Ruby the variable kind is determined by the identifier's sigil/case: @x instance, @@x class, $x global, X (uppercase first) constant, plain lowercase local. Encoding the kind in HIR avoids re-classification by every downstream pass.
+@End Reasoning
+
+@Implementation:
+Dictionary tagged node_type=identifier with name copied from ast.value. Inspect the first character: "@" then "@" -> class_variable, "@" alone -> instance_variable, "$" -> global_variable, uppercase letter -> constant, anything else -> local_variable. Store the classification at "variable_type".
+@End Implementation
 
 Process called "translate_identifier" takes translator as Integer, ast as Integer returns Integer:
     Note: Translate Ruby identifier to HIR
@@ -678,20 +846,52 @@ End Process
 
 Note: Helper processes for Ruby to HIR translation
 
+@Reasoning:
+HIR Dictionaries follow a 32-byte block layout (count / capacity / keys ptr / values ptr); centralising the allocation in one helper keeps the size constant in one place.
+@End Reasoning
+
+@Implementation:
+Request a 32-byte block from Layout and return the raw pointer.
+@End Implementation
+
 Process called "create_hir_dict" returns Integer:
     Note: Create HIR dictionary node
     Return proc memory_allocate from Layout with 32
 End Process
+
+@Reasoning:
+HIR Lists use a 16-byte header (count + storage pointer); the helper keeps the size constant adjacent to its sibling create_hir_dict.
+@End Reasoning
+
+@Implementation:
+Request a 16-byte block from Layout and return the raw pointer.
+@End Implementation
 
 Process called "create_list" returns Integer:
     Note: Create list for HIR storage
     Return proc memory_allocate from Layout with 16
 End Process
 
+@Reasoning:
+The translator's internal symbol-table dictionary uses a smaller 24-byte header than HIR Dictionaries because it does not need to track the same metadata.
+@End Reasoning
+
+@Implementation:
+Request a 24-byte block from Layout and return the raw pointer.
+@End Implementation
+
 Process called "create_dict" returns Integer:
     Note: Create dictionary for storage
     Return proc memory_allocate from Layout with 24
 End Process
+
+@Reasoning:
+if/elsif/else bodies are lists of statements; uniform translation through one helper keeps the conditional translator simple.
+@End Reasoning
+
+@Implementation:
+Allocate an output List, walk the source list translating each entry via translate_ruby_to_hir, append non-null results.
+@End Implementation
 
 Process called "translate_statement_list" takes translator as Integer, statements as Integer returns Integer:
     Note: Translate list of Ruby statements to HIR
@@ -713,6 +913,14 @@ Process called "translate_statement_list" takes translator as Integer, statement
 
     Return hir_statements
 End Process
+
+@Reasoning:
+Ruby methods implicitly return the last expression evaluated; making that explicit in HIR (as a return node with implicit="true") lets downstream optimisers treat returns uniformly regardless of source style.
+@End Reasoning
+
+@Implementation:
+If the body has at least one statement and the last is not already a "return", construct an implicit-return Dictionary wrapping that statement (with implicit="true") and overwrite the last list entry with the wrapper.
+@End Implementation
 
 Process called "ensure_implicit_return" takes hir_method as Integer, body_statements as Integer returns Integer:
     Note: Ensure Ruby's implicit return semantics in HIR
@@ -737,6 +945,14 @@ Process called "ensure_implicit_return" takes hir_method as Integer, body_statem
 
     Return 1
 End Process
+
+@Reasoning:
+Ruby's mixin mechanism uses include/extend calls inside the class body; hoisting them into dedicated includes/extends lists on the class node makes the mixin graph directly queryable without rescanning the body.
+@End Reasoning
+
+@Implementation:
+Walk body_statements; sort statements whose node_type equals "include" into the includes List and "extend" into the extends List. After scanning, if either list is non-empty, attach it to hir_class at "includes" / "extends".
+@End Implementation
 
 Process called "extract_mixins" takes translator as Integer, hir_class as Integer, body_statements as Integer returns Integer:
     Note: Extract include and extend statements from class body
@@ -770,17 +986,41 @@ Process called "extract_mixins" takes translator as Integer, hir_class as Intege
     Return 1
 End Process
 
+@Reasoning:
+The scope stack is updated through one helper so callers do not have to know the underlying scope linkage strategy.
+@End Reasoning
+
+@Implementation:
+Allocate a new scope of the given kind ("class", "module", "method", "block") linked to the translator's current scope, then make it current.
+@End Implementation
+
 Process called "push_scope" takes translator as Integer, scope_type as String returns Integer:
     Note: Push new scope onto translator's scope stack
     Note: Implementation  create new scope and link to parent
     Return 1
 End Process
 
+@Reasoning:
+Pop is the symmetric helper for push; centralising it keeps the stack discipline invariant - every push has exactly one matching pop in the translate_* helpers.
+@End Reasoning
+
+@Implementation:
+Restore the translator's current scope pointer to the parent of the current scope.
+@End Implementation
+
 Process called "pop_scope" takes translator as Integer returns Integer:
     Note: Pop current scope from translator's scope stack
     Note: Implementation  restore previous scope
     Return 1
 End Process
+
+@Reasoning:
+Identifier classification needs to detect ASCII uppercase letters as the marker for Ruby constants; a tight code-point predicate is faster than a String comparison.
+@End Reasoning
+
+@Implementation:
+Get the integer code point of the input character and return 1 if it lies in 65..90 (A..Z), 0 otherwise.
+@End Implementation
 
 Process called "is_uppercase" takes char as String returns Integer:
     Note: Check if character is uppercase

@@ -10,6 +10,22 @@ Import "compiler/frontend/primitives/core/memory_core.runa" as Memory
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
+@Reasoning:
+Verilog uses a full pipeline orchestrator rather than the simple
+byte-buffer emitter pattern of other backends because Verilog supports
+round-trip translation (Verilog -> HIR -> Verilog). The emitter owns
+the lexer, parser, AST/HIR translator, backend, and the lists of
+errors/warnings produced at each pipeline stage.
+@End Reasoning
+
+@Implementation:
+72-byte heap-allocated struct: source_file (offset 0), lexer (8),
+parser (16), translator (24), backend (32), ast (40), hir (48), errors
+list (56), warnings list (64). All sub-objects are allocated lazily as
+the pipeline progresses and remain owned by the emitter for the
+duration of its life.
+@End Implementation
+
 Type called "VerilogEmitter":
     source_file as String
     lexer as Integer
@@ -21,6 +37,24 @@ Type called "VerilogEmitter":
     errors as Integer
     warnings as Integer
 End Type
+
+@Reasoning:
+Allocates a clean emitter with empty error/warning lists; the lexer,
+parser, translator, backend, AST, and HIR slots are filled in as the
+pipeline runs.
+@End Reasoning
+
+@Implementation:
+Allocates 72 bytes, zeroes the pointer slots (offsets 8 through 48),
+then creates fresh List instances for errors (offset 56) and warnings
+(offset 64). The source_file slot at offset 0 is initialized to the
+empty string.
+@End Implementation
+
+@Performance_Hints:
+Two list allocations plus one heap allocation per emitter. Cheap relative
+to the cost of running the pipeline.
+@End Performance_Hints
 
 Process called "create_emitter" that takes nothing returns Integer:
     Let emitter_ptr be proc allocate from Memory with 72
@@ -37,6 +71,31 @@ Process called "create_emitter" that takes nothing returns Integer:
     proc write_integer from Memory with emitter_ptr, 64, warnings
     Return emitter_ptr
 End Process
+
+@Reasoning:
+Multi-arg internal form lets the round_trip helper reuse a single
+emitter across both legs of a round trip without paying for two emitter
+allocations or losing the error/warning lists between stages.
+@End Reasoning
+
+@Implementation:
+Runs lex -> parse -> translate. After each stage, calls merge_errors to
+fold per-stage errors into the emitter's error list. If any stage
+reports errors, returns 0 immediately so the caller can short-circuit
+without continuing into an undefined state. On success, returns the
+HIR root pointer.
+@End Implementation
+
+@Performance_Hints:
+Cold path - called once per source file. Three full pipeline stages
+dominate the cost.
+@End Performance_Hints
+
+@Security_Scope:
+Treats verilog_source as untrusted input; all parse errors are funneled
+through the lexer/parser/translator error lists and propagated to the
+emitter via merge_errors, never crashing the orchestrator.
+@End Security_Scope
 
 Process called "verilog_to_hir_with_emitter" that takes emitter_ptr as Integer, verilog_source as String returns Integer:
     Note: Multi-arg internal form. Runs the Verilog -> HIR pipeline through a
@@ -85,6 +144,20 @@ Process called "verilog_to_hir_with_emitter" that takes emitter_ptr as Integer, 
     Return hir
 End Process
 
+@Reasoning:
+Multi-arg internal form for the backend leg of the pipeline. Used by
+round_trip so it can reuse an existing emitter (and any errors already
+collected) instead of creating a new one.
+@End Reasoning
+
+@Implementation:
+Stores the HIR module at offset 48, creates the HIR->Verilog backend at
+offset 32, invokes its translate method, and returns the generated
+Verilog source. Backend errors (if any) would be merged through the
+backend's own mechanism in future revisions; currently the backend is
+expected to produce output for any valid HIR.
+@End Implementation
+
 Process called "hir_to_verilog_with_emitter" that takes emitter_ptr as Integer, hir_module as Integer returns String:
     Note: Multi-arg internal form. Runs the HIR -> Verilog pipeline through a
     Note: caller-supplied emitter. The single-arg `hir_to_verilog` wrapper
@@ -98,6 +171,20 @@ Process called "hir_to_verilog_with_emitter" that takes emitter_ptr as Integer, 
 
     Return verilog_output
 End Process
+
+@Reasoning:
+End-to-end test entry point: ingest Verilog source, lower to HIR, then
+regenerate Verilog source from that HIR. Used by golden-output tests
+to verify round-trip fidelity. Empty string on the forward leg failure
+prevents the caller from feeding partial/null HIR into the backend.
+@End Reasoning
+
+@Implementation:
+Chains verilog_to_hir_with_emitter then hir_to_verilog_with_emitter,
+reusing the same emitter so any forward-leg errors are captured. If the
+forward leg returned 0 (failure), returns the empty string without
+attempting regeneration.
+@End Implementation
 
 Process called "round_trip" that takes emitter_ptr as Integer, verilog_source as String returns String:
     Let hir be proc verilog_to_hir_with_emitter with emitter_ptr, verilog_source
@@ -119,6 +206,18 @@ Note: the canonical single-arg shape. These wrappers create a fresh emitter,
 Note: run the pipeline, and return the result so the dispatcher does not
 Note: need to manage emitter lifecycles.
 
+@Reasoning:
+Single-arg dispatcher entry point matching the convention enforced by
+translation.runa: every frontend exposes a one-argument `X_to_hir`
+function. This wrapper hides emitter lifecycle from the dispatcher.
+@End Reasoning
+
+@Implementation:
+Creates a fresh emitter and forwards to verilog_to_hir_with_emitter.
+The emitter is not destroyed here so callers can still inspect errors;
+the orchestrator's lifetime is tied to its containing arena.
+@End Implementation
+
 Process called "verilog_to_hir" that takes verilog_source as String returns Integer:
     Note: Single-arg dispatcher entry point. Creates a fresh emitter, runs
     Note: the Verilog -> HIR pipeline, and returns the HIR root pointer or 0
@@ -127,6 +226,16 @@ Process called "verilog_to_hir" that takes verilog_source as String returns Inte
     Return proc verilog_to_hir_with_emitter with emitter_ptr, verilog_source
 End Process
 
+@Reasoning:
+Single-arg dispatcher entry point matching the convention enforced by
+translation.runa: every backend exposes a one-argument `hir_to_X`
+function.
+@End Reasoning
+
+@Implementation:
+Creates a fresh emitter and forwards to hir_to_verilog_with_emitter.
+@End Implementation
+
 Process called "hir_to_verilog" that takes hir_module as Integer returns String:
     Note: Single-arg dispatcher entry point. Creates a fresh emitter, runs
     Note: the HIR -> Verilog pipeline, and returns the generated Verilog
@@ -134,6 +243,24 @@ Process called "hir_to_verilog" that takes hir_module as Integer returns String:
     Let emitter_ptr be proc create_emitter
     Return proc hir_to_verilog_with_emitter with emitter_ptr, hir_module
 End Process
+
+@Reasoning:
+Stage helpers (lexer, parser, translator) own their own error lists;
+when one stage produces errors, the orchestrator must hoist them into
+the emitter's central error list so callers can inspect a unified view.
+@End Reasoning
+
+@Implementation:
+Reads the emitter's error list pointer (offset 56), then iterates the
+incoming error_list by index, appending each error to the emitter's
+list. Returns 1 unconditionally because the underlying list append
+cannot fail in the current List implementation.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the size of the incoming error list. Called at most three times
+per pipeline run (after lex, parse, translate).
+@End Performance_Hints
 
 Process called "merge_errors" that takes emitter_ptr as Integer, error_list as Integer returns Integer:
     Let errors be proc read_integer from Memory with emitter_ptr, 56
@@ -147,9 +274,24 @@ Process called "merge_errors" that takes emitter_ptr as Integer, error_list as I
     Return 1
 End Process
 
+@Reasoning:
+Exposes the unified error list so callers (golden-output tests, the
+driver) can format diagnostics in a single place.
+@End Reasoning
+
 Process called "get_errors" that takes emitter_ptr as Integer returns Integer:
     Return proc read_integer from Memory with emitter_ptr, 56
 End Process
+
+@Reasoning:
+Boolean shorthand asking "did the pipeline produce any errors". Lets
+callers gate on success/failure without computing the list size twice.
+@End Reasoning
+
+@Implementation:
+Reads the error list pointer, asks the List its size, returns 1 if
+positive else 0.
+@End Implementation
 
 Process called "has_errors" that takes emitter_ptr as Integer returns Integer:
     Let errors be proc read_integer from Memory with emitter_ptr, 56
@@ -160,10 +302,20 @@ Process called "has_errors" that takes emitter_ptr as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Alias used by older call sites that say "translate" rather than
+"verilog_to_hir"; preserved for source compatibility.
+@End Reasoning
+
 Process called "translate_from_verilog" that takes verilog_source as String returns Integer:
     Let emitter_ptr be proc create_emitter
     Return proc verilog_to_hir_with_emitter with emitter_ptr, verilog_source
 End Process
+
+@Reasoning:
+Alias used by older call sites that say "translate" rather than
+"hir_to_verilog"; preserved for source compatibility.
+@End Reasoning
 
 Process called "translate_to_verilog" that takes hir_module as Integer returns String:
     Let emitter_ptr be proc create_emitter

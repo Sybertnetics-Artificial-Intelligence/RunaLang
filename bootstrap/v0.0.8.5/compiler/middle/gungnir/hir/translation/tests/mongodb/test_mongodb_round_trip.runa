@@ -45,11 +45,47 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/io/file.runa" as File
 
+@Reasoning:
+Counter triple shared by the MongoDB round-trip driver. Same layout
+as peer suites for unified-runner compatibility.
+@End Reasoning
+
+@Implementation:
+total at offset 0, passed at 8, failed at 16; mutated via raw
+Layout.memory_set_int64 because results is shared by handle.
+@End Implementation
+
 Type called "TestResults":
     total as Integer
     passed as Integer
     failed as Integer
 End Type
+
+@Reasoning:
+Drives 16 MongoDB -> HIR -> MongoDB round-trip checks covering: scalar
+fields (string/number/bool), comparison and array operators ($gt, $in,
+$ne), update operators ($set, $inc, $push), top-level arrays, nested
+documents, logical $and, multiple operators in one expression, and a
+$match aggregation stage. Unlike peer round-trip suites this one
+performs a SEMANTIC equivalence check between HIR1 and HIR2, not just
+"both legs reach HIR", so it can detect emitter regressions that
+silently mangle field order or values.
+@End Reasoning
+
+@Implementation:
+Initialize TestResults, print banner, call test_round_trip with each
+inline JSON-like snippet. Print summary, return 1 on any failure.
+@End Implementation
+
+@TestCases:
+- `{"name": "Alice"}` -> HIR1 ~= HIR2
+- `{"age": {"$gt": 18}}` -> nested operator document survives both legs
+- `{"$set": {"status": "active"}}` -> update operator preserved
+- `[1, 2, 3]` -> top-level array round-trips
+- `{"$and": [{"a": 1}, {"b": 2}]}` -> logical AND with sub-documents
+- Any malformed snippet -> "Initial parse failed", exit 1
+- Emitter loses field -> "HIR mismatch", exit 1
+@End TestCases
 
 Process called "main" returns Integer:
     Note: MongoDB Round-Trip Translation Test Suite
@@ -99,6 +135,40 @@ Process called "main" returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Performs a six-stage check for one MongoDB fragment: parse, translate,
+emit, re-parse, re-translate, compare. The HIR1 vs HIR2 structural
+comparison is the key differentiator from peer round-trip suites —
+it catches emitter regressions that produce a parseable but
+semantically different query (e.g. swapping field order in a way the
+server would interpret differently for compound indexes, or losing a
+nested value).
+@End Reasoning
+
+@Implementation:
+1. Increment results.total.
+2. parse_mongodb(source) -> ast1; null -> "Initial parse failed".
+3. translate_mongodb_to_hir(source, 0) -> hir1; null ->
+   "Translation to HIR failed".
+4. generate_mongodb(hir1) -> generated; null ->
+   "Generation from HIR failed".
+5. parse_mongodb(generated) -> ast2; null -> free generated,
+   "Re-parse failed".
+6. translate_mongodb_to_hir(generated, 0) -> hir2; null -> free
+   generated, "Re-translation to HIR failed".
+7. compare_hir(hir1, hir2) -> hirs_match; free generated. If 0,
+   "HIR mismatch".
+8. Success: increment results.passed.
+@End Implementation
+
+@TestCases:
+- `{"name": "Alice"}` -> all 7 stages succeed, passed += 1
+- Emitter swaps key order in `{"score": {"$gte": 70, "$lt": 100}}`
+  -> compare_hir returns 0 -> "HIR mismatch"
+- Translator returns 0 on second pass -> "Re-translation to HIR failed"
+- Malformed input -> stage 2 fails with "Initial parse failed"
+@End TestCases
 
 Process called "test_round_trip" takes source as Integer, test_name as Integer, results as Integer returns Integer:
     Note: Test MongoDB → HIR → MongoDB round-trip
@@ -177,6 +247,27 @@ Process called "test_round_trip" takes source as Integer, test_name as Integer, 
     Return 1
 End Process
 
+@Reasoning:
+Recursive structural comparator for HIR nodes. Dispatches by node
+shape: both null is equal, otherwise both must be dictionaries
+(compare_dictionaries) or both must be lists (compare_lists) or both
+must be primitives (string_equals). Required because the emitter is
+free to reorder fields and the parser to relocate them, so a byte-
+identical comparison of the regenerated MongoDB string would yield
+false positives on legitimate transformations.
+@End Reasoning
+
+@Implementation:
+1. If hir1 == 0 and hir2 == 0 -> return 1 (both empty match).
+2. If exactly one is 0 -> return 0 (asymmetric mismatch).
+3. is_dictionary(hir1): if hir2 is not dict -> 0; else recurse via
+   compare_dictionaries.
+4. is_list(hir1): if hir2 is not list -> 0; else recurse via
+   compare_lists.
+5. Otherwise treat both as string primitives and use
+   StringCore.string_equals.
+@End Implementation
+
 Process called "compare_hir" takes hir1 as Integer, hir2 as Integer returns Integer:
     Note: Compare two HIR structures for semantic equivalence
 
@@ -219,6 +310,21 @@ Process called "compare_hir" takes hir1 as Integer, hir2 as Integer returns Inte
     Return match
 End Process
 
+@Reasoning:
+Structural type predicate used by compare_hir to decide which recursive
+comparator to dispatch into. Matches the Dictionary layout produced by
+the primitives module (size at 0, capacity at 8, keys at 16); requiring
+capacity > 0 and size <= capacity weeds out garbage pointers.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> not a dict.
+2. Read size and capacity from offsets 0 and 8.
+3. Dictionary is well-formed iff capacity > 0, size <= capacity, and
+   the keys pointer at offset 16 is non-zero. Returns 1 in that case,
+   0 otherwise.
+@End Implementation
+
 Process called "is_dictionary" takes value as Integer returns Integer:
     Note: Check if value is a dictionary structure
 
@@ -242,6 +348,22 @@ Process called "is_dictionary" takes value as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Structural type predicate matching the primitives List layout (size at
+0, capacity at 8, items at 16). Combined with is_dictionary it lets
+compare_hir dispatch on shape without explicit tag fields on each node.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> not a list.
+2. Read size and capacity from offsets 0 and 8.
+3. List is well-formed iff capacity > 0 and size <= capacity. Returns
+   1 in that case, 0 otherwise.
+Note: the items pointer at offset 16 is not validated here because an
+empty list with size 0 may have a freshly-allocated items buffer or a
+null one; the consumer (compare_lists) handles either case.
+@End Implementation
+
 Process called "is_list" takes value as Integer returns Integer:
     Note: Check if value is a list structure
 
@@ -261,6 +383,26 @@ Process called "is_list" takes value as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Order-independent dictionary comparator. Iterates every key in dict1
+and searches dict2 for a matching key, comparing the associated value
+recursively via compare_hir. This is essential for MongoDB round-trip
+correctness because both the parser and emitter may legitimately
+reorder fields.
+@End Reasoning
+
+@Implementation:
+1. size1 != size2 -> return 0.
+2. Read keys/values arrays from offsets 16/24 of each dict.
+3. For each key1[i] in dict1:
+   a. Inner loop over j in dict2 looking for keys2[j] equal via
+      StringCore.string_equals.
+   b. On match, recurse compare_hir(values1[i], values2[j]); 0 -> return 0.
+   c. After inner break or completion, if no match found -> return 0.
+4. If all keys matched with equal values -> return 1.
+Note: keys/values arrays store 8-byte pointers indexed by i * 8.
+@End Implementation
 
 Process called "compare_dictionaries" takes dict1 as Integer, dict2 as Integer returns Integer:
     Note: Compare two dictionaries
@@ -314,6 +456,23 @@ Process called "compare_dictionaries" takes dict1 as Integer, dict2 as Integer r
     Return 1
 End Process
 
+@Reasoning:
+Order-preserving list comparator. Unlike compare_dictionaries this
+comparator requires index-by-index equality because array order is
+semantically meaningful in MongoDB queries — the order of stages in
+an aggregation pipeline determines the result, and the order of
+elements in an $in array is documented behavior.
+@End Reasoning
+
+@Implementation:
+1. size1 != size2 -> return 0.
+2. Read items pointers from offset 16 of each list.
+3. For each index in 0..size1:
+   - Read items1[i] and items2[i] (each at offset i*8).
+   - Recurse compare_hir(item1, item2); 0 -> return 0.
+4. All items matched -> return 1.
+@End Implementation
+
 Process called "compare_lists" takes list1 as Integer, list2 as Integer returns Integer:
     Note: Compare two lists
 
@@ -344,6 +503,16 @@ Process called "compare_lists" takes list1 as Integer, list2 as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Banner emitted once at startup. Separator width (44 "=") matches the
+title length so the heading boxes cleanly in CI logs.
+@End Reasoning
+
+@Implementation:
+Allocate title and "=" rule via StringCore, print each, deallocate.
+Always returns 1.
+@End Implementation
+
 Process called "print_header" returns Integer:
     Note: Print test suite header
 
@@ -358,6 +527,16 @@ Process called "print_header" returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+"[PASS] <name>" line. Identical to peer MongoDB suites so unified
+greps work across the language family.
+@End Reasoning
+
+@Implementation:
+Allocate "[PASS] " prefix, print prefix and caller-owned test_name,
+deallocate the prefix.
+@End Implementation
+
 Process called "print_test_success" takes test_name as Integer returns Integer:
     Note: Print test success message
 
@@ -368,6 +547,16 @@ Process called "print_test_success" takes test_name as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+"[FAIL] <name>: <reason>" line. reason names the round-trip stage that
+broke or "HIR mismatch" when the comparator detects semantic divergence.
+@End Reasoning
+
+@Implementation:
+Allocate "[FAIL] " prefix, print prefix/test_name/": "/reason in order,
+then deallocate the prefix.
+@End Implementation
 
 Process called "print_test_failure" takes test_name as Integer, reason as Integer returns Integer:
     Note: Print test failure message
@@ -381,6 +570,17 @@ Process called "print_test_failure" takes test_name as Integer, reason as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Final summary block. Reads counters through type-checked struct field
+access (results.total etc.) at the report site, complementing the raw
+memory_get_int64 path used inside test_round_trip.
+@End Reasoning
+
+@Implementation:
+Print "=" separator, "Test Results:" heading, then Total/Passed/Failed
+lines. Each label allocated/printed/deallocated; numbers via print_int.
+@End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
     Note: Print final test results
@@ -410,6 +610,20 @@ Process called "print_results" takes results as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Local integer formatter so this suite has no dependency on stdlib
+formatting allocators. Zero and negative inputs are handled explicitly.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> print "0", return.
+2. Allocate 32-byte buffer; walk position from 31 downward writing
+   48 + (temp % 10), dividing temp by 10 each pass.
+3. For negatives, operate on -temp and write '-' (45) at the final
+   position.
+4. Increment position, print buffer+position as a C string, deallocate.
+@End Implementation
 
 Process called "print_int" takes value as Integer returns Integer:
     Note: Print integer value

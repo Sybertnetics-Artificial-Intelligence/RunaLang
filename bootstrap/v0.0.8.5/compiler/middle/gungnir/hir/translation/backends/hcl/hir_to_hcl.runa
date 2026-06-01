@@ -17,11 +17,38 @@ Note: ===================================================================
 Note: GENERATION CONTEXT
 Note: ===================================================================
 
+@Reasoning:
+Generation context for the legacy line-buffered HCL translator. Stores
+indent state and an accumulated list of pre-indented lines.
+@End Reasoning
+
+@Implementation:
+Three fields: indent_level (current depth), indent_string (the unit
+indent, defaults to two spaces) and code_buffer (a List of fully-indented
+String lines that is joined with newlines by get_generated_code).
+@End Implementation
+
+@Performance_Hints:
+String-concat-per-line approach: O(n) per emit times O(n) lines gives
+O(n^2) total. Acceptable for typical Terraform-sized configurations
+(hundreds of lines), not for large outputs.
+@End Performance_Hints
+
 Type called "HCLGenerationContext":
     indent_level as Integer
     indent_string as Integer
     code_buffer as Integer
 End Type
+
+@Reasoning:
+Allocate a fresh HCL generation context with default 2-space indent
+and an empty code buffer.
+@End Reasoning
+
+@Implementation:
+Constructs HCLGenerationContext with indent_level 0, indent_string "  ",
+and a new empty list for code_buffer.
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Let ctx be a value of type HCLGenerationContext with
@@ -32,13 +59,46 @@ Process called "create_generation_context" returns Integer:
     Return ctx
 End Process
 
+@Reasoning:
+Step into a deeper HCL block (resource body, dynamic block).
+@End Reasoning
+
+@Implementation:
+Increments ctx.indent_level by 1.
+@End Implementation
+
 Process called "increase_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level plus 1
 End Process
 
+@Reasoning:
+Step out of an HCL block. Note: does NOT clamp at zero, so callers must
+keep the increase/decrease calls balanced.
+@End Reasoning
+
+@Implementation:
+Decrements ctx.indent_level by 1 unconditionally.
+@End Implementation
+
 Process called "decrease_indent" takes ctx as Integer:
     Set ctx.indent_level to ctx.indent_level minus 1
 End Process
+
+@Reasoning:
+Build the current indent prefix string by repeating indent_string
+indent_level times.
+@End Reasoning
+
+@Implementation:
+Loops indent_level times, concatenating indent_string into a result
+accumulator. Returns the accumulated String.
+@End Implementation
+
+@Performance_Hints:
+O(n) string_concat per call where n is indent_level. Called for every
+emitted line which makes overall emission O(N*L) in lines * average
+depth.
+@End Performance_Hints
 
 Process called "get_current_indent" takes ctx as Integer returns Integer:
     Let indent be ""
@@ -50,15 +110,49 @@ Process called "get_current_indent" takes ctx as Integer returns Integer:
     Return indent
 End Process
 
+@Reasoning:
+Append a complete pre-indented line to the buffer. The trailing newline
+is NOT included here; get_generated_code joins lines with "\n".
+@End Reasoning
+
+@Implementation:
+Computes current indent string, concatenates with the line, appends the
+result to ctx.code_buffer.
+@End Implementation
+
 Process called "emit_line" takes ctx as Integer, line as Integer:
     Let indent be proc get_current_indent from ctx
     Let full_line be proc string_concat from StringCore with indent, line
     proc list_append from ListCore with ctx.code_buffer, full_line
 End Process
 
+@Reasoning:
+Append an empty line for visual separation between HCL blocks.
+@End Reasoning
+
+@Implementation:
+Appends "" to ctx.code_buffer; the join step will render this as a
+bare newline.
+@End Implementation
+
 Process called "emit_blank_line" takes ctx as Integer:
     proc list_append from ListCore with ctx.code_buffer, ""
 End Process
+
+@Reasoning:
+Join the accumulated buffer lines into a single newline-separated
+String. Called once at the end of translation.
+@End Reasoning
+
+@Implementation:
+Iterates code_buffer, concatenates each line into a result accumulator
+with "\n" separators between (no trailing newline after the last line).
+@End Implementation
+
+@Performance_Hints:
+O(L^2) in line count due to repeated string_concat. Consider migrating
+to the byte-buffer emitter for large outputs.
+@End Performance_Hints
 
 Process called "get_generated_code" takes ctx as Integer returns Integer:
     Let result be ""
@@ -83,6 +177,15 @@ Note: ===================================================================
 Note: MAIN GENERATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Public driver for HIR -> HCL translation.
+@End Reasoning
+
+@Implementation:
+Creates a context, dispatches the HIR module through generate_module,
+returns the joined output string.
+@End Implementation
+
 Process called "generate_hcl_from_hir" takes hir_module as Integer returns Integer:
     Let ctx be proc create_generation_context
 
@@ -96,6 +199,20 @@ End Process
 Note: ===================================================================
 Note: MODULE GENERATION
 Note: ===================================================================
+
+@Reasoning:
+Translate the top-level HIR module. HIR module declarations
+(classes representing HCL block types, plus top-level variables and
+constants) are walked and dispatched to specialised generators.
+@End Reasoning
+
+@Implementation:
+Iterates the module's declaration list. For class declarations,
+dispatches to generate_class_as_block (which switches on the class
+kind into resource/variable/output/etc.). For variable and constant
+declarations, dispatches to generate_variable_declaration and
+generate_constant_declaration respectively.
+@End Implementation
 
 Process called "generate_module" takes ctx as Integer, hir_module as Integer:
     Let declarations be proc hir_get_declarations from HIR with hir_module
@@ -126,6 +243,18 @@ End Process
 Note: ===================================================================
 Note: CLASS/BLOCK GENERATION
 Note: ===================================================================
+
+@Reasoning:
+HCL has many block kinds (resource, variable, output, module, provider,
+data, terraform, dynamic). Each is encoded as a class declaration in HIR
+with a "kind" or stereotype tag; this dispatcher routes to the matching
+generate_*_block helper.
+@End Reasoning
+
+@Implementation:
+Inspects the class's stereotype/kind discriminator and dispatches to the
+appropriate generate_*_block proc.
+@End Implementation
 
 Process called "generate_class_as_block" takes ctx as Integer, class_node as Integer:
     Note: Check HCL block type metadata
@@ -185,6 +314,17 @@ Process called "generate_class_as_block" takes ctx as Integer, class_node as Int
     End If
 End Process
 
+@Reasoning:
+Emit a Terraform "resource type name { ... }" block. Used to declare
+managed infrastructure resources.
+@End Reasoning
+
+@Implementation:
+Reads the resource type and name from class metadata, emits the header
+line, increases indent, emits body via generate_block_body, decreases
+indent, emits closing brace.
+@End Implementation
+
 Process called "generate_resource_block" takes ctx as Integer, class_node as Integer:
     Note: resource "type" "name" { ... }
     Let resource_type be proc hir_get_metadata from HIR with class_node, "hcl_resource_type"
@@ -207,6 +347,16 @@ Process called "generate_resource_block" takes ctx as Integer, class_node as Int
     proc emit_line with ctx, "}"
 End Process
 
+@Reasoning:
+Emit a "variable name { ... }" block. Used to declare Terraform input
+variables with type and default fields.
+@End Reasoning
+
+@Implementation:
+Reads the variable name, emits the header, then body via
+generate_block_body which translates type/default/description fields.
+@End Implementation
+
 Process called "generate_variable_block" takes ctx as Integer, class_node as Integer:
     Note: variable "name" { ... }
     Let class_name be proc hir_get_class_name from HIR with class_node
@@ -223,6 +373,16 @@ Process called "generate_variable_block" takes ctx as Integer, class_node as Int
     proc decrease_indent from ctx
     proc emit_line with ctx, "}"
 End Process
+
+@Reasoning:
+Emit an "output name { value = ... }" block. Used to expose Terraform
+module outputs.
+@End Reasoning
+
+@Implementation:
+Reads the output name, emits the header, then body via
+generate_block_body which translates the value expression.
+@End Implementation
 
 Process called "generate_output_block" takes ctx as Integer, class_node as Integer:
     Note: output "name" { ... }
@@ -241,6 +401,16 @@ Process called "generate_output_block" takes ctx as Integer, class_node as Integ
     proc emit_line with ctx, "}"
 End Process
 
+@Reasoning:
+Emit a "module name { source = ... }" block. Used to instantiate
+Terraform child modules.
+@End Reasoning
+
+@Implementation:
+Reads the module instance name, emits the header, body via
+generate_block_body for source/version/variable values.
+@End Implementation
+
 Process called "generate_module_block" takes ctx as Integer, class_node as Integer:
     Note: module "name" { ... }
     Let module_name be proc hir_get_metadata from HIR with class_node, "hcl_module_name"
@@ -258,6 +428,16 @@ Process called "generate_module_block" takes ctx as Integer, class_node as Integ
     proc emit_line with ctx, "}"
 End Process
 
+@Reasoning:
+Emit a "provider name { ... }" block. Configures Terraform's provider
+plugins (aws, azurerm, kubernetes, ...).
+@End Reasoning
+
+@Implementation:
+Reads provider name, emits header, body via generate_block_body for
+provider-specific configuration arguments.
+@End Implementation
+
 Process called "generate_provider_block" takes ctx as Integer, class_node as Integer:
     Note: provider "name" { ... }
     Let provider_name be proc hir_get_metadata from HIR with class_node, "hcl_provider_name"
@@ -274,6 +454,16 @@ Process called "generate_provider_block" takes ctx as Integer, class_node as Int
     proc decrease_indent from ctx
     proc emit_line with ctx, "}"
 End Process
+
+@Reasoning:
+Emit a "data type name { ... }" block. Used to fetch existing
+infrastructure data for use in Terraform expressions.
+@End Reasoning
+
+@Implementation:
+Reads the data source type and instance name, emits the header, body
+via generate_block_body for query arguments.
+@End Implementation
 
 Process called "generate_data_block" takes ctx as Integer, class_node as Integer:
     Note: data "type" "name" { ... }
@@ -295,6 +485,15 @@ Process called "generate_data_block" takes ctx as Integer, class_node as Integer
     proc emit_line with ctx, "}"
 End Process
 
+@Reasoning:
+Emit a "terraform { ... }" block. Configures the Terraform engine
+itself (required_version, backend, etc.).
+@End Reasoning
+
+@Implementation:
+Emits the "terraform {" header, body via generate_block_body, then "}".
+@End Implementation
+
 Process called "generate_terraform_block" takes ctx as Integer, class_node as Integer:
     Note: terraform { ... }
     proc emit_line with ctx, "terraform {"
@@ -305,6 +504,16 @@ Process called "generate_terraform_block" takes ctx as Integer, class_node as In
     proc decrease_indent from ctx
     proc emit_line with ctx, "}"
 End Process
+
+@Reasoning:
+Emit a "dynamic name { ... }" block. Dynamic blocks let Terraform
+generate nested configuration via for_each iteration.
+@End Reasoning
+
+@Implementation:
+Reads the dynamic block name, emits the header, body via
+generate_block_body for the for_each / content nested structure.
+@End Implementation
 
 Process called "generate_dynamic_block" takes ctx as Integer, class_node as Integer:
     Note: dynamic "block_name" { ... }
@@ -322,6 +531,17 @@ Process called "generate_dynamic_block" takes ctx as Integer, class_node as Inte
     proc decrease_indent from ctx
     proc emit_line with ctx, "}"
 End Process
+
+@Reasoning:
+Emit the body of a block: a sequence of "key = value" attribute lines
+and nested blocks. Shared by all generate_*_block helpers.
+@End Reasoning
+
+@Implementation:
+Walks the class's members list. For property declarations emits
+"name = " + expression. For nested class declarations recurses into
+generate_class_as_block (for nested blocks like provisioners).
+@End Implementation
 
 Process called "generate_block_body" takes ctx as Integer, class_node as Integer:
     Let members be proc hir_get_class_members from HIR with class_node
@@ -353,6 +573,18 @@ End Process
 Note: ===================================================================
 Note: VARIABLE AND CONSTANT GENERATION
 Note: ===================================================================
+
+@Reasoning:
+Emit a top-level HCL "variable name { ... }" block from a HIR variable
+declaration. Distinct from generate_variable_block which works from a
+class declaration.
+@End Reasoning
+
+@Implementation:
+Reads name, type, default value, description from the HIR var node.
+Emits a "variable" block with appropriate type, default, and
+description attribute lines.
+@End Implementation
 
 Process called "generate_variable_declaration" takes ctx as Integer, var_node as Integer:
     Let var_name be proc hir_get_variable_name from HIR with var_node
@@ -394,6 +626,18 @@ Process called "generate_variable_declaration" takes ctx as Integer, var_node as
     Note: Otherwise skip (regular HIR variable)
 End Process
 
+@Reasoning:
+Emit a top-level HCL "locals { name = value }" entry from a HIR
+constant declaration. HCL has no separate constant syntax; constants
+become locals.
+@End Reasoning
+
+@Implementation:
+Reads the constant name and value expression. Emits a locals block
+header (or contributes to an existing one), followed by "name = value"
+inside.
+@End Implementation
+
 Process called "generate_constant_declaration" takes ctx as Integer, const_node as Integer:
     Let const_name be proc hir_get_constant_name from HIR with const_node
 
@@ -433,6 +677,19 @@ End Process
 Note: ===================================================================
 Note: EXPRESSION GENERATION
 Note: ===================================================================
+
+@Reasoning:
+Translate an HIR expression to an HCL value expression. HCL supports
+literals, references (var.x, local.y, resource_type.name.attr),
+function calls, arithmetic and comparison operators, ternary
+conditionals, lists, and objects.
+@End Reasoning
+
+@Implementation:
+Dispatches on node_type to emit the corresponding HCL syntax. Literals
+are rendered with appropriate quoting; identifiers are emitted bare;
+member/index access becomes dotted/bracketed paths.
+@End Implementation
 
 Process called "generate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
     Let expr_type be proc hir_node_type from HIR with expr_node
@@ -503,6 +760,16 @@ Process called "generate_expression" takes ctx as Integer, expr_node as Integer 
     Return "unknown"
 End Process
 
+@Reasoning:
+Emit an HCL list literal "[a, b, c]". Used for variable defaults,
+resource arrays, and any list value.
+@End Reasoning
+
+@Implementation:
+Builds a "[" + comma-separated elements via generate_expression + "]"
+string. Returns the accumulated expression.
+@End Implementation
+
 Process called "generate_array_literal" takes ctx as Integer, array_node as Integer returns Integer:
     Let elements be proc hir_get_array_elements from HIR with array_node
     Let elem_count be proc list_length from ListCore with elements
@@ -525,6 +792,16 @@ Process called "generate_array_literal" takes ctx as Integer, array_node as Inte
     Set result to proc string_concat from StringCore with result, "]"
     Return result
 End Process
+
+@Reasoning:
+Emit an HCL object literal "{ key = value, ... }". Used where HCL
+expects a structured map rather than a block.
+@End Reasoning
+
+@Implementation:
+Builds "{ " + comma-separated "key = value" pairs via
+generate_expression + " }".
+@End Implementation
 
 Process called "generate_dictionary_literal" takes ctx as Integer, dict_node as Integer returns Integer:
     Let pairs be proc hir_get_dictionary_pairs from HIR with dict_node
@@ -557,6 +834,17 @@ Process called "generate_dictionary_literal" takes ctx as Integer, dict_node as 
     Return result
 End Process
 
+@Reasoning:
+Emit a binary expression in HCL syntax. The HIR operator must be mapped
+to its HCL spelling via map_hir_operator_to_hcl since the spellings can
+differ (e.g. HIR "equals" -> HCL "==").
+@End Reasoning
+
+@Implementation:
+Recursively renders left, then concatenates " op " (where op is from
+map_hir_operator_to_hcl), then right.
+@End Implementation
+
 Process called "generate_binary_expr" takes ctx as Integer, binary_node as Integer returns Integer:
     Let operator be proc hir_get_binary_operator from HIR with binary_node
     Let left be proc hir_get_binary_left from HIR with binary_node
@@ -573,6 +861,17 @@ Process called "generate_binary_expr" takes ctx as Integer, binary_node as Integ
 
     Return result
 End Process
+
+@Reasoning:
+Map a HIR operator string to the equivalent HCL operator. Most match
+("+", "-", "*", "/", "%"); equality and logical operators differ
+(HCL uses "==", "!=", "&&", "||" vs HIR's word-based names).
+@End Reasoning
+
+@Implementation:
+Switch-style chain of string comparisons against HIR operator names.
+Returns the HCL spelling. Unknown operators fall through to a default.
+@End Implementation
 
 Process called "map_hir_operator_to_hcl" takes operator as Integer returns Integer:
     If operator is equal to HIR.HIR_OP_ADD:
@@ -614,6 +913,16 @@ Process called "map_hir_operator_to_hcl" takes operator as Integer returns Integ
     Return "+"
 End Process
 
+@Reasoning:
+Emit a unary expression. HCL supports unary "-" and "!"; the operator
+is mapped from HIR's spelling.
+@End Reasoning
+
+@Implementation:
+Emits the mapped HCL operator immediately followed by the operand
+expression.
+@End Implementation
+
 Process called "generate_unary_expr" takes ctx as Integer, unary_node as Integer returns Integer:
     Let operator be proc hir_get_unary_operator from HIR with unary_node
     Let operand be proc hir_get_unary_operand from HIR with unary_node
@@ -635,6 +944,16 @@ Process called "generate_unary_expr" takes ctx as Integer, unary_node as Integer
     Return operand_str
 End Process
 
+@Reasoning:
+Emit an HCL ternary "cond ? a : b". HCL's only conditional syntax in
+expression position.
+@End Reasoning
+
+@Implementation:
+Builds "cond ? then : else" by recursively rendering each branch and
+concatenating with the punctuation.
+@End Implementation
+
 Process called "generate_conditional_expr" takes ctx as Integer, cond_node as Integer returns Integer:
     Let condition be proc hir_get_conditional_condition from HIR with cond_node
     Let true_expr be proc hir_get_conditional_true from HIR with cond_node
@@ -651,6 +970,16 @@ Process called "generate_conditional_expr" takes ctx as Integer, cond_node as In
 
     Return result
 End Process
+
+@Reasoning:
+Emit an HCL function call "name(arg1, arg2, ...)". HCL has a fixed set
+of builtin functions plus provider-supplied ones; the callee name is
+passed through verbatim.
+@End Reasoning
+
+@Implementation:
+Renders callee, "(", comma-separated argument expressions, ")".
+@End Implementation
 
 Process called "generate_call_expr" takes ctx as Integer, call_node as Integer returns Integer:
     Let callee be proc hir_get_call_callee from HIR with call_node
@@ -678,6 +1007,15 @@ Process called "generate_call_expr" takes ctx as Integer, call_node as Integer r
     Return result
 End Process
 
+@Reasoning:
+Emit HCL dotted-path access "obj.member". Common for variable
+references (var.x, local.y, aws_instance.foo.id).
+@End Reasoning
+
+@Implementation:
+Renders the object expression, emits ".", emits the member name.
+@End Implementation
+
 Process called "generate_member_expr" takes ctx as Integer, member_node as Integer returns Integer:
     Let object be proc hir_get_member_object from HIR with member_node
     Let member_name be proc hir_get_member_name from HIR with member_node
@@ -697,6 +1035,16 @@ Process called "generate_member_expr" takes ctx as Integer, member_node as Integ
     Return result
 End Process
 
+@Reasoning:
+Emit HCL bracket-index access "obj[index]". Used for list element
+access and map key lookup.
+@End Reasoning
+
+@Implementation:
+Renders the object expression, emits "[", renders the index expression,
+emits "]".
+@End Implementation
+
 Process called "generate_index_expr" takes ctx as Integer, index_node as Integer returns Integer:
     Let object be proc hir_get_index_object from HIR with index_node
     Let index be proc hir_get_index_index from HIR with index_node
@@ -714,6 +1062,16 @@ End Process
 Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
+
+@Reasoning:
+Public alias for generate_hcl_from_hir, kept for callers that prefer
+the "hir_to_target_generate" naming convention used elsewhere in the
+backend tree.
+@End Reasoning
+
+@Implementation:
+Calls generate_hcl_from_hir and returns its result unchanged.
+@End Implementation
 
 Process called "hir_to_hcl_generate" takes hir_module as Integer returns Integer:
     Return proc generate_hcl_from_hir from hir_module

@@ -40,6 +40,14 @@ Note: ========================================
 Note: AST Node Structure
 Note: ========================================
 
+@Reasoning:
+The regex AST adds a metadata slot beyond the generic shape: quantifier kind for REGEX_QUANTIFIED nodes, group flavour for REGEX_GROUP nodes, anchor source-kind for REGEX_ANCHOR nodes. A single typed slot avoids per-kind subclasses.
+@End Reasoning
+
+@Implementation:
+Five 8-byte fields: discriminator tag, pointer to lexeme view, lexeme length, metadata integer, and a heap List of children pointers.
+@End Implementation
+
 Type called "RegexNode":
     node_type as Integer      Note: Node type constant
     value as Integer          Note: Pointer to value string
@@ -47,6 +55,14 @@ Type called "RegexNode":
     metadata as Integer       Note: Additional metadata (quantifier info, group type)
     children as Integer       Note: List of child nodes
 End Type
+
+@Reasoning:
+Every node-producing path (parse_atom, parse_quantified, parse_group, parse_char_class) feeds through one constructor so the 5-field layout stays defined in one place.
+@End Reasoning
+
+@Implementation:
+Allocate 40 bytes (five 8-byte slots), store node_type, value pointer, value length, metadata; allocate an empty children List and attach at offset 32.
+@End Implementation
 
 Process called "create_regex_node" takes node_type as Integer, value as Integer, value_length as Integer, metadata as Integer returns Integer:
     Note: Create new regex AST node
@@ -63,6 +79,18 @@ Process called "create_regex_node" takes node_type as Integer, value as Integer,
 
     Return node
 End Process
+
+@Reasoning:
+The parser hands trees to callers; when callers discard a subtree they need a single helper that recursively releases descendants and the children List.
+@End Reasoning
+
+@Implementation:
+Walk the children List recursively destroying each, dispose the List, then release the 40-byte node block.
+@End Implementation
+
+@Performance_Hints:
+O(n) in total descendant count; one deallocation per node and per child-List.
+@End Performance_Hints
 
 Process called "destroy_regex_node" takes node as Integer:
     Note: Recursively destroy regex AST node
@@ -81,6 +109,14 @@ Process called "destroy_regex_node" takes node as Integer:
     proc deallocate from Layout with node
 End Process
 
+@Reasoning:
+The children-List slot lives at offset 32 (after the metadata field); hiding that offset behind a helper keeps the parser readable.
+@End Reasoning
+
+@Implementation:
+Read the children-List pointer from offset 32 of the parent node and push the child pointer onto it.
+@End Implementation
+
 Process called "add_child" takes parent as Integer, child as Integer:
     Note: Add child node to parent
 
@@ -92,11 +128,27 @@ Note: ========================================
 Note: Parser Structure
 Note: ========================================
 
+@Reasoning:
+The parser is a cursor over the lexer's token List; caching the token-list pointer at construction avoids dereferencing the lexer on every advance.
+@End Reasoning
+
+@Implementation:
+Three 8-byte slots: backing lexer pointer, cached token-list pointer (copied from lexer offset 24), current token index.
+@End Implementation
+
 Type called "RegexParser":
     lexer as Integer          Note: Lexer instance
     tokens as Integer         Note: Token list
     current as Integer        Note: Current token index
 End Type
+
+@Reasoning:
+Hoisting the token-list pointer into the parser struct shortens the hot path lookahead.
+@End Reasoning
+
+@Implementation:
+Allocate 24 bytes, store the lexer pointer, copy lexer.tokens (offset 24) into parser.tokens (offset 8), initialise the cursor to 0.
+@End Implementation
 
 Process called "create_parser" takes lexer as Integer returns Integer:
     Note: Create new regex parser
@@ -113,6 +165,14 @@ Process called "create_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser owns only its own 24-byte struct; the lexer and token storage are externally managed.
+@End Reasoning
+
+@Implementation:
+Deallocate the parser block; lexer and tokens are untouched.
+@End Implementation
+
 Process called "destroy_parser" takes parser as Integer:
     Note: Destroy parser
 
@@ -122,6 +182,14 @@ End Process
 Note: ========================================
 Note: Token Navigation
 Note: ========================================
+
+@Reasoning:
+Lookahead is the most-called helper in this parser; centralising it lets all callers share one lookup path.
+@End Reasoning
+
+@Implementation:
+Read tokens pointer at offset 8 and cursor index at offset 16; return the List entry at that index. Out-of-range indexing is the caller's responsibility (downstream code branches on the returned 0 sentinel).
+@End Implementation
 
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token
@@ -134,12 +202,28 @@ Process called "current_token" takes parser as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Concentrating cursor mutation in one helper guarantees every accepted token advances exactly once.
+@End Reasoning
+
+@Implementation:
+Read the cursor index at parser offset 16, add one, store back.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer:
     Note: Advance to next token
 
     Let current be proc memory_get_int64 from Layout with parser, 16
     proc memory_set_int64 from Layout with parser, 16, current + 1
 End Process
+
+@Reasoning:
+Predicate-style lookahead lets each production decide between alternatives without copying token-shape inspection logic into every call site.
+@End Reasoning
+
+@Implementation:
+Fetch the current token; if null return 0. Otherwise read the type tag from offset 0 and return 1 on match, 0 otherwise.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
@@ -163,6 +247,22 @@ Note: ========================================
 Note: Parsing (Top Level)
 Note: ========================================
 
+@Reasoning:
+The grammar's start production is the alternation expression; wrapping it in a REGEX_PATTERN envelope gives the consumer a stable single-rooted tree even for empty input.
+@End Reasoning
+
+@Implementation:
+Create the REGEX_PATTERN root, parse one alternation, and if it returned a non-null node attach it as the root's sole child.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source token count; recursion bounded by group/alternation nesting depth.
+@End Performance_Hints
+
+@Security_Scope:
+Operates on a tokenised view of untrusted regex source; each production either consumes a token or returns 0 so the parser cannot loop indefinitely.
+@End Security_Scope
+
 Process called "parse" takes parser as Integer returns Integer:
     Note: Parse complete regex pattern
 
@@ -180,6 +280,18 @@ End Process
 Note: ========================================
 Note: Alternation Parsing
 Note: ========================================
+
+@Reasoning:
+"a|b|c" forms an n-ary alternation rather than a left-leaning binary tree; gathering all '|'-separated branches into one REGEX_ALTERNATION simplifies HIR consumers.
+@End Reasoning
+
+@Implementation:
+Parse the first concatenation. If no '|' follows, return it unwrapped. Otherwise allocate a REGEX_ALTERNATION node, attach the first branch, and loop consuming '|' and another concatenation per iteration until a non-'|' token appears.
+@End Implementation
+
+@Performance_Hints:
+O(b * c) where b is the number of branches and c is the cost of one concatenation; bounded by source token count.
+@End Performance_Hints
 
 Process called "parse_alternation" takes parser as Integer returns Integer:
     Note: Parse alternation (|)
@@ -223,6 +335,18 @@ End Process
 Note: ========================================
 Note: Concatenation Parsing
 Note: ========================================
+
+@Reasoning:
+A concatenation is a run of quantified atoms terminating at ')', '|', or EOF; collapsing a one-element concatenation to its single child avoids redundant REGEX_CONCATENATION wrappers in the HIR.
+@End Reasoning
+
+@Implementation:
+Allocate a REGEX_CONCATENATION accumulator. Loop: parse_quantified; if it returns 0, break. Push the element. Peek the current token - on TOKEN_GROUP_END (16), TOKEN_ALTERNATION (23), or EOF (0) break. After the loop: 0 children -> destroy accumulator and return 0; 1 child -> return the child directly and dispose the accumulator's List; otherwise return the accumulator.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source token count; one atom per iteration.
+@End Performance_Hints
 
 Process called "parse_concatenation" takes parser as Integer returns Integer:
     Note: Parse concatenated elements
@@ -283,6 +407,14 @@ Note: ========================================
 Note: Quantified Element Parsing
 Note: ========================================
 
+@Reasoning:
+Quantifiers postfix-attach to an atom: greedy *, +, ?, and bounded {m,n}. Wrapping the atom in a REGEX_QUANTIFIED node only when a quantifier is present avoids inflating the tree for plain atoms.
+@End Reasoning
+
+@Implementation:
+Parse an atom; on null return 0. Peek the next token: 8 (*), 9 (+), 10 (?) -> consume the quantifier, wrap atom in REGEX_QUANTIFIED with metadata=token tag. Tag 11 ({m,n}) additionally copies the range lexeme into the node's value pointer/length. Anything else returns the unwrapped atom.
+@End Implementation
+
 Process called "parse_quantified" takes parser as Integer returns Integer:
     Note: Parse element with optional quantifier
 
@@ -338,6 +470,18 @@ End Process
 Note: ========================================
 Note: Atom Parsing
 Note: ========================================
+
+@Reasoning:
+An atom is the smallest quantifiable unit: literal, escaped literal, shorthand class, bracketed class, dot, anchor, group (any flavour), or backreference. First-token dispatch covers them all.
+@End Reasoning
+
+@Implementation:
+Switch on the current token's tag. TOKEN_LITERAL/ESCAPED -> REGEX_LITERAL (escaped sets metadata=1). TOKEN_CHAR_CLASS_SHORTHAND -> REGEX_CHAR_CLASS with metadata=1. TOKEN_CHAR_CLASS_START -> parse_char_class. TOKEN_DOT -> REGEX_DOT. TOKEN_ANCHOR_START/END/WORD -> REGEX_ANCHOR with metadata=originating tag. TOKEN_GROUP_START / NON_CAPTURING / NAMED_GROUP / LOOKAHEAD_POS/NEG / LOOKBEHIND_POS/NEG -> parse_group with that tag as the group flavour. TOKEN_BACKREFERENCE -> REGEX_BACKREFERENCE.
+@End Implementation
+
+@Security_Scope:
+Unknown leading tags return 0; the caller breaks out of its loop preventing forward progress only when no atom was parseable.
+@End Security_Scope
 
 Process called "parse_atom" takes parser as Integer returns Integer:
     Note: Parse atomic element (char, class, group, anchor, etc.)
@@ -451,6 +595,18 @@ Note: ========================================
 Note: Character Class Parsing
 Note: ========================================
 
+@Reasoning:
+The current parser treats "[...]" as an opaque region: the lexer's char-class start/end tokens delimit the span and the parser produces a single REGEX_CHAR_CLASS leaf, deferring range/escape decomposition to a later analysis pass.
+@End Reasoning
+
+@Implementation:
+Consume '[', allocate a REGEX_CHAR_CLASS node. Loop until TOKEN_CHAR_CLASS_END (5) is seen, advancing past every interior token. Consume ']' when found. Return the node.
+@End Implementation
+
+@Security_Scope:
+The loop is bounded by the token stream; an unterminated "[" terminates on EOF.
+@End Security_Scope
+
 Process called "parse_char_class" takes parser as Integer returns Integer:
     Note: Parse character class [...]
 
@@ -482,6 +638,22 @@ End Process
 Note: ========================================
 Note: Group Parsing
 Note: ========================================
+
+@Reasoning:
+Every group flavour - capturing, non-capturing, named, lookaround - shares the same body grammar (a nested alternation); a single helper parameterised by the token tag of the opening delimiter handles them all.
+@End Reasoning
+
+@Implementation:
+Capture the opening token's lexeme view (value pointer/length) - meaningful for named groups - and the token tag (group flavour). Advance past the opener. Allocate a REGEX_GROUP with metadata=group_type. Recursively parse_alternation for the body. Consume the closing ')' if present.
+@End Implementation
+
+@Performance_Hints:
+Recursion depth equals the source's group-nesting depth.
+@End Performance_Hints
+
+@Security_Scope:
+Untrusted input. The closing-paren check is forgiving - missing ')' does not crash, the group node just lacks a close - but the wrapping productions still terminate because each iteration consumes at least one token.
+@End Security_Scope
 
 Process called "parse_group" takes parser as Integer, group_type as Integer returns Integer:
     Note: Parse group (...) or (?:...) or (?<name>...)

@@ -20,6 +20,21 @@ Constant ARM_REGISTER_LIST as Integer is 7
 Constant ARM_SHIFTED as Integer is 8
 Constant ARM_IDENTIFIER as Integer is 9
 
+@Reasoning:
+A uniform AST node shape lets the rest of the pipeline (arm_to_hir, validators)
+walk the tree by inspecting node_type and recursing through a single children
+list, regardless of whether the node represents an instruction, directive,
+register, immediate, or label. Lexeme info is carried inline so to_hir can
+recover the original bytes without revisiting the source.
+@End Reasoning
+
+@Implementation:
+node_type holds an ARM_* constant at offset 0, value is a pointer into the
+source bytes at offset 8, value_length is the lexeme length at offset 16,
+children is a List of child ArmNode handles at offset 24. Total record size
+is 32 bytes.
+@End Implementation
+
 Type called "ArmNode":
     node_type as Integer
     value as Integer
@@ -27,11 +42,35 @@ Type called "ArmNode":
     children as Integer
 End Type
 
+@Reasoning:
+Carries the in-progress parse state: the producing lexer, the token list
+pulled from that lexer, and the current cursor index. Keeping the token list
+pointer locally avoids re-reading it from the lexer on every advance.
+@End Reasoning
+
+@Implementation:
+lexer at offset 0 retains the source/token owner, tokens at offset 8 is the
+cached List pointer, current at offset 16 is the integer index of the next
+unconsumed token. Total record size is 24 bytes.
+@End Implementation
+
 Type called "ArmParser":
     lexer as Integer
     tokens as Integer
     current as Integer
 End Type
+
+@Reasoning:
+Constructor that snapshots the lexer's token list at construction time;
+parse must be called after the lexer has finished tokenize, otherwise the
+parser will see an empty list.
+@End Reasoning
+
+@Implementation:
+Allocates 24 bytes, writes the lexer pointer at offset 0, reads the lexer's
+tokens List pointer from lexer offset 24 and stores it at parser offset 8,
+initialises current to 0 at offset 16.
+@End Implementation
 
 Process called "create_parser" takes lexer as Integer returns Integer:
     Note: Create new parser from lexer
@@ -44,11 +83,44 @@ Process called "create_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser does not own the lexer or the token list (the lexer does), so it
+only needs to release its own 24-byte record. The AST it produced lives
+independently and must be freed via destroy_arm_node.
+@End Reasoning
+
+@Implementation:
+Single Layout.deallocate on the parser record.
+@End Implementation
+
 Process called "destroy_parser" takes parser as Integer:
     Note: Free parser
 
     proc deallocate from Layout with parser
 End Process
+
+@Reasoning:
+ArmNodes own their children list and (transitively) their children. Recursive
+post-order destruction is the only safe pattern; freeing parent first would
+leak descendants because we hand back ownership of children via add_child.
+@End Reasoning
+
+@Implementation:
+Guards against the 0 sentinel. Reads the children List at offset 24, iterates
+its entries, recurses into each child. Then destroys the List itself and
+finally deallocates the 32-byte node record. The value pointer is intentionally
+not freed - it points into the source buffer owned by the lexer.
+@End Implementation
+
+@Performance_Hints:
+O(n) over the number of nodes in the subtree. Recursion depth bounded by AST
+depth, which for assembly is typically shallow (instruction -> operand).
+@End Performance_Hints
+
+@Security_Scope:
+Must be called exactly once per tree root. Calling twice is a double-free of
+the underlying List and node memory.
+@End Security_Scope
 
 Process called "destroy_arm_node" takes node as Integer:
     Note: Recursively free AST node and children
@@ -68,6 +140,32 @@ Process called "destroy_arm_node" takes node as Integer:
     proc destroy from List with children
     proc deallocate from Layout with node
 End Process
+
+@Reasoning:
+Top-level entry point. Produces a synthetic ARM_INSTRUCTION root whose
+children are the actual top-level statements (directives, labels,
+instructions). Using ARM_INSTRUCTION as the root tag is intentional: it gives
+the to_hir traversal a consistent type to dispatch on for the root.
+@End Reasoning
+
+@Implementation:
+Creates an empty root node, then loops the token stream. Newlines (token type
+14) are silently skipped to handle blank lines and statement separators. Any
+non-newline token kicks off parse_statement; non-null results are attached as
+children of the root. Termination occurs on a 0 token pointer (EOF sentinel)
+or token_type 0 (true EOF).
+@End Implementation
+
+@Performance_Hints:
+O(t) where t is the number of tokens. Each call to parse_statement consumes
+at least one token, guaranteeing progress and finite termination.
+@End Performance_Hints
+
+@Security_Scope:
+Operates on attacker-controlled tokens. Malformed input may produce a tree
+with skipped statements (parse_statement returns 0 on unrecognised tokens),
+never an infinite loop.
+@End Security_Scope
 
 Process called "parse" takes parser as Integer returns Integer:
     Note: Parse entire ARM assembly source into AST
@@ -99,6 +197,25 @@ Process called "parse" takes parser as Integer returns Integer:
 
     Return root
 End Process
+
+@Reasoning:
+Statement-level dispatch. ARM source has three statement forms at this level:
+directives ('.text', '.global foo'), labels ('foo:'), and instructions
+('add r0, r1, r2'). An identifier is ambiguous - it is a label only if the
+following token is a colon - so we disambiguate via a one-token lookahead.
+@End Reasoning
+
+@Implementation:
+Inspects current token type. Token type 3 -> parse_directive. Token type 15
+(identifier) -> is_label_definition decides between parse_label and
+parse_identifier_operand. Token type 1 -> parse_instruction. Anything else is
+malformed; skip_to_newline drops the line and returns 0.
+@End Implementation
+
+@Security_Scope:
+Untrusted input. Unknown statements are dropped to a newline rather than
+aborting, ensuring forward progress on malformed assembly.
+@End Security_Scope
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse a single ARM assembly statement
@@ -136,6 +253,24 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     proc skip_to_newline from parser
     Return 0
 End Process
+
+@Reasoning:
+A GAS directive is the leading directive token followed by comma-separated
+operand expressions and terminated by a newline. The directive node retains
+the lexeme (e.g. '.global') and operands attach as children, mirroring the
+shape of instruction nodes so to_hir can use one operand-walker for both.
+@End Reasoning
+
+@Implementation:
+Reads value_ptr and value_length off the current token, builds an ARM_DIRECTIVE
+node, advances past it. Then loops: stop on newline (advance and break), stop
+on EOF (break). Each non-terminator token is parsed via parse_operand and
+attached. A trailing comma is silently consumed between operands.
+@End Implementation
+
+@Performance_Hints:
+O(k) where k is operand count.
+@End Performance_Hints
 
 Process called "parse_directive" takes parser as Integer returns Integer:
     Note: Parse assembler directive
@@ -183,6 +318,21 @@ Process called "parse_directive" takes parser as Integer returns Integer:
     Return directive
 End Process
 
+@Reasoning:
+Called only after is_label_definition has confirmed the identifier-colon
+pattern, so this proc just packages the identifier lexeme as an ARM_LABEL
+node and consumes both the identifier and the colon. Any trailing tokens on
+the same line (e.g. label-on-same-line-as-instruction is rare but legal in
+GAS) are skipped to keep one statement per line.
+@End Reasoning
+
+@Implementation:
+Captures value_ptr/length from the identifier token, builds the ARM_LABEL
+node, advances. Reads the next token expecting type 13 (colon) and consumes
+it if present (defensive). Calls skip_to_newline to drop any leftover tokens
+on the same line.
+@End Implementation
+
 Process called "parse_label" takes parser as Integer returns Integer:
     Note: Parse label definition
 
@@ -207,6 +357,24 @@ Process called "parse_label" takes parser as Integer returns Integer:
 
     Return label
 End Process
+
+@Reasoning:
+An instruction is a mnemonic followed by zero or more operands separated by
+commas and terminated by a newline. Mirrors parse_directive structurally
+because both consume the same operand syntax; the only difference is the
+node tag and the lexeme being a TOKEN_INSTRUCTION vs TOKEN_DIRECTIVE.
+@End Reasoning
+
+@Implementation:
+Captures the mnemonic lexeme into an ARM_INSTRUCTION node, advances. Loops:
+stop on newline (advance and break), stop on EOF (break). Each operand is
+parsed via parse_operand and attached. Inter-operand commas are silently
+consumed.
+@End Implementation
+
+@Performance_Hints:
+O(k) where k is operand count. ARM instructions typically have <= 4 operands.
+@End Performance_Hints
 
 Process called "parse_instruction" takes parser as Integer returns Integer:
     Note: Parse ARM instruction with operands
@@ -253,6 +421,25 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
 
     Return instruction
 End Process
+
+@Reasoning:
+Operand-level dispatch table. ARM operands fall into a closed set of forms:
+register (possibly with shift), '#'-prefixed immediate, '[...]' memory
+reference, '{...}' register list, raw identifier (label ref), raw number
+(directive context), and string (directive context). Routing here lets every
+caller (instructions and directives alike) share one operand grammar.
+@End Reasoning
+
+@Implementation:
+Reads the current token type and dispatches: 2 -> parse_register_or_shifted,
+12 -> parse_immediate, 8 -> parse_memory, 10 -> parse_register_list,
+15 -> parse_identifier_operand, 5 -> parse_number_operand, 6 -> parse_string_operand.
+Unknown tokens are advanced past and 0 is returned.
+@End Implementation
+
+@Security_Scope:
+Untrusted input; unknown tokens advance the cursor to guarantee progress.
+@End Security_Scope
 
 Process called "parse_operand" takes parser as Integer returns Integer:
     Note: Parse ARM instruction operand
@@ -304,6 +491,22 @@ Process called "parse_operand" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ARM register operands can be wrapped in a shift expression like 'r1, LSL #2'.
+We always parse the base register first, then peek for a TOKEN_SHIFT to
+decide whether to wrap it in an ARM_SHIFTED node. This avoids backtracking
+in parse_operand.
+@End Reasoning
+
+@Implementation:
+Calls parse_register to get the base, then inspects the next token. If its
+type is 17 (TOKEN_SHIFT), allocates an ARM_SHIFTED node, attaches the
+register as first child, then attaches an ARM_IDENTIFIER node holding the
+shift mnemonic lexeme, then parses the shift amount via parse_operand
+(typically #imm or register) and attaches it. Returns the shifted wrapper.
+If no shift follows, returns the bare register.
+@End Implementation
+
 Process called "parse_register_or_shifted" takes parser as Integer returns Integer:
     Note: Parse register, possibly with shift operation
 
@@ -338,6 +541,18 @@ Process called "parse_register_or_shifted" takes parser as Integer returns Integ
     Return register
 End Process
 
+@Reasoning:
+The lexer already classified registers via classify_token, so the parser
+trusts TOKEN_REGISTER and just wraps the lexeme in an ARM_REGISTER node
+without re-validating. Validation of bank membership belongs in semantic
+analysis.
+@End Reasoning
+
+@Implementation:
+Reads value_ptr/length off the current TOKEN_REGISTER token, allocates an
+ARM_REGISTER node carrying the lexeme, advances the cursor.
+@End Implementation
+
 Process called "parse_register" takes parser as Integer returns Integer:
     Note: Parse register (r0-r15, sp, lr, pc, etc.)
 
@@ -354,6 +569,19 @@ Process called "parse_register" takes parser as Integer returns Integer:
 
     Return register
 End Process
+
+@Reasoning:
+ARM immediates appear as '#<value>'. The '#' is purely a syntactic marker;
+the numeric value lives in the token following it. We discard the '#' and
+keep the numeric lexeme in an ARM_IMMEDIATE node.
+@End Reasoning
+
+@Implementation:
+Advances past the '#' TOKEN_HASH unconditionally, reads value_ptr/length off
+the next token (number or identifier - identifier covers labels used as
+immediates), wraps it in an ARM_IMMEDIATE node, advances. Returns 0 if the
+'#' is at EOF.
+@End Implementation
 
 Process called "parse_immediate" takes parser as Integer returns Integer:
     Note: Parse immediate value (#123)
@@ -373,6 +601,27 @@ Process called "parse_immediate" takes parser as Integer returns Integer:
 
     Return immediate
 End Process
+
+@Reasoning:
+Memory references use the ARM '[base, offset]' form, optionally with a '!'
+writeback marker. We capture the base register, optional offset (immediate
+or register), and writeback indicator into a single ARM_MEMORY node whose
+children encode all three. We do not parse pre/post-indexed variants beyond
+this; the to_hir layer infers indexing mode from the children.
+@End Reasoning
+
+@Implementation:
+Consumes '['. Allocates ARM_MEMORY. If the next token is a register, parses
+it via parse_register and attaches as first child. If a comma follows,
+consumes it and parses the offset via parse_operand (handles #imm, register,
+or shifted register) and attaches it. Consumes the expected ']'. If the next
+token is '!' (TOKEN_EXCLAIM, type 16), attaches a synthetic ARM_IDENTIFIER
+sentinel as a third child to encode writeback and consumes the '!'.
+@End Implementation
+
+@Performance_Hints:
+O(1) modulo the optional inner operand parse.
+@End Performance_Hints
 
 Process called "parse_memory" takes parser as Integer returns Integer:
     Note: Parse memory reference [base, offset]
@@ -430,6 +679,24 @@ Process called "parse_memory" takes parser as Integer returns Integer:
     Return memory
 End Process
 
+@Reasoning:
+LDM/STM and PUSH/POP take a brace-enclosed register list. We flatten the list
+into an ARM_REGISTER_LIST whose children are ARM_REGISTER nodes. Range
+notation ('r0-r3') is treated as separate registers at this layer; expanding
+ranges is a semantic-analysis concern, not a parsing one.
+@End Reasoning
+
+@Implementation:
+Consumes '{'. Allocates ARM_REGISTER_LIST. Loops: stop on '}' (type 11,
+advance and break); if the token is a register (type 2), parse it via
+parse_register and attach. After each register, consume an optional comma.
+EOF terminates the loop. Returns the list node.
+@End Implementation
+
+@Performance_Hints:
+O(k) where k is the number of registers in the list (typically <= 16).
+@End Performance_Hints
+
 Process called "parse_register_list" takes parser as Integer returns Integer:
     Note: Parse register list {r0-r3, lr}
 
@@ -471,6 +738,17 @@ Process called "parse_register_list" takes parser as Integer returns Integer:
     Return register_list
 End Process
 
+@Reasoning:
+When an identifier appears in operand position it is a symbol or label
+reference, not a label definition (parse_statement already disambiguated).
+We wrap the lexeme in an ARM_IDENTIFIER node; resolution to a symbol address
+happens later.
+@End Reasoning
+
+@Implementation:
+Captures value_ptr/length, builds an ARM_IDENTIFIER node, advances.
+@End Implementation
+
 Process called "parse_identifier_operand" takes parser as Integer returns Integer:
     Note: Parse identifier (label reference or symbol)
 
@@ -483,6 +761,18 @@ Process called "parse_identifier_operand" takes parser as Integer returns Intege
 
     Return identifier
 End Process
+
+@Reasoning:
+Some directive operands accept a bare number with no '#' prefix (e.g.
+'.word 42'). We still tag the result with ARM_IMMEDIATE because semantically
+a directive's numeric operand is an immediate value; this lets to_hir share
+one numeric-conversion path.
+@End Reasoning
+
+@Implementation:
+Captures value_ptr/length from the TOKEN_NUMBER token, wraps in an
+ARM_IMMEDIATE node, advances.
+@End Implementation
 
 Process called "parse_number_operand" takes parser as Integer returns Integer:
     Note: Parse number operand
@@ -497,6 +787,18 @@ Process called "parse_number_operand" takes parser as Integer returns Integer:
     Return number
 End Process
 
+@Reasoning:
+String literals appear only as directive operands (.ascii "...", .asciz "..."
+etc.). We currently tag them as ARM_IDENTIFIER because the lexeme - including
+the surrounding quotes - is preserved verbatim and the HIR lowerer recognises
+the leading quote.
+@End Reasoning
+
+@Implementation:
+Captures value_ptr/length from the TOKEN_STRING token, wraps in an
+ARM_IDENTIFIER node, advances.
+@End Implementation
+
 Process called "parse_string_operand" takes parser as Integer returns Integer:
     Note: Parse string operand
 
@@ -509,6 +811,23 @@ Process called "parse_string_operand" takes parser as Integer returns Integer:
 
     Return string_node
 End Process
+
+@Reasoning:
+Disambiguates an identifier at statement position. Without lookahead we
+cannot tell whether 'foo' is a label or an operand-style reference, but if
+the next token is ':' it must be a label definition. One token of lookahead
+is sufficient; we never need to commit and roll back.
+@End Reasoning
+
+@Implementation:
+Reads the parser's token list and current index. If current+1 is past the
+end, returns 0. Otherwise reads token at current+1 and returns 1 if its type
+is 13 (TOKEN_COLON), else 0. The parser cursor is not modified.
+@End Implementation
+
+@Performance_Hints:
+O(1).
+@End Performance_Hints
 
 Process called "is_label_definition" takes parser as Integer returns Integer:
     Note: Check if current position is a label definition (identifier followed by colon)
@@ -531,6 +850,21 @@ Process called "is_label_definition" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Read-only accessor used by every parse_* helper before deciding what to do.
+Returning 0 instead of asserting on out-of-range index turns end-of-stream
+into a regular control-flow signal that every caller already checks.
+@End Reasoning
+
+@Implementation:
+Reads the tokens list and current index off the parser. If current is at or
+past List.size, returns 0; otherwise returns List.get at current.
+@End Implementation
+
+@Performance_Hints:
+O(1) accessor. Called many times per token.
+@End Performance_Hints
+
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token without advancing
 
@@ -545,12 +879,39 @@ Process called "current_token" takes parser as Integer returns Integer:
     Return proc get from List with tokens, current
 End Process
 
+@Reasoning:
+Cursor mutation isolated to one helper so every parse_* path advances
+consistently. Does not bounds-check because current_token's out-of-range
+test handles end-of-stream uniformly.
+@End Reasoning
+
+@Implementation:
+Reads current at offset 16, writes current+1 back to offset 16.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer:
     Note: Move to next token
 
     Let current be proc memory_get_int64 from Layout with parser, 16
     proc memory_set_int64 from Layout with parser, 16, current plus 1
 End Process
+
+@Reasoning:
+Recovery primitive used when a statement is unrecognised. ARM source is
+line-structured so dropping the rest of the line is a deterministic, sane
+recovery point that lets parse continue with the next statement.
+@End Reasoning
+
+@Implementation:
+Loops reading current_token. On 0 (out of range) or token_type 0 (EOF),
+returns without advancing. On token_type 14 (newline), advances past it and
+returns. Otherwise advances and continues. Worst case consumes the rest of
+the token list.
+@End Implementation
+
+@Performance_Hints:
+O(remaining tokens on line).
+@End Performance_Hints
 
 Process called "skip_to_newline" takes parser as Integer:
     Note: Skip tokens until newline or EOF
@@ -575,6 +936,19 @@ Process called "skip_to_newline" takes parser as Integer:
     End While
 End Process
 
+@Reasoning:
+Single point of allocation for ArmNode to keep the 32-byte layout in one
+place. Every node gets its own children list at construction even if it
+turns out to be a leaf - we trade a small allocation for simpler walker code
+(no null-children check needed).
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes via Layout.allocate, writes node_type/value/value_length
+at offsets 0/8/16, creates a fresh List and stores its handle at offset 24.
+Returns the node pointer.
+@End Implementation
+
 Process called "create_arm_node" takes node_type as Integer, value as Integer, value_length as Integer returns Integer:
     Note: Create new AST node
 
@@ -586,6 +960,17 @@ Process called "create_arm_node" takes node_type as Integer, value as Integer, v
     proc memory_set_int64 from Layout with node, 24, children
     Return node
 End Process
+
+@Reasoning:
+Helper isolates the children-list mutation so future changes to the ArmNode
+layout (e.g. moving children to a different offset or switching list type)
+only require touching this one proc.
+@End Reasoning
+
+@Implementation:
+Reads the children List handle at parent offset 24 and pushes child onto it.
+Ownership of child transfers to parent.
+@End Implementation
 
 Process called "add_child" takes parent as Integer, child as Integer:
     Note: Add child node to parent

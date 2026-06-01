@@ -12,6 +12,30 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
+@Reasoning:
+Entry point converting a wasm_module HIR dictionary into WebAssembly
+Text Format (WAT). Validates the type tag first to avoid producing
+nonsense WAT from a wrong-type input.
+@End Reasoning
+
+@Implementation:
+Null-HIR guard returns 0. Creates a WASM emitter; reads HIR "type"
+and bails (destroying the emitter) if absent or not "wasm_module".
+Opens the module with "(module" plus optional name, then walks the
+top-level sections in canonical order: types, imports, functions,
+exports. Closes with ')' and newline. Returns the emitter's output.
+@End Implementation
+
+@Performance_Hints:
+Cold path - one call per HIR module. Cost is dominated by function
+body translation.
+@End Performance_Hints
+
+@Security_Scope:
+HIR input is trusted. Output ownership follows the emitter's
+get_output contract; the emitter is destroyed before return.
+@End Security_Scope
+
 Process called "generate_wasm_from_hir" takes hir as Integer returns Integer:
     Note: Main entry point - generate WAT from HIR dictionary
 
@@ -87,6 +111,19 @@ Process called "generate_wasm_from_hir" takes hir as Integer returns Integer:
     Return output
 End Process
 
+@Reasoning:
+Emits WASM type declarations - (type $name (func (param T) (result T)))
+forms that declare the signature of each function type used by the
+module. Required by the WASM binary format for type-checking.
+@End Reasoning
+
+@Implementation:
+Walks the types list. For each type HIR, emits "  (type" plus the
+type name (if any), then " (func". For each entry in "parameters",
+emits " (param T)" (T is the type string). For each entry in
+"results", emits " (result T)". Closes with "))" and a newline.
+@End Implementation
+
 Process called "generate_types" takes emitter as Integer, types as Integer:
     Note: Generate WASM type declarations
 
@@ -151,6 +188,25 @@ Process called "generate_types" takes emitter as Integer, types as Integer:
     End While
 End Process
 
+@Reasoning:
+Emits WASM import declarations - (import "mod" "name" desc) forms
+that bind external symbols (from JavaScript host, other modules) to
+module-local identifiers.
+@End Reasoning
+
+@Implementation:
+Walks the imports list. For each import HIR, emits "  (import ". The
+module string is double-quoted (34), then a space, then the name
+string is double-quoted, then a space and the descriptor (e.g.,
+"(func $name (type $sig))"). Closes with ')' and newline.
+@End Implementation
+
+@Security_Scope:
+Module and name strings are emitted verbatim between quotes; caller
+must ensure they contain no embedded quote characters that would
+break the WAT syntax.
+@End Security_Scope
+
 Process called "generate_imports" takes emitter as Integer, imports as Integer:
     Note: Generate WASM import declarations
 
@@ -200,6 +256,25 @@ Process called "generate_imports" takes emitter as Integer, imports as Integer:
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+Emits WASM function definitions - the bulk of any WAT module. Each
+function has a header (name plus signature), an optional locals list,
+and a body of nested-instruction s-expressions.
+@End Reasoning
+
+@Implementation:
+Walks the functions list. For each function HIR, opens with "  (func"
+plus the name (if any) and a newline. Then delegates the signature
+to generate_parameters and generate_results, the locals list to
+generate_locals, and the body to generate_instructions at indent
+level 4. Closes with "  )" and a newline.
+@End Implementation
+
+@Performance_Hints:
+Hot path within a single module - one full traversal per function.
+Each function body can dominate runtime.
+@End Performance_Hints
 
 Process called "generate_functions" takes emitter as Integer, functions as Integer:
     Note: Generate WASM function definitions
@@ -260,6 +335,17 @@ Process called "generate_functions" takes emitter as Integer, functions as Integ
     End While
 End Process
 
+@Reasoning:
+Emits one (param $name T) form per declared function parameter.
+Indented 4 spaces to align under the (func ...) header.
+@End Reasoning
+
+@Implementation:
+Walks the params list. For each param HIR, emits "    (param", then
+optionally " $name", then " T" (where T is the param_type), then ')'
+and a newline.
+@End Implementation
+
 Process called "generate_parameters" takes emitter as Integer, params as Integer:
     Note: Generate function parameters
 
@@ -297,6 +383,17 @@ Process called "generate_parameters" takes emitter as Integer, params as Integer
     End While
 End Process
 
+@Reasoning:
+Emits one (result T) form per declared function result. WASM 1.0
+allows at most one result per function but the multi-return-value
+proposal lifts this; the loop accommodates both.
+@End Reasoning
+
+@Implementation:
+Walks the results list. For each result HIR, emits "    (result"
+then " T" (where T is the result_type), then ')' and a newline.
+@End Implementation
+
 Process called "generate_results" takes emitter as Integer, results as Integer:
     Note: Generate function results
 
@@ -324,6 +421,18 @@ Process called "generate_results" takes emitter as Integer, results as Integer:
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+Emits one (local $name T) form per declared local variable in a
+function. Locals are addressed by index in WASM bytecode; the WAT
+form lets us also give them symbolic names.
+@End Reasoning
+
+@Implementation:
+Walks the locals list. For each local HIR, emits "    (local",
+optionally " $name", then " T" (where T is the local_type), then
+')' and a newline.
+@End Implementation
 
 Process called "generate_locals" takes emitter as Integer, locals as Integer:
     Note: Generate local variables
@@ -362,6 +471,18 @@ Process called "generate_locals" takes emitter as Integer, locals as Integer:
     End While
 End Process
 
+@Reasoning:
+Sequencer that emits each instruction in the body in source order at
+the supplied indent level. The indent is passed in (not derived
+internally) because nested instruction s-expressions must indent
+further than their parent.
+@End Reasoning
+
+@Implementation:
+Walks the instructions list and delegates each entry to
+generate_instruction, forwarding indent_level unchanged.
+@End Implementation
+
 Process called "generate_instructions" takes emitter as Integer, instructions as Integer, indent_level as Integer:
     Note: Generate instruction list with proper indentation
 
@@ -374,6 +495,30 @@ Process called "generate_instructions" takes emitter as Integer, instructions as
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+Core recursive emitter for a single WAT instruction. Handles three
+shapes: opcode-only ("nop", "drop"), opcode with simple operands
+("(i32.const 42)"), and opcode with nested instructions as operands
+("(i32.add (local.get $a) (local.get $b))"). Nested instructions
+indent further to keep the s-expression structure readable.
+@End Reasoning
+
+@Implementation:
+Emits the leading indent (a literal space count = indent_level).
+Reads the "opcode" string and bails if missing. If "operands" is
+non-null, opens with '(' and the opcode, then iterates operands. For
+each operand, checks the "type" field: type == "instruction" means
+recurse with indent_level + 2 on a new line; otherwise treat as a
+simple immediate and emit " value". Closes with ')'. If no operands,
+emits the opcode bare. Terminates with a newline.
+@End Implementation
+
+@Performance_Hints:
+O(n) in total instruction count including nested children.
+Recursion depth bounded by the original HIR's nesting; WAT itself
+limits practical nesting in real-world modules.
+@End Performance_Hints
 
 Process called "generate_instruction" takes emitter as Integer, instr_hir as Integer, indent_level as Integer:
     Note: Generate a single instruction with proper S-expression nesting
@@ -442,6 +587,23 @@ Process called "generate_instruction" takes emitter as Integer, instr_hir as Int
     proc emit_char from Emitter with emitter, 10  Note: Newline
 End Process
 
+@Reasoning:
+Emits WASM export declarations - (export "name" $internal) forms
+exposing internal symbols to the host environment under (possibly
+different) external names.
+@End Reasoning
+
+@Implementation:
+Walks the exports list. For each export HIR, emits "  (export ", a
+double-quoted name string, a space, then the internal reference
+verbatim (e.g., "(func $foo)"). Closes with ')' and a newline.
+@End Implementation
+
+@Security_Scope:
+Export name is double-quoted; caller must ensure it contains no
+embedded quote characters.
+@End Security_Scope
+
 Process called "generate_exports" takes emitter as Integer, exports as Integer:
     Note: Generate WASM export declarations
 
@@ -481,6 +643,20 @@ Process called "generate_exports" takes emitter as Integer, exports as Integer:
     End While
 End Process
 
+@Reasoning:
+Local null-terminated string compare, inlined to keep the dispatcher
+hot path dependency-light.
+@End Reasoning
+
+@Implementation:
+Byte-by-byte walk; returns 0 on first mismatch, 1 when both bytes
+hit NUL simultaneously. Sentinel-free infinite-loop form.
+@End Implementation
+
+@Performance_Hints:
+O(n) in shorter string length. No allocation.
+@End Performance_Hints
+
 Process called "string_equals" takes str1 as String, str2 as String returns Integer:
     Note: Compare two null-terminated strings for equality
 
@@ -498,6 +674,11 @@ Process called "string_equals" takes str1 as String, str2 as String returns Inte
     End While
     Return 0
 End Process
+
+@Reasoning:
+Local alias for StringCore.create_string_from_literal; keeps call
+sites concise.
+@End Reasoning
 
 Process called "create_string_literal" takes value as String returns Integer:
     Return proc create_string_from_literal from StringCore with value

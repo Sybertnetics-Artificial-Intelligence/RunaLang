@@ -23,6 +23,27 @@ Constant ARM_REGISTER_LIST as Integer is 7
 Constant ARM_SHIFTED as Integer is 8
 Constant ARM_IDENTIFIER as Integer is 9
 
+@Reasoning:
+Top-level entry that flattens the ARM parser's tree into a HIR document
+shaped as a dictionary with "type"=arm_assembly plus three parallel lists
+(instructions, directives, labels). Categorising at translation time means
+downstream consumers (validator, codegen) can index directly without
+re-walking the AST.
+@End Reasoning
+
+@Implementation:
+Guards on a 0 AST. Creates a Dict, stamps type=arm_assembly. Allocates three
+empty Lists. Iterates the root's children, dispatches on node_type to
+translate_instruction / translate_directive / translate_label, and pushes
+non-null results into the matching list. Stores all three lists into the
+HIR dict under "instructions", "directives", "labels". Returns the dict.
+@End Implementation
+
+@Performance_Hints:
+O(n) over AST nodes plus O(d) over dictionary operations. Single pass over
+the top-level statements; deep recursion handled by per-statement helpers.
+@End Performance_Hints
+
 Process called "translate_arm_to_hir" takes arm_ast as Integer returns Integer:
     Note: Main entry point - translate ARM AST to HIR dictionary
 
@@ -88,6 +109,23 @@ Process called "translate_arm_to_hir" takes arm_ast as Integer returns Integer:
     Return hir
 End Process
 
+@Reasoning:
+Lowers an ARM_INSTRUCTION AST node into a {type, mnemonic, operands} HIR
+dict. Operand translation is delegated to translate_operand so that
+instruction lowering does not have to know about each operand kind.
+@End Reasoning
+
+@Implementation:
+Creates a dict, sets type="instruction". Reads value_ptr/length from offsets
+8/16 and (when non-empty) builds a Runa String for the mnemonic, stored
+under "mnemonic". Walks the children list, calls translate_operand on each,
+collects non-null results into an "operands" List stored on the dict.
+@End Implementation
+
+@Performance_Hints:
+O(operand count) plus O(1) dict writes.
+@End Performance_Hints
+
 Process called "translate_instruction" takes instr_node as Integer returns Integer:
     Note: Translate instruction node to HIR dictionary
 
@@ -127,6 +165,24 @@ Process called "translate_instruction" takes instr_node as Integer returns Integ
 
     Return instr_hir
 End Process
+
+@Reasoning:
+Lowers an ARM_DIRECTIVE node into a {type, name, arguments} dict. Mirrors
+translate_instruction structurally because the AST shapes for directives
+and instructions are parallel (lexeme + operand list); only the schema
+keys differ ("name"/"arguments" vs "mnemonic"/"operands").
+@End Reasoning
+
+@Implementation:
+Creates a dict with type="directive". Reads the directive lexeme from
+offsets 8/16 (including the leading '.') and stores under "name". Iterates
+children, translates each via translate_operand, and pushes non-null
+results into an "arguments" List on the dict.
+@End Implementation
+
+@Performance_Hints:
+O(argument count).
+@End Performance_Hints
 
 Process called "translate_directive" takes dir_node as Integer returns Integer:
     Note: Translate directive node to HIR dictionary
@@ -168,6 +224,16 @@ Process called "translate_directive" takes dir_node as Integer returns Integer:
     Return dir_hir
 End Process
 
+@Reasoning:
+A label is just a named anchor; the HIR only needs the label's name and a
+type tag. No operands are involved, so no child walk is required.
+@End Reasoning
+
+@Implementation:
+Creates a dict with type="label". Reads name lexeme from offsets 8/16,
+stores under "name" if non-empty.
+@End Implementation
+
 Process called "translate_label" takes label_node as Integer returns Integer:
     Note: Translate label node to HIR dictionary
 
@@ -189,6 +255,21 @@ Process called "translate_label" takes label_node as Integer returns Integer:
 
     Return label_hir
 End Process
+
+@Reasoning:
+Single dispatcher for the closed set of ARM operand kinds (register,
+immediate, memory, register_list, shifted, identifier). Centralising the
+switch keeps callers in instructions/directives identical and ensures every
+operand kind round-trips to a well-known HIR schema.
+@End Reasoning
+
+@Implementation:
+Null-safe (returns 0 on a 0 node). Reads node_type at offset 0 and routes:
+ARM_REGISTER -> translate_register, ARM_IMMEDIATE -> translate_immediate,
+ARM_MEMORY -> translate_memory, ARM_REGISTER_LIST -> translate_register_list,
+ARM_SHIFTED -> translate_shifted, ARM_IDENTIFIER -> translate_identifier.
+Unknown node types return 0 so the caller can skip them.
+@End Implementation
 
 Process called "translate_operand" takes operand_node as Integer returns Integer:
     Note: Translate operand node to HIR dictionary
@@ -226,6 +307,17 @@ Process called "translate_operand" takes operand_node as Integer returns Integer
     Return 0
 End Process
 
+@Reasoning:
+Registers lower to a minimal {type, name} dict. Register-bank validation
+(legal register set, sp/lr/pc aliasing) is deferred to semantic analysis;
+this layer just preserves the lexeme.
+@End Reasoning
+
+@Implementation:
+Creates a dict with type="register". Reads value lexeme from offsets 8/16
+and stores under "name" if non-empty.
+@End Implementation
+
 Process called "translate_register" takes reg_node as Integer returns Integer:
     Note: Translate register operand to HIR
 
@@ -247,6 +339,17 @@ Process called "translate_register" takes reg_node as Integer returns Integer:
     Return reg_hir
 End Process
 
+@Reasoning:
+Immediates lower to {type, value} preserving the textual representation
+(e.g. '0xFF', '#42'). Numeric conversion is deferred so the HIR can still
+carry hex/dec/bin forms for diagnostics and round-trip printing.
+@End Reasoning
+
+@Implementation:
+Creates a dict with type="immediate". Reads value lexeme from offsets 8/16
+and stores under "value" if non-empty.
+@End Implementation
+
 Process called "translate_immediate" takes imm_node as Integer returns Integer:
     Note: Translate immediate value to HIR
 
@@ -267,6 +370,22 @@ Process called "translate_immediate" takes imm_node as Integer returns Integer:
 
     Return imm_hir
 End Process
+
+@Reasoning:
+Memory references decompose into {type, base, offset?, writeback?}. The
+arm_parser produces children in a fixed positional order (base, optional
+offset, optional writeback sentinel), and we recover the schema by indexing
+those positions rather than tagging children in the AST.
+@End Reasoning
+
+@Implementation:
+Creates dict type="memory". Walks children list by index: child 0 is the
+base register, extracted as a raw string via get_operand_value_string and
+stored under "base". Child 1, if present, is the offset, lowered recursively
+via translate_operand and stored under "offset". Child 2's mere presence
+signals writeback; we store writeback="true" without inspecting the child
+(it is the sentinel ARM_IDENTIFIER from arm_parser.parse_memory).
+@End Implementation
 
 Process called "translate_memory" takes mem_node as Integer returns Integer:
     Note: Translate memory reference to HIR
@@ -307,6 +426,22 @@ Process called "translate_memory" takes mem_node as Integer returns Integer:
     Return mem_hir
 End Process
 
+@Reasoning:
+Register lists (LDM/STM/PUSH/POP) lower to {type, registers} where
+registers is a List of register HIR dicts. We re-use translate_operand for
+each child so range expansion or future shifted-list extensions only need
+to be implemented once.
+@End Reasoning
+
+@Implementation:
+Creates dict type="register_list". Iterates children, calls translate_operand
+on each, collects non-null results into a "registers" List on the dict.
+@End Implementation
+
+@Performance_Hints:
+O(register count). Typically <= 16.
+@End Performance_Hints
+
 Process called "translate_register_list" takes reglist_node as Integer returns Integer:
     Note: Translate register list to HIR
 
@@ -336,6 +471,23 @@ Process called "translate_register_list" takes reglist_node as Integer returns I
 
     Return reglist_hir
 End Process
+
+@Reasoning:
+A shifted operand 'Rm, LSL #imm' carries three pieces (base register, shift
+op mnemonic, shift amount). Lowering to {type, register, shift_op,
+shift_amount} keeps these decoupled so codegen can pattern-match each
+piece independently.
+@End Reasoning
+
+@Implementation:
+Creates dict type="shifted". Reads child 0 as the base register and lowers
+recursively via translate_operand, stored under "register". Reads child 1
+as the shift operator and extracts its raw lexeme (LSL/LSR/ASR/ROR) via
+get_operand_value_string, stored under "shift_op". Reads child 2 as the
+shift amount and lowers recursively via translate_operand, stored under
+"shift_amount". All three children are optional; missing ones leave the
+key absent.
+@End Implementation
 
 Process called "translate_shifted" takes shifted_node as Integer returns Integer:
     Note: Translate shifted operand to HIR
@@ -377,6 +529,17 @@ Process called "translate_shifted" takes shifted_node as Integer returns Integer
     Return shifted_hir
 End Process
 
+@Reasoning:
+A bare identifier in operand position is a symbol or label reference. Lowers
+to {type, name}. The HIR layer does not resolve the symbol; downstream
+linking handles that.
+@End Reasoning
+
+@Implementation:
+Creates dict type="identifier". Reads value lexeme from offsets 8/16 and
+stores under "name" if non-empty.
+@End Implementation
+
 Process called "translate_identifier" takes ident_node as Integer returns Integer:
     Note: Translate identifier (symbol) to HIR
 
@@ -398,6 +561,19 @@ Process called "translate_identifier" takes ident_node as Integer returns Intege
     Return ident_hir
 End Process
 
+@Reasoning:
+Small helper used where the lowerer wants the raw lexeme of an operand
+(not a wrapped dict) - e.g. when storing the memory base or the shift
+operator. Returns an empty string instead of 0 so callers can store the
+result into a Dict without a null check.
+@End Reasoning
+
+@Implementation:
+Reads value_ptr/length from offsets 8/16. If length > 0, materialises a
+Runa String from the byte range via create_string_from_buffer. Otherwise
+returns a fresh empty string literal.
+@End Implementation
+
 Process called "get_operand_value_string" takes operand_node as Integer returns Integer:
     Note: Extract value string from operand node
 
@@ -408,6 +584,17 @@ Process called "get_operand_value_string" takes operand_node as Integer returns 
     End If
     Return proc create_string_literal with ""
 End Process
+
+@Reasoning:
+Thin alias for StringCore.create_string_from_literal so the file's
+translation helpers can use a short local name and we have a single place
+to add interning, caching, or memory-tracking later without touching every
+call site.
+@End Reasoning
+
+@Implementation:
+One-line wrapper delegating directly to StringCore.create_string_from_literal.
+@End Implementation
 
 Process called "create_string_literal" takes value as String returns Integer:
     Return proc create_string_from_literal from StringCore with value

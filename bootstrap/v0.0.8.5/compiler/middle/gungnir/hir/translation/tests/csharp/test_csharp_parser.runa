@@ -14,11 +14,42 @@ Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/io/file.runa" as File
 
+@Reasoning:
+Lightweight accumulator passed by reference to every test helper so the suite
+can tally totals without relying on global state. Three Integer counters keep
+the struct flat-loadable from memory_get_int64 at offsets 0/8/16.
+@End Reasoning
+
+@Implementation:
+Plain POD: total at offset 0, passed at offset 8, failed at offset 16.
+Initialized to zero by main and mutated via memory_set_int64 inside
+test_parse_file because results is passed as an Integer handle.
+@End Implementation
+
 Type called "TestResults":
     total as Integer
     passed as Integer
     failed as Integer
 End Type
+
+@Reasoning:
+Top-level driver for the C# parser corpus. Exercises ten representative
+.cs programs covering language surface most likely to regress (classes,
+properties, lambdas, generics, async, events, control flow, operators,
+nullable types, namespaces). Exit code maps to results.failed so CI
+fails on any regression.
+@End Reasoning
+
+@Implementation:
+Allocates a TestResults on stack, calls test_parse_file once per program,
+then prints aggregate counts. Returns 1 when any test failed, 0 otherwise.
+@End Implementation
+
+@TestCases:
+- All 10 .cs programs parse to non-null AST with root node type 3000 -> exit 0
+- Any single program failing to parse -> exit 1
+- Empty corpus path -> read_file returns 0 -> failure counted, exit 1
+@End TestCases
 
 Process called "main" returns Integer:
     Let results be a value of type TestResults with total as 0, passed as 0, failed as 0
@@ -44,6 +75,30 @@ Process called "main" returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Single-program parse check used by main as the per-corpus probe. Pulled
+out so each program path is one call site and so the results counter
+mutation logic lives in exactly one place.
+@End Reasoning
+
+@Implementation:
+1. Increment results.total.
+2. read_file(content); null -> record failure ("Failed to read file").
+3. parse_csharp(content); null AST -> record failure.
+4. memory_get_int64(ast, 0) must equal 3000 (CSHARP_PROGRAM) -> otherwise
+   "Invalid root node type" failure.
+5. On success, increment results.passed and print [PASS].
+6. Always deallocate(content) before returning on the success path; the
+   failure paths that already deallocated must not double-free.
+@End Implementation
+
+@TestCases:
+- programs/basic_class.cs -> AST root 3000, results.passed += 1
+- Non-existent path -> read_file == 0 -> failure with "Failed to read file"
+- Malformed .cs -> parse_csharp returns 0 -> failure with "Parser returned null AST"
+- Valid lex but wrong root tag (synthetic) -> failure with "Invalid root node type"
+@End TestCases
 
 Process called "test_parse_file" takes file_path as Integer, test_name as Integer, results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -87,6 +142,16 @@ Process called "test_parse_file" takes file_path as Integer, test_name as Intege
     Return 1
 End Process
 
+@Reasoning:
+Suite banner emitted once at startup. Separator width matches the title
+so visual scanning of CI logs lines up.
+@End Reasoning
+
+@Implementation:
+Allocate the title and a 22-character "=" rule via StringCore, print
+each via the runtime print primitive, then deallocate. Always returns 1.
+@End Implementation
+
 Process called "print_header" returns Integer:
     Let header be proc create_string from StringCore with "C# Parser Test Suite"
     proc print from header
@@ -99,6 +164,17 @@ Process called "print_header" returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Emits a "[PASS] <test_name>" line. Kept separate from print_test_failure
+so grep "[FAIL]" on CI output cleanly isolates regressions.
+@End Reasoning
+
+@Implementation:
+Allocate "[PASS] " prefix string, print it, then print the caller-owned
+test_name pointer. Caller retains ownership of test_name; only the
+prefix string is freed here.
+@End Implementation
+
 Process called "print_test_success" takes test_name as Integer returns Integer:
     Let pass_msg be proc create_string from StringCore with "[PASS] "
     proc print from pass_msg
@@ -107,6 +183,18 @@ Process called "print_test_success" takes test_name as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Emits "[FAIL] <test_name>: <reason>" — both name and reason are caller
+owned. Required so a CI failure shows which program failed AND why
+(missing file vs. parser-null vs. wrong root tag) without grepping
+upstream context.
+@End Reasoning
+
+@Implementation:
+Allocate "[FAIL] " prefix, print prefix, print test_name, print ": ",
+print reason, deallocate prefix. test_name and reason are not freed.
+@End Implementation
 
 Process called "print_test_failure" takes test_name as Integer, reason as Integer returns Integer:
     Let fail_msg be proc create_string from StringCore with "[FAIL] "
@@ -118,6 +206,19 @@ Process called "print_test_failure" takes test_name as Integer, reason as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Final summary footer with total/passed/failed counts. Reads counters
+directly via struct field access (results.total, etc.) rather than
+memory_get_int64 because the type-checked path is preferred at the
+report site.
+@End Reasoning
+
+@Implementation:
+Print "======================" rule, "Test Results:" heading, then
+three "Total: N", "Passed: N", "Failed: N" lines. Each label string
+is allocated, printed, and deallocated; numeric values use print_int.
+@End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
     Let separator be proc create_string from StringCore with "======================"
@@ -145,6 +246,24 @@ Process called "print_results" takes results as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Self-contained integer printer so the test harness has no dependency on
+stdlib formatting (those modules pull in heavyweight allocators not yet
+wired in this layer). Handles zero and negative values explicitly so
+single-digit edge cases don't fall through the divmod loop.
+@End Reasoning
+
+@Implementation:
+1. If value == 0, print "0" and return early.
+2. Allocate a 32-byte buffer, walk position from 31 downward, writing
+   ASCII digits (48 + value % 10) right-to-left.
+3. For negative values, work on -temp during the loop and prepend '-'
+   (45) at the final position.
+4. Advance position by 1 to skip past the last decrement, then print
+   buffer + position as a zero-terminated C string.
+5. Deallocate the 32-byte buffer.
+@End Implementation
 
 Process called "print_int" takes value as Integer returns Integer:
     If value is equal to 0:

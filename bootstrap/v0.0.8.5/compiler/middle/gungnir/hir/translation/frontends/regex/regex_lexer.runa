@@ -67,6 +67,14 @@ Note: ========================================
 Note: Token Structure
 Note: ========================================
 
+@Reasoning:
+Regex tokens carry the same shape as the other frontend lexers: a tag plus a non-owning view into source and the byte offset, so diagnostics can map back without re-scanning.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields: type discriminator, pointer into source, value byte length, originating source position.
+@End Implementation
+
 Type called "RegexToken":
     token_type as Integer     Note: Token type constant
     value as Integer          Note: Pointer to token value string
@@ -78,12 +86,28 @@ Note: ========================================
 Note: Lexer Structure
 Note: ========================================
 
+@Reasoning:
+Regex patterns are typically short, single-line strings; the lexer keeps the source pointer, its cached length, the read cursor, and the accumulating token List together for cache locality.
+@End Reasoning
+
+@Implementation:
+Four 8-byte slots: source pointer, source length, current byte cursor, and pointer to a List of RegexToken pointers populated by tokenize.
+@End Implementation
+
 Type called "RegexLexer":
     source as Integer         Note: Pointer to source string
     source_length as Integer  Note: Length of source
     position as Integer       Note: Current position in source
     tokens as Integer         Note: List of tokens
 End Type
+
+@Reasoning:
+Measuring the pattern length once at construction lets the inner branch-heavy dispatch avoid repeated string_length probes.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes, store the source pointer and its measured length, initialise the cursor to 0, allocate the token List, and return the lexer pointer.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create new regex lexer
@@ -103,6 +127,14 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+The lexer owns its accumulated token list; destruction must release both to keep ownership symmetric with create_lexer.
+@End Reasoning
+
+@Implementation:
+Read the token-list pointer from offset 24, dispose via List.destroy, then deallocate the 32-byte lexer block.
+@End Implementation
+
 Process called "destroy_lexer" takes lexer as Integer:
     Note: Destroy regex lexer
 
@@ -115,6 +147,22 @@ End Process
 Note: ========================================
 Note: Tokenization
 Note: ========================================
+
+@Reasoning:
+Driving the lexer to completion in one loop keeps the per-token policy (skip EOF, store everything else) in a single place.
+@End Reasoning
+
+@Implementation:
+Loop calling next_token; on null break; on EOF tag (0) break; otherwise push onto the accumulator list.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source byte length; one token allocation per produced token.
+@End Performance_Hints
+
+@Security_Scope:
+Operates on untrusted regex source. next_token's bound check at entry plus the catch-all "unknown char becomes TOKEN_LITERAL" path ensure forward progress on every input.
+@End Security_Scope
 
 Process called "tokenize" takes lexer as Integer:
     Note: Tokenize complete regex pattern
@@ -136,6 +184,18 @@ Process called "tokenize" takes lexer as Integer:
         proc push from List with tokens, token
     End While
 End Process
+
+@Reasoning:
+PCRE syntax is uniformly first-character dispatchable: meta-characters (* + ? { ^ $ ( ) | . [ ]) are single bytes; backslash and "(?" introduce variable-length escape and group-flavour scans handled by helpers.
+@End Reasoning
+
+@Implementation:
+On EOF emit a TOKEN_EOF. Backslash (92) -> lex_backslash. Single-byte meta-characters [ ] * + ? ^ $ ) | . each emit their own token tag and consume one byte. { -> lex_quantifier_range. ( -> lex_group_start. Any other character becomes a one-byte TOKEN_LITERAL.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; the EOF check on entry plus per-character one-byte advance guarantee termination.
+@End Security_Scope
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
@@ -229,6 +289,14 @@ End Process
 Note: ========================================
 Note: Backslash Handling
 Note: ========================================
+
+@Reasoning:
+After "\", the next character determines kind: shorthand classes (\d \D \w \W \s \S), word-boundary anchors (\b \B), absolute anchors (\A \Z \z), numeric backreferences (\1..\9..), named backreferences (\k<name>), or escape of a literal meta-character.
+@End Reasoning
+
+@Implementation:
+Bound-check the source. If the following byte is d/D/w/W/s/S emit TOKEN_CHAR_CLASS_SHORTHAND with span 2. If b/B emit TOKEN_ANCHOR_WORD. If A emit TOKEN_ANCHOR_START, Z or z emit TOKEN_ANCHOR_END. Digits 0-9 -> lex_backreference. 'k' -> lex_named_backreference. Anything else becomes a 2-byte TOKEN_ESCAPED literal.
+@End Implementation
 
 Process called "lex_backslash" takes lexer as Integer returns Integer:
     Note: Lex escaped sequences, character classes, or anchors after backslash
@@ -324,6 +392,18 @@ Note: ========================================
 Note: Quantifier Range Lexing
 Note: ========================================
 
+@Reasoning:
+"{n}", "{n,}", "{n,m}" carry their bracketed contents as the literal lexeme; deferring numeric parsing to the parser keeps the lexer minimal.
+@End Reasoning
+
+@Implementation:
+Record start_pos at '{', advance past it, then consume bytes until '}' (125) is found or source ends; consume the '}' as well. Emit TOKEN_QUANTIFIER_RANGE with the full bracketed lexeme.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. Source-length bound guarantees termination on an unclosed "{".
+@End Security_Scope
+
 Process called "lex_quantifier_range" takes lexer as Integer returns Integer:
     Note: Lex quantifier range {n}, {n,}, {n,m}
 
@@ -355,6 +435,14 @@ End Process
 Note: ========================================
 Note: Group Start Lexing
 Note: ========================================
+
+@Reasoning:
+PCRE encodes group flavour in the 2-4 bytes after "(": "(?:" non-capturing, "(?=" positive lookahead, "(?!" negative lookahead, "(?<=" / "(?<!" lookbehinds, "(?<name>" / "(?P<name>" named groups. Lexing the flavour up front saves the parser a separate disambiguation pass.
+@End Reasoning
+
+@Implementation:
+If the next byte is not '?', emit TOKEN_GROUP_START (length 1). Otherwise inspect the third byte. ':' -> NON_CAPTURING (length 3). '=' -> LOOKAHEAD_POS. '!' -> LOOKAHEAD_NEG. '<' triggers a 4th-byte test: '=' LOOKBEHIND_POS, '!' LOOKBEHIND_NEG, otherwise hand off to lex_named_group. 'P' -> lex_named_group. Bound checks at each step return a simple GROUP_START on truncation.
+@End Implementation
 
 Process called "lex_group_start" takes lexer as Integer returns Integer:
     Note: Lex group start: (, (?:, (?<name>, (?=, (?!, (?<=, (?<!
@@ -438,6 +526,18 @@ Note: ========================================
 Note: Named Group Lexing
 Note: ========================================
 
+@Reasoning:
+A named group's lexeme spans from the opening "(?<" through the closing ">"; capturing it intact lets the parser extract the name without re-scanning.
+@End Reasoning
+
+@Implementation:
+Record start_pos at the current position, advance byte-by-byte until '>' (62) or source ends; consume '>'. Emit TOKEN_NAMED_GROUP with the full lexeme.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. Source-length bound ensures termination on an unterminated named group.
+@End Security_Scope
+
 Process called "lex_named_group" takes lexer as Integer returns Integer:
     Note: Lex named group (?<name> or (?P<name>
 
@@ -468,6 +568,14 @@ End Process
 Note: ========================================
 Note: Backreference Lexing
 Note: ========================================
+
+@Reasoning:
+Numeric backreferences "\1", "\23" can have multiple trailing digits (PCRE supports two-digit references for groups 1-99); greedy digit consumption preserves the full reference.
+@End Reasoning
+
+@Implementation:
+Record start_pos at '\', advance two bytes past '\\' and the first digit, then greedily consume any additional ASCII digits 48-57. Emit TOKEN_BACKREFERENCE with the full "\NN" lexeme.
+@End Implementation
 
 Process called "lex_backreference" takes lexer as Integer returns Integer:
     Note: Lex backreference \1, \2, etc.
@@ -500,6 +608,18 @@ Process called "lex_backreference" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_BACKREFERENCE, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+A named backreference "\k<name>" spans from the leading backslash through the closing '>'; capturing the full lexeme leaves name-extraction to the parser.
+@End Reasoning
+
+@Implementation:
+Record start_pos at the leading '\' (cursor already there), advance byte-by-byte until '>' (62) or source ends; consume the '>'. Emit TOKEN_BACKREFERENCE with the full "\k<name>" lexeme.
+@End Implementation
+
+@Security_Scope:
+Untrusted source. Source-length bound ensures termination on an unterminated named reference.
+@End Security_Scope
+
 Process called "lex_named_backreference" takes lexer as Integer returns Integer:
     Note: Lex named backreference \k<name>
 
@@ -530,6 +650,14 @@ End Process
 Note: ========================================
 Note: Helper Functions
 Note: ========================================
+
+@Reasoning:
+Every lex_* helper hands off here so that the RegexToken layout (tag + lexeme view + position) lives in exactly one site.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes (four 8-byte slots) and populate token_type, value_ptr, value_length, position in order.
+@End Implementation
 
 Process called "create_token" takes token_type as Integer, value_ptr as Integer, value_length as Integer, position as Integer returns Integer:
     Note: Create new token

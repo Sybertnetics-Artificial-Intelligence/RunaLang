@@ -20,6 +20,32 @@ Import "compiler/middle/gungnir/hir/translation/backends/emitter_common.runa" as
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
+@Reasoning:
+Top-level entry point for the HIR -> CSS backend. Owns the emitter lifecycle
+so callers can pass an HIR root and receive a freshly allocated CSS source
+buffer without managing buffer state themselves.
+@End Reasoning
+
+@Implementation:
+Creates a raw byte-buffer emitter via emitter_common, dispatches the root node
+through generate_node at indent level 0, then snapshots the buffer into a
+heap-allocated null-terminated string. Returns 0 if the emitter allocation
+fails. The emitter is intentionally NOT destroyed here because the returned
+output points into a freshly allocated copy and the caller owns it.
+@End Implementation
+
+@Performance_Hints:
+Cost is dominated by the recursive walk in generate_node; emitter appends are
+amortized O(1). Whole-file generation is O(n) in HIR node count plus output
+byte count.
+@End Performance_Hints
+
+@Security_Scope:
+Trusts the HIR dictionary shape produced by the upstream parser. No untrusted
+external input is read directly; all dispatch is keyed by sanitized "type"
+discriminators baked into the HIR.
+@End Security_Scope
+
 Process called "generate_css" takes hir as Integer returns Integer:
     Let emitter be proc emitter_raw_create from EmitterCommon
 
@@ -33,6 +59,26 @@ Process called "generate_css" takes hir as Integer returns Integer:
 
     Return output
 End Process
+
+@Reasoning:
+Central dispatcher that routes an HIR node to its CSS-specific generator
+based on a "type" string discriminator. Centralising dispatch keeps each
+generate_* helper focused on one shape of HIR.
+@End Reasoning
+
+@Implementation:
+Null nodes are silently accepted (return 1) so recursive callers can pass
+optional children without pre-checks. Reads the "type" field, compares it
+against the five known CSS node kinds (stylesheet, rule, at-rule, comment,
+declaration is handled by the rule path) and tail-delegates. Unknown types
+return success rather than aborting to keep the backend forward-compatible
+with HIR additions.
+@End Implementation
+
+@Performance_Hints:
+O(k) string comparisons where k is the number of recognised node types
+(small constant). Per-call cost is dominated by the chosen subroutine.
+@End Performance_Hints
 
 Process called "generate_node" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     If node is equal to 0:
@@ -70,6 +116,23 @@ Process called "generate_node" takes node as Integer, emitter as Integer, indent
     Return 1
 End Process
 
+@Reasoning:
+Top-level stylesheet emission iterates the rules list and emits each with a
+blank line between rules but not after the final one. Avoiding a trailing
+blank line keeps generated CSS clean for downstream minifiers.
+@End Reasoning
+
+@Implementation:
+Reads the "rules" list off the stylesheet dict, walks it with an index loop,
+calls generate_node for each rule, and emits a single newline (byte 10) only
+when not on the final rule. Returns 1 even if the rules key is missing so
+empty stylesheets are valid output.
+@End Implementation
+
+@Performance_Hints:
+O(n) in number of rules; per-rule cost dominates.
+@End Performance_Hints
+
 Process called "generate_stylesheet" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Let rules_key be proc create_string from StringCore with "rules"
     Let rules be proc dict_get with node, rules_key
@@ -96,6 +159,23 @@ Process called "generate_stylesheet" takes node as Integer, emitter as Integer, 
 
     Return 1
 End Process
+
+@Reasoning:
+Emits a CSS rule: indented selector list followed by a brace-delimited block
+of declarations. Comma-separated selector grouping mirrors how human-written
+CSS conveys "this block applies to all of these".
+@End Reasoning
+
+@Implementation:
+Emits indent, then walks the "selectors" list joining with ", ". Opens with
+" {\n", iterates the "declarations" list at indent_level+1, then closes with
+an indented "}\n". Missing selector or declaration lists are tolerated to
+allow partially-constructed rules during incremental HIR generation.
+@End Implementation
+
+@Performance_Hints:
+O(s + d) where s is selector count and d is declaration count.
+@End Performance_Hints
 
 Process called "generate_rule" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     proc emit_indent with emitter, indent_level
@@ -145,6 +225,24 @@ Process called "generate_rule" takes node as Integer, emitter as Integer, indent
 
     Return 1
 End Process
+
+@Reasoning:
+Handles CSS at-rules (@media, @import, @keyframes, etc.). At-rules may be
+statement-form (";"-terminated) or block-form ("{...}"); both shapes are
+emitted by inspecting whether the at-rule has a "rules" child list.
+@End Reasoning
+
+@Implementation:
+Emits "@" (byte 64) followed by the rule name. If the rules child is absent
+the rule is closed with ";\n" (statement form). An empty rules list produces
+" {}\n" to preserve the at-rule's block shape. Non-empty rules are emitted
+between " {\n" and "}\n" at indent_level+1, with blank-line separators
+identical to generate_stylesheet.
+@End Implementation
+
+@Performance_Hints:
+O(n) in nested rule count; recursion depth bounded by HIR nesting depth.
+@End Performance_Hints
 
 Process called "generate_at_rule" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     proc emit_indent with emitter, indent_level
@@ -196,6 +294,18 @@ Process called "generate_at_rule" takes node as Integer, emitter as Integer, ind
     Return 1
 End Process
 
+@Reasoning:
+Emits a single CSS declaration ("property: value;"). Both property and value
+are treated as opaque pre-validated strings produced by the CSS parser; the
+emitter does no syntactic checking here.
+@End Reasoning
+
+@Implementation:
+Emits leading indent, then "property", ": ", "value", and ";\n". Either
+component being absent emits the surrounding punctuation anyway so malformed
+HIR produces visibly malformed CSS rather than silently skipped output.
+@End Implementation
+
 Process called "generate_declaration" takes declaration as Integer, emitter as Integer, indent_level as Integer returns Integer:
     proc emit_indent with emitter, indent_level
 
@@ -222,6 +332,18 @@ Process called "generate_declaration" takes declaration as Integer, emitter as I
     Return 1
 End Process
 
+@Reasoning:
+Preserves CSS comments from the source through HIR by emitting "/* ... */"
+blocks. Comment preservation matters for licence headers and downstream
+tooling annotations that round-trip through Runa.
+@End Reasoning
+
+@Implementation:
+Emits indent, "/* ", the raw "value" string, then " */\n". The value is
+emitted verbatim - the parser is responsible for stripping any embedded
+"*/" sequences, since CSS comments cannot nest.
+@End Implementation
+
 Process called "generate_comment" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     proc emit_indent with emitter, indent_level
 
@@ -240,6 +362,16 @@ Process called "generate_comment" takes node as Integer, emitter as Integer, ind
     Return 1
 End Process
 
+@Reasoning:
+CSS convention uses 2-space indentation per nesting level. Centralising the
+indent count here keeps the convention consistent and easy to retune.
+@End Reasoning
+
+@Implementation:
+Multiplies level by 2 and emits that many ASCII space bytes (32). Zero level
+emits nothing.
+@End Implementation
+
 Process called "emit_indent" takes emitter as Integer, level as Integer returns Integer:
     Let spaces_per_level be 2
     Let total_spaces be level multiplied by spaces_per_level
@@ -252,6 +384,24 @@ Process called "emit_indent" takes emitter as Integer, level as Integer returns 
 
     Return 1
 End Process
+
+@Reasoning:
+Local dict_get exists so the CSS backend does not have a transitive
+dependency on the full dictionary primitive module - the layout it operates
+on is the small "size, _, keys_ptr, values_ptr" struct produced upstream.
+@End Reasoning
+
+@Implementation:
+Reads the 24-byte dict header (size at offset 0, keys_ptr at 16, values_ptr
+at 24), linearly scans keys with string_equals, and returns the value at the
+matching index or 0 if not found. Linear scan is acceptable because CSS
+dicts are small (typically <16 entries).
+@End Implementation
+
+@Performance_Hints:
+O(n) linear scan. Acceptable for the small dicts in CSS HIR; do not adopt
+for larger structures.
+@End Performance_Hints
 
 Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Let size be proc memory_get_int64 from Layout with dict, 0
@@ -274,10 +424,36 @@ Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Returns the count of items in a CSS-HIR list header. Inlined here to avoid
+dragging the full list primitive into this backend.
+@End Reasoning
+
+@Implementation:
+Reads the 8-byte size field at offset 0 of the list header.
+@End Implementation
+
 Process called "list_size" takes list as Integer returns Integer:
     Let size be proc memory_get_int64 from Layout with list, 0
     Return size
 End Process
+
+@Reasoning:
+Random-access read of a CSS-HIR list element by index. Pairs with list_size
+to drive the iteration loops above without bounds checking (caller is
+responsible for staying within size).
+@End Reasoning
+
+@Implementation:
+Reads items pointer at offset 16, then loads the 8-byte entry at items +
+index * 8. No bounds check; out-of-range index returns undefined memory.
+@End Implementation
+
+@Security_Scope:
+Trusted caller only - the list pointer and index are assumed valid. Callers
+in this file always guard with list_size, so the lack of an in-function
+bounds check is safe in this module.
+@End Security_Scope
 
 Process called "list_get" takes list as Integer, index as Integer returns Integer:
     Let items be proc memory_get_int64 from Layout with list, 16

@@ -32,6 +32,18 @@ Import "compiler/middle/gungnir/hir/translation/backends/emitter_common.runa" as
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
+@Reasoning:
+Public driver for HIR -> HTML5 translation. Owns the emitter lifetime
+so callers receive a freshly allocated HTML source string.
+@End Reasoning
+
+@Implementation:
+Creates a raw byte-buffer emitter via emitter_common, dispatches the
+root HIR through generate_node at indent level 0, snapshots the buffer
+via emitter_raw_get_output, returns the output. Emitter is not destroyed
+here - the snapshot is a fresh copy that the caller owns.
+@End Implementation
+
 Process called "generate_html" takes hir as Integer returns Integer:
     Note: Generate HTML from HIR
 
@@ -51,6 +63,18 @@ End Process
 Note: ============================================================================
 Note: Node Generation
 Note: ============================================================================
+
+@Reasoning:
+Central dispatcher mapping the HIR "type" discriminator to the matching
+generate_*_html helper. Used recursively to walk the HIR tree.
+@End Reasoning
+
+@Implementation:
+Reads node["type"] and string-compares against the six known HIR node
+kinds: document, doctype, element, text, comment, entity. Each match
+dispatches to its specialised generator. Null nodes and unknown types
+return 1 silently.
+@End Implementation
 
 Process called "generate_node" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate HTML from HIR node
@@ -104,6 +128,18 @@ Note: ==========================================================================
 Note: Document Generation
 Note: ============================================================================
 
+@Reasoning:
+Document-node generator: walks the top-level children of an HTML
+document (typically a doctype followed by an html element). The
+document node itself has no syntactic representation.
+@End Reasoning
+
+@Implementation:
+Reads the "children" list, iterates, and dispatches each via
+generate_node at the current indent. Missing children list is a safe
+no-op.
+@End Implementation
+
 Process called "generate_document" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate HTML document
 
@@ -133,6 +169,16 @@ Note: ==========================================================================
 Note: DOCTYPE Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit a "<!DOCTYPE x>" line. HTML5 standardises on "<!DOCTYPE html>" as
+the doctype, which is also the fallback when the node has no explicit
+"value" field.
+@End Reasoning
+
+@Implementation:
+Emits "<!DOCTYPE ", the value (or "html" as fallback), then ">" + LF.
+@End Implementation
+
 Process called "generate_doctype" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate DOCTYPE declaration
 
@@ -156,6 +202,23 @@ End Process
 Note: ============================================================================
 Note: Element Generation
 Note: ============================================================================
+
+@Reasoning:
+Emit an HTML element. Handles three shapes: void elements ("<tag />"),
+empty non-void elements ("<tag></tag>"), and elements with children.
+Children that are all text/entity are emitted inline; mixed children are
+emitted on newlines with indent.
+@End Reasoning
+
+@Implementation:
+Reads tag, attributes, children. Emits indent + "<tag". Calls
+generate_attributes if attributes are present. If is_void_element
+returns 1, closes with " />\n" and returns. If no children, emits
+"></tag>\n". Otherwise checks if all children are text/entity via
+check_only_text_children. Inline-text path: emits ">" then children
+at indent 0, then "</tag>\n". Mixed path: emits ">\n", children at +1
+indent, then indent + "</tag>\n".
+@End Implementation
 
 Process called "generate_element" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate HTML element
@@ -243,6 +306,24 @@ Note: ==========================================================================
 Note: Attribute Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit element attributes inline after the tag name. Each attribute is
+emitted as ' key="value"' with double-quoted values. Boolean attributes
+(empty value) emit just ' key'.
+@End Reasoning
+
+@Implementation:
+Reads the 24-byte attribute dict header (size, keys_ptr, values_ptr).
+For each entry, emits a leading space, the key, then '="' + value + '"'
+when value is non-empty. Skips the value-emission half for empty values.
+@End Implementation
+
+@Security_Scope:
+Attribute values are emitted verbatim. Caller is responsible for
+escaping embedded double quotes and HTML entities; otherwise output
+will be XSS-vulnerable.
+@End Security_Scope
+
 Process called "generate_attributes" takes attributes as Integer, emitter as Integer returns Integer:
     Note: Generate element attributes
 
@@ -277,6 +358,21 @@ Note: ==========================================================================
 Note: Text and Comment Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit raw text content. Used inside elements to emit visible HTML text.
+Indent is ignored because text emission is typically inline.
+@End Reasoning
+
+@Implementation:
+Reads node["value"] and emits it via emitter_raw_emit_string. Missing
+value is a no-op.
+@End Implementation
+
+@Security_Scope:
+Text is emitted verbatim. Caller must escape HTML entities (&, <, >)
+in the value to prevent injection.
+@End Security_Scope
+
 Process called "generate_text" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate text content
 
@@ -290,6 +386,16 @@ Process called "generate_text" takes node as Integer, emitter as Integer, indent
 
     Return 1
 End Process
+
+@Reasoning:
+Emit an HTML comment "<!-- value -->" on its own line.
+@End Reasoning
+
+@Implementation:
+Emits indent + "<!-- " + value + " -->" + LF. Comment text is emitted
+verbatim; caller must avoid embedded "--" sequences which HTML disallows
+inside comments.
+@End Implementation
 
 Process called "generate_comment" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate HTML comment
@@ -311,6 +417,18 @@ Process called "generate_comment" takes node as Integer, emitter as Integer, ind
     Return 1
 End Process
 
+@Reasoning:
+Emit an HTML entity "&name;". Entities are emitted inline (no indent or
+trailing newline). HIR carries the body between '&' and ';' so
+generators do not need an entity table.
+@End Reasoning
+
+@Implementation:
+Emits '&' (byte 38) then the entity body string. Note: this does NOT
+emit the trailing ';' - the HIR producer is expected to include it in
+the value field.
+@End Implementation
+
 Process called "generate_entity" takes node as Integer, emitter as Integer, indent_level as Integer returns Integer:
     Note: Generate HTML entity
 
@@ -331,6 +449,15 @@ Note: ==========================================================================
 Note: Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+HTML pretty-printing convention: 2 spaces per nesting level. Centralised
+here.
+@End Reasoning
+
+@Implementation:
+Multiplies level by 2 and emits that many space bytes.
+@End Implementation
+
 Process called "emit_indent" takes emitter as Integer, level as Integer returns Integer:
     Note: Emit indentation spaces
 
@@ -345,6 +472,18 @@ Process called "emit_indent" takes emitter as Integer, level as Integer returns 
 
     Return 1
 End Process
+
+@Reasoning:
+Predicate that decides whether an element's children should be emitted
+inline (no newlines) or on their own lines. HTML elements with only
+text/entity children look better inline (e.g. <p>Hello, <em>world</em>!</p>).
+@End Reasoning
+
+@Implementation:
+Returns 0 immediately for empty child lists. Walks children; if any
+child's type is not "text" and not "entity", returns 0. Otherwise
+returns 1.
+@End Implementation
 
 Process called "check_only_text_children" takes children as Integer, child_count as Integer returns Integer:
     Note: Check if element has only text children
@@ -379,6 +518,26 @@ Process called "check_only_text_children" takes children as Integer, child_count
 
     Return 1
 End Process
+
+@Reasoning:
+HTML void elements (area, base, br, col, embed, hr, img, input, link,
+meta, source, track, wbr) cannot have content and use self-closing
+syntax. Centralising the check here lets generate_element choose the
+correct closing shape.
+@End Reasoning
+
+@Implementation:
+Compares tag_name against each of the 13 void-element names via
+string_equals. Returns 1 on first match, 0 if no match. Each comparison
+allocates a transient string literal which is freed before the next
+check.
+@End Implementation
+
+@Performance_Hints:
+O(13) string comparisons in the worst case. The transient allocations
+per check are wasteful but kept for parity with the existing StringCore
+API; a perfect-hash lookup would be faster if this becomes hot.
+@End Performance_Hints
 
 Process called "is_void_element" takes tag_name as Integer returns Integer:
     Note: Check if element is a void element
@@ -481,6 +640,22 @@ Note: ==========================================================================
 Note: Dictionary and List Utilities
 Note: ============================================================================
 
+@Reasoning:
+Local dict_get exists so the HTML backend does not need to take a
+dependency on the full dictionary primitive module.
+@End Reasoning
+
+@Implementation:
+Reads the 24-byte dict header layout (size at offset 0, keys_ptr at 16,
+values_ptr at 24), linearly scans keys with string_equals, returns the
+value at the matching index or 0 if not found.
+@End Implementation
+
+@Performance_Hints:
+O(n) linear scan. Acceptable for HTML dicts which are small (attribute
+maps typically <16 entries).
+@End Performance_Hints
+
 Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Note: Get value from dictionary by key
 
@@ -504,12 +679,35 @@ Process called "dict_get" takes dict as Integer, key as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Return the count of items in an HTML-HIR list header.
+@End Reasoning
+
+@Implementation:
+Reads the 8-byte size field at offset 0 of the list header.
+@End Implementation
+
 Process called "list_size" takes list as Integer returns Integer:
     Note: Get list size
 
     Let size be proc memory_get_int64 from Layout with list, 0
     Return size
 End Process
+
+@Reasoning:
+Random-access read of an HTML-HIR list element by index. Pairs with
+list_size to drive iteration loops without bounds checking.
+@End Reasoning
+
+@Implementation:
+Reads items pointer at offset 16, then loads the 8-byte entry at items
++ index * 8. No bounds check; caller is expected to stay within
+list_size.
+@End Implementation
+
+@Security_Scope:
+Trusted caller only - list pointer and index are assumed valid.
+@End Security_Scope
 
 Process called "list_get" takes list as Integer, index as Integer returns Integer:
     Note: Get item from list by index

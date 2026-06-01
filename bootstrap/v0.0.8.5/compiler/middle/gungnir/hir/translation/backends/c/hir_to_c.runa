@@ -47,6 +47,18 @@ Note: ==========================================================================
 Note: Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Context carried through every generate_* call. Bundling emitter, indent
+state, and error state means deep recursion does not need to thread these
+through every call.
+@End Reasoning
+
+@Implementation:
+Four Integer fields packed at 8-byte offsets: emitter pointer (0), indent
+depth (8), error message string pointer (16), and has_error flag (24).
+Allocated as a 32-byte heap block.
+@End Implementation
+
 Type called "CGenContext":
     emitter as Integer           Note: C code emitter
     indent_level as Integer      Note: Current indentation level
@@ -57,6 +69,17 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocate and initialise a CGenContext with a fresh emitter. Used once
+per top-level translation.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes and immediately creates an emitter. On either failure
+cleans up the partial work and returns 0. Initialises indent to 0, error
+fields to null/false.
+@End Implementation
 
 Process called "create_codegen_context" returns Integer:
     Note: Create code generation context
@@ -82,6 +105,20 @@ Process called "create_codegen_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Free the emitter, any error string, and the context block. Safe to call
+on a null context.
+@End Reasoning
+
+@Implementation:
+Null check, then destroys the emitter (if non-null), frees the error
+string (if non-null), and finally frees the 32-byte context.
+@End Implementation
+
+@Security_Scope:
+Caller must drop the context pointer after this call.
+@End Security_Scope
 
 Process called "destroy_codegen_context" takes context as Integer returns Integer:
     Note: Destroy code generation context
@@ -111,6 +148,18 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Record a code-generation error on the context. Previous errors are
+overwritten so the most recent failure is what callers see.
+@End Reasoning
+
+@Implementation:
+Frees any previously stored message, allocates msg_length+1 bytes, copies
+the new message, and writes a trailing NUL. Sets has_error to 1. If
+allocation fails the message pointer is left null but has_error is still
+set.
+@End Implementation
+
 Process called "set_codegen_error" takes context as Integer, message as Integer returns Integer:
     Note: Set code generation error message
 
@@ -134,6 +183,14 @@ Process called "set_codegen_error" takes context as Integer, message as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Predicate over the context's error flag.
+@End Reasoning
+
+@Implementation:
+Reads the has_error field at offset 24.
+@End Implementation
+
 Process called "has_codegen_error" takes context as Integer returns Integer:
     Note: Check if code generation has error
 
@@ -141,6 +198,19 @@ Process called "has_codegen_error" takes context as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Return the current error message pointer. May be null even when
+has_error is set (allocation failure during set_codegen_error).
+@End Reasoning
+
+@Implementation:
+Reads the message pointer at offset 16.
+@End Implementation
+
+@Security_Scope:
+Returned pointer is owned by the context. Caller must not free it.
+@End Security_Scope
 
 Process called "get_codegen_error" takes context as Integer returns Integer:
     Note: Get code generation error message
@@ -154,6 +224,16 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+Convenience wrapper that emits the current context indent at the start
+of a line. Avoids passing the indent level explicitly at every call site.
+@End Reasoning
+
+@Implementation:
+Reads the emitter (offset 0) and indent_level (offset 8) from the
+context, delegates to Emitter.emit_indent.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation at current level
 
@@ -165,6 +245,15 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Step into a deeper block. Used before emitting the body of a function,
+if, while, for, etc.
+@End Reasoning
+
+@Implementation:
+Loads indent_level from offset 8, writes back +1.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -173,6 +262,16 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Step out of a block. Clamped at zero so error-recovery sequences cannot
+underflow the indent depth.
+@End Reasoning
+
+@Implementation:
+Loads indent_level; if greater than 0, writes back level-1. Calls on
+zero are silent no-ops.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -189,6 +288,18 @@ End Process
 Note: ============================================================================
 Note: HIR Dictionary Access Helpers
 Note: ============================================================================
+
+@Reasoning:
+Retrieve a string value from an HIR dictionary. Returns 0 when either
+the key is missing or the value is not a string. Distinct from
+get_dict_hir_value so dispatch sites can clearly assert "this should be
+a string".
+@End Reasoning
+
+@Implementation:
+Looks up the value via HIR.get_dictionary_value, checks that it is a
+string-shaped HIR via is_string_hir, then extracts the literal value.
+@End Implementation
 
 Process called "get_dict_string_value" takes hir_node as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
@@ -210,6 +321,15 @@ Process called "get_dict_string_value" takes hir_node as Integer, key as Integer
     Return value_str
 End Process
 
+@Reasoning:
+Generic dictionary lookup for sub-HIR values (nested expressions,
+statements, lists). Returns the raw HIR pointer without type checks.
+@End Reasoning
+
+@Implementation:
+Single forward to HIR.get_dictionary_value.
+@End Implementation
+
 Process called "get_dict_hir_value" takes hir_node as Integer, key as Integer returns Integer:
     Note: Get HIR value from dictionary
 
@@ -222,13 +342,21 @@ Note: ==========================================================================
 Note: Type Generation
 Note: ============================================================================
 
+@Reasoning:
+Emit a C type specifier. HIR types come in two shapes: a raw string for
+simple builtins ("int", "char", "float") and a dictionary tagged with
+"_type" for compound types ("pointer", "array") that carry sub-types.
+@End Reasoning
+
+@Implementation:
+String case: emit the literal value. Dictionary case: dispatch on the
+"_type" key. "pointer" recurses on "base_type" and emits "*". "array"
+recurses on "element_type" without size syntax (sizes are emitted by the
+declaration). Unknown shapes return success without emitting.
+@End Implementation
+
 Process called "generate_type" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate C type from HIR
-
-    @Reasoning:
-    Types can be simple strings (int, char, float) or dictionaries
-    (pointer, array). Generate appropriate C type syntax.
-    @End Reasoning
 
     If type_hir is equal to 0:
         Return 1
@@ -279,6 +407,26 @@ End Process
 Note: ============================================================================
 Note: Expression Generation
 Note: ============================================================================
+
+@Reasoning:
+Top-level expression dispatcher. Branches on the "_type" discriminator
+to the appropriate generate_*_expr helper. String-shaped HIR is treated
+as a verbatim emission so literal tokens (numeric constants, etc.) can be
+embedded without a separate node type.
+@End Reasoning
+
+@Implementation:
+String case: emit literal value. Dictionary case: read "_type" and probe
+the ten known kinds (literal, identifier, binary, unary, call, subscript,
+member, assignment, ternary, sizeof, cast). Unknown types return 1
+without emitting.
+@End Implementation
+
+@Performance_Hints:
+O(k) string compares per call where k is the number of expression
+kinds. Recurses through generate_expression for sub-expressions; total
+cost is O(N) in expression tree size.
+@End Performance_Hints
 
 Process called "generate_expression" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate C expression from HIR
@@ -401,6 +549,18 @@ Process called "generate_expression" takes context as Integer, expr_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emit infix binary expression "left op right". Spacing around the
+operator is fixed (one space each side) regardless of operator
+identity to keep output uniform.
+@End Reasoning
+
+@Implementation:
+Recurses left, emits " op " if operator present, recurses right. No
+parenthesisation - the HIR producer is expected to bake precedence into
+the tree shape.
+@End Implementation
+
 Process called "generate_binary_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate binary expression
 
@@ -422,6 +582,19 @@ Process called "generate_binary_expr" takes context as Integer, expr_hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a unary expression, handling both prefix and postfix forms.
+Postfix ++ and -- are special-cased because the operator must appear
+after the operand; all other operators are prefix.
+@End Reasoning
+
+@Implementation:
+Compares operator against "++post"/"--post" (operand then "++"/"--"),
+"++pre"/"--pre" ("++"/"--" then operand), or any other (operator string
+verbatim then operand). The "post"/"pre" suffix on the operator string
+disambiguates ++ used as prefix vs postfix.
+@End Implementation
 
 Process called "generate_unary_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate unary expression
@@ -474,6 +647,18 @@ Process called "generate_unary_expr" takes context as Integer, expr_hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Emit a C function call "function(arg1, arg2, ...)". The function position
+can be any expression (named function, pointer dereference, member
+access), so it is generated recursively.
+@End Reasoning
+
+@Implementation:
+Generates the function expression, emits '(', walks the "arguments" HIR
+list with comma-separated generate_expression calls, emits ')'. Missing
+arguments list emits "()".
+@End Implementation
+
 Process called "generate_call_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate function call expression
 
@@ -512,6 +697,15 @@ Process called "generate_call_expr" takes context as Integer, expr_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emit C array subscripting "array[index]". Both array and index are
+generic expressions so the helper recurses.
+@End Reasoning
+
+@Implementation:
+Recurses on "array", emits '[', recurses on "index", emits ']'.
+@End Implementation
+
 Process called "generate_subscript_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate array subscript expression
 
@@ -527,6 +721,17 @@ Process called "generate_subscript_expr" takes context as Integer, expr_hir as I
 
     Return 1
 End Process
+
+@Reasoning:
+Emit C member access "object.member" or "object->member" depending on
+the operator stored in HIR. Object can be any expression.
+@End Reasoning
+
+@Implementation:
+Recurses on "object", then emits the operator string verbatim (typical
+values: "." or "->"), then the member name verbatim. Missing parts emit
+nothing rather than aborting.
+@End Implementation
 
 Process called "generate_member_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate member access expression
@@ -550,6 +755,17 @@ Process called "generate_member_expr" takes context as Integer, expr_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit C assignment "left op right" where op is one of =, +=, -=, *=, /=,
+%=, &=, |=, ^=, <<=, >>=. Uniform space-around-operator style for all.
+@End Reasoning
+
+@Implementation:
+Recurses left, emits " op " if operator present, recurses right.
+Identical structure to generate_binary_expr but kept separate so future
+divergence (e.g. enforcing left as an lvalue) is straightforward.
+@End Implementation
+
 Process called "generate_assignment_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate assignment expression
 
@@ -572,6 +788,15 @@ Process called "generate_assignment_expr" takes context as Integer, expr_hir as 
     Return 1
 End Process
 
+@Reasoning:
+Emit C ternary "cond ? a : b" with spaces around both '?' and ':'.
+@End Reasoning
+
+@Implementation:
+Recurses condition, emits " ? ", recurses true_expr, emits " : ",
+recurses false_expr.
+@End Implementation
+
 Process called "generate_ternary_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate ternary conditional expression
 
@@ -590,6 +815,16 @@ Process called "generate_ternary_expr" takes context as Integer, expr_hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Emit "sizeof(operand)". The operand can be a type or an expression;
+both share the same emission because generate_expression already handles
+type-emission when sizeof's operand is shaped as a type HIR.
+@End Reasoning
+
+@Implementation:
+Emits "sizeof(", recurses generate_expression on the operand, emits ')'.
+@End Implementation
+
 Process called "generate_sizeof_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate sizeof expression
 
@@ -604,6 +839,17 @@ Process called "generate_sizeof_expr" takes context as Integer, expr_hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a C-style cast "(type)operand". Generates the target type via the
+type emitter so pointer/array cast targets work.
+@End Reasoning
+
+@Implementation:
+Emits '(', recurses generate_type on "target_type", emits ')', recurses
+generate_expression on "operand". No space between ')' and operand to
+keep cast tight against its argument.
+@End Implementation
 
 Process called "generate_cast_expr" takes context as Integer, expr_hir as Integer returns Integer:
     Note: Generate cast expression
@@ -626,6 +872,21 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+Top-level statement dispatcher. Tags every statement HIR with "_type"
+and routes to the matching generator. Break and continue are inlined
+here because they have no operand and a single-line emission is too
+small to warrant a helper.
+@End Reasoning
+
+@Implementation:
+Reads "_type" off the dict and probes against the 14 known statement
+kinds (compound, expression_stmt, if, while, for, do_while, switch,
+case, default, return, break, continue, goto, label). Order favours
+the most common kinds (expression_stmt and compound). Unknown types
+silently return 1.
+@End Implementation
 
 Process called "generate_statement" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate C statement from HIR
@@ -755,6 +1016,17 @@ Process called "generate_statement" takes context as Integer, stmt_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emit a braced "{ ... }" C block. Used for function bodies, if/else
+clauses, and explicit block scopes.
+@End Reasoning
+
+@Implementation:
+Emits indent then '{' + LF, raises indent by one, walks the "statements"
+HIR list calling generate_statement on each, lowers indent, then emits
+indent + '}' + LF.
+@End Implementation
+
 Process called "generate_compound_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate compound statement (block)
 
@@ -793,6 +1065,16 @@ Process called "generate_compound_stmt" takes context as Integer, stmt_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Emit an expression as a statement (terminated with ';' + LF). Used for
+function calls used for side effects and standalone assignments.
+@End Reasoning
+
+@Implementation:
+Emits indent, recurses generate_expression on the "expression" sub-HIR,
+emits ';' + LF.
+@End Implementation
+
 Process called "generate_expr_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate expression statement
 
@@ -808,6 +1090,20 @@ Process called "generate_expr_stmt" takes context as Integer, stmt_hir as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Emit a C "if (cond) then [else ...]". Compound then-branches stay on
+the "if" line as "if (cond) {"; single-statement then-branches drop to
+the next line at +1 indent for readability.
+@End Reasoning
+
+@Implementation:
+Detects whether the "then" HIR is a compound statement by inspecting its
+"_type". Compound: inlines the braces and statement list to keep the
+opening brace on the if line. Non-compound: newline, indent in, recurse
+generate_statement, indent out. If "else" is present, emits " else "
+then recurses; otherwise emits a closing newline.
+@End Implementation
 
 Process called "generate_if_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate if statement
@@ -884,6 +1180,17 @@ Process called "generate_if_stmt" takes context as Integer, stmt_hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+Emit "while (cond) body". Body is delegated to generate_statement so a
+compound body is naturally braced and a single-statement body emits on
+the next line.
+@End Reasoning
+
+@Implementation:
+Emits indent + "while (", recurses condition, emits ") ", recurses body
+via generate_statement.
+@End Implementation
+
 Process called "generate_while_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate while statement
 
@@ -902,6 +1209,18 @@ Process called "generate_while_stmt" takes context as Integer, stmt_hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "for (init; cond; incr) body". Each of init/cond/incr is optional;
+absent components emit an empty position so the C "for (;;) {}" idiom is
+expressible.
+@End Reasoning
+
+@Implementation:
+Emits "for (". Optionally recurses init via generate_expression. Emits
+"; ". Optionally recurses cond. Emits "; ". Optionally recurses incr.
+Emits ") " then recurses body via generate_statement.
+@End Implementation
 
 Process called "generate_for_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate for statement
@@ -941,6 +1260,15 @@ Process called "generate_for_stmt" takes context as Integer, stmt_hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+Emit "do body while (cond);" form. The trailing semicolon is mandatory.
+@End Reasoning
+
+@Implementation:
+Emits "do ", recurses body via generate_statement, emits " while (",
+recurses condition, emits ");" + LF.
+@End Implementation
+
 Process called "generate_do_while_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate do-while statement
 
@@ -963,6 +1291,16 @@ Process called "generate_do_while_stmt" takes context as Integer, stmt_hir as In
     Return 1
 End Process
 
+@Reasoning:
+Emit "switch (cond) body". Body is typically a compound statement
+containing case and default labels.
+@End Reasoning
+
+@Implementation:
+Emits "switch (", recurses condition, emits ") ", recurses body via
+generate_statement.
+@End Implementation
+
 Process called "generate_switch_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate switch statement
 
@@ -982,6 +1320,16 @@ Process called "generate_switch_stmt" takes context as Integer, stmt_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit a "case value:" label inside a switch. Trailing newline so the
+following statements appear on the next line at the current indent.
+@End Reasoning
+
+@Implementation:
+Emits indent + "case ", recurses value via generate_expression, emits
+':' + LF.
+@End Implementation
+
 Process called "generate_case_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate case label
 
@@ -999,6 +1347,15 @@ Process called "generate_case_stmt" takes context as Integer, stmt_hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Emit a "default:" label inside a switch. Separate from generate_case_stmt
+because there is no value expression to recurse on.
+@End Reasoning
+
+@Implementation:
+Emits indent + "default:" + LF.
+@End Implementation
+
 Process called "generate_default_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate default label
 
@@ -1010,6 +1367,15 @@ Process called "generate_default_stmt" takes context as Integer, stmt_hir as Int
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "return [value];". Bare returns (void functions) omit the value.
+@End Reasoning
+
+@Implementation:
+Emits indent + "return". If a value is present emits a space then
+recurses generate_expression. Emits ';' + LF.
+@End Implementation
 
 Process called "generate_return_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate return statement
@@ -1032,6 +1398,16 @@ Process called "generate_return_stmt" takes context as Integer, stmt_hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+Emit "goto label;". The label name is emitted verbatim with no
+validation; it is the producer's responsibility to ensure the label
+exists.
+@End Reasoning
+
+@Implementation:
+Emits indent + "goto " + label name + ";" + LF.
+@End Implementation
+
 Process called "generate_goto_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate goto statement
 
@@ -1051,6 +1427,15 @@ Process called "generate_goto_stmt" takes context as Integer, stmt_hir as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Emit "name:" as a goto target. Labels are not indented (start at column 0)
+to match standard C formatting.
+@End Reasoning
+
+@Implementation:
+Emits the label name (no indent) followed by ':' + LF.
+@End Implementation
 
 Process called "generate_label_stmt" takes context as Integer, stmt_hir as Integer returns Integer:
     Note: Generate label statement
@@ -1072,6 +1457,17 @@ End Process
 Note: ============================================================================
 Note: Declaration Generation
 Note: ============================================================================
+
+@Reasoning:
+Emit "type name [= init];". Handles both bare declarations and
+declarations with initialisers.
+@End Reasoning
+
+@Implementation:
+Emits indent, recurses generate_type on "type_info", emits a space and
+the name. If "initializer" exists, emits " = " then recurses
+generate_expression. Closes with ';' + LF.
+@End Implementation
 
 Process called "generate_variable_declaration" takes context as Integer, var_hir as Integer returns Integer:
     Note: Generate variable declaration
@@ -1103,6 +1499,20 @@ Process called "generate_variable_declaration" takes context as Integer, var_hir
 
     Return 1
 End Process
+
+@Reasoning:
+Emit either a function prototype "type name(params);" or a full
+definition "type name(params) { body }" depending on whether the HIR
+carries a body sub-tree.
+@End Reasoning
+
+@Implementation:
+Emits return type, space, name, '(' . Walks the "parameters" list, each
+emitting "type name" with ", " separators. Emits ')'. If "body" exists,
+emits ' ' then recurses generate_statement (which will emit braces if
+it is a compound). If body is absent, emits ';' + LF. Trailing extra LF
+provides visual separation between top-level functions.
+@End Implementation
 
 Process called "generate_function_declaration" takes context as Integer, func_hir as Integer returns Integer:
     Note: Generate function declaration/definition
@@ -1180,13 +1590,21 @@ Note: ==========================================================================
 Note: Program Generation
 Note: ============================================================================
 
+@Reasoning:
+Walk top-level declarations of a C program and emit each in source order.
+Currently recognises c_function and c_variable; other declaration shapes
+(structs, typedefs, enums) are silently skipped and will be added as the
+HIR producer learns them.
+@End Reasoning
+
+@Implementation:
+On null program HIR, sets a codegen error and returns 0. Reads the
+"declarations" sub-list. For each item, dispatches based on the "_type"
+field. Returns 1 on success even if no declarations were recognised.
+@End Implementation
+
 Process called "generate_program" takes context as Integer, program_hir as Integer returns Integer:
     Note: Generate complete C program
-
-    @Reasoning:
-    Generate all top-level declarations (functions, variables, structs)
-    in proper C program format.
-    @End Reasoning
 
     If program_hir is equal to 0:
         proc set_codegen_error with context, "Null program HIR"
@@ -1237,13 +1655,27 @@ Note: ==========================================================================
 Note: Top-Level Generation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Public driver for HIR -> C translation. Owns the lifetime of the
+codegen context so callers only need to pass an HIR root and receive a
+freshly allocated null-terminated C source string.
+@End Reasoning
+
+@Implementation:
+Creates a codegen context, runs generate_program, then either returns 0
+(after destroying the context) on codegen error or snapshots the
+emitter output and returns it after destroying the context. Output is a
+heap allocation owned by the caller.
+@End Implementation
+
+@Performance_Hints:
+O(N) in HIR node count plus O(B) in output byte count. Two allocations
+not directly tied to N: the context (32 bytes) and the final output
+snapshot.
+@End Performance_Hints
+
 Process called "generate_c_from_hir" takes hir_ast as Integer returns Integer:
     Note: Generate C code from HIR (top-level entry point)
-
-    @Reasoning:
-    Entry point for generating C code from HIR representation.
-    Create context, generate code, return output string.
-    @End Reasoning
 
     Let context be proc create_codegen_context
 

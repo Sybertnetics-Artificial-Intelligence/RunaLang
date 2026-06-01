@@ -73,6 +73,14 @@ Note: ==========================================================================
 Note: XML AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+A single node shape covers every XML kind: elements have name+attributes+children, text/CDATA/comment/PI have value, documents have children only. Distinct null slots per kind keep the schema declarative without per-kind subclasses.
+@End Reasoning
+
+@Implementation:
+Seven 8-byte fields: discriminator tag, element/PI name pointer (or 0), text/comment/CDATA/PI value pointer (or 0), attributes dictionary (or 0), children list (or 0), source line and column.
+@End Implementation
+
 Type called "XMLNode":
     node_type as Integer        Note: XML_* constant
     name as Integer             Note: Element/PI name (null for text/comment/cdata)
@@ -87,6 +95,14 @@ Note: ==========================================================================
 Note: XML Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+The parser is a streaming cursor over the lexer; caching one current_token lets every parse_* helper peek without re-querying the lexer.
+@End Reasoning
+
+@Implementation:
+Four 8-byte slots: lexer pointer, current_token pointer, owned error_message string (or 0), and has_error flag.
+@End Implementation
+
 Type called "XMLParser":
     lexer as Integer            Note: XML lexer
     current_token as Integer    Note: Current token
@@ -97,6 +113,14 @@ End Type
 Note: ============================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Priming the first token at construction lets every parse_* routine assume current_token is always valid (or EOF), avoiding a "have we started yet?" guard.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes; null-check. Store lexer, null out current_token / error_message / has_error. Pull the first token from the lexer and write it into the current_token slot.
+@End Implementation
 
 Process called "create_xml_parser" takes lexer as Integer returns Integer:
     Note: Create XML parser with lexer
@@ -121,6 +145,14 @@ Process called "create_xml_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser owns its error_message buffer; destruction must release it on the standard "parse failed" path.
+@End Reasoning
+
+@Implementation:
+Null-check the parser. Read the error_message pointer; if non-null deallocate. Deallocate the parser block.
+@End Implementation
+
 Process called "destroy_xml_parser" takes parser as Integer returns Integer:
     Note: Destroy XML parser
 
@@ -144,6 +176,14 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Token consumption happens at many call sites; isolating the cursor bump in one routine guarantees the cached current_token slot stays consistent with the lexer.
+@End Reasoning
+
+@Implementation:
+Pull the lexer pointer from offset 0, request next_token from the lexer, store the result at offset 8, return it.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -154,6 +194,14 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return token
 End Process
+
+@Reasoning:
+Every parse decision starts with a token-type inspection; returning TOKEN_EOF for null tokens lets callers compare safely without explicit null guards.
+@End Reasoning
+
+@Implementation:
+Read the current_token at offset 8; if null return TOKEN_EOF. Otherwise read the type tag at the token's offset 0.
+@End Implementation
 
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Peek at current token type
@@ -169,6 +217,14 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Predicate-style lookahead lets each production decide between alternatives without copying token-shape inspection logic into every call site.
+@End Reasoning
+
+@Implementation:
+Call peek_token_type and return 1 if it equals expected_type, 0 otherwise.
+@End Implementation
+
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
 
@@ -180,6 +236,14 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+A mandatory-token helper turns required-syntax checks into single-line calls and writes a uniform error message on mismatch.
+@End Reasoning
+
+@Implementation:
+Compare peek_token_type to expected_type; on mismatch call set_parse_error with the provided message and return 0. On match, advance the cursor and return 1.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect token of specific type, set error if mismatch
@@ -199,6 +263,14 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Recording the first parse error requires copying the message into parser-owned storage so the original message buffer's lifetime is independent of the parser.
+@End Reasoning
+
+@Implementation:
+Read the current error_message; if non-null free it. Measure new message length, allocate length+1 bytes, copy, null-terminate. Store the pointer at offset 16 and set has_error=1 at offset 24.
+@End Implementation
 
 Process called "set_parse_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
@@ -229,6 +301,14 @@ Note: ==========================================================================
 Note: Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Centralised node allocation initialises every slot to null/zero so consumers of partially-populated nodes (e.g. text nodes without attributes) never read uninitialised memory.
+@End Reasoning
+
+@Implementation:
+Allocate 56 bytes; null-check. Store node_type at offset 0; zero name / value / attributes / children / line / column.
+@End Implementation
+
 Process called "create_xml_node" takes node_type as Integer returns Integer:
     Note: Create XML AST node
 
@@ -254,13 +334,20 @@ Note: ==========================================================================
 Note: Attribute Parsing
 Note: ============================================================================
 
+@Reasoning:
+XML attributes are name="value" or name='value' pairs appearing inside opening tags; lifting them into a name->value Dictionary makes attribute lookup O(1) for downstream consumers and matches the XML information set representation.
+@End Reasoning
+
+@Implementation:
+Allocate an empty Dictionary. Loop while current token is TOKEN_NAME: copy the name lexeme; expect '=' then a TOKEN_STRING value; copy the string lexeme; put name->value into the Dictionary. Stop when no further name token is present.
+@End Implementation
+
+@Performance_Hints:
+O(k) in attribute count, two heap allocations (name copy + value copy) per attribute.
+@End Performance_Hints
+
 Process called "parse_attributes" takes parser as Integer returns Integer:
     Note: Parse element attributes
-
-    @Reasoning:
-    Attributes are name="value" or name='value' pairs.
-    We parse them into a dictionary for easy access.
-    @End Reasoning
 
     Let attributes be proc create from Dict
 
@@ -321,15 +408,24 @@ Note: ==========================================================================
 Note: Element Parsing
 Note: ============================================================================
 
+@Reasoning:
+XML elements support three syntactic forms (self-closing, content, mixed content) that all start with "<NAME attr=val ...>"; the parser handles them with a single dispatcher and verifies that the closing tag name matches the opening tag to catch nesting errors.
+@End Reasoning
+
+@Implementation:
+Expect '<'. Copy the element name lexeme. Build an XML_ELEMENT node, attach name and source position. Call parse_attributes; attach result. If '/>' follows return the self-closing node. Otherwise expect '>', allocate a children list, loop calling parse_content and appending until '</' is seen; on EOF emit error. Consume '</', verify the closing name matches the opening name via strings_equal; on mismatch emit error. Expect '>'.
+@End Implementation
+
+@Performance_Hints:
+Recursive over the document tree; each element causes one node allocation plus its attributes and child-list allocations.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes untrusted XML source. Stack depth equals the source's element nesting depth - adversarial deeply-nested XML must be capped before reaching here. The closing-tag name check defends against XSS-style "</a><b>" injection by requiring the close-tag to match the open-tag exactly.
+@End Security_Scope
+
 Process called "parse_element" takes parser as Integer returns Integer:
     Note: Parse XML element: <name attr="value">content</name> or <name />
-
-    @Reasoning:
-    Elements can be:
-    - Self-closing: <element />
-    - With content: <element>...</element>
-    - With mixed content: <element>text<child/>more text</element>
-    @End Reasoning
 
     Note: Expect <
     proc expect_token with parser, TOKEN_TAG_OPEN from Lexer, "Expected '<'"
@@ -445,6 +541,14 @@ Process called "parse_element" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+The closing-tag-name check needs byte-for-byte equality with a known length on both sides; an inline byte loop avoids the null-terminated string assumption that StringCore's compare would require.
+@End Reasoning
+
+@Implementation:
+On length mismatch return 0. Otherwise loop comparing byte i of both strings; return 0 on the first mismatch, 1 if all bytes match.
+@End Implementation
+
 Process called "strings_equal" takes str1 as Integer, len1 as Integer, str2 as Integer, len2 as Integer returns Integer:
     Note: Check if two strings are equal
 
@@ -471,6 +575,14 @@ End Process
 Note: ============================================================================
 Note: Content Parsing
 Note: ============================================================================
+
+@Reasoning:
+Element content can be a mix of nested elements, text runs, comments, CDATA sections, and processing instructions; one dispatcher routed by token type keeps parse_element's loop short.
+@End Reasoning
+
+@Implementation:
+Inspect the current token type. TOKEN_TAG_OPEN -> parse_element; TOKEN_TEXT -> parse_text; TOKEN_COMMENT -> parse_comment; TOKEN_CDATA -> parse_cdata; TOKEN_PROCESSING_INSTRUCTION -> parse_processing_instruction. Any other tag records "Unexpected token in content" and returns 0.
+@End Implementation
 
 Process called "parse_content" takes parser as Integer returns Integer:
     Note: Parse content node (text, element, comment, CDATA, PI)
@@ -506,6 +618,14 @@ Process called "parse_content" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Text content between tags becomes XML_TEXT leaf nodes; the lexer has already resolved entity references, so the parser only copies the resolved value into a fresh buffer to decouple lifetime from the token's storage.
+@End Reasoning
+
+@Implementation:
+Read the text lexeme. Allocate length+1 bytes, copy, null-terminate. Build an XML_TEXT node, attach the copy at offset 16, store line/column, advance.
+@End Implementation
+
 Process called "parse_text" takes parser as Integer returns Integer:
     Note: Parse text content node
 
@@ -534,6 +654,14 @@ Process called "parse_text" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Comments become XML_COMMENT leaf nodes; preserving them lets round-trip serialisers reproduce the original document, with comment-stripping callers ignoring these nodes.
+@End Reasoning
+
+@Implementation:
+Read the comment lexeme. Allocate length+1 bytes, copy, null-terminate. Build an XML_COMMENT node, attach the copy at offset 16, store line/column, advance.
+@End Implementation
 
 Process called "parse_comment" takes parser as Integer returns Integer:
     Note: Parse comment node
@@ -564,6 +692,14 @@ Process called "parse_comment" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+CDATA sections in XML are functionally equivalent to text but with no escaping; preserving the XML_CDATA tag (rather than collapsing to XML_TEXT) lets serialisers re-emit them in CDATA form.
+@End Reasoning
+
+@Implementation:
+Read the CDATA content lexeme (already de-delimited by the lexer). Allocate length+1 bytes, copy, null-terminate. Build an XML_CDATA node, attach the copy at offset 16, store line/column, advance.
+@End Implementation
+
 Process called "parse_cdata" takes parser as Integer returns Integer:
     Note: Parse CDATA section node
 
@@ -592,6 +728,14 @@ Process called "parse_cdata" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Processing instructions like "<?xml-stylesheet ...?>" carry document metadata that some consumers act on; preserving them as XML_PROCESSING_INSTRUCTION leaves the decision to downstream code.
+@End Reasoning
+
+@Implementation:
+Read the PI content lexeme. Allocate length+1 bytes, copy, null-terminate. Build an XML_PROCESSING_INSTRUCTION node, attach the copy at offset 16, store line/column, advance.
+@End Implementation
 
 Process called "parse_processing_instruction" takes parser as Integer returns Integer:
     Note: Parse processing instruction node
@@ -625,6 +769,18 @@ End Process
 Note: ============================================================================
 Note: Document Parsing
 Note: ============================================================================
+
+@Reasoning:
+An XML document consists of an optional prolog (PIs and comments) followed by exactly one root element; the parser collects prolog nodes as children of a synthetic XML_DOCUMENT envelope before the root element appears.
+@End Reasoning
+
+@Implementation:
+Build an XML_DOCUMENT node with an empty children list. Loop: skip top-level whitespace; on EOF break; if current token is TOKEN_PROCESSING_INSTRUCTION or TOKEN_COMMENT parse and append; if TOKEN_TAG_OPEN parse_element and append (root); otherwise record an error. Return the document node.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source token count plus the cost of recursive element parsing.
+@End Performance_Hints
 
 Process called "parse_document" takes parser as Integer returns Integer:
     Note: Parse XML document
@@ -704,6 +860,18 @@ End Process
 Note: ============================================================================
 Note: Top-Level Parsing Entry Point
 Note: ============================================================================
+
+@Reasoning:
+Public entry point hides the lex+parse orchestration; callers receive either the XML document node or 0 on failure.
+@End Reasoning
+
+@Implementation:
+Null-check source. Create the lexer; on failure return 0. Create the parser; on failure destroy the lexer and return 0. Run parse_document. Check parser.has_error; on failure clean up and return 0. Destroy parser and lexer; return the document node.
+@End Implementation
+
+@Security_Scope:
+Consumes untrusted XML source. The lex+parse cleanup path always runs on every failure exit to prevent leaks.
+@End Security_Scope
 
 Process called "parse_xml" takes source as Integer returns Integer:
     Note: Parse XML source code to AST

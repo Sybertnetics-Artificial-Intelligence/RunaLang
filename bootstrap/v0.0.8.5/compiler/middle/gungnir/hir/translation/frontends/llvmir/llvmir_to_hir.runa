@@ -60,6 +60,20 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Minimal context: this translator does not need source position tracking
+(unlike json_to_hir / mongodb_to_hir) because LLVM IR error reporting
+operates on opcodes and module-level identifiers rather than file line
+numbers, and the AST already preserves the identifiers in the node
+fields. Hence the context only carries error state.
+@End Reasoning
+
+@Implementation:
+Two 64-bit slots in declared order: error_message (owned heap string or
+0) and has_error boolean. Total size 16 bytes; offsets 0/8 are
+referenced directly by the helper Processes.
+@End Implementation
+
 Type called "LLVMToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -68,6 +82,17 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocates the per-translation context with both slots zeroed so a fresh
+context starts in the "no error" state and destroy is a no-op for the
+message until something gets set.
+@End Reasoning
+
+@Implementation:
+Allocate 16 bytes; return 0 on OOM. Zero offsets 0 (error_message) and
+8 (has_error).
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create LLVM IR to HIR translation context
@@ -84,6 +109,17 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Cleanup paired with create_translation_context. Idempotent for null
+context so callers can drop the context in a single call regardless of
+construction success.
+@End Reasoning
+
+@Implementation:
+If context is 0, return 1. Read offset 0 (error_message); if non-zero,
+deallocate. Then deallocate the context block. Always returns 1.
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -106,6 +142,20 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Replaces any previous error message with a heap-copied NUL-terminated
+buffer and sets has_error=1. The terminal has_error check in
+translate_llvmir_to_hir uses this flag to surface deep recursive
+failures uniformly.
+@End Reasoning
+
+@Implementation:
+Read offset 0 (error_message); if non-zero, deallocate. Compute
+msg_length via StringCore.string_length, allocate msg_length+1 bytes,
+memory_copy and NUL-terminate. Store buffer at offset 0 and 1 at
+offset 8 (has_error). Returns 1.
+@End Implementation
 
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
@@ -130,6 +180,16 @@ Process called "set_translation_error" takes context as Integer, message as Inte
     Return 1
 End Process
 
+@Reasoning:
+Boolean accessor for the has_error flag. Provided as a Process (rather
+than inlining the offset-8 read at the call site) so callers can treat
+the context's internals as opaque.
+@End Reasoning
+
+@Implementation:
+Read offset 8 of context and return its value.
+@End Implementation
+
 Process called "has_translation_error" takes context as Integer returns Integer:
     Note: Check if translation has error
 
@@ -137,6 +197,16 @@ Process called "has_translation_error" takes context as Integer returns Integer:
 
     Return has_error
 End Process
+
+@Reasoning:
+Accessor that returns the borrowed pointer to the current error message
+buffer (or 0). The buffer is still owned by the context, so callers MUST
+NOT free it; it will be freed by destroy_translation_context.
+@End Reasoning
+
+@Implementation:
+Read offset 0 of context and return its value.
+@End Implementation
 
 Process called "get_error_message" takes context as Integer returns Integer:
     Note: Get translation error message
@@ -150,12 +220,28 @@ Note: ==========================================================================
 Note: LLVM Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+Type-switch over the seven LLVM_* AST node tags. Centralised dispatch
+makes recursion uniform -- a function body's basic blocks, a basic
+block's instructions, and an instruction's operands all flow through
+this single dispatcher, so a new node kind only needs a single branch
+addition.
+@End Reasoning
+
+@Implementation:
+Guard llvm_node!=0. Read node_type at offset 0 and dispatch:
+  LLVM_MODULE       -> translate_module
+  LLVM_FUNCTION     -> translate_function
+  LLVM_BASIC_BLOCK  -> translate_basic_block
+  LLVM_INSTRUCTION  -> translate_instruction
+  LLVM_TYPE         -> translate_type
+  LLVM_VALUE        -> translate_value
+  LLVM_GLOBAL       -> translate_global
+Returns 0 (with translation error set) on null input or unknown tag.
+@End Implementation
+
 Process called "translate_llvm_node_to_hir" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on LLVM node type.
-    @End Reasoning
 
     If llvm_node is equal to 0:
         proc set_translation_error with context, "Null LLVM node"
@@ -200,13 +286,26 @@ Note: ==========================================================================
 Note: Module Translation
 Note: ============================================================================
 
+@Reasoning:
+A LLVM module becomes a tagged HIR dictionary {_type:"llvm_module",
+functions:[...]}. We name the type field "_type" rather than "type" to
+avoid collision with LLVM IR type-name fields in instructions and values
+-- a HIR consumer treating `dict["type"]` as "the LLVM type of this
+value" would mistakenly match the module metadata otherwise.
+@End Reasoning
+
+@Implementation:
+Create HIR dict; on OOM set translation error and return 0. Bind
+"_type" -> "llvm_module" (HIR string literal). Read basic_blocks at
+offset 40 of llvm_node (the parser uses this slot to hold the top-level
+functions list for module nodes). If non-zero and List.size > 0, create
+a HIR list, iterate the functions, recurse via translate_llvm_node_to_hir,
+and add non-null results. Bind the list to "functions". Returns the
+hir_dict.
+@End Implementation
+
 Process called "translate_module" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM module to HIR dictionary
-
-    @Reasoning:
-    Modules contain functions and global declarations.
-    We translate to a dictionary with metadata.
-    @End Reasoning
 
     Let hir_dict be proc create_hir_dictionary_literal from HIR
 
@@ -251,12 +350,25 @@ Note: ==========================================================================
 Note: Function Translation
 Note: ============================================================================
 
+@Reasoning:
+A LLVM function becomes {_type:"llvm_function", name:..., return_type:...,
+basic_blocks:[...]}. The return type is recursed through translate_llvm_
+node_to_hir so that pointer / aggregate / vector type wrappers preserve
+their structure; we don't flatten it into a string here.
+@End Reasoning
+
+@Implementation:
+Create HIR dict; on OOM set error and return 0. Bind "_type" ->
+"llvm_function". Read func_name at offset 8; if non-null, wrap as HIR
+string and bind to "name". Read ret_type at offset 24; if non-null,
+recurse via translate_llvm_node_to_hir and bind to "return_type". Read
+basic_blocks at offset 40; if non-null and non-empty, create a HIR list,
+iterate, recurse on each, append non-null results, and bind the list to
+"basic_blocks". Returns the hir_dict.
+@End Implementation
+
 Process called "translate_function" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM function to HIR dictionary
-
-    @Reasoning:
-    Functions have name, return type, parameters, and basic blocks.
-    @End Reasoning
 
     Let hir_dict be proc create_hir_dictionary_literal from HIR
 
@@ -317,12 +429,25 @@ Note: ==========================================================================
 Note: Basic Block Translation
 Note: ============================================================================
 
+@Reasoning:
+A basic block becomes {_type:"llvm_basic_block", label:..., instructions:
+[...]}. Instructions live at offset 48 (not 40) because basic blocks
+overload offset 40 differently in the parser's layout; reading the
+correct field is critical -- a wrong offset would silently produce an
+empty instruction list with no error.
+@End Reasoning
+
+@Implementation:
+Create HIR dict; on OOM set error and return 0. Bind "_type" ->
+"llvm_basic_block". Read label_name at offset 8; if non-null, wrap as
+HIR string and bind to "label". Read instructions at offset 48; if
+non-null and non-empty, create a HIR list, iterate, recurse on each
+instruction, append non-null results, and bind the list to
+"instructions". Returns the hir_dict.
+@End Implementation
+
 Process called "translate_basic_block" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM basic block to HIR dictionary
-
-    @Reasoning:
-    Basic blocks have label and instructions.
-    @End Reasoning
 
     Let hir_dict be proc create_hir_dictionary_literal from HIR
 
@@ -375,12 +500,26 @@ Note: ==========================================================================
 Note: Instruction Translation
 Note: ============================================================================
 
+@Reasoning:
+A LLVM instruction has up to four observable fields: opcode (mnemonic),
+optional result register (LHS of `%r = add ...`), and an ordered operand
+list. The result is optional because terminator instructions like `ret`
+and `store` do not produce a value; modelling result as "missing key"
+rather than "empty string" lets the consumer dispatch on key presence.
+@End Reasoning
+
+@Implementation:
+Create HIR dict; on OOM set error and return 0. Bind "_type" ->
+"llvm_instruction". Read opcode at offset 16; if non-null, wrap as HIR
+string and bind to "opcode". Read result_reg at offset 8; if non-null,
+wrap as HIR string and bind to "result". Read operands at offset 32; if
+non-null and non-empty, create a HIR list, iterate, recurse via
+translate_llvm_node_to_hir on each operand, append non-null results,
+and bind to "operands". Returns the hir_dict.
+@End Implementation
+
 Process called "translate_instruction" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM instruction to HIR dictionary
-
-    @Reasoning:
-    Instructions have opcode, optional result register, and operands.
-    @End Reasoning
 
     Let hir_dict be proc create_hir_dictionary_literal from HIR
 
@@ -441,6 +580,20 @@ Note: ==========================================================================
 Note: Type Translation
 Note: ============================================================================
 
+@Reasoning:
+LLVM types collapse to a single string in this translator because we
+preserve the IR textual form (e.g. "i32", "i8*", "[4 x float]")
+verbatim; downstream type-aware passes parse the string when they need
+structural information. Lossy by design at this layer -- losing
+nothing because the string is the canonical form.
+@End Reasoning
+
+@Implementation:
+Read type_name at offset 8; guard null with a translation error. Wrap
+via HIR.create_hir_string_literal and return; guard construction
+failure with a translation error.
+@End Implementation
+
 Process called "translate_type" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM type to HIR string
 
@@ -465,6 +618,21 @@ Note: ==========================================================================
 Note: Value Translation
 Note: ============================================================================
 
+@Reasoning:
+A LLVM_VALUE node can carry either a named register reference (at
+offset 8) or a literal constant string (at offset 16). We try the
+register first because most values in well-formed IR are SSA register
+references; the literal form is used for immediate constants and
+inline ConstantExpr-style printouts.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (value_name) and offset 16 (value_str). If value_name is
+non-null, wrap as HIR string literal and return it. Otherwise if
+value_str is non-null, wrap as HIR string literal and return it.
+Otherwise set translation error "Null value" and return 0.
+@End Implementation
+
 Process called "translate_value" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM value to HIR
 
@@ -484,6 +652,20 @@ Process called "translate_value" takes context as Integer, llvm_node as Integer 
     proc set_translation_error with context, "Null value"
     Return 0
 End Process
+
+@Reasoning:
+A global declaration / definition is currently lowered to just its
+mangled name -- the body (type / initialiser / linkage) is preserved
+by the parser but not yet projected into HIR. This keeps the global
+sites locateable in HIR for now; richer modelling can be added later
+without changing the call site shape.
+@End Reasoning
+
+@Implementation:
+Read global_name at offset 8; guard null with translation error. Wrap
+via HIR.create_hir_string_literal and return; guard construction
+failure.
+@End Implementation
 
 Process called "translate_global" takes context as Integer, llvm_node as Integer returns Integer:
     Note: Translate LLVM global to HIR
@@ -509,12 +691,28 @@ Note: ==========================================================================
 Note: Top-Level Translation
 Note: ============================================================================
 
+@Reasoning:
+Top-level driver. Owns its own local context so per-translation error
+state is isolated from any caller's. The terminal has_error check is
+the canonical place where a recursive translator's deeper failure is
+surfaced to the caller as a single "Return 0".
+@End Reasoning
+
+@Implementation:
+Create a fresh context via create_translation_context; on OOM return 0.
+Translate the root via translate_llvm_node_to_hir. Call
+has_translation_error; on 1 destroy the context and return 0. Otherwise
+destroy the context and return the HIR result.
+@End Implementation
+
+@Security_Scope:
+`llvm_ast` is trusted to be a well-formed Parser output; null/wrong-type
+inputs propagate to the dispatched translator and surface as
+translation errors, never crashes.
+@End Security_Scope
+
 Process called "translate_llvmir_to_hir" takes llvm_ast as Integer returns Integer:
     Note: Translate LLVM IR AST to HIR (top-level entry point)
-
-    @Reasoning:
-    Entry point for translating LLVM IR AST to HIR representation.
-    @End Reasoning
 
     Let context be proc create_translation_context
 

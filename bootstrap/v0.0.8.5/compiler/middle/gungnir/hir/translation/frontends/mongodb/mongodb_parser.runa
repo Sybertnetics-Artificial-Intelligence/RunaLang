@@ -60,6 +60,21 @@ Note: ==========================================================================
 Note: Parser State Structure
 Note: ============================================================================
 
+@Reasoning:
+The parser is a tiny stateful driver over the lexer: a single-token
+lookahead is enough for LL(1) parsing of MongoDB's JSON-derived syntax,
+and `error_message` carries the most-recent failure across helper calls
+so callers do not have to thread error returns through every recursion.
+@End Reasoning
+
+@Implementation:
+Three 64-bit slots in declared order: lexer pointer (owned), current_token
+pointer (advanced via the lexer's next_token), and error_message (NUL-
+terminated string literal, currently set by expect_token only). Total
+size 24 bytes; offsets 0/8/16 are referenced directly by every parser
+Process.
+@End Implementation
+
 Type called "Parser":
     lexer as Integer
     current_token as Integer
@@ -69,6 +84,23 @@ End Type
 Note: ============================================================================
 Note: AST Node Structure
 Note: ============================================================================
+
+@Reasoning:
+A single ASTNode shape with discriminated tag `node_type` (the MONGO_*
+constants) rather than a sum type per kind keeps the recursive parser
+short and lets the HIR translator dispatch on a single field. The
+generic name/value/metadata slots overlap meaningfully across kinds:
+fields use `name`, values use `value`, operators use `name` for the
+operator string, and `metadata` is reserved for future per-node
+annotations (currently always 0).
+@End Reasoning
+
+@Implementation:
+Six 64-bit slots in declared order: node_type tag, name pointer, value
+pointer, children pointer (an Integer-array of child node pointers),
+child_count, metadata. Total size 48 bytes; offsets 0/8/16/24/32/40 are
+referenced directly by add_child and the translators.
+@End Implementation
 
 Type called "ASTNode":
     node_type as Integer
@@ -82,6 +114,27 @@ End Type
 Note: ============================================================================
 Note: Parser Creation
 Note: ============================================================================
+
+@Reasoning:
+Constructor for the parser state. Eagerly priming current_token with the
+first lexer output guarantees that every parsing predicate
+(current_token_type / check_token_type / expect_token) sees a valid token
+on the first call, removing the need for a "have we read any token yet"
+guard inside the hot path.
+@End Reasoning
+
+@Implementation:
+Create a lexer via Lexer.create_lexer(source); return 0 on failure.
+Allocate the 24-byte Parser block; write lexer pointer at offset 0,
+zero current_token (offset 8) and error_message (offset 16). Then call
+Lexer.next_token to obtain the first token and store it at offset 8.
+Returns the parser pointer.
+@End Implementation
+
+@Security_Scope:
+`source` is treated as untrusted shell input -- forwarded to the lexer
+which performs all bounds checking. No further validation here.
+@End Security_Scope
 
 Process called "create_parser" takes source as Integer returns Integer:
     Note: Create a new parser for MongoDB query source
@@ -114,6 +167,19 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+The single-token-lookahead accessor used by every parsing predicate.
+Centralising the null-token check here lets callers compare against
+expected token types without each one having to guard the indirection.
+Returning 0 (which matches TOKEN_EOF in the lexer) when the slot is null
+makes "no token loaded" behave identically to "end of input".
+@End Reasoning
+
+@Implementation:
+Read current_token at offset 8 of parser. If 0, return 0. Otherwise read
+the token's token_type field at offset 0 and return it.
+@End Implementation
+
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
 
@@ -127,6 +193,20 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Token-cursor advance. The previous current_token's lifetime now becomes
+the parser's responsibility (we still hold the only pointer until the
+AST owns it); deliberately not freeing it here because every consumed
+token in MongoDB parsing is either stored into an AST node's name/value
+slot or already inlined into create_string_from_bytes -- never abandoned.
+@End Reasoning
+
+@Implementation:
+Read lexer pointer at offset 0 of parser. Call Lexer.next_token to obtain
+the next token, then store it at offset 8 of parser, replacing the prior
+current_token. Returns 1.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -136,6 +216,19 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Non-consuming predicate used by loop heads (parse_document, parse_array)
+that need to peek for terminators before committing to another iteration.
+Pulled out as its own Process so the predicate's intent is obvious in
+callers rather than being open-coded with `current_token_type ==`
+comparisons.
+@End Reasoning
+
+@Implementation:
+Call current_token_type(parser); if it equals expected_type return 1,
+else return 0. No mutation.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
@@ -148,6 +241,22 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+The match-and-consume combinator. On mismatch we record `error_msg` into
+the parser's error_message slot so the outer caller can surface a
+descriptive parse error rather than only knowing "parsing failed". On
+match we advance the cursor; this dual role is what lets the parser
+write linear grammar rules like
+    expect_token(parser, LBRACE, "Expected '{'")
+without manual cursor bookkeeping per call site.
+@End Reasoning
+
+@Implementation:
+Call check_token_type(parser, expected_type). On mismatch (0), write
+error_msg into parser.error_message at offset 16 and return 0. On match
+(1), call advance_token and return 1.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect a specific token type
@@ -166,6 +275,19 @@ End Process
 Note: ============================================================================
 Note: AST Node Creation
 Note: ============================================================================
+
+@Reasoning:
+Single factory for all ASTNode kinds. Zeroing every optional slot at
+construction means individual parsers only set the slots they actually
+use; the translator can safely test for "has X?" by comparing against 0
+without each parser remembering to zero unused fields.
+@End Reasoning
+
+@Implementation:
+Allocate 48 bytes (six 64-bit fields). On OOM return 0. Otherwise write
+node_type at offset 0 and zeros at offsets 8/16/24/32/40 (name, value,
+children, child_count, metadata).
+@End Implementation
 
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create a new AST node
@@ -186,6 +308,28 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Lazy children-array allocation: nodes that never accumulate children (most
+MONGO_VALUE leaves) pay zero for an empty backing buffer. The initial
+capacity of 20 was chosen to cover the largest commonly-observed document
+shape (an update operation with 4-5 fields plus a deeply nested $or with
+~15 clauses) without needing growth -- and the structure currently has no
+growth path, so callers must stay within that bound.
+@End Reasoning
+
+@Implementation:
+Read child_count (offset 32) and children (offset 24) from parent. If
+children is 0, allocate a 160-byte (20 * 8) array and store the pointer
+back at offset 24. Write child into children[child_count] via byte
+offset child_count * 8. Increment child_count and store back at offset
+32. Returns 1.
+@End Implementation
+
+@Performance_Hints:
+O(1) per append; no growth, so the 20-child cap silently truncates --
+audit this if adding new operation shapes with >20 children.
+@End Performance_Hints
 
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
@@ -212,6 +356,42 @@ End Process
 Note: ============================================================================
 Note: Document Parsing
 Note: ============================================================================
+
+@Reasoning:
+Public entry point. The MongoDB shell input can either be (a) a bare
+document/array (used for ad-hoc filters), or (b) an operation call like
+db.coll.find({...}). We sniff the leading token: an identifier means
+"call shape", routed to the matching parse_*_operation by name length and
+first-byte heuristics; anything else is parsed as a value and returned
+directly. The first-byte switch keeps recognition O(1) without
+materialising and comparing against a keyword table.
+@End Reasoning
+
+@Implementation:
+Build a parser via create_parser. If the leading token is an identifier,
+read its slice (op_name_ptr/op_name_len from the token at offsets 8/16);
+then dispatch:
+  - length 4 starting "find"        -> parse_query_operation
+  - length 7 (treated as "findOne") -> parse_query_operation
+  - length 9 starting 'u'           -> parse_update_operation
+  - length 9 starting 'i'           -> parse_insert_operation
+  - length 9 starting 'd'           -> parse_delete_operation
+  - length 9 (treated as "aggregate") -> parse_aggregate_operation
+  - length 10 starting 'u' or 'r'   -> parse_update_operation (updateMany/replaceOne)
+  - length 10 starting 'i'          -> parse_insert_operation (insertMany)
+  - length 10 starting 'd'          -> parse_delete_operation (deleteMany)
+Fallback: parse_value (a bare document/array/literal).
+@End Implementation
+
+@Performance_Hints:
+O(1) dispatch -- single token lookahead plus at most one byte compare.
+@End Performance_Hints
+
+@Security_Scope:
+`source` is untrusted; all parser interior validation rests on the lexer
+returning well-formed tokens and on the absence of out-of-bounds children
+arrays (capped at 20 in add_child).
+@End Security_Scope
 
 Process called "parse_mongodb" takes source as Integer returns Integer:
     Note: Parse MongoDB operation or query document
@@ -323,6 +503,27 @@ Process called "parse_mongodb" takes source as Integer returns Integer:
     Return document
 End Process
 
+@Reasoning:
+The unified value-position dispatcher. Every place in MongoDB syntax that
+expects "a value" -- a field's value, an array element, an operator's
+operand -- routes through here so the same set of literal/document/array
+recognisers is reused without duplicating the dispatch logic. Returning 0
+on an unrecognised leading token allows higher-level parsers to surface
+the error via expect_token rather than asserting here.
+@End Reasoning
+
+@Implementation:
+Read the leading token type via current_token_type and switch:
+  10 LBRACE      -> parse_document
+  12 LBRACKET    -> parse_array
+   2 STRING      -> parse_string_value
+   3 NUMBER      -> parse_number_value
+   4 BOOLEAN     -> parse_boolean_value
+   5 NULL        -> parse_null_value
+  30 OBJECTID, 31 ISODATE, 32 NUMBERLONG -> parse_bson_constructor
+Otherwise return 0.
+@End Implementation
+
 Process called "parse_value" takes parser as Integer returns Integer:
     Note: Parse any MongoDB value (document, array, literal)
 
@@ -374,6 +575,21 @@ Process called "parse_value" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Parses a brace-delimited list of fields separated by optional commas. We
+accept trailing commas and missing commas to match the de-facto leniency
+of the MongoDB shell; the strict-comma rule from JSON proper is enforced
+only at validation layers above the parser, not in syntax recognition.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_DOCUMENT node. Consume the opening LBRACE via
+expect_token. Loop: if the current token is RBRACE (11) break;
+otherwise call parse_field, append non-null result via add_child; then,
+if the next token is COMMA (15), advance past it. After the loop,
+consume the closing RBRACE via expect_token. Returns the document node.
+@End Implementation
+
 Process called "parse_document" takes parser as Integer returns Integer:
     Note: Parse document: { field: value, ... }
 
@@ -406,6 +622,24 @@ Process called "parse_document" takes parser as Integer returns Integer:
 
     Return document
 End Process
+
+@Reasoning:
+A document entry is either `name: value` (a MONGO_FIELD) or
+`$operator: value` (a MONGO_OPERATOR). Choosing the node-kind here at
+the syntax point -- rather than after the fact in the translator -- lets
+the AST consumer dispatch on node_type alone and lets later passes rely
+on $-prefixed names never appearing on a MONGO_FIELD node.
+@End Reasoning
+
+@Implementation:
+Build a default MONGO_FIELD node. Read the leading token type; if it is
+TOKEN_OPERATOR (20), discard the default and create a MONGO_OPERATOR node
+instead, then copy the operator name via create_string_from_bytes and
+advance. Otherwise treat the token as a name -- copy its bytes to a
+fresh String and store at offset 8 (name) before advancing. Consume the
+colon via expect_token. Parse the value via parse_value and append via
+add_child. Returns the field/operator node.
+@End Implementation
 
 Process called "parse_field" takes parser as Integer returns Integer:
     Note: Parse field: name: value or $operator: value
@@ -447,6 +681,21 @@ Process called "parse_field" takes parser as Integer returns Integer:
     Return field
 End Process
 
+@Reasoning:
+Bracket-delimited heterogeneous element list. Symmetric with
+parse_document on commas: optional separators tolerated to match the
+MongoDB shell's leniency. Elements are appended in source order, which
+must be preserved because aggregation pipeline ordering is observable.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_ARRAY node. Consume the opening LBRACKET via
+expect_token. Loop: if the current token is RBRACKET (13) break;
+otherwise call parse_value, append non-null result via add_child; then,
+if the next token is COMMA (15), advance past it. After the loop,
+consume the closing RBRACKET via expect_token. Returns the array node.
+@End Implementation
+
 Process called "parse_array" takes parser as Integer returns Integer:
     Note: Parse array: [ value, ... ]
 
@@ -484,6 +733,21 @@ Note: ==========================================================================
 Note: Literal Value Parsing
 Note: ============================================================================
 
+@Reasoning:
+Wraps the lexer's already-bounded string-token slice into a MONGO_VALUE
+leaf carrying an owned, NUL-terminated copy. The copy is necessary
+because the lexer's slice is an interior pointer into the source buffer;
+once translation/HIR rewriting begins, the source buffer may be released.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_VALUE node. Read the current token at offset 8 of parser;
+extract value_ptr (token offset 8) and value_len (token offset 16); copy
+to a fresh NUL-terminated String via create_string_from_bytes and store
+at offset 16 (value) of the new node. Advance the token cursor. Returns
+the value node.
+@End Implementation
+
 Process called "parse_string_value" takes parser as Integer returns Integer:
     Note: Parse string literal
 
@@ -499,6 +763,21 @@ Process called "parse_string_value" takes parser as Integer returns Integer:
 
     Return value_node
 End Process
+
+@Reasoning:
+Numbers are preserved as their original lexeme (rather than parsed into a
+native int/float) so the HIR translator can decide the numeric type --
+e.g. whether to lift a digit-only literal to NumberLong -- without
+re-lexing. The textual fidelity also matters for values that exceed
+64-bit signed range, which MongoDB supports via NumberDecimal.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_VALUE node. Read the current token; extract value_ptr/
+value_len; copy to a NUL-terminated String via create_string_from_bytes
+and store at offset 16 of the node. Advance the cursor and return the
+value node.
+@End Implementation
 
 Process called "parse_number_value" takes parser as Integer returns Integer:
     Note: Parse number literal
@@ -516,6 +795,20 @@ Process called "parse_number_value" takes parser as Integer returns Integer:
     Return value_node
 End Process
 
+@Reasoning:
+Booleans are stored as their textual form ("true" / "false") to keep
+MONGO_VALUE nodes uniformly string-typed regardless of whether the
+underlying datum is a string, number, boolean, or null. The translator
+recognises true/false strings when constructing HIR booleans.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_VALUE node. Read the current token; copy its byte slice
+(offsets 8/16) to a fresh NUL-terminated String via
+create_string_from_bytes and store at offset 16 of the node. Advance the
+cursor and return the value node.
+@End Implementation
+
 Process called "parse_boolean_value" takes parser as Integer returns Integer:
     Note: Parse boolean literal
 
@@ -532,6 +825,20 @@ Process called "parse_boolean_value" takes parser as Integer returns Integer:
     Return value_node
 End Process
 
+@Reasoning:
+The null token from the lexer has no useful slice (the parser already
+knows it's "null"), so we materialise a fresh "null" String literal
+directly rather than copying from the source. This keeps every
+MONGO_VALUE node carrying a string at offset 16, satisfying the
+translator's uniformity assumption.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_VALUE node. Allocate a NUL-terminated "null" String via
+StringCore.create_string and store at offset 16 of the node. Advance the
+cursor and return the value node.
+@End Implementation
+
 Process called "parse_null_value" takes parser as Integer returns Integer:
     Note: Parse null literal
 
@@ -544,6 +851,25 @@ Process called "parse_null_value" takes parser as Integer returns Integer:
 
     Return value_node
 End Process
+
+@Reasoning:
+BSON constructor literals like `ObjectId("...")` carry two pieces: the
+constructor name (which identifies the BSON type) and a single argument
+(the string operand). Storing the name in `name` (offset 8) and the
+argument as a child preserves both for the translator, which renders
+them as a tagged document or a typed HIR literal depending on the BSON
+type.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_VALUE node. Copy the constructor identifier's slice to a
+fresh String via create_string_from_bytes and store at offset 8 (name).
+Advance past the identifier. If the next token type equals 32 (the
+historical TOKEN_LPAREN slot -- present here for forward-compat with
+lexers that emit parentheses), advance past it, parse one argument via
+parse_value, append via add_child, then advance past the closing paren.
+Returns the value node.
+@End Implementation
 
 Process called "parse_bson_constructor" takes parser as Integer returns Integer:
     Note: Parse BSON constructor: ObjectId("..."), ISODate("..."), etc.
@@ -571,6 +897,25 @@ Process called "parse_bson_constructor" takes parser as Integer returns Integer:
     Return value_node
 End Process
 
+@Reasoning:
+Helper that copies a non-NUL-terminated byte slice into a freshly-owned
+NUL-terminated String. The MongoDB lexer's tokens carry interior pointers
+into the source buffer; durable AST storage requires an owned copy that
+survives the source buffer's lifetime.
+@End Reasoning
+
+@Implementation:
+Allocate length+1 bytes; return 0 on OOM. memory_copy `length` bytes from
+the input byte buffer to the new buffer at offset 0, then write a 0
+byte at offset length to NUL-terminate. Returns the new buffer pointer.
+@End Implementation
+
+@Performance_Hints:
+O(length) per call due to memory_copy; called once per identifier/string
+token consumed by the parser, so total cost scales with input token-byte
+volume.
+@End Performance_Hints
+
 Process called "create_string_from_bytes" takes bytes as Integer, length as Integer returns Integer:
     Note: Create string from byte range
 
@@ -589,6 +934,25 @@ End Process
 Note: ============================================================================
 Note: MongoDB Operation Parsing
 Note: ============================================================================
+
+@Reasoning:
+Recognises find() / findOne() and stores the operation name + arguments
+into a MONGO_QUERY_OPERATION node. The argument layout (query first,
+optional projection second) is fixed by the MongoDB shell -- we preserve
+order via add_child rather than slotting into named fields so the
+translator can rely on child[0]=query, child[1]=projection.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_QUERY_OPERATION node. Copy the leading identifier's slice
+into a fresh String and store at offset 8 (name). Advance. Currently the
+lexer emits TOKEN_LBRACE (10) for the function-call open paren -- check
+for it; if present, advance, parse the query document via parse_document,
+add it as the first child, and if the next token is TOKEN_COMMA (15),
+advance and parse the projection document, adding it as the second
+child. Then consume the closing TOKEN_RBRACE if present. Returns the
+operation node.
+@End Implementation
 
 Process called "parse_query_operation" takes parser as Integer returns Integer:
     Note: Parse find() or findOne() operation
@@ -635,6 +999,21 @@ Process called "parse_query_operation" takes parser as Integer returns Integer:
     Return operation_node
 End Process
 
+@Reasoning:
+aggregate() takes a single pipeline argument -- always an array of stage
+documents. Storing the synthetic "aggregate" name on the node (rather
+than copying from the source token) keeps the translator's name-based
+dispatch consistent regardless of any source-side casing variation.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_AGGREGATE_OPERATION node. Write a fresh "aggregate"
+String at offset 8 (name). Advance past the identifier. If the next
+token is TOKEN_LBRACE (10), advance, parse the pipeline via parse_array,
+append it as the single child, then consume the closing TOKEN_RBRACE if
+present. Returns the operation node.
+@End Implementation
+
 Process called "parse_aggregate_operation" takes parser as Integer returns Integer:
     Note: Parse aggregate() operation
     Note: Syntax: db.collection.aggregate([{$match: ...}, {$group: ...}, ...])
@@ -667,6 +1046,24 @@ Process called "parse_aggregate_operation" takes parser as Integer returns Integ
 
     Return operation_node
 End Process
+
+@Reasoning:
+A single recogniser for updateOne / updateMany / replaceOne since the
+syntactic shape is identical (filter, update, [options]); the operation
+name on the node is what differentiates the semantics downstream.
+Children are stored in syntactic argument order so translate_update_
+operation can rely on child[0]=filter, child[1]=update, child[2]=options.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_UPDATE_OPERATION node. Copy the leading identifier's
+slice into a fresh String and store at offset 8 (name). Advance. If the
+next token is TOKEN_LBRACE (10), advance and parse the filter document;
+add as first child. If the next token is TOKEN_COMMA (15), advance and
+parse the update document; add as second child. If another TOKEN_COMMA
+follows, advance and parse the options document; add as third child.
+Consume the closing TOKEN_RBRACE if present. Returns the operation node.
+@End Implementation
 
 Process called "parse_update_operation" takes parser as Integer returns Integer:
     Note: Parse updateOne(), updateMany(), or replaceOne() operation
@@ -724,6 +1121,22 @@ Process called "parse_update_operation" takes parser as Integer returns Integer:
     Return operation_node
 End Process
 
+@Reasoning:
+insertOne and insertMany differ only in payload cardinality: a single
+document vs. an array of documents. We disambiguate at the leading
+argument token (LBRACKET implies many) so the AST faithfully reflects
+what the user wrote without forcing the translator to re-classify.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_INSERT_OPERATION node. Copy the leading identifier's
+slice into a fresh String and store at offset 8 (name). Advance. If the
+next token is TOKEN_LBRACE (10), advance, then look at the next token:
+TOKEN_LBRACKET (12) -> parse_array (insertMany); otherwise ->
+parse_document (insertOne). Append the result as the single child.
+Consume the closing TOKEN_RBRACE if present. Returns the operation node.
+@End Implementation
+
 Process called "parse_insert_operation" takes parser as Integer returns Integer:
     Note: Parse insertOne() or insertMany() operation
     Note: Syntax: db.collection.insertOne(document) or db.collection.insertMany([documents])
@@ -768,6 +1181,20 @@ Process called "parse_insert_operation" takes parser as Integer returns Integer:
 
     Return operation_node
 End Process
+
+@Reasoning:
+deleteOne / deleteMany take a single filter document; the cardinality of
+deletion is encoded in the operation name only. Single recogniser since
+the shape is identical.
+@End Reasoning
+
+@Implementation:
+Create a MONGO_DELETE_OPERATION node. Copy the leading identifier's
+slice into a fresh String and store at offset 8 (name). Advance. If the
+next token is TOKEN_LBRACE (10), advance, parse the filter document via
+parse_document, and append as the single child. Consume the closing
+TOKEN_RBRACE if present. Returns the operation node.
+@End Implementation
 
 Process called "parse_delete_operation" takes parser as Integer returns Integer:
     Note: Parse deleteOne() or deleteMany() operation

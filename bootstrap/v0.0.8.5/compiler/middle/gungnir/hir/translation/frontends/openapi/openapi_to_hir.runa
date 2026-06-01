@@ -23,6 +23,26 @@ Note: ========================================
 Note: Top-Level Translation
 Note: ========================================
 
+@Reasoning:
+The translator's job is shape-preserving: the OpenAPI AST is already a
+nested Dict/List structure from openapi_parser, so we mostly rebuild it
+into a fresh HIR-namespaced Dict, swapping out the parser's internal
+"type": "openapi_document" tag for the HIR-side
+"type": "openapi_specification" tag. Per-section translators are dispatched
+by key string rather than positional order because the parser preserves
+input key order, which is not the OpenAPI section order.
+@End Reasoning
+
+@Implementation:
+Guard openapi_ast!=0. Allocate a fresh HIR Dict and set its "type" to
+"openapi_specification". Enumerate openapi_ast's keys; skip the inner
+"type" tag. For each remaining key compare against the eight known
+section names ("openapi", "info", "servers", "paths", "components",
+"security", "tags", "externalDocs"); for "info", "servers", "paths" and
+"components" dispatch the matching translate_* subroutine and store the
+result; for the others store the value as-is. Returns the HIR dict.
+@End Implementation
+
 Process called "translate_openapi_to_hir" takes openapi_ast as Integer returns Integer:
     Note: Translate OpenAPI AST to HIR dictionary
     Note: Returns: HIR dictionary with complete OpenAPI semantics
@@ -111,6 +131,21 @@ Note: ========================================
 Note: Info Object Translation
 Note: ========================================
 
+@Reasoning:
+The info object's fields (title, version, description, contact, license,
+termsOfService, etc.) are all already in their final HIR-compatible
+shape -- strings or sub-dicts that don't need further structural
+transformation. Building a fresh Dict (rather than passing info_dict
+through unchanged) ensures the HIR layer never holds a pointer into
+parser-owned storage.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict. Enumerate info_dict's keys and copy each
+key -> value binding into the new info_hir Dict without modification.
+Returns info_hir.
+@End Implementation
+
 Process called "translate_info" takes info_dict as Integer returns Integer:
     Note: Translate info object to HIR
 
@@ -137,6 +172,19 @@ Note: ========================================
 Note: Servers Array Translation
 Note: ========================================
 
+@Reasoning:
+The servers section is an ordered list; element order is significant
+because OpenAPI clients pick the first server entry as the default
+endpoint. We rebuild a fresh List and run each entry through
+translate_server so that the inner Dicts also pass into HIR ownership.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh List. Iterate i from 0 to List.size(servers_list); for
+each i, get servers_list[i], run translate_server to produce server_hir,
+and push it to servers_hir. Returns servers_hir.
+@End Implementation
+
 Process called "translate_servers" takes servers_list as Integer returns Integer:
     Note: Translate servers array to HIR
 
@@ -155,6 +203,18 @@ Process called "translate_servers" takes servers_list as Integer returns Integer
 
     Return servers_hir
 End Process
+
+@Reasoning:
+A server entry's fields (url, description, variables) are already
+HIR-compatible; we just need a clean Dict in HIR ownership. The variables
+sub-dict is structured but follows the same shape-preserving rule, so no
+recursive translation is necessary.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict. Enumerate server_dict's keys and copy each
+key -> value binding into the new server_hir Dict. Returns server_hir.
+@End Implementation
 
 Process called "translate_server" takes server_dict as Integer returns Integer:
     Note: Translate single server object to HIR
@@ -182,6 +242,19 @@ Note: ========================================
 Note: Paths Object Translation
 Note: ========================================
 
+@Reasoning:
+The paths dict maps path-template strings to path-item dicts. Path-items
+contain operation dicts whose subfields require nested translation
+(parameters, requestBody, responses), so we recurse via
+translate_path_item rather than copying the value verbatim.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict paths_hir. Enumerate paths_dict.keys; for each
+path_key, fetch path_item_dict, run translate_path_item, and bind
+path_key -> path_item_hir on paths_hir. Returns paths_hir.
+@End Implementation
+
 Process called "translate_paths" takes paths_dict as Integer returns Integer:
     Note: Translate paths object to HIR
 
@@ -203,6 +276,21 @@ Process called "translate_paths" takes paths_dict as Integer returns Integer:
 
     Return paths_hir
 End Process
+
+@Reasoning:
+A path item's keys are either HTTP method names (operations to translate
+recursively) or common-section fields (parameters, summary, description,
+servers) that are passed through unchanged. We dispatch by checking the
+key against the eight standard HTTP methods via is_http_method; anything
+else is treated as a pass-through field.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict path_item_hir. Enumerate path_item_dict.keys; for
+each key, convert to a NUL-terminated C string via StringCore.to_cstring
+and call is_http_method. If 1, translate via translate_operation and
+bind; otherwise bind the value verbatim. Returns path_item_hir.
+@End Implementation
 
 Process called "translate_path_item" takes path_item_dict as Integer returns Integer:
     Note: Translate path item (operations) to HIR
@@ -239,6 +327,22 @@ End Process
 Note: ========================================
 Note: Operation Translation
 Note: ========================================
+
+@Reasoning:
+Operation fields fall into three dispatched ones (parameters,
+requestBody, responses -- each with its own recursive translator) and a
+free-form pass-through set (summary, description, operationId, tags,
+deprecated, security, callbacks, x-* extensions). We iterate every key
+so unknown extensions survive into the HIR without us enumerating them.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict operation_hir. Enumerate operation_dict.keys; for
+each key, convert via StringCore.to_cstring and compare against the
+three dispatched names using string_equals. Match -> run the matching
+translate_parameters / translate_request_body / translate_responses and
+bind the result. Otherwise bind value verbatim. Returns operation_hir.
+@End Implementation
 
 Process called "translate_operation" takes operation_dict as Integer returns Integer:
     Note: Translate operation object to HIR
@@ -287,6 +391,18 @@ Note: ========================================
 Note: Parameters Translation
 Note: ========================================
 
+@Reasoning:
+Operation parameters are an ordered list (the order is observable to
+HTTP clients building URLs). We rebuild a fresh List and translate each
+entry via translate_parameter to detach from parser-owned storage.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh List. Iterate i from 0 to List.size(params_list); fetch
+params_list[i], run translate_parameter, and push the result to
+params_hir. Returns params_hir.
+@End Implementation
+
 Process called "translate_parameters" takes params_list as Integer returns Integer:
     Note: Translate parameters array to HIR
 
@@ -305,6 +421,18 @@ Process called "translate_parameters" takes params_list as Integer returns Integ
 
     Return params_hir
 End Process
+
+@Reasoning:
+A parameter entry has six commonly-set keys (name, in, schema,
+description, required, style) plus optional spec extensions; all of them
+are HIR-compatible without further transformation, so we duplicate the
+dict bindings into a fresh Dict for HIR ownership.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict param_hir. Enumerate param_dict.keys and copy each
+key -> value binding. Returns param_hir.
+@End Implementation
 
 Process called "translate_parameter" takes param_dict as Integer returns Integer:
     Note: Translate single parameter object to HIR
@@ -332,6 +460,19 @@ Note: ========================================
 Note: Request Body Translation
 Note: ========================================
 
+@Reasoning:
+The request body's keys (content, description, required) are all
+HIR-compatible without restructuring. We rebuild into a fresh Dict for
+HIR ownership; the content sub-dict (a media-type -> media-type-object
+mapping) is preserved as-is because no media-type-specific transformation
+applies at this stage.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict request_body_hir. Enumerate request_body_dict.keys
+and copy each key -> value binding. Returns request_body_hir.
+@End Implementation
+
 Process called "translate_request_body" takes request_body_dict as Integer returns Integer:
     Note: Translate request body object to HIR
 
@@ -358,6 +499,19 @@ Note: ========================================
 Note: Responses Translation
 Note: ========================================
 
+@Reasoning:
+The responses dict is keyed by status code (or "default"). Each entry is
+a response object that requires recursive translation via
+translate_response to detach from parser ownership. Keys are reused as-is
+because the status-code strings come from the parser already.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict responses_hir. Enumerate responses_dict.keys; for
+each status_code, fetch response_dict, run translate_response, and bind
+status_code -> response_hir on responses_hir. Returns responses_hir.
+@End Implementation
+
 Process called "translate_responses" takes responses_dict as Integer returns Integer:
     Note: Translate responses object to HIR
 
@@ -379,6 +533,18 @@ Process called "translate_responses" takes responses_dict as Integer returns Int
 
     Return responses_hir
 End Process
+
+@Reasoning:
+A response entry's fields (description, content, headers, links) are all
+HIR-compatible without restructuring. We rebuild into a fresh Dict for
+HIR ownership without recursing into content or headers, which downstream
+HIR passes interpret per-media-type.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict response_hir. Enumerate response_dict.keys and
+copy each key -> value binding. Returns response_hir.
+@End Implementation
 
 Process called "translate_response" takes response_dict as Integer returns Integer:
     Note: Translate single response object to HIR
@@ -405,6 +571,24 @@ End Process
 Note: ========================================
 Note: Components Translation
 Note: ========================================
+
+@Reasoning:
+The components section holds reusable definitions. Three sub-sections
+(schemas, responses, parameters) require recursive translation because
+their entries carry the same per-entry shapes as their inline siblings.
+Other component sections (requestBodies, headers, securitySchemes,
+links, callbacks, examples) are passed through verbatim because their
+internal structure is not yet transformed by this layer.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict components_hir. Enumerate components_dict.keys;
+for each key, convert via StringCore.to_cstring and compare against
+"schemas", "responses", "parameters" via string_equals. Match -> call
+the matching translate_schemas / translate_component_responses /
+translate_component_parameters and bind. Otherwise bind value verbatim.
+Returns components_hir.
+@End Implementation
 
 Process called "translate_components" takes components_dict as Integer returns Integer:
     Note: Translate components object to HIR
@@ -449,6 +633,20 @@ Process called "translate_components" takes components_dict as Integer returns I
     Return components_hir
 End Process
 
+@Reasoning:
+Schema definitions are already structured Dicts with JSON-Schema-shaped
+internals (type, properties, items, required, etc.). Schema-level
+transformation (e.g., resolving $ref) happens later in the HIR pipeline;
+here we just rebuild the outer Dict into HIR ownership while keeping
+each schema definition verbatim.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict schemas_hir. Enumerate schemas_dict.keys; for each
+schema_name, fetch schema_def and bind schema_name -> schema_def on
+schemas_hir without recursive transformation. Returns schemas_hir.
+@End Implementation
+
 Process called "translate_schemas" takes schemas_dict as Integer returns Integer:
     Note: Translate schemas component to HIR
 
@@ -471,6 +669,19 @@ Process called "translate_schemas" takes schemas_dict as Integer returns Integer
     Return schemas_hir
 End Process
 
+@Reasoning:
+Component-level responses are a name -> response-object dict (keyed by a
+free-form name like "NotFound") rather than by status code; the entry
+shape is identical to inline response objects, so we delegate per-entry
+translation to translate_response.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict responses_hir. Enumerate responses_dict.keys; for
+each response_name, fetch response_def, run translate_response, and bind
+response_name -> response_hir on responses_hir. Returns responses_hir.
+@End Implementation
+
 Process called "translate_component_responses" takes responses_dict as Integer returns Integer:
     Note: Translate component responses to HIR
 
@@ -492,6 +703,19 @@ Process called "translate_component_responses" takes responses_dict as Integer r
 
     Return responses_hir
 End Process
+
+@Reasoning:
+Component-level parameters are a name -> parameter-object dict (keyed by
+a free-form name like "UserId") rather than positional in a list. Per-
+entry shape matches inline parameter objects, so we delegate per-entry
+translation to translate_parameter.
+@End Reasoning
+
+@Implementation:
+Allocate a fresh Dict params_hir. Enumerate params_dict.keys; for each
+param_name, fetch param_def, run translate_parameter, and bind
+param_name -> param_hir on params_hir. Returns params_hir.
+@End Implementation
 
 Process called "translate_component_parameters" takes params_dict as Integer returns Integer:
     Note: Translate component parameters to HIR
@@ -518,6 +742,19 @@ End Process
 Note: ========================================
 Note: Helper Functions
 Note: ========================================
+
+@Reasoning:
+Closed-set predicate over the eight standard HTTP methods (get/post/put/
+delete/patch/head/options/trace). Used by translate_path_item to gate
+operation translation; unknown methods (or `x-*` extensions that share a
+slot) fall through and are passed verbatim by the caller.
+@End Reasoning
+
+@Implementation:
+Short-circuit OR over eight string_equals comparisons against "get",
+"post", "put", "delete", "patch", "head", "options", "trace". Return 1
+on first match; return 0 if none match.
+@End Implementation
 
 Process called "is_http_method" takes method as String returns Integer:
     Note: Check if string is a valid HTTP method
@@ -565,6 +802,19 @@ Process called "is_http_method" takes method as String returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Local NUL-terminated equality used by the dispatched section/key
+checks. Same rationale as the openapi_parser's helper: short inner loop
+that inlines well and avoids a cross-module call into StringCore for
+each compare.
+@End Reasoning
+
+@Implementation:
+Loop index from 0; at each step read memory_get_byte on both strings. On
+mismatch return 0; on simultaneous 0 byte (joint terminator) return 1;
+otherwise advance index.
+@End Implementation
+
 Process called "string_equals" takes str1 as String, str2 as String returns Integer:
     Note: Compare two null-terminated C strings for equality
 
@@ -587,6 +837,17 @@ Process called "string_equals" takes str1 as String, str2 as String returns Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Wrapper around StringCore.create_from_literal kept here so the long list
+of `proc create_string_literal with "..."` call sites above read cleanly.
+StringCore.create_from_literal is O(1) identity-on-pointer for valid
+literals, so this wrapper costs nothing at runtime.
+@End Reasoning
+
+@Implementation:
+Return StringCore.create_string_from_literal(value).
+@End Implementation
 
 Process called "create_string_literal" takes value as String returns Integer:
     Note: Create string from string literal

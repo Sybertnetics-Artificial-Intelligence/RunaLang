@@ -12,6 +12,34 @@ Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
+@Reasoning:
+Entry point converting a verified x86_assembly HIR dictionary into
+AT&T-syntax x86-64 assembly text consumable by GNU as. Validates the
+HIR type field first to avoid silently producing nonsense from a
+non-x86 input dictionary.
+@End Reasoning
+
+@Implementation:
+Null-HIR guard returns 0 immediately. Creates an x86 emitter; reads
+the HIR "type" field and bails (destroying the emitter) if it is
+absent or not equal to "x86_assembly". Walks the three top-level
+sections in source order: labels, directives, instructions. Each
+section is optional; missing sections are silently skipped. Returns
+the emitter's accumulated output string and destroys the emitter.
+@End Implementation
+
+@Performance_Hints:
+Cold path - called once per HIR module. Dominated by the size of the
+instructions list.
+@End Performance_Hints
+
+@Security_Scope:
+HIR input is trusted (produced by an upstream compiler stage).
+Returned pointer ownership follows the emitter's get_output contract;
+the emitter itself is destroyed before return so no caller has access
+to it.
+@End Security_Scope
+
 Process called "generate_x86_from_hir" takes hir as Integer returns Integer:
     Note: Main entry point - generate x86-64 assembly from HIR dictionary
 
@@ -62,6 +90,18 @@ Process called "generate_x86_from_hir" takes hir as Integer returns Integer:
     Return output
 End Process
 
+@Reasoning:
+Emits label definitions in their declared order. Labels are emitted
+flush-left (no indent) per GNU as convention; the trailing ':' marks
+each as a label definition rather than a reference.
+@End Reasoning
+
+@Implementation:
+Walks the labels list by index. For each label HIR, reads "name", and
+if present emits name then ':' (58) then a newline. Labels missing a
+name are silently skipped.
+@End Implementation
+
 Process called "generate_labels" takes emitter as Integer, labels as Integer:
     Note: Generate label definitions
 
@@ -84,6 +124,20 @@ Process called "generate_labels" takes emitter as Integer, labels as Integer:
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+Emits assembler directives like .text, .data, .globl, .quad with
+their argument lists. Directives are emitted flush-left (no indent)
+per GNU as convention.
+@End Reasoning
+
+@Implementation:
+Walks the directives list by index. For each directive HIR, emits
+the "name" string (which includes the leading '.'). If "arguments"
+is present, emits a space and walks the arguments via generate_operand,
+separating adjacent arguments with ',' (44). Terminates each directive
+with a newline.
+@End Implementation
 
 Process called "generate_directives" takes emitter as Integer, directives as Integer:
     Note: Generate assembler directives
@@ -123,6 +177,24 @@ Process called "generate_directives" takes emitter as Integer, directives as Int
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+Emits the body of the assembly program: indented "mnemonic op1, op2"
+instructions in source order. The indent (one level = 4 spaces) is
+the convention for AT&T-syntax x86 assembly inside function bodies.
+@End Reasoning
+
+@Implementation:
+Walks the instructions list by index. For each instruction HIR, emits
+one indent level, the mnemonic, then (if there are operands) a space
+followed by the operands separated by ", " (44, 32). Each instruction
+ends with a newline.
+@End Implementation
+
+@Performance_Hints:
+O(n*m) in instruction count n and average operands m. The inner
+operand loop is short for x86 (1-3 operands per instruction).
+@End Performance_Hints
 
 Process called "generate_instructions" takes emitter as Integer, instructions as Integer:
     Note: Generate assembly instructions
@@ -170,6 +242,21 @@ Process called "generate_instructions" takes emitter as Integer, instructions as
     End While
 End Process
 
+@Reasoning:
+Operand dispatcher mapping a HIR operand node's "type" string to its
+corresponding generator. The four supported operand types
+(register, immediate, memory, identifier) cover every operand form
+in the x86_assembly HIR.
+@End Reasoning
+
+@Implementation:
+Null-operand guard returns immediately. Reads "type" and sequentially
+checks against each known operand-type tag, delegating to the
+matching generate_X helper. Unrecognized types produce no output (a
+silent no-op) rather than an error because the type is supposed to
+have been validated upstream.
+@End Implementation
+
 Process called "generate_operand" takes emitter as Integer, operand as Integer:
     Note: Generate assembly operand
 
@@ -210,6 +297,18 @@ Process called "generate_operand" takes emitter as Integer, operand as Integer:
     End If
 End Process
 
+@Reasoning:
+Emits an x86 register operand. AT&T syntax prefixes register names
+with '%' (e.g., %rax); the HIR stores the bare name without the
+prefix, so this proc prepends it.
+@End Reasoning
+
+@Implementation:
+Emits '%' (37). Reads "name" and emits it verbatim; missing name
+emits just the '%' (which is malformed but matches the upstream
+HIR's contract: name is required).
+@End Implementation
+
 Process called "generate_register" takes emitter as Integer, register as Integer:
     Note: Generate register operand (%rax, %rbx, etc.)
 
@@ -223,6 +322,17 @@ Process called "generate_register" takes emitter as Integer, register as Integer
     End If
 End Process
 
+@Reasoning:
+Emits an x86 immediate operand. AT&T syntax prefixes immediates with
+'$' (e.g., $42); the HIR stores the bare numeric string without the
+prefix.
+@End Reasoning
+
+@Implementation:
+Emits '$' (36). Reads "value" (a pre-formatted decimal/hex string)
+and emits it verbatim.
+@End Implementation
+
 Process called "generate_immediate" takes emitter as Integer, immediate as Integer:
     Note: Generate immediate value ($123)
 
@@ -235,6 +345,20 @@ Process called "generate_immediate" takes emitter as Integer, immediate as Integ
         proc emit_string from Emitter with emitter, value_str
     End If
 End Process
+
+@Reasoning:
+Emits an x86 memory reference in AT&T scaled-index addressing form:
+"offset(%base, %index, scale)". Each component is optional except the
+parens; the HIR provides whichever components are present and this
+proc renders them in canonical order.
+@End Reasoning
+
+@Implementation:
+Emits the "offset" string (if any) before the '('. Opens with '(' (40).
+For "base", emits '%' (37) then the base register name. If "index"
+is present, emits ',' then '%' then the index name. If "scale" is
+present, emits ',' then the scale string. Closes with ')' (41).
+@End Implementation
 
 Process called "generate_memory" takes emitter as Integer, memory as Integer:
     Note: Generate memory reference (offset(%base,%index,scale))
@@ -282,6 +406,16 @@ Process called "generate_memory" takes emitter as Integer, memory as Integer:
     proc emit_char from Emitter with emitter, 41  Note: )
 End Process
 
+@Reasoning:
+Emits a symbol or label reference operand (e.g., in 'callq foo' or
+'movq foo(%rip), %rax'). No prefix is required; the bare name is
+used directly.
+@End Reasoning
+
+@Implementation:
+Reads "name" and emits it verbatim; missing name emits nothing.
+@End Implementation
+
 Process called "generate_identifier" takes emitter as Integer, identifier as Integer:
     Note: Generate identifier (label reference or symbol)
 
@@ -292,6 +426,22 @@ Process called "generate_identifier" takes emitter as Integer, identifier as Int
         proc emit_string from Emitter with emitter, name_str
     End If
 End Process
+
+@Reasoning:
+Local null-terminated string compare. Inlined here instead of
+importing the StringCore variant to keep the type dispatcher hot path
+dependency-light.
+@End Reasoning
+
+@Implementation:
+Walks both strings byte-by-byte. Returns 0 on the first mismatch, 1
+when both bytes hit the terminating NUL. The "While 1 is equal to 1"
+sentinel-free form uses the NUL byte as the natural loop exit.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the shorter string's length. No allocation.
+@End Performance_Hints
 
 Process called "string_equals" takes str1 as String, str2 as String returns Integer:
     Note: Compare two null-terminated strings for equality
@@ -310,6 +460,12 @@ Process called "string_equals" takes str1 as String, str2 as String returns Inte
     End While
     Return 0
 End Process
+
+@Reasoning:
+Local alias for StringCore.create_string_from_literal kept for source
+readability: the dispatcher reads better with the shorter name
+"create_string_literal".
+@End Reasoning
 
 Process called "create_string_literal" takes value as String returns Integer:
     Return proc create_string_from_literal from StringCore with value

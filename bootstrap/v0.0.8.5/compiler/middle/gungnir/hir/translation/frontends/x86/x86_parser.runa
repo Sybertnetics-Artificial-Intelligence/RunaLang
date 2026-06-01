@@ -18,6 +18,14 @@ Constant ASM_IMMEDIATE as Integer is 5
 Constant ASM_MEMORY as Integer is 6
 Constant ASM_IDENTIFIER as Integer is 7
 
+@Reasoning:
+Assembly statements (instructions, directives, labels, operands) are heterogeneous but every form has the same shape: a tag, an optional lexeme view, and a child list. A uniform node simplifies recursive memory operand parsing.
+@End Reasoning
+
+@Implementation:
+Four 8-byte fields: discriminator tag (ASM_INSTRUCTION/DIRECTIVE/LABEL/REGISTER/IMMEDIATE/MEMORY/IDENTIFIER), pointer to the lexeme bytes in the source buffer, lexeme length, and a children List.
+@End Implementation
+
 Type called "AsmNode":
     node_type as Integer
     value as Integer
@@ -25,11 +33,27 @@ Type called "AsmNode":
     children as Integer
 End Type
 
+@Reasoning:
+The parser is a cursor over the lexer's token List; caching the token-list pointer at construction avoids dereferencing the lexer on every advance.
+@End Reasoning
+
+@Implementation:
+Three 8-byte slots: backing lexer pointer, cached token-list pointer (copied from lexer offset 24), and the current token index.
+@End Implementation
+
 Type called "AsmParser":
     lexer as Integer
     tokens as Integer
     current as Integer
 End Type
+
+@Reasoning:
+Hoisting the lexer's token-list pointer into the parser struct keeps the per-token lookup tight (two loads instead of three).
+@End Reasoning
+
+@Implementation:
+Allocate 24 bytes, store the lexer pointer, copy the token-list pointer from lexer offset 24 into parser offset 8, and initialise the cursor to 0.
+@End Implementation
 
 Process called "create_parser" takes lexer as Integer returns Integer:
     Note: Create new parser from lexer
@@ -42,11 +66,31 @@ Process called "create_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser owns only its own 24-byte struct; the backing lexer and token storage are owned externally, so destruction is minimal.
+@End Reasoning
+
+@Implementation:
+Deallocate the parser block; lexer and token list are untouched.
+@End Implementation
+
 Process called "destroy_parser" takes parser as Integer:
     Note: Free parser
 
     proc deallocate from Layout with parser
 End Process
+
+@Reasoning:
+The parser builds an AST it hands to callers; when callers discard a subtree they need a single helper that recursively releases descendants and the children List.
+@End Reasoning
+
+@Implementation:
+Null-check the node; for each child in the children List recurse into destroy_asm_node, then dispose the List and the 32-byte node block.
+@End Implementation
+
+@Performance_Hints:
+O(n) in total descendant node count; one allocator deallocation per node and per child-List.
+@End Performance_Hints
 
 Process called "destroy_asm_node" takes node as Integer:
     Note: Recursively free AST node and children
@@ -66,6 +110,22 @@ Process called "destroy_asm_node" takes node as Integer:
     proc destroy from List with children
     proc deallocate from Layout with node
 End Process
+
+@Reasoning:
+The top-level driver materialises a synthetic root and gathers one statement per non-empty line; using an ASM_INSTRUCTION root is a placeholder shape that downstream consumers can treat as the module envelope.
+@End Reasoning
+
+@Implementation:
+Create the root node; loop fetching the current token, stopping on null or EOF (tag 0); skip standalone newlines (tag 13); otherwise call parse_statement and attach its result as a child.
+@End Implementation
+
+@Performance_Hints:
+O(n) in total token count; one allocation per statement plus its operands.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes a tokenised view of untrusted assembly source; parse_statement and parse_operand discard unknown tokens to ensure termination.
+@End Security_Scope
 
 Process called "parse" takes parser as Integer returns Integer:
     Note: Parse entire assembly source into AST
@@ -97,6 +157,18 @@ Process called "parse" takes parser as Integer returns Integer:
 
     Return root
 End Process
+
+@Reasoning:
+A single statement is exactly one of: directive (.foo), label ("name:"), instruction mnemonic, or a stray identifier. The first-token tag plus a 1-token lookahead for ":" is enough to dispatch.
+@End Reasoning
+
+@Implementation:
+Read the current token's type. Tag 3 (DIRECTIVE) -> parse_directive. Tag 14 (IDENTIFIER): if is_label_definition (next is ":") parse_label, otherwise treat as a bare identifier operand. Tag 1 (INSTRUCTION) -> parse_instruction. Any other tag triggers skip_to_newline as a recovery action and returns null.
+@End Implementation
+
+@Security_Scope:
+Unknown tags drive skip_to_newline which is bounded by source length, preventing pathological inputs from looping.
+@End Security_Scope
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse a single assembly statement
@@ -134,6 +206,18 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     proc skip_to_newline from parser
     Return 0
 End Process
+
+@Reasoning:
+GAS directives are "Name args, args, ..." extending to end-of-line; building one ASM_DIRECTIVE node with operand children mirrors the instruction shape so later passes can iterate uniformly.
+@End Reasoning
+
+@Implementation:
+Capture the directive lexeme into an ASM_DIRECTIVE node, advance past it, then loop calling parse_operand until newline or EOF, consuming optional comma separators between operands.
+@End Implementation
+
+@Performance_Hints:
+O(k) in directive operand count; each operand allocates its own node.
+@End Performance_Hints
 
 Process called "parse_directive" takes parser as Integer returns Integer:
     Note: Parse assembler directive
@@ -181,6 +265,14 @@ Process called "parse_directive" takes parser as Integer returns Integer:
     Return directive
 End Process
 
+@Reasoning:
+A label is "name:" followed by an optional same-line statement (rare in our supported subset); skipping the rest of the line keeps the label as a standalone node and avoids tangling label binding with the next statement.
+@End Reasoning
+
+@Implementation:
+Capture the identifier lexeme into an ASM_LABEL node, advance past the identifier, consume the colon (tag 12), then skip_to_newline to discard any trailing tokens.
+@End Implementation
+
 Process called "parse_label" takes parser as Integer returns Integer:
     Note: Parse label definition
 
@@ -205,6 +297,18 @@ Process called "parse_label" takes parser as Integer returns Integer:
 
     Return label
 End Process
+
+@Reasoning:
+Mnemonics carry zero or more comma-separated operands until end-of-line; the structural shape exactly matches parse_directive but the discriminator differs, so the loop is duplicated rather than parameterised.
+@End Reasoning
+
+@Implementation:
+Capture the mnemonic lexeme into an ASM_INSTRUCTION node and advance. Loop until newline or EOF: parse_operand, attach as child, consume optional comma.
+@End Implementation
+
+@Performance_Hints:
+O(k) in operand count; bounded by source line length.
+@End Performance_Hints
 
 Process called "parse_instruction" takes parser as Integer returns Integer:
     Note: Parse instruction with operands
@@ -252,6 +356,18 @@ Process called "parse_instruction" takes parser as Integer returns Integer:
     Return instruction
 End Process
 
+@Reasoning:
+AT&T operand forms are distinguishable by their leading token: '$' immediate, '%' register, '(' or leading number/identifier+'(' memory reference, bare identifier label-ref, bare number, or string.
+@End Reasoning
+
+@Implementation:
+Inspect the current token tag. 10 (DOLLAR) -> parse_immediate. 11 (PERCENT) -> parse_register. is_memory_operand returns true -> parse_memory. 14 (IDENTIFIER) -> parse_identifier_operand. 5 (NUMBER) -> parse_number_operand. 6 (STRING) -> parse_string_operand. Anything else: advance one token and return null so the caller resyncs.
+@End Implementation
+
+@Security_Scope:
+Unknown leading tags advance exactly one position to guarantee forward progress on adversarial input.
+@End Security_Scope
+
 Process called "parse_operand" takes parser as Integer returns Integer:
     Note: Parse instruction operand
 
@@ -298,6 +414,14 @@ Process called "parse_operand" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+The '$' prefix marks an immediate value; the literal that follows is captured verbatim (numeric formatting validation belongs to the parser's downstream consumer).
+@End Reasoning
+
+@Implementation:
+Skip the '$' sigil, read the next token's lexeme into an ASM_IMMEDIATE node, advance past it, and return.
+@End Implementation
+
 Process called "parse_immediate" takes parser as Integer returns Integer:
     Note: Parse immediate value ($123)
 
@@ -317,6 +441,14 @@ Process called "parse_immediate" takes parser as Integer returns Integer:
     Return immediate
 End Process
 
+@Reasoning:
+The '%' prefix marks a register; the bare name that follows (rax, rbx, eax, ...) is captured verbatim with downstream sub-register width determination deferred.
+@End Reasoning
+
+@Implementation:
+Skip the '%' sigil, read the next token's lexeme into an ASM_REGISTER node, advance, and return.
+@End Implementation
+
 Process called "parse_register" takes parser as Integer returns Integer:
     Note: Parse register (%rax, %rbx, etc.)
 
@@ -335,6 +467,18 @@ Process called "parse_register" takes parser as Integer returns Integer:
 
     Return register
 End Process
+
+@Reasoning:
+AT&T memory operands are "offset(%base, %index, scale)" with optional offset and optional ",index,scale" tail; positionally encoded children (offset, base, index, scale) make later code-generation lowering straightforward.
+@End Reasoning
+
+@Implementation:
+Allocate an ASM_MEMORY node. If the current token is a number or identifier, parse it as the offset child. Consume '('. Parse the base register. If a comma follows, parse the index register; if another comma follows, parse the scale literal. Consume ')'.
+@End Implementation
+
+@Performance_Hints:
+O(1) - at most four child operands are parsed.
+@End Performance_Hints
 
 Process called "parse_memory" takes parser as Integer returns Integer:
     Note: Parse memory reference (offset(%base,%index,scale))
@@ -416,6 +560,14 @@ Process called "parse_memory" takes parser as Integer returns Integer:
     Return memory
 End Process
 
+@Reasoning:
+Bare identifiers appear as branch targets, symbol references, and directive arguments; tagging them ASM_IDENTIFIER lets the lowering stage resolve them against the symbol table later.
+@End Reasoning
+
+@Implementation:
+Capture the identifier lexeme into an ASM_IDENTIFIER node, advance one token, return.
+@End Implementation
+
 Process called "parse_identifier_operand" takes parser as Integer returns Integer:
     Note: Parse identifier (label reference or symbol)
 
@@ -428,6 +580,14 @@ Process called "parse_identifier_operand" takes parser as Integer returns Intege
 
     Return identifier
 End Process
+
+@Reasoning:
+Bare numeric operands appear in directives (.long 42) and as memory-offset literals; the same ASM_IMMEDIATE shape used by '$N' is reused since downstream consumers only need the literal text.
+@End Reasoning
+
+@Implementation:
+Capture the numeric lexeme into an ASM_IMMEDIATE node, advance one token, return.
+@End Implementation
 
 Process called "parse_number_operand" takes parser as Integer returns Integer:
     Note: Parse number operand
@@ -442,6 +602,14 @@ Process called "parse_number_operand" takes parser as Integer returns Integer:
     Return number
 End Process
 
+@Reasoning:
+String operands appear in data-section directives (.ascii, .string). Capturing them as ASM_IDENTIFIER nodes (text-bearing leaves) defers actual escape interpretation to later passes.
+@End Reasoning
+
+@Implementation:
+Capture the string lexeme - including its surrounding quotes - into an ASM_IDENTIFIER node, advance one token, return.
+@End Implementation
+
 Process called "parse_string_operand" takes parser as Integer returns Integer:
     Note: Parse string operand
 
@@ -454,6 +622,14 @@ Process called "parse_string_operand" takes parser as Integer returns Integer:
 
     Return string_node
 End Process
+
+@Reasoning:
+Distinguishing a label "name:" from a bare identifier operand requires one-token lookahead for ':'; centralising the test keeps parse_statement's dispatch concise.
+@End Reasoning
+
+@Implementation:
+Bounds-check current+1 against the token list size; peek token at current+1 and return 1 if its tag is 12 (COLON), 0 otherwise.
+@End Implementation
 
 Process called "is_label_definition" takes parser as Integer returns Integer:
     Note: Check if current position is a label definition (identifier followed by colon)
@@ -475,6 +651,14 @@ Process called "is_label_definition" takes parser as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Memory operands can start with a number (offset), an LPAREN (no offset, e.g. "(%rax)"), or a symbolic offset followed by LPAREN ("foo(%rax)"); positively identifying memory shape lets parse_operand avoid backtracking.
+@End Reasoning
+
+@Implementation:
+If the current tag is 5 (NUMBER) or 8 (LPAREN) return 1. If it is 14 (IDENTIFIER), peek current+1 and return 1 only when that next tag is 8 (LPAREN). Otherwise return 0.
+@End Implementation
 
 Process called "is_memory_operand" takes parser as Integer returns Integer:
     Note: Check if current position starts a memory operand
@@ -514,6 +698,18 @@ Process called "is_memory_operand" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Lookahead is the most frequent parser operation; bounding-checking inside the helper means every caller automatically gets a 0 sentinel on EOF without duplicating range checks.
+@End Reasoning
+
+@Implementation:
+Read tokens pointer and cursor index. If the cursor is at or past the token-list size return 0. Otherwise return the List entry at the cursor index.
+@End Implementation
+
+@Performance_Hints:
+O(1) with three memory loads and a List index access.
+@End Performance_Hints
+
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token without advancing
 
@@ -528,12 +724,32 @@ Process called "current_token" takes parser as Integer returns Integer:
     Return proc get from List with tokens, current
 End Process
 
+@Reasoning:
+Token consumption happens at many call sites; isolating the cursor bump in one helper guarantees each accepted token advances the cursor exactly once.
+@End Reasoning
+
+@Implementation:
+Read the cursor index at parser offset 16, add one, store back.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer:
     Note: Move to next token
 
     Let current be proc memory_get_int64 from Layout with parser, 16
     proc memory_set_int64 from Layout with parser, 16, current plus 1
 End Process
+
+@Reasoning:
+After a label or an unparseable statement, the parser resyncs to the next line so a single malformed statement does not derail subsequent statements.
+@End Reasoning
+
+@Implementation:
+Loop fetching the current token; on null or EOF return; on newline (tag 13) advance past it and return; otherwise advance past it and continue.
+@End Implementation
+
+@Security_Scope:
+Bounded by source line length and the token list size; guarantees forward progress on adversarial input.
+@End Security_Scope
 
 Process called "skip_to_newline" takes parser as Integer:
     Note: Skip tokens until newline or EOF
@@ -558,6 +774,14 @@ Process called "skip_to_newline" takes parser as Integer:
     End While
 End Process
 
+@Reasoning:
+Every node-producing parse_* helper goes through this constructor so the AsmNode layout (tag + lexeme view + children List) stays exactly defined in one site.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes, store node_type / value / value_length at offsets 0, 8, 16; create an empty children List and store it at offset 24.
+@End Implementation
+
 Process called "create_asm_node" takes node_type as Integer, value as Integer, value_length as Integer returns Integer:
     Note: Create new AST node
 
@@ -569,6 +793,14 @@ Process called "create_asm_node" takes node_type as Integer, value as Integer, v
     proc memory_set_int64 from Layout with node, 24, children
     Return node
 End Process
+
+@Reasoning:
+Attaching a child requires touching the parent's children-List slot at offset 24; a tiny helper hides the layout offset and keeps the parse_* code readable.
+@End Reasoning
+
+@Implementation:
+Read the children-List pointer from offset 24 of the parent node and push the child node pointer onto it.
+@End Implementation
 
 Process called "add_child" takes parent as Integer, child as Integer:
     Note: Add child node to parent

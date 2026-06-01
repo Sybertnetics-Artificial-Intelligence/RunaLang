@@ -1,6 +1,14 @@
 Note: Ruby Lexer for Translation Translation System
 Note: Handles Ruby syntax including blocks, symbols, string interpolation, metaprogramming
 
+@Reasoning:
+Ruby's lexer must track line + column for diagnostics and cache the current character to avoid repeated charAt calls; bundling them in one struct keeps the per-character hot path tight.
+@End Reasoning
+
+@Implementation:
+Six fields: source string, byte cursor, line, column, cached current_char, and the accumulating token list.
+@End Implementation
+
 Type called "RubyLexer":
     source as String
     position as Integer
@@ -9,6 +17,14 @@ Type called "RubyLexer":
     current_char as String
     tokens as Integer  Note: List of tokens
 End Type
+
+@Reasoning:
+Tokens carry source line/column so the parser and downstream error reporter can pinpoint exact failure sites without consulting the lexer afterwards.
+@End Reasoning
+
+@Implementation:
+Four fields: token_type discriminator, the lexeme string, line, and column at the lexeme start.
+@End Implementation
 
 Type called "RubyToken":
     token_type as Integer
@@ -110,6 +126,14 @@ Constant TOKEN_COLON as Integer is 96
 Constant TOKEN_AT as Integer is 97
 Constant TOKEN_DOUBLE_AT as Integer is 98
 
+@Reasoning:
+Initialising line=1 column=1 and seeding current_char from position 0 lets the per-character dispatcher in tokenize_ruby start without a special-case "first character" branch.
+@End Reasoning
+
+@Implementation:
+Construct a RubyLexer with the source string, position=0, line=1, column=1, current_char=source[0], and an empty token list.
+@End Implementation
+
 Process called "create_ruby_lexer" takes source as String returns Integer:
     Note: Create new Ruby lexer instance
 
@@ -123,6 +147,22 @@ Process called "create_ruby_lexer" takes source as String returns Integer:
 
     Return lexer
 End Process
+
+@Reasoning:
+Newlines are syntactically meaningful in Ruby (they end statements), so the dispatcher emits TOKEN_NEWLINE explicitly rather than skipping with whitespace. Comments ('#'), strings ('"', '\''), symbols (':'), numbers, identifiers/keywords, and operator/punctuation prefixes each have a dedicated handler.
+@End Reasoning
+
+@Implementation:
+Loop while position < source length: skip horizontal whitespace; on newline emit TOKEN_NEWLINE; '#' -> skip_comment; quote chars -> tokenize_string; ':' -> tokenize_symbol; digit -> tokenize_number; alpha/_ -> tokenize_identifier; try tokenize_operator and tokenize_punctuation; '@' -> tokenize_instance_variable; unknown -> advance one. Emit TOKEN_EOF at end.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source length; one token per logical lexeme. Continue-style loop avoids redundant dispatch checks after each handler.
+@End Performance_Hints
+
+@Security_Scope:
+Operates on untrusted Ruby source. The "unknown advance" fallback guarantees forward progress; the embedded #{} expression handler re-enters tokenize_ruby recursively, so deeply nested interpolation must be bounded by callers.
+@End Security_Scope
 
 Process called "tokenize_ruby" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby source code with complete syntax support
@@ -199,6 +239,18 @@ Process called "tokenize_ruby" takes lexer as Integer returns Integer:
     Return lexer.tokens
 End Process
 
+@Reasoning:
+Ruby string literals support both '"' and '\'' delimiters with C-style backslash escapes; capturing the opening quote in a local lets the loop terminate on the matching closer without a second dispatcher.
+@End Reasoning
+
+@Implementation:
+Save the opening quote character and skip past it. Loop until matching quote or end-of-source: on '\\' read the following character and substitute the appropriate escape sequence ('\n', '\t', '\r', '"', '\'', '\\'); other characters are appended verbatim. Skip the closing quote and emit TOKEN_STRING with the assembled value.
+@End Implementation
+
+@Security_Scope:
+Untrusted input. The loop's end-of-source check guarantees termination on an unterminated literal.
+@End Security_Scope
+
 Process called "tokenize_string" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby string literals with escape sequences
 
@@ -242,6 +294,22 @@ Process called "tokenize_string" takes lexer as Integer returns Integer:
     proc add_token with lexer, TOKEN_STRING, value
     Return 1
 End Process
+
+@Reasoning:
+Ruby's "#{expr}" interpolation can nest braces and contain arbitrary expressions; tracking a brace counter and recursively tokenising the embedded code preserves token boundaries that the parser needs to reassemble the string at lowering time.
+@End Reasoning
+
+@Implementation:
+Skip the opening quote. Loop until closing '"' or EOF: detect "#{" via current+peek, emit any accumulated literal text as TOKEN_STRING, then walk forward incrementing/decrementing a brace_count on '{'/'}'. Once brace_count drops to 0, slice the embedded expression text, build a sub-lexer to tokenise it, and emit a TOKEN_INTERPOLATED_STRING capturing the expression. Other characters accumulate verbatim.
+@End Implementation
+
+@Performance_Hints:
+O(n) in source length; recursive sub-lexer adds linear cost per interpolation.
+@End Performance_Hints
+
+@Security_Scope:
+Recursive lexer call on the interpolated expression must terminate; the source-length bound on the inner brace-tracking loop prevents runaway scans on malformed input.
+@End Security_Scope
 
 Process called "tokenize_interpolated_string" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby interpolated strings with #{} expressions
@@ -303,6 +371,14 @@ Process called "tokenize_interpolated_string" takes lexer as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Ruby symbols accept two forms: bare ":foo" (identifier-like) and quoted ":\"complex string\""; branching on whether the byte after the colon is a quote covers both.
+@End Reasoning
+
+@Implementation:
+Skip the ':'. If the next char is a quote, consume bytes until the matching quote (no escape handling). Otherwise greedily consume identifier characters (alpha-numeric and underscore). Emit TOKEN_SYMBOL with the accumulated value.
+@End Implementation
+
 Process called "tokenize_symbol" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby symbols (:symbol, :"string symbol")
 
@@ -334,6 +410,14 @@ Process called "tokenize_symbol" takes lexer as Integer returns Integer:
     proc add_token with lexer, TOKEN_SYMBOL, value
     Return 1
 End Process
+
+@Reasoning:
+Ruby numeric literals span integer, float (1.5), and scientific (1.5e10) forms; lexing the maximal valid prefix lets the parser/typechecker do the final classification.
+@End Reasoning
+
+@Implementation:
+Greedy-consume digits. If the next char is '.' AND the following byte is also a digit, consume the '.' (require digit-after-dot to avoid swallowing range operators) and the fractional digits. If 'e' or 'E' follows, consume it, an optional sign, then exponent digits. Emit TOKEN_NUMBER.
+@End Implementation
 
 Process called "tokenize_number" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby numbers including integers, floats, and scientific notation
@@ -380,6 +464,14 @@ Process called "tokenize_number" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Ruby method names can end with '?' (predicate) or '!' (destructive variant); consuming a trailing sigil character keeps them as one lexeme, and a single classification pass identifies keywords post-scan.
+@End Reasoning
+
+@Implementation:
+Greedy-consume alphanumeric or underscore bytes. If the next char is '?' or '!', append it. Call get_keyword_type on the assembled name; if it returns 0 (no match), fall back to TOKEN_IDENTIFIER. Emit the chosen token.
+@End Implementation
+
 Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby identifiers and keywords
 
@@ -405,6 +497,18 @@ Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     proc add_token with lexer, token_type, value
     Return 1
 End Process
+
+@Reasoning:
+A single Match over the full Ruby keyword set keeps keyword classification O(1) per identifier with no per-call hash table allocation overhead.
+@End Reasoning
+
+@Implementation:
+Match the input word against the 33 Ruby keywords (class, module, def, end, if, elsif, else, unless, while, until, for, in, do, break, next, return, yield, super, self, true, false, nil, and, or, not, begin, rescue, ensure, raise, case, when, then, alias, undef) returning the matching token type. Non-matching words return 0.
+@End Implementation
+
+@Performance_Hints:
+Compiles to a sequence of string comparisons; O(k) where k is the number of keywords.
+@End Performance_Hints
 
 Process called "get_keyword_type" takes word as String returns Integer:
     Note: Return token type for Ruby keywords
@@ -447,6 +551,18 @@ Process called "get_keyword_type" takes word as String returns Integer:
         Otherwise: Return 0
     End Match
 End Process
+
+@Reasoning:
+Ruby operators have compound assignment forms (+=, *=, **=) and multi-character variants (==, !=, =~, !~, <=>, &&, ||, .., ...); a giant Match on the first character handles each family with one-character lookahead.
+@End Reasoning
+
+@Implementation:
+For each operator-leading character (+ - * / % = ! < > & | .), peek the next byte and emit the appropriate longest-match token: assignment variants on trailing '=', range/spaceship/power on doubled '*' or '.', boolean on doubled '&' or '|'. Single-character form emits when no extension matches. Returns 1 on match, 0 when current_char isn't an operator-leading byte.
+@End Implementation
+
+@Performance_Hints:
+O(1) per token; at most 3 character lookaheads for "...", "<=>", "**=" forms.
+@End Performance_Hints
 
 Process called "tokenize_operator" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby operators including compound assignments
@@ -621,6 +737,14 @@ Process called "tokenize_operator" takes lexer as Integer returns Integer:
     End Match
 End Process
 
+@Reasoning:
+Ruby treats "@var" as instance variables and "@@var" as class variables; lexing both as TOKEN_IDENTIFIER with the sigil preserved in the value lets the parser disambiguate downstream by looking at the leading sigil.
+@End Reasoning
+
+@Implementation:
+Skip the first '@'. If a second '@' follows, prepend "@@" to the value and skip it; otherwise prepend "@". Then greedy-consume alphanumeric or underscore bytes into the value. Emit TOKEN_IDENTIFIER with the full sigil+name.
+@End Implementation
+
 Process called "tokenize_instance_variable" takes lexer as Integer returns Integer:
     Note: Tokenize Ruby instance and class variables (@var, @@var)
 
@@ -645,6 +769,14 @@ End Process
 
 Note: Helper processes for lexer functionality
 
+@Reasoning:
+Every cursor mutation must also update line/column for diagnostics; concentrating that bookkeeping in one helper guarantees no caller forgets it.
+@End Reasoning
+
+@Implementation:
+Increment position. If we reached end-of-source set current_char to "". Otherwise refresh current_char from source[position]. If the new current_char is '\n', increment line and reset column to 1; otherwise increment column.
+@End Implementation
+
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Advance to next character in source
 
@@ -666,6 +798,14 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Operator tokenisation needs single-character lookahead to decide between "+" and "+=" etc.; a one-line helper that returns "" past end-of-source lets callers compare safely without bound-checking.
+@End Reasoning
+
+@Implementation:
+Compute position+1; if out of bounds return ""; otherwise return source[position+1].
+@End Implementation
+
 Process called "peek" takes lexer as Integer returns String:
     Note: Peek at next character without advancing
 
@@ -677,6 +817,14 @@ Process called "peek" takes lexer as Integer returns String:
     Return proc char_at with lexer.source, next_pos
 End Process
 
+@Reasoning:
+Three-character operator forms like "<=>" and "..." need two-character lookahead; parameterising peek by offset handles both peek(2) cases without duplicating the bound check.
+@End Reasoning
+
+@Implementation:
+Compute position+offset; if out of bounds return ""; otherwise return source[position+offset].
+@End Implementation
+
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns String:
     Note: Peek ahead multiple characters
 
@@ -687,6 +835,14 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns St
 
     Return proc char_at with lexer.source, peek_pos
 End Process
+
+@Reasoning:
+Newlines are statement terminators in Ruby and must reach the parser; this helper skips only horizontal whitespace and carriage returns so the main dispatcher can react to '\n' separately.
+@End Reasoning
+
+@Implementation:
+Loop advancing while current_char is space (" "), tab ("\t"), or carriage return ("\r").
+@End Implementation
 
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters except newlines
@@ -700,6 +856,14 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Ruby '#' comments run from '#' to end-of-line; leaving the newline in place lets the dispatcher emit TOKEN_NEWLINE so the comment does not silently merge two statements.
+@End Reasoning
+
+@Implementation:
+Advance until current_char is '\n' or "" (EOF). The newline itself is left unconsumed.
+@End Implementation
+
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip Ruby comment until end of line
 
@@ -709,6 +873,14 @@ Process called "skip_comment" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Every tokenize_* helper goes through this constructor so the RubyToken layout (type / value / line / column) is materialised in one site and any future field addition only touches one place.
+@End Reasoning
+
+@Implementation:
+Construct a RubyToken with the given type and value, copying the lexer's current line/column. Push the token onto lexer.tokens.
+@End Implementation
 
 Process called "add_token" takes lexer as Integer, token_type as Integer, value as String returns Integer:
     Note: Add token to lexer's token list
@@ -723,10 +895,26 @@ Process called "add_token" takes lexer as Integer, token_type as Integer, value 
     Return 1
 End Process
 
+@Reasoning:
+Numeric detection is needed by the dispatcher and by number/symbol/identifier scans; centralising it in one predicate avoids repeating the ASCII range test.
+@End Reasoning
+
+@Implementation:
+Get the character's code point and return true iff it falls in 48..57 (ASCII '0' through '9').
+@End Implementation
+
 Process called "is_digit" takes char as String returns Integer:
     Note: Check if character is a digit
     Return proc char_code with char is greater than or equal to 48 and proc char_code with char is less than or equal to 57
 End Process
+
+@Reasoning:
+Identifier-start detection requires ASCII letters; two range checks against the lowercase and uppercase letter blocks are tighter than table-driven approaches at this scale.
+@End Reasoning
+
+@Implementation:
+Compute the character's code point and return true iff it falls in 65..90 (A-Z) or 97..122 (a-z).
+@End Implementation
 
 Process called "is_alpha" takes char as String returns Integer:
     Note: Check if character is alphabetic
@@ -734,6 +922,14 @@ Process called "is_alpha" takes char as String returns Integer:
     Return code is greater than or equal to 65 and code is less than or equal to 90 or
            code is greater than or equal to 97 and code is less than or equal to 122
 End Process
+
+@Reasoning:
+Identifier continuation includes both letters and digits; layering is_alpha_numeric atop the two simpler predicates keeps the alphabet definition centrally located.
+@End Reasoning
+
+@Implementation:
+Return true if is_alpha(char) or is_digit(char) returns 1.
+@End Implementation
 
 Process called "is_alpha_numeric" takes char as String returns Integer:
     Note: Check if character is alphanumeric

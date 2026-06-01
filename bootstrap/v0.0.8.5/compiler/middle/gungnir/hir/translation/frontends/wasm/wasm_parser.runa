@@ -19,12 +19,32 @@ Constant WASM_TYPE as Integer is 7
 Constant WASM_IMPORT as Integer is 8
 Constant WASM_EXPORT as Integer is 9
 
+@Reasoning:
+WAT s-expressions form arbitrarily nested trees, so every parsed construct is uniformly represented as a tagged node with a value slice and a child list. This single shape lets the parser stay recursive without per-construct AST classes.
+@End Reasoning
+
+@Implementation:
+Four-field layout: discriminator tag (WASM_MODULE / WASM_FUNCTION / etc), pointer to the lexeme text, byte length of that lexeme, and a heap List of child node pointers.
+@End Implementation
+
 Type called "WasmNode":
     node_type as Integer
     value as Integer
     value_length as Integer
     children as Integer
 End Type
+
+@Reasoning:
+Allocate a new tree node up-front so that the recursive descent walker can attach children without revisiting the node after construction.
+@End Reasoning
+
+@Implementation:
+Reserve 32 bytes (four 8-byte slots), store node_type / value / value_length, then materialize an empty List for the children slot and return the raw node pointer.
+@End Implementation
+
+@Performance_Hints:
+O(1) allocation per node plus the List header. Total node count is proportional to source token count.
+@End Performance_Hints
 
 Process called "create_wasm_node" takes node_type as Integer, value as Integer, value_length as Integer returns Integer:
     Let node be proc allocate from Layout with 32
@@ -35,6 +55,18 @@ Process called "create_wasm_node" takes node_type as Integer, value as Integer, 
     proc memory_set_int64 from Layout with node, 24, children
     Return node
 End Process
+
+@Reasoning:
+The parser owns the AST it produces; recursive destruction prevents the children-List from leaking when callers discard a module subtree.
+@End Reasoning
+
+@Implementation:
+Walk the child List, recursively destroy each child, dispose the List itself, then release the 32-byte node block.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the total number of descendant nodes; one allocator call per node.
+@End Performance_Hints
 
 Process called "destroy_wasm_node" takes node as Integer:
     Let children be proc memory_get_int64 from Layout with node, 24
@@ -49,16 +81,40 @@ Process called "destroy_wasm_node" takes node as Integer:
     proc deallocate from Layout with node
 End Process
 
+@Reasoning:
+Building the tree from inside parse_sexpr requires a one-line helper that hides the children-slot offset and keeps the caller free of layout details.
+@End Reasoning
+
+@Implementation:
+Read the children List pointer from offset 24 of the parent node and push the child pointer onto it.
+@End Implementation
+
 Process called "add_child" takes parent as Integer, child as Integer:
     Let children be proc memory_get_int64 from Layout with parent, 24
     proc push from List with children, child
 End Process
+
+@Reasoning:
+The parser is a cursor over the lexer's token stream; bundling lexer, token list, and current index keeps token lookahead and consumption inexpensive.
+@End Reasoning
+
+@Implementation:
+Three slots: backing lexer (owns token storage), cached pointer to the token List, and the integer index of the next unconsumed token.
+@End Implementation
 
 Type called "WasmParser":
     lexer as Integer
     tokens as Integer
     current as Integer
 End Type
+
+@Reasoning:
+Hoist the token list pointer out of the lexer at parser-construction so the hot path advance_token / current_token avoids one memory_get_int64 per call.
+@End Reasoning
+
+@Implementation:
+Allocate 24 bytes, store the lexer pointer, copy the token-list pointer from lexer offset 24 into parser offset 8, and initialize the cursor to index 0.
+@End Implementation
 
 Process called "create_parser" takes lexer as Integer returns Integer:
     Let parser be proc allocate from Layout with 24
@@ -69,9 +125,29 @@ Process called "create_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+The parser only owns its own 24-byte struct; the lexer and token storage have separate lifetimes managed by the caller, so destruction is intentionally minimal.
+@End Reasoning
+
+@Implementation:
+Release the parser block only; lexer and token list are not touched.
+@End Implementation
+
 Process called "destroy_parser" takes parser as Integer:
     proc deallocate from Layout with parser
 End Process
+
+@Reasoning:
+Lookahead is the single most frequent operation in recursive descent; centralizing it in one helper keeps the hot path consistent and the cursor logic in one place.
+@End Reasoning
+
+@Implementation:
+Read tokens pointer from offset 8 and cursor index from offset 16, then return the List entry at that index. Out-of-range access is the caller's responsibility.
+@End Implementation
+
+@Performance_Hints:
+O(1) with two memory loads and one List index lookup.
+@End Performance_Hints
 
 Process called "current_token" takes parser as Integer returns Integer:
     Let tokens be proc memory_get_int64 from Layout with parser, 8
@@ -79,10 +155,26 @@ Process called "current_token" takes parser as Integer returns Integer:
     Return proc get from List with tokens, current
 End Process
 
+@Reasoning:
+Token consumption must happen exactly once per accepted token; isolating the cursor bump in one helper guarantees that invariant is not violated by ad-hoc increments.
+@End Reasoning
+
+@Implementation:
+Load cursor index from offset 16, add one, store back. No bounds check; the parser is expected to verify with check_token_type / current_token before calling.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer:
     Let current be proc memory_get_int64 from Layout with parser, 16
     proc memory_set_int64 from Layout with parser, 16, current plus 1
 End Process
+
+@Reasoning:
+Predicate-style lookahead lets every production decide between alternatives without copying token-shape inspection logic into every site.
+@End Reasoning
+
+@Implementation:
+Fetch the current token; if null pointer return 0. Otherwise read the type tag from offset 0 and return 1 on match, 0 otherwise.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, token_type as Integer returns Integer:
     Let token be proc current_token from parser
@@ -95,6 +187,22 @@ Process called "check_token_type" takes parser as Integer, token_type as Integer
     End If
     Return 0
 End Process
+
+@Reasoning:
+The top-level WAT production is (module ...); enforcing the leading "(module" pair at this entry point keeps subsequent recursion in parse_sexpr ignorant of file-level shape.
+@End Reasoning
+
+@Implementation:
+Require an LPAREN, then consume the identifier that names the module, allocate a WASM_MODULE node, and loop collecting child s-expressions until the matching RPAREN.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the number of WAT tokens; one allocation per AST node.
+@End Performance_Hints
+
+@Security_Scope:
+Consumes untrusted WAT source; relies on the lexer to bound token storage. A malformed input with unbalanced parens drives parse_sexpr's loop until the token stream is exhausted - callers must validate parse depth on adversarial inputs.
+@End Security_Scope
 
 Process called "parse" takes parser as Integer returns Integer:
     Let is_lparen be proc check_token_type with parser, 1
@@ -120,6 +228,22 @@ Process called "parse" takes parser as Integer returns Integer:
     End While
     Return module_node
 End Process
+
+@Reasoning:
+WAT's grammar is uniformly s-expression - every nested construct is a parenthesized head identifier followed by children - so a single recursive helper handles every depth without per-construct branches.
+@End Reasoning
+
+@Implementation:
+After requiring "(", read the head identifier and classify it: "func" forms become WASM_FUNCTION nodes, everything else WASM_INSTRUCTION. Loop collecting children: nested "(" recurses, plain tokens become WASM_TYPE leaves, ")" terminates.
+@End Implementation
+
+@Performance_Hints:
+O(n) tokens per call across the full recursion. Stack depth bounded by source nesting depth.
+@End Performance_Hints
+
+@Security_Scope:
+Pathologically deep s-expressions can exhaust the native stack. Callers parsing untrusted WAT should reject inputs whose paren-depth exceeds a configured limit before reaching this routine.
+@End Security_Scope
 
 Process called "parse_sexpr" takes parser as Integer returns Integer:
     Let is_lparen be proc check_token_type with parser, 1

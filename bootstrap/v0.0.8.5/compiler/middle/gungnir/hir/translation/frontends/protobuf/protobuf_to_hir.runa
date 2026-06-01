@@ -52,6 +52,20 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Per-translation error context, identical in shape to the json_to_hir
+translator's context but tracked independently because the two
+translation pipelines run in parallel and each must own its own error
+state without cross-contamination.
+@End Reasoning
+
+@Implementation:
+Four 64-bit slots in declared order: error_message (owned heap string or
+0), has_error boolean, current line and column captured from the
+proto_node being translated. Total size 32 bytes; offsets 0/8/16/24 are
+referenced directly by the helper Processes.
+@End Implementation
+
 Type called "ProtoToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -62,6 +76,16 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocates the context with all four slots zeroed so error_message is
+safely null (destroy is a no-op for the message until it gets set) and
+has_error=0 matches the success path.
+@End Reasoning
+
+@Implementation:
+Allocate 32 bytes; return 0 on OOM. Otherwise zero offsets 0/8/16/24.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create Protocol Buffers to HIR translation context
@@ -81,6 +105,18 @@ Process called "create_translation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Cleanup pairing with create_translation_context. Idempotent for null
+context so callers can drop the context in one call regardless of
+construction success.
+@End Reasoning
+
+@Implementation:
+If context is 0, return 1. Otherwise read offset 0 (error_message); if
+non-zero, deallocate the message buffer. Then deallocate the context
+block. Always returns 1.
+@End Implementation
 
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
@@ -104,6 +140,20 @@ End Process
 Note: ============================================================================
 Note: Error Handling
 Note: ============================================================================
+
+@Reasoning:
+Replaces any previous error message with a freshly heap-owned copy of
+the supplied message and flips has_error=1 so the terminal check in
+translate_protobuf_to_hir surfaces the failure regardless of which
+recursive translator reported it.
+@End Reasoning
+
+@Implementation:
+Read offset 0 (error_message); if non-zero, deallocate. Compute
+msg_length via StringCore.string_length, allocate msg_length+1 bytes,
+memory_copy the message and NUL-terminate at offset msg_length. Store
+the new buffer at offset 0 and 1 at offset 8 (has_error). Returns 1.
+@End Implementation
 
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
@@ -134,13 +184,36 @@ Note: ==========================================================================
 Note: Proto Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+Type-switch over the 12 PROTO_* AST node tags. Centralised dispatch
+serves the same purpose as in json_to_hir / mongodb_to_hir: every
+recursive descent (a message's fields, a service's RPCs, a oneof's
+member fields) flows back through this single switch, so the per-node
+source-position update (lines 153-158) runs uniformly for error
+reporting and adding a new node kind needs a single branch insertion.
+@End Reasoning
+
+@Implementation:
+Guard proto_node!=0. Read node_type at offset 0 and source position at
+offsets 48 (line) / 56 (column). Write line/column into context offsets
+16/24. Dispatch:
+  PROTO_FILE       -> translate_proto_file
+  PROTO_SYNTAX     -> translate_proto_syntax
+  PROTO_PACKAGE    -> translate_proto_package
+  PROTO_IMPORT     -> translate_proto_import
+  PROTO_MESSAGE    -> translate_proto_message
+  PROTO_FIELD      -> translate_proto_field
+  PROTO_ENUM       -> translate_proto_enum
+  PROTO_ENUM_VALUE -> translate_proto_enum_value
+  PROTO_SERVICE    -> translate_proto_service
+  PROTO_RPC        -> translate_proto_rpc
+  PROTO_ONEOF      -> translate_proto_oneof
+  PROTO_MAP_FIELD  -> translate_proto_map_field
+Returns 0 (with translation error set) on null input or unknown tag.
+@End Implementation
+
 Process called "translate_proto_node_to_hir" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate Protocol Buffers AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on Protocol Buffers node type.
-    Creates corresponding HIR dictionary or literal node.
-    @End Reasoning
 
     If proto_node is equal to 0:
         proc set_translation_error with context, "Null Protocol Buffers node"
@@ -209,12 +282,31 @@ Process called "translate_proto_node_to_hir" takes context as Integer, proto_nod
     Return 0
 End Process
 
+@Reasoning:
+A .proto file's top-level children mix six distinct kinds (syntax,
+package, imports, messages, enums, plus optional services and options).
+We do a single pass over the children, accumulating each kind into its
+own collection so the resulting HIR dict has a fixed shape -- syntax
+and package as scalars, imports/messages/enums as lists -- regardless
+of source order. This separation is what lets HIR consumers index by
+name without knowing the parse order.
+@End Reasoning
+
+@Implementation:
+Create the HIR dictionary literal and bind type="proto_file". Read the
+children list at offset 32 and its size. Initialise per-kind accumulators
+(syntax_value=0, package_value=0, imports_list, messages_list,
+enums_list). Loop over children; for each child, read its node_type and
+dispatch: PROTO_SYNTAX/PROTO_PACKAGE store into the scalar slot;
+PROTO_IMPORT/PROTO_MESSAGE/PROTO_ENUM translate recursively and
+add_list_element into the matching list. After the loop, attach syntax
+and package only when set (so the dict has no null bindings) and always
+attach imports/messages/enums (empty lists are valid signal). Returns
+the hir_dict.
+@End Implementation
+
 Process called "translate_proto_file" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate Protocol Buffers file to HIR dictionary
-
-    @Reasoning:
-    Proto files become dictionaries with type, syntax, package, imports, messages, and enums.
-    @End Reasoning
 
     Note: Create HIR dictionary
     Let hir_dict be proc create_hir_dictionary_literal from HIR
@@ -307,6 +399,19 @@ Process called "translate_proto_file" takes context as Integer, proto_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+The syntax declaration ("proto2" or "proto3") is stored as a HIR string
+literal -- a bare scalar at the file level rather than nested under a
+dictionary -- because consumers query it as `proto_file["syntax"]` and
+need a literal, not another dict.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (the syntax string pointer). Guard null -> translation
+error. Wrap via HIR.create_hir_string_literal and return; guard
+construction failure with a translation error too.
+@End Implementation
+
 Process called "translate_proto_syntax" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate syntax declaration to HIR string
 
@@ -326,6 +431,19 @@ Process called "translate_proto_syntax" takes context as Integer, proto_node as 
 
     Return hir_string
 End Process
+
+@Reasoning:
+The package declaration (e.g., "com.example.foo") is a dotted identifier
+stored as a HIR string literal. Consumers use it to build fully-qualified
+type names; preserving it verbatim avoids re-parsing dotted notation at
+every use site.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (the package string pointer). Guard null -> translation
+error. Wrap via HIR.create_hir_string_literal and return; guard
+construction failure with a translation error.
+@End Implementation
 
 Process called "translate_proto_package" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate package declaration to HIR string
@@ -347,6 +465,19 @@ Process called "translate_proto_package" takes context as Integer, proto_node as
     Return hir_string
 End Process
 
+@Reasoning:
+An import statement carries a single path string (e.g.,
+"google/protobuf/timestamp.proto") which downstream code uses to resolve
+the imported file. Wrapped as a HIR string literal so it can sit
+uniformly in the imports list alongside other string-shaped entries.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (the import path pointer). Guard null -> translation
+error. Wrap via HIR.create_hir_string_literal and return; guard
+construction failure.
+@End Implementation
+
 Process called "translate_proto_import" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate import statement to HIR string
 
@@ -366,6 +497,24 @@ Process called "translate_proto_import" takes context as Integer, proto_node as 
 
     Return hir_string
 End Process
+
+@Reasoning:
+A `message` definition becomes a tagged HIR dict {type:"message",
+name:..., fields:[...]}. Field children may include nested PROTO_FIELD,
+PROTO_ONEOF, and PROTO_MAP_FIELD nodes; we recurse on every child via
+the central translator so each child gets the correct sub-shape and
+nested messages defined inside this message are also picked up (they'd
+emerge as additional fields with `type:"message"` -- the consumer
+distinguishes them by `type` tag).
+@End Reasoning
+
+@Implementation:
+Read offset 8 (name). Create the HIR dictionary; on failure set
+translation error. Bind type="message" and name=name (as HIR string
+literals). Read children at offset 32 and iterate; for each non-null
+child, recurse via translate_proto_node_to_hir and add non-null results
+to a HIR list literal. Bind that list to "fields". Returns hir_dict.
+@End Implementation
 
 Process called "translate_proto_message" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate message definition to HIR dictionary
@@ -424,6 +573,27 @@ Process called "translate_proto_message" takes context as Integer, proto_node as
     Return hir_dict
 End Process
 
+@Reasoning:
+A regular field has four observable properties: name, type (the protobuf
+scalar/message type name as a string), field number (the wire tag), and
+the `repeated` modifier. We materialise these into named keys on the HIR
+dict so the codegen can read them by name; nesting `field_number` as a
+HIR integer literal (rather than a string) gives the consumer a usable
+scalar without re-parsing.
+@End Reasoning
+
+@Implementation:
+Read fields at offsets 8 (name), 16 (field_type), 24 (field_number), 40
+(is_repeated). Create the HIR dict; bind:
+  type         -> "field"           (HIR string literal)
+  name         -> name              (HIR string literal)
+  field_type   -> field_type        (HIR string literal)
+  field_number -> field_number      (HIR integer literal)
+  repeated     -> is_repeated       (HIR boolean literal, 0 or 1)
+Returns hir_dict; sets translation error and returns 0 on dict-create
+failure.
+@End Implementation
+
 Process called "translate_proto_field" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate message field to HIR dictionary
 
@@ -474,6 +644,21 @@ Process called "translate_proto_field" takes context as Integer, proto_node as I
 
     Return hir_dict
 End Process
+
+@Reasoning:
+An `enum` block has a name plus a list of named (name, number) entries.
+We mirror messages' structure: the enum dict carries type/name plus a
+`values` list of recursively-translated PROTO_ENUM_VALUE dicts. This
+shape lets consumers iterate values without distinguishing enum from
+message at every loop step.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (enum name). Create the HIR dict; bind type="enum" and
+name=name. Read children at offset 32 and iterate; for each non-null
+child recurse via translate_proto_node_to_hir and add non-null results
+to a HIR list literal. Bind that list to "values". Returns hir_dict.
+@End Implementation
 
 Process called "translate_proto_enum" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate enum definition to HIR dictionary
@@ -532,6 +717,21 @@ Process called "translate_proto_enum" takes context as Integer, proto_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+An enum entry is a (name, number) pair. Per the protobuf spec the
+number is the wire-format tag and MUST be an integer; we store it as a
+HIR integer literal so consumers don't have to re-parse. We deliberately
+omit the "type" tag here because the parent's "values" key already
+identifies these dicts.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (name) and offset 24 (value_number). Create the HIR dict;
+bind name -> name (HIR string literal) and number -> value_number (HIR
+integer literal). Returns hir_dict; translation error and 0 on dict-
+create failure.
+@End Implementation
+
 Process called "translate_proto_enum_value" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate enum value to HIR dictionary
 
@@ -560,6 +760,21 @@ Process called "translate_proto_enum_value" takes context as Integer, proto_node
 
     Return hir_dict
 End Process
+
+@Reasoning:
+A `service` block has a name and a list of RPC method definitions. We
+filter the children to PROTO_RPC only (skipping options, which the
+parser emits as siblings) so the resulting "rpcs" list is homogeneous
+and consumers don't have to type-check each entry.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (name). Create the HIR dict; bind type="service" and
+name=name. Read children at offset 32; iterate. For each non-null child,
+read child_type at offset 0; only when it equals PROTO_RPC, recurse via
+translate_proto_node_to_hir and add non-null results to the rpcs list.
+Bind the list to "rpcs". Returns hir_dict.
+@End Implementation
 
 Process called "translate_proto_service" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate service definition to HIR dictionary
@@ -623,6 +838,29 @@ Process called "translate_proto_service" takes context as Integer, proto_node as
     Return hir_dict
 End Process
 
+@Reasoning:
+An RPC method carries name, request type, response type, and the two
+`stream` modifiers (request-side and response-side). The parser packs
+both streaming flags into a single 2-bit `stream_flags` field at offset
+24 -- bit 1 for request stream, bit 0 for response stream -- so this
+translator decodes them back into two booleans on the HIR dict so
+codegen doesn't need to know the bit layout.
+@End Reasoning
+
+@Implementation:
+Read offsets 8 (name), 16 (request_type), 32 (response_type), 24
+(stream_flags). Decode: request_stream = stream_flags / 2 (high bit),
+response_stream = stream_flags % 2 (low bit). Create the HIR dict and
+bind:
+  type             -> "rpc"
+  name             -> name
+  request_type     -> request_type
+  response_type    -> response_type
+  request_stream   -> request_stream (HIR boolean)
+  response_stream  -> response_stream (HIR boolean)
+Returns hir_dict; translation error and 0 on dict-create failure.
+@End Implementation
+
 Process called "translate_proto_rpc" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate RPC method to HIR dictionary
 
@@ -684,6 +922,20 @@ Process called "translate_proto_rpc" takes context as Integer, proto_node as Int
     Return hir_dict
 End Process
 
+@Reasoning:
+A `oneof` is a union-of-fields construct -- exactly one member is set
+on the wire at a time. The HIR shape mirrors that of a message
+(name + fields list) but with type="oneof" so codegen can lower it to a
+tagged union rather than a sequence of independent optional fields.
+@End Reasoning
+
+@Implementation:
+Read offset 8 (oneof name). Create the HIR dict; bind type="oneof" and
+name=name. Read children at offset 32 and iterate; for each non-null
+child, recurse via translate_proto_node_to_hir and add non-null results
+to a HIR list literal. Bind the list to "fields". Returns hir_dict.
+@End Implementation
+
 Process called "translate_proto_oneof" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate oneof to HIR dictionary (union type)
 
@@ -741,6 +993,25 @@ Process called "translate_proto_oneof" takes context as Integer, proto_node as I
     Return hir_dict
 End Process
 
+@Reasoning:
+A `map<K, V>` field has a different shape from a regular field: it
+carries two type names (key_type and value_type) plus the standard name
+and field_number. Distinct HIR type tag ("map_field") lets consumers
+distinguish it from a regular field without having to test for the
+presence of the key_type key.
+@End Reasoning
+
+@Implementation:
+Read offsets 8 (name), 16 (key_type), 24 (field_number), 32 (value_type).
+Create the HIR dict and bind:
+  type         -> "map_field"
+  name         -> name
+  key_type     -> key_type      (HIR string literal)
+  value_type   -> value_type    (HIR string literal)
+  field_number -> field_number  (HIR integer literal)
+Returns hir_dict; translation error and 0 on dict-create failure.
+@End Implementation
+
 Process called "translate_proto_map_field" takes context as Integer, proto_node as Integer returns Integer:
     Note: Translate map field to HIR dictionary
 
@@ -796,13 +1067,32 @@ Note: ==========================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
 
+@Reasoning:
+Public driver from source string to HIR root. Owns the local translation
+context lifetime so per-pipeline error state is isolated. The supplied
+translation_context parameter is reserved for forward integration with
+the Translation orchestrator (it's currently unused inside this function
+but kept on the signature for ABI stability); local error state is held
+on the per-call context, not the orchestrator's.
+@End Reasoning
+
+@Implementation:
+Guard source_code!=0. Create a fresh local context via
+create_translation_context. Parse the source via Parser.parse_protobuf
+to obtain the proto_ast; on parse failure destroy the context and
+return 0. Translate the root via translate_proto_node_to_hir. Read
+has_error at offset 8 of the local context; if 1, destroy and return 0.
+Otherwise destroy and return the HIR root.
+@End Implementation
+
+@Security_Scope:
+`source_code` is untrusted; all syntactic validation rests on the parser.
+`translation_context` is currently unused but should be either 0 or a
+valid pointer per caller convention.
+@End Security_Scope
+
 Process called "translate_protobuf_to_hir" takes source_code as Integer, translation_context as Integer returns Integer:
     Note: Translate Protocol Buffers source code to Runa HIR
-
-    @Reasoning:
-    Entry point for Protocol Buffers→HIR translation. Parses proto, translates to HIR,
-    handles errors, and reports to Translation context.
-    @End Reasoning
 
     If source_code is equal to 0:
         Note: Report error to Translation context (if available)

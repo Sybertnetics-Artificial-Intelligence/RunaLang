@@ -15,11 +15,44 @@ Import "compiler/middle/gungnir/hir/translation/frontends/csharp/csharp_parser.r
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
+@Reasoning:
+Counter triple shared across the round-trip driver. Same layout as the
+parser test suite so test_csharp_round_trip can be wired into a future
+unified runner with no struct conversion.
+@End Reasoning
+
+@Implementation:
+total at offset 0, passed at offset 8, failed at offset 16. Mutations
+go through Layout.memory_set_int64 because results is shared by handle.
+@End Implementation
+
 Type called "TestResults":
     total as Integer
     passed as Integer
     failed as Integer
 End Type
+
+@Reasoning:
+Drives 30+ C# -> HIR -> C# round-trip checks across the language surface:
+classes, properties, lambdas, generics, nullables, async/await, events,
+delegates, control flow, operators, namespaces. A regression in any
+emitter rule that loses information shows up as a re-parse failure on
+the second leg.
+@End Reasoning
+
+@Implementation:
+Initialize a TestResults, print header, then call test_round_trip with
+each inline C# snippet. After the matrix, print_results and return 1
+when any test failed, 0 otherwise.
+@End Implementation
+
+@TestCases:
+- "class Person { }" -> parse->HIR->emit->parse succeeds
+- "Func<int,int> f = x => x * 2;" -> lambda preserved
+- "public async Task<int> GetDataAsync() { return 0; }" -> async modifier survives
+- "string name = value ?? \"default\";" -> null-coalescing preserved
+- Any malformed snippet -> "Initial parse failed", results.failed += 1, exit 1
+@End TestCases
 
 Process called "main" returns Integer:
     Let results be a value of type TestResults with total as 0, passed as 0, failed as 0
@@ -87,6 +120,39 @@ Process called "main" returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Performs the full parse -> HIR -> emit -> re-parse -> HIR pipeline for one
+C# fragment. Both legs must reach HIR for the test to pass, which proves
+the emitter produced syntactically valid C# that round-trips through the
+parser. Catches any emitter bug that drops/scrambles tokens such that
+the second parse rejects the output.
+@End Reasoning
+
+@Implementation:
+1. Increment results.total.
+2. parse_csharp(source) -> ast1; failure: "Initial parse failed".
+3. Allocate a 64 KiB arena for HIR translation.
+4. translate_csharp_to_hir(ast1, arena) -> hir1; failure: free arena,
+   "Translation to HIR failed".
+5. generate_csharp(hir1) -> generated; failure: free arena,
+   "Generation from HIR failed".
+6. parse_csharp(generated) -> ast2; failure: free generated and arena,
+   "Re-parse failed".
+7. translate_csharp_to_hir(ast2, arena) -> hir2; failure: free generated
+   and arena, "Re-translation to HIR failed".
+8. Success: free generated and arena, mark passed.
+Note: each failure path tracks the exact buffers allocated up to that
+point so deallocation is balanced.
+@End Implementation
+
+@TestCases:
+- "class Person { }" -> all six stages succeed, results.passed += 1
+- ")(not csharp" -> ast1 == 0 -> "Initial parse failed"
+- Emitter regression that drops semicolons -> ast2 == 0 -> "Re-parse failed"
+- Translator bug that yields null HIR on second pass -> hir2 == 0 ->
+  "Re-translation to HIR failed"
+@End TestCases
 
 Process called "test_round_trip" takes source as Integer, test_name as Integer, results as Integer returns Integer:
     Let _rtot1 be proc memory_get_int64 from Layout with results, 0
@@ -162,6 +228,15 @@ Process called "test_round_trip" takes source as Integer, test_name as Integer, 
     Return 1
 End Process
 
+@Reasoning:
+Banner emitted once at startup; rule width (39 "=") matches title length
+so the heading boxes cleanly in CI log output.
+@End Reasoning
+
+@Implementation:
+Allocate title, print, deallocate; same for separator. Always returns 1.
+@End Implementation
+
 Process called "print_header" returns Integer:
     Let header be proc create_string from StringCore with "C# Round-Trip Translation Test Suite"
     proc print from header
@@ -174,6 +249,16 @@ Process called "print_header" returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Per-test "[PASS] <name>" line. Mirrors test_csharp_parser layout so
+unified greps work across the C# suites.
+@End Reasoning
+
+@Implementation:
+Allocate "[PASS] " prefix, print prefix and caller-owned test_name,
+deallocate prefix.
+@End Implementation
+
 Process called "print_test_success" takes test_name as Integer returns Integer:
     Let pass_msg be proc create_string from StringCore with "[PASS] "
     proc print from pass_msg
@@ -182,6 +267,17 @@ Process called "print_test_success" takes test_name as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Per-test "[FAIL] <name>: <reason>" line. The reason argument distinguishes
+which stage of the round trip broke so a failure log immediately localizes
+the bug (parser vs. translator vs. emitter).
+@End Reasoning
+
+@Implementation:
+Allocate "[FAIL] " prefix, print prefix/test_name/": "/reason in order,
+then deallocate the prefix.
+@End Implementation
 
 Process called "print_test_failure" takes test_name as Integer, reason as Integer returns Integer:
     Let fail_msg be proc create_string from StringCore with "[FAIL] "
@@ -193,6 +289,19 @@ Process called "print_test_failure" takes test_name as Integer, reason as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+Final summary block. Uses struct field access on results (results.total
+etc.) at the report site so the type-checked path is exercised at least
+once even though the body of test_round_trip uses raw memory_get_int64
+to keep its hot path uniform.
+@End Reasoning
+
+@Implementation:
+Print separator, "Test Results:" heading, then three lines
+"Total: N", "Passed: N", "Failed: N". Each label is allocated/printed/
+deallocated; numbers go through print_int.
+@End Implementation
 
 Process called "print_results" takes results as Integer returns Integer:
     Let separator be proc create_string from StringCore with "======================================="
@@ -220,6 +329,24 @@ Process called "print_results" takes results as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Local integer printer kept in each test file so this suite has no
+dependency on stdlib formatting (which pulls in allocators that are
+not yet bound in this layer of the bootstrap). Handles zero and the
+negative-MIN-INT path correctly via explicit early-return and sign
+prepending.
+@End Reasoning
+
+@Implementation:
+1. value == 0 -> print "0" and return.
+2. Allocate 32-byte buffer; walk position 31 downward, writing
+   48 + (temp % 10) and dividing temp by 10 each iteration.
+3. For negative values: work on -temp, then write '-' (45) at the
+   final position.
+4. Increment position once to skip past the last decrement, print
+   buffer+position as a C string, deallocate buffer.
+@End Implementation
 
 Process called "print_int" takes value as Integer returns Integer:
     If value is equal to 0:

@@ -27,31 +27,123 @@ Conventions:
 
 Import "../emitter_common.runa" as EmitterCommon
 
+@Reasoning:
+SwiftUI is structurally Swift, so the emitter only needs the shared byte
+buffer plus a thin type wrapper that gives callers a SwiftUI-named handle.
+Keeping the struct distinct from SwiftEmitter prevents accidental cross-use
+in the dispatch tables of hir_to_swiftui.runa.
+@End Reasoning
+
+@Implementation:
+Three fields shadow the layout of the raw emitter in emitter_common.runa
+(buffer pointer, allocated capacity, current length). The actual storage
+lives in the EmitterCommon arena; this struct exists only as a typed
+handle for the translation backend.
+@End Implementation
+
 Type called "SwiftUIEmitter":
     buffer as Integer
     capacity as Integer
     length as Integer
 End Type
 
+@Reasoning:
+Factory entry that hides the shared emitter dependency from
+hir_to_swiftui.runa so the backend never imports EmitterCommon directly.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_create which allocates an initial byte buffer
+(default capacity selected by EmitterCommon) and zeroes the length.
+@End Implementation
+
 Process called "create_swiftui_emitter" returns Integer:
     Return proc emitter_raw_create from EmitterCommon
 End Process
+
+@Reasoning:
+Mirrors create_swiftui_emitter so the caller has a symmetric lifecycle
+pair and never has to touch raw deallocation.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_destroy which frees the byte buffer then the
+emitter struct itself. Returns the EmitterCommon status code unchanged.
+@End Implementation
+
+@Security_Scope:
+Caller must guarantee the handle was produced by create_swiftui_emitter
+and has not already been destroyed; double-free is the caller's bug, not
+the emitter's responsibility.
+@End Security_Scope
 
 Process called "destroy_swiftui_emitter" takes emitter as Integer returns Integer:
     Return proc emitter_raw_destroy from EmitterCommon with emitter
 End Process
 
+@Reasoning:
+Exposes the growth hook so call sites that know they are about to emit a
+large literal can pre-size the buffer and avoid repeated realloc churn.
+@End Reasoning
+
+@Implementation:
+Delegates to emitter_raw_ensure_capacity which grows the buffer to at
+least the requested byte count using EmitterCommon's doubling policy.
+@End Implementation
+
 Process called "ensure_capacity" takes emitter as Integer, needed as Integer returns Integer:
     Return proc emitter_raw_ensure_capacity from EmitterCommon with emitter, needed
 End Process
+
+@Reasoning:
+Single-byte emission is the hot primitive for punctuation, braces, and
+operators in the SwiftUI output, so it is exposed as its own entry rather
+than forcing callers to allocate one-character strings.
+@End Reasoning
+
+@Implementation:
+Forwards the byte value to emitter_raw_emit_byte, which appends after
+ensuring capacity for at least one more byte.
+@End Implementation
+
+@Performance_Hints:
+Hot path. O(1) amortized; called once per emitted character of SwiftUI
+source.
+@End Performance_Hints
 
 Process called "emit_char" takes emitter as Integer, char as Integer returns Integer:
     Return proc emitter_raw_emit_byte from EmitterCommon with emitter, char
 End Process
 
+@Reasoning:
+Bulk emission for keywords, identifiers, and pre-formatted fragments;
+strictly faster than looping emit_char from the caller.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_emit_string which walks the null-terminated input
+and copies bytes into the buffer, growing as needed.
+@End Implementation
+
+@Performance_Hints:
+Hot path. O(n) in input length with one capacity check per grow event.
+@End Performance_Hints
+
 Process called "emit_string" takes emitter as Integer, str as Integer returns Integer:
     Return proc emitter_raw_emit_string from EmitterCommon with emitter, str
 End Process
+
+@Reasoning:
+Convenience for the common pattern of emitting a SwiftUI statement
+followed by a newline; avoids forcing callers to emit the terminator
+separately.
+@End Reasoning
+
+@Implementation:
+Emits the string then appends ASCII LF (10) as the line terminator. Swift
+tooling on all supported platforms accepts LF, matching the project's
+LF-only convention.
+@End Implementation
 
 Process called "emit_line" takes emitter as Integer, str as Integer returns Integer:
     proc emitter_raw_emit_string from EmitterCommon with emitter, str
@@ -59,9 +151,35 @@ Process called "emit_line" takes emitter as Integer, str as Integer returns Inte
     Return 1
 End Process
 
+@Reasoning:
+Dedicated helper because spaces are emitted between every identifier and
+operator pair; keeping the literal 32 in one place avoids magic numbers
+in the backend.
+@End Reasoning
+
+@Implementation:
+Emits ASCII SPACE (32) as a single byte.
+@End Implementation
+
 Process called "emit_space" takes emitter as Integer returns Integer:
     Return proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
 End Process
+
+@Reasoning:
+Apple's Swift API Design Guidelines and SwiftUI sample code both use
+4-space indentation; the emitter materializes that directly instead of
+relying on a post-pass formatter.
+@End Reasoning
+
+@Implementation:
+Multiplies the logical indent level by 4 to obtain the space count, then
+emits that many ASCII SPACE bytes in a tight loop. No string allocation.
+@End Implementation
+
+@Performance_Hints:
+O(level) bytes emitted. Called once per emitted statement; level rarely
+exceeds 6 in practice so the loop is short.
+@End Performance_Hints
 
 Process called "emit_indent" takes emitter as Integer, level as Integer returns Integer:
     Note: 4-space indentation per Apple Swift style guide.
@@ -74,13 +192,48 @@ Process called "emit_indent" takes emitter as Integer, level as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Returns the accumulated SwiftUI source as a null-terminated string so the
+driver can hand it to disk I/O or further processing without copying.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_get_output which terminates the buffer and
+returns its base pointer. Caller does not own the pointer; lifetime is
+tied to the emitter handle.
+@End Implementation
+
+@Security_Scope:
+Returned pointer aliases the emitter's internal buffer. Caller must not
+free it directly and must not use it after destroy_swiftui_emitter.
+@End Security_Scope
+
 Process called "get_output" takes emitter as Integer returns Integer:
     Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
 
+@Reasoning:
+Exposes the current byte count so callers (e.g., golden-output diff
+tools) can detect empty or unexpectedly short generation results.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_length which reads the stored length field.
+@End Implementation
+
 Process called "get_length" takes emitter as Integer returns Integer:
     Return proc emitter_raw_length from EmitterCommon with emitter
 End Process
+
+@Reasoning:
+Lets the driver reuse a single emitter across multiple translation units
+without paying allocation cost for each one.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_reset which zeroes the length field but keeps
+the buffer allocation intact for reuse.
+@End Implementation
 
 Process called "reset" takes emitter as Integer returns Integer:
     Return proc emitter_raw_reset from EmitterCommon with emitter
