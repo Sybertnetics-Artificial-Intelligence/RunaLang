@@ -1,33 +1,84 @@
 Note: VHDL Code Emitter - Handles VHDL code generation, formatting, and indentation
 Note: Provides utilities for emitting well-formatted VHDL code
 Note: Production-perfect implementation with zero technical debt
+Note:
+Note: Buffer management delegates to the shared byte-buffer foundation in
+Note: backends/emitter_common.runa. The emitter is a 48-byte heap state:
+Note:   offset  0: buffer pointer   (managed by emitter_common raw API)
+Note:   offset  8: buffer capacity  (managed by emitter_common raw API)
+Note:   offset 16: buffer length    (managed by emitter_common raw API)
+Note:   offset 24: indent_level     (VHDL-specific - 4 spaces per level)
+Note:   offset 32: needs_indent     (1 if next emit begins a fresh line)
+Note:   offset 40: current_line     (1-based line counter)
+Note: All byte appends route through emitter_raw_emit_string /
+Note: emitter_raw_emit_byte so the entire VHDL pipeline shares the same
+Note: O(amortized 1) growth and lifecycle semantics as the other 36+
+Note: Wave 2-migrated emitters.
+:End Note
 
+Import "compiler/middle/gungnir/hir/translation/backends/emitter_common.runa" as EmitterCommon
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
 Note: ==================== Emitter State ====================
 
 Type called "VhdlEmitter":
-    buffer as Integer          Note: Output buffer (string)
+    buffer as Integer          Note: Output buffer pointer (managed by emitter_common)
+    capacity as Integer        Note: Output buffer capacity (managed by emitter_common)
+    length as Integer          Note: Output buffer length  (managed by emitter_common)
     indent_level as Integer    Note: Current indentation level
-    indent_string as Integer   Note: String used for one level of indentation
-    current_line as Integer    Note: Current line number
     needs_indent as Integer    Note: Flag indicating next emit needs indentation
+    current_line as Integer    Note: Current line number
 End Type
 
 Note: ==================== Emitter Creation ====================
 
 Process called "create_emitter" returns Integer:
-    Note: Create new VHDL code emitter
+    Note: Create new VHDL code emitter as a 48-byte heap state. The first
+    Note: 24 bytes form a raw emitter_common header (buffer/capacity/length).
+    Note: Remaining fields carry VHDL-specific indentation and diagnostic
+    Note: state.
 
-    Let emitter be a value of type VhdlEmitter
-    Set emitter.buffer to proc create_string from StringCore with ""
-    Set emitter.indent_level to 0
-    Set emitter.indent_string to proc create_string from StringCore with "    "
-    Set emitter.current_line to 1
-    Set emitter.needs_indent to 1
+    Let emitter be proc allocate from Layout with 48
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Let buf be proc allocate from Layout with 4096
+    If buf is equal to 0:
+        proc deallocate from Layout with emitter
+        Return 0
+    End If
+
+    proc memory_set_int64 from MemoryCore with emitter, 0, buf
+    proc memory_set_int64 from MemoryCore with emitter, 8, 4096
+    proc memory_set_int64 from MemoryCore with emitter, 16, 0
+    proc memory_set_int64 from MemoryCore with emitter, 24, 0
+    proc memory_set_int64 from MemoryCore with emitter, 32, 1
+    proc memory_set_int64 from MemoryCore with emitter, 40, 1
+
     Return emitter
+End Process
+
+Process called "destroy_emitter" that takes emitter as Integer returns Integer:
+    Note: Release the byte buffer and the 48-byte state in one shot. The raw
+    Note: header lives at offset 0/8/16 of `emitter`, so we read it directly
+    Note: rather than using emitter_raw_destroy (which would also free the
+    Note: header, but its allocation size differs from ours).
+
+    If emitter is equal to 0:
+        Return 1
+    End If
+
+    Let buf be proc memory_get_int64 from MemoryCore with emitter, 0
+    If buf is not equal to 0:
+        proc deallocate from Layout with buf
+    End If
+    proc deallocate from Layout with emitter
+
+    Return 1
 End Process
 
 Note: ==================== Indentation Management ====================
@@ -35,59 +86,91 @@ Note: ==================== Indentation Management ====================
 Process called "indent" that takes emitter as Integer returns Integer:
     Note: Increase indentation level
 
-    Set emitter.indent_level to emitter.indent_level plus 1
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Let level be proc memory_get_int64 from MemoryCore with emitter, 24
+    proc memory_set_int64 from MemoryCore with emitter, 24, level plus 1
     Return 1
 End Process
 
 Process called "dedent" that takes emitter as Integer returns Integer:
-    Note: Decrease indentation level
+    Note: Decrease indentation level, clamped at 0
 
-    If emitter.indent_level is greater than 0:
-        Set emitter.indent_level to emitter.indent_level minus 1
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Let level be proc memory_get_int64 from MemoryCore with emitter, 24
+    If level is greater than 0:
+        proc memory_set_int64 from MemoryCore with emitter, 24, level minus 1
     End If
 
     Return 1
 End Process
 
 Process called "emit_indent" that takes emitter as Integer returns Integer:
-    Note: Emit current indentation to buffer
+    Note: Emit current indentation to buffer. VHDL convention is 4 spaces
+    Note: per nesting level. Bytes route through emitter_raw_emit_byte so
+    Note: the buffer grows geometrically.
 
-    Let i be 0
-    While i is less than emitter.indent_level:
-        Set emitter.buffer to proc string_concat from StringCore with emitter.buffer, emitter.indent_string
-        Set i to i plus 1
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Let level be proc memory_get_int64 from MemoryCore with emitter, 24
+    Let level_i be 0
+    While level_i is less than level:
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
+        Set level_i to level_i plus 1
     End While
 
-    Set emitter.needs_indent to 0
+    proc memory_set_int64 from MemoryCore with emitter, 32, 0
     Return 1
 End Process
 
 Note: ==================== Code Emission ====================
 
 Process called "emit" that takes emitter as Integer, text as Integer returns Integer:
-    Note: Emit text without newline
+    Note: Emit text without newline. Applies indentation if we are at the
+    Note: start of a fresh line, then appends bytes via the raw emitter API.
 
-    Note: Add indentation if needed
-    If emitter.needs_indent is equal to 1:
-        proc emit_indent from emitter
+    If emitter is equal to 0:
+        Return 0
     End If
 
-    Set emitter.buffer to proc string_concat from StringCore with emitter.buffer, text
+    Let needs_indent be proc memory_get_int64 from MemoryCore with emitter, 32
+    If needs_indent is equal to 1:
+        proc emit_indent with emitter
+    End If
+
+    proc emitter_raw_emit_string from EmitterCommon with emitter, text
     Return 1
 End Process
 
 Process called "emit_line" that takes emitter as Integer, text as Integer returns Integer:
-    Note: Emit text with newline
+    Note: Emit text followed by a newline. Newline marks needs_indent so
+    Note: subsequent emits re-apply indentation. Bumps current_line.
 
-    Note: Add indentation if needed
-    If emitter.needs_indent is equal to 1:
-        proc emit_indent from emitter
+    If emitter is equal to 0:
+        Return 0
     End If
 
-    Set emitter.buffer to proc string_concat from StringCore with emitter.buffer, text
-    Set emitter.buffer to proc string_concat from StringCore with emitter.buffer, "\n"
-    Set emitter.current_line to emitter.current_line plus 1
-    Set emitter.needs_indent to 1
+    Let needs_indent be proc memory_get_int64 from MemoryCore with emitter, 32
+    If needs_indent is equal to 1:
+        proc emit_indent with emitter
+    End If
+
+    proc emitter_raw_emit_string from EmitterCommon with emitter, text
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
+
+    Let current_line be proc memory_get_int64 from MemoryCore with emitter, 40
+    proc memory_set_int64 from MemoryCore with emitter, 40, current_line plus 1
+    proc memory_set_int64 from MemoryCore with emitter, 32, 1
 
     Return 1
 End Process
@@ -95,16 +178,26 @@ End Process
 Process called "emit_raw" that takes emitter as Integer, text as Integer returns Integer:
     Note: Emit text without indentation handling
 
-    Set emitter.buffer to proc string_concat from StringCore with emitter.buffer, text
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    proc emitter_raw_emit_string from EmitterCommon with emitter, text
     Return 1
 End Process
 
 Process called "emit_newline" that takes emitter as Integer returns Integer:
     Note: Emit newline and mark that next line needs indentation
 
-    Set emitter.buffer to proc string_concat from StringCore with emitter.buffer, "\n"
-    Set emitter.current_line to emitter.current_line plus 1
-    Set emitter.needs_indent to 1
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
+
+    Let current_line be proc memory_get_int64 from MemoryCore with emitter, 40
+    proc memory_set_int64 from MemoryCore with emitter, 40, current_line plus 1
+    proc memory_set_int64 from MemoryCore with emitter, 32, 1
 
     Return 1
 End Process
@@ -600,24 +693,39 @@ End Process
 Note: ==================== Output Retrieval ====================
 
 Process called "get_code" that takes emitter as Integer returns Integer:
-    Note: Get the generated VHDL code as string
+    Note: Get the generated VHDL code as a freshly allocated null-terminated
+    Note: copy of the accumulated buffer bytes. Caller owns the returned
+    Note: pointer.
 
-    Return emitter.buffer
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
 
 Process called "get_line_count" that takes emitter as Integer returns Integer:
     Note: Get the number of lines in generated code
 
-    Return emitter.current_line
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    Return proc memory_get_int64 from MemoryCore with emitter, 40
 End Process
 
 Process called "reset" that takes emitter as Integer returns Integer:
-    Note: Reset emitter to initial state
+    Note: Reset emitter to initial state. Keeps the existing buffer
+    Note: allocation - only zeros the length and resets VHDL-specific state.
 
-    Set emitter.buffer to proc create_string from StringCore with ""
-    Set emitter.indent_level to 0
-    Set emitter.current_line to 1
-    Set emitter.needs_indent to 1
+    If emitter is equal to 0:
+        Return 0
+    End If
+
+    proc emitter_raw_reset from EmitterCommon with emitter
+    proc memory_set_int64 from MemoryCore with emitter, 24, 0
+    proc memory_set_int64 from MemoryCore with emitter, 32, 1
+    proc memory_set_int64 from MemoryCore with emitter, 40, 1
 
     Return 1
 End Process
