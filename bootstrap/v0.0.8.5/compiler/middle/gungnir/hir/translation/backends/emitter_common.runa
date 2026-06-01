@@ -1,33 +1,67 @@
 Note: ============================================================================
-Note: EMITTER COMMON - Shared Foundation for HIR Translation Backends
+Note: EMITTER COMMON - Shared Byte-Buffer Foundation for HIR Translation Backends
 Note: ============================================================================
 Note: Provides the canonical EmitterContext type and shared helpers used by all
-Note: HIR-to-target-language emitters (Julia, Lua, Python, Ruby, Dart, etc.).
-Note: Centralizes indentation, output buffering, error tracking, and line/column
-Note: bookkeeping so each backend only implements its target-specific logic.
+Note: HIR-to-target-language emitters. Internally backed by a raw byte buffer
+Note: that grows geometrically, giving amortized O(1) append performance (the
+Note: previous implementation rebuilt a String on every emit, costing O(n^2)
+Note: in the size of the accumulated output).
+Note: Two parallel APIs are exposed:
+Note:   1. EmitterContext (Runa struct) - high-level API consumed by
+Note:      hir_to_julia.runa and any other backend that prefers to carry
+Note:      indentation / line-column / error state in a typed context.
+Note:   2. Raw 24-byte buffer header (Integer pointer) - low-level API used by
+Note:      the 33+ per-language byte-buffer emitters (c_emitter.runa,
+Note:      python_emitter.runa, ...). Layout:
+Note:           offset 0  - buffer pointer  (Integer)
+Note:           offset 8  - buffer capacity (Integer, bytes)
+Note:           offset 16 - buffer length   (Integer, bytes written)
+Note: Both APIs share the same growth, indent and reset semantics so a backend
+Note: can use whichever fits its existing structure best.
 Note: ============================================================================
 
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
 Note: ============================================================================
-Note: EMITTER CONTEXT
+Note: CONSTANTS
 Note: ============================================================================
-Note: Canonical context carried through every emit_* call in a backend.
+
+Constant EMITTER_INITIAL_CAPACITY as Integer is 4096
+Constant EMITTER_HEADER_SIZE as Integer is 24
+Constant EMITTER_OFFSET_BUFFER as Integer is 0
+Constant EMITTER_OFFSET_CAPACITY as Integer is 8
+Constant EMITTER_OFFSET_LENGTH as Integer is 16
+Constant EMITTER_NEWLINE_BYTE as Integer is 10
+Constant EMITTER_SPACE_BYTE as Integer is 32
+Constant EMITTER_TAB_BYTE as Integer is 9
+
+Note: ============================================================================
+Note: EMITTER CONTEXT (high-level struct API)
+Note: ============================================================================
+Note: Canonical context carried through every emit_* call in a high-level
+Note: backend. Wraps a raw byte buffer in `output_buffer` so all string
+Note: appends are O(amortized 1) rather than O(n).
 Note: Fields:
-Note:   output_buffer   - accumulated target-language source text
-Note:   indent_level    - logical nesting depth (multiplied by indent_size on emit)
+Note:   output_buffer   - Integer pointer to raw byte buffer (heap-allocated)
+Note:   output_capacity - capacity of the byte buffer (bytes)
+Note:   output_length   - bytes currently written to the buffer
+Note:   indent_level    - logical nesting depth
 Note:   indent_size     - spaces per nesting level (typical: 2 or 4)
 Note:   use_tabs        - 1 if indent should use tabs, 0 for spaces
 Note:   current_line    - 1-based line number in output_buffer (post-emit)
 Note:   current_column  - 1-based column number in output_buffer (post-emit)
 Note:   line_start      - 1 if next emit begins a fresh line (so indent is needed)
-Note:   errors          - List of emitter error messages (String)
-Note:   warnings        - List of emitter warning messages (String)
+Note:   errors          - List of emitter error messages
+Note:   warnings        - List of emitter warning messages
 Note:   had_error       - 1 if any error was recorded
 Note: ============================================================================
 Type called "EmitterContext":
-    output_buffer as String
+    output_buffer as Integer
+    output_capacity as Integer
+    output_length as Integer
     indent_level as Integer
     indent_size as Integer
     use_tabs as Integer
@@ -40,16 +74,189 @@ Type called "EmitterContext":
 End Type
 
 Note: ============================================================================
-Note: CONSTRUCTOR
+Note: RAW BUFFER PRIMITIVES
+Note: ============================================================================
+Note: These operate on the 24-byte header layout described above and are
+Note: shared between the struct API (which embeds the header in EmitterContext)
+Note: and per-language byte-buffer emitters which use the layout directly.
+Note: ============================================================================
+
+Note: Grow a raw header so it has room for `needed` additional bytes beyond
+Note: the current length. Returns 1 on success, 0 on allocation failure.
+Note: Doubles capacity (and keeps doubling) until the request fits.
+Process called "emitter_raw_ensure_capacity" takes header as Integer, needed as Integer returns Integer:
+    Let capacity be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_CAPACITY
+    Let length be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH
+
+    Let available be capacity minus length
+    If available is greater than or equal to needed:
+        Return 1
+    End If
+
+    Let new_capacity be capacity multiplied by 2
+    If new_capacity is less than capacity plus needed:
+        Set new_capacity to capacity plus needed
+    End If
+    While new_capacity minus length is less than needed:
+        Set new_capacity to new_capacity multiplied by 2
+    End While
+
+    Let new_buffer be proc allocate from Layout with new_capacity
+    If new_buffer is equal to 0:
+        Return 0
+    End If
+
+    Let old_buffer be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER
+    If length is greater than 0:
+        proc memory_copy from MemoryCore with new_buffer, old_buffer, length
+    End If
+
+    If old_buffer is not equal to 0:
+        proc deallocate from Layout with old_buffer
+    End If
+
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER, new_buffer
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_CAPACITY, new_capacity
+    Return 1
+End Process
+
+Note: Append a single byte to the raw buffer. Returns 1 on success.
+Process called "emitter_raw_emit_byte" takes header as Integer, byte_value as Integer returns Integer:
+    Let success be proc emitter_raw_ensure_capacity with header, 1
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Let buffer be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER
+    Let length be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH
+    proc memory_set_byte from MemoryCore with buffer, length, byte_value
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH, length plus 1
+    Return 1
+End Process
+
+Note: Append the bytes of a null-terminated string to the raw buffer.
+Note: A null str pointer or empty string is a no-op returning 1.
+Process called "emitter_raw_emit_string" takes header as Integer, str as Integer returns Integer:
+    If str is equal to 0:
+        Return 1
+    End If
+
+    Let str_length be proc string_length from StringCore with str
+    If str_length is equal to 0:
+        Return 1
+    End If
+
+    Let success be proc emitter_raw_ensure_capacity with header, str_length
+    If success is equal to 0:
+        Return 0
+    End If
+
+    Let buffer be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER
+    Let length be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH
+
+    Note: memory_copy uses absolute pointers; offset the destination so we
+    Note: append after existing content. The source string is read from
+    Note: offset 0 of `str`.
+    Let dest_ptr be buffer plus length
+    proc memory_copy from MemoryCore with dest_ptr, str, str_length
+
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH, length plus str_length
+    Return 1
+End Process
+
+Note: Allocate and initialize a raw 24-byte header backed by a fresh
+Note: initial-capacity byte buffer. Returns the header pointer, 0 on failure.
+Process called "emitter_raw_create" returns Integer:
+    Let header be proc allocate from Layout with EMITTER_HEADER_SIZE
+    If header is equal to 0:
+        Return 0
+    End If
+
+    Let buffer be proc allocate from Layout with EMITTER_INITIAL_CAPACITY
+    If buffer is equal to 0:
+        proc deallocate from Layout with header
+        Return 0
+    End If
+
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER, buffer
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_CAPACITY, EMITTER_INITIAL_CAPACITY
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH, 0
+    Return header
+End Process
+
+Note: Destroy a raw header by deallocating its byte buffer and the header
+Note: itself. Safe to call with a null header (returns 1).
+Process called "emitter_raw_destroy" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 1
+    End If
+
+    Let buffer be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER
+    If buffer is not equal to 0:
+        proc deallocate from Layout with buffer
+    End If
+    proc deallocate from Layout with header
+    Return 1
+End Process
+
+Note: Return the current byte length recorded in a raw header.
+Process called "emitter_raw_length" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH
+End Process
+
+Note: Return a freshly allocated null-terminated copy of the bytes written
+Note: to the raw buffer. Caller owns the returned pointer. Returns 0 on
+Note: allocation failure or for a null header.
+Process called "emitter_raw_get_output" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 0
+    End If
+
+    Let buffer be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_BUFFER
+    Let length be proc memory_get_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH
+
+    Let output be proc allocate from Layout with length plus 1
+    If output is equal to 0:
+        Return 0
+    End If
+
+    If length is greater than 0:
+        proc memory_copy from MemoryCore with output, buffer, length
+    End If
+    proc memory_set_byte from MemoryCore with output, length, 0
+    Return output
+End Process
+
+Note: Reset the byte length to 0, keeping the existing allocation. Safe with
+Note: a null header.
+Process called "emitter_raw_reset" takes header as Integer returns Integer:
+    If header is equal to 0:
+        Return 1
+    End If
+    proc memory_set_int64 from MemoryCore with header, EMITTER_OFFSET_LENGTH, 0
+    Return 1
+End Process
+
+Note: ============================================================================
+Note: HIGH-LEVEL EMITTERCONTEXT CONSTRUCTOR
 Note: ============================================================================
 Note: Build a fresh EmitterContext with defaults suitable for most backends.
-Note: Default style: 4-space indentation, no tabs.
-Note: Callers may mutate the returned context for backend-specific conventions
-Note: (e.g. Go prefers tabs - set use_tabs to 1 after creation).
-Note: ============================================================================
+Note: Default style: 4-space indentation, no tabs. The output buffer starts
+Note: at EMITTER_INITIAL_CAPACITY bytes and grows geometrically on demand.
 Process called "create_emitter_context" returns EmitterContext:
+    Let buf be proc allocate from Layout with EMITTER_INITIAL_CAPACITY
+    Let cap be EMITTER_INITIAL_CAPACITY
+    If buf is equal to 0:
+        Set cap to 0
+    End If
+
     Let ctx be a value of type EmitterContext with
-        output_buffer as "",
+        output_buffer as buf,
+        output_capacity as cap,
+        output_length as 0,
         indent_level as 0,
         indent_size as 4,
         use_tabs as 0,
@@ -64,48 +271,91 @@ Process called "create_emitter_context" returns EmitterContext:
 End Process
 
 Note: ============================================================================
+Note: INTERNAL GROWTH HELPERS (struct API)
+Note: ============================================================================
+
+Note: Ensure the context's buffer has room for `needed` additional bytes.
+Note: Returns 1 on success, 0 on allocation failure. The caller is expected
+Note: to set ctx.had_error / append to ctx.errors if this returns 0.
+Process called "emitter_ctx_ensure_capacity" takes ctx as EmitterContext, needed as Integer returns Integer:
+    Let available be ctx.output_capacity minus ctx.output_length
+    If available is greater than or equal to needed:
+        Return 1
+    End If
+
+    Let new_capacity be ctx.output_capacity multiplied by 2
+    If new_capacity is less than ctx.output_capacity plus needed:
+        Set new_capacity to ctx.output_capacity plus needed
+    End If
+    While new_capacity minus ctx.output_length is less than needed:
+        Set new_capacity to new_capacity multiplied by 2
+    End While
+
+    Let new_buffer be proc allocate from Layout with new_capacity
+    If new_buffer is equal to 0:
+        Return 0
+    End If
+
+    If ctx.output_length is greater than 0:
+        proc memory_copy from MemoryCore with new_buffer, ctx.output_buffer, ctx.output_length
+    End If
+    If ctx.output_buffer is not equal to 0:
+        proc deallocate from Layout with ctx.output_buffer
+    End If
+
+    Set ctx.output_buffer to new_buffer
+    Set ctx.output_capacity to new_capacity
+    Return 1
+End Process
+
+Note: Append a single byte to the context buffer, growing as needed.
+Process called "emitter_ctx_emit_byte" takes ctx as EmitterContext, byte_value as Integer:
+    Let success be proc emitter_ctx_ensure_capacity with ctx, 1
+    If success is equal to 0:
+        Set ctx.had_error to 1
+        proc list_append from ListCore with ctx.errors, "emitter buffer growth failed"
+        Return
+    End If
+
+    proc memory_set_byte from MemoryCore with ctx.output_buffer, ctx.output_length, byte_value
+    Set ctx.output_length to ctx.output_length plus 1
+End Process
+
+Note: ============================================================================
 Note: INDENTATION MANAGEMENT
 Note: ============================================================================
 
-Note: Increase the nesting depth by 1. Subsequent emits at a fresh line will
-Note: prepend the corresponding indentation.
+Note: Increase the nesting depth by 1.
 Process called "emitter_indent" takes ctx as EmitterContext:
     Set ctx.indent_level to ctx.indent_level plus 1
 End Process
 
-Note: Decrease the nesting depth by 1. Indent is clamped at 0 so malformed
-Note: enter/leave pairings cannot drive the level negative.
+Note: Decrease the nesting depth by 1, clamped at 0.
 Process called "emitter_dedent" takes ctx as EmitterContext:
     If ctx.indent_level is greater than 0:
         Set ctx.indent_level to ctx.indent_level minus 1
     End If
 End Process
 
-Note: Emit the indentation prefix for the current nesting depth. Should be
-Note: called at the start of a new line (after emit_newline) before any
-Note: visible text. Respects use_tabs and indent_size.
+Note: Emit the indentation prefix for the current nesting depth using the
+Note: byte buffer. Respects use_tabs and indent_size.
 Process called "emitter_emit_indent" takes ctx as EmitterContext:
-    Let unit be ""
     If ctx.use_tabs is equal to 1:
-        Set unit to "\t"
+        Let level_i be 0
+        While level_i is less than ctx.indent_level:
+            proc emitter_ctx_emit_byte with ctx, EMITTER_TAB_BYTE
+            Set ctx.current_column to ctx.current_column plus 1
+            Set level_i to level_i plus 1
+        End While
     Otherwise:
+        Let total_spaces be ctx.indent_level multiplied by ctx.indent_size
         Let space_i be 0
-        While space_i is less than ctx.indent_size:
-            Set unit to proc string_concat from StringCore with unit, " "
+        While space_i is less than total_spaces:
+            proc emitter_ctx_emit_byte with ctx, EMITTER_SPACE_BYTE
             Set space_i to space_i plus 1
         End While
+        Set ctx.current_column to ctx.current_column plus total_spaces
     End If
-
-    Let level_i be 0
-    While level_i is less than ctx.indent_level:
-        Set ctx.output_buffer to proc string_concat from StringCore with ctx.output_buffer, unit
-        If ctx.use_tabs is equal to 1:
-            Set ctx.current_column to ctx.current_column plus 1
-        Otherwise:
-            Set ctx.current_column to ctx.current_column plus ctx.indent_size
-        End If
-        Set level_i to level_i plus 1
-    End While
 
     Set ctx.line_start to 0
 End Process
@@ -116,21 +366,37 @@ Note: ==========================================================================
 
 Note: Append raw text to the output buffer. If line_start is set, emits
 Note: indentation first. Updates current_line/current_column by scanning the
-Note: text for newline characters - callers do NOT have to pre-process the
-Note: text. This is the primary low-level emit operation.
+Note: text for newline characters.
 Process called "emitter_emit" takes ctx as EmitterContext, text as String:
     If ctx.line_start is equal to 1:
         proc emitter_emit_indent with ctx
     End If
 
-    Set ctx.output_buffer to proc string_concat from StringCore with ctx.output_buffer, text
+    If text is equal to 0:
+        Return
+    End If
+
+    Let text_len be proc string_length from StringCore with text
+    If text_len is equal to 0:
+        Return
+    End If
+
+    Let success be proc emitter_ctx_ensure_capacity with ctx, text_len
+    If success is equal to 0:
+        Set ctx.had_error to 1
+        proc list_append from ListCore with ctx.errors, "emitter buffer growth failed"
+        Return
+    End If
+
+    Let dest_ptr be ctx.output_buffer plus ctx.output_length
+    proc memory_copy from MemoryCore with dest_ptr, text, text_len
+    Set ctx.output_length to ctx.output_length plus text_len
 
     Note: Scan text for newlines to update line/column counters.
-    Let text_len be proc string_length from StringCore with text
     Let scan_i be 0
     While scan_i is less than text_len:
         Let ch_code be proc string_char_code_at from StringCore with text, scan_i
-        If ch_code is equal to 10:
+        If ch_code is equal to EMITTER_NEWLINE_BYTE:
             Set ctx.current_line to ctx.current_line plus 1
             Set ctx.current_column to 1
             Set ctx.line_start to 1
@@ -142,31 +408,31 @@ Process called "emitter_emit" takes ctx as EmitterContext, text as String:
     End While
 End Process
 
-Note: Append text followed by a newline and mark the next emit as line-start.
-Note: Equivalent to emit(text) followed by emit_newline.
+Note: Append text followed by a newline. Equivalent to emit(text) +
+Note: emit_newline.
 Process called "emitter_emit_line" takes ctx as EmitterContext, text as String:
     proc emitter_emit with ctx, text
     proc emitter_emit_newline with ctx
 End Process
 
-Note: Append a newline character. Updates line counter and sets line_start
+Note: Append a newline byte. Updates the line counter and sets line_start
 Note: so the next emit re-applies indentation.
 Process called "emitter_emit_newline" takes ctx as EmitterContext:
-    Set ctx.output_buffer to proc string_concat from StringCore with ctx.output_buffer, "\n"
+    proc emitter_ctx_emit_byte with ctx, EMITTER_NEWLINE_BYTE
     Set ctx.current_line to ctx.current_line plus 1
     Set ctx.current_column to 1
     Set ctx.line_start to 1
 End Process
 
-Note: Append a single space without affecting line state. Used between tokens.
+Note: Append a single space byte without affecting line state.
 Process called "emitter_emit_space" takes ctx as EmitterContext:
-    Set ctx.output_buffer to proc string_concat from StringCore with ctx.output_buffer, " "
+    proc emitter_ctx_emit_byte with ctx, EMITTER_SPACE_BYTE
     Set ctx.current_column to ctx.current_column plus 1
     Set ctx.line_start to 0
 End Process
 
-Note: Append a blank line (a bare newline with no preceding indent).
-Note: Useful between top-level declarations.
+Note: Append a blank line (bare newline with no preceding indent). Useful
+Note: between top-level declarations.
 Process called "emitter_emit_blank_line" takes ctx as EmitterContext:
     proc emitter_emit_newline with ctx
 End Process
@@ -175,8 +441,7 @@ Note: ==========================================================================
 Note: ERROR AND WARNING TRACKING
 Note: ============================================================================
 
-Note: Record an error message. Sets had_error so the caller can detect failure
-Note: without iterating the errors list.
+Note: Record an error message. Sets had_error.
 Process called "emitter_error" takes ctx as EmitterContext, message as String:
     proc list_append from ListCore with ctx.errors, message
     Set ctx.had_error to 1
@@ -191,14 +456,26 @@ Note: ==========================================================================
 Note: OUTPUT ACCESS
 Note: ============================================================================
 
-Note: Return the accumulated output buffer. Backends call this after walking
-Note: the HIR module to retrieve the emitted target-language source.
+Note: Return the accumulated output as a null-terminated String. The
+Note: returned pointer is freshly allocated and owned by the caller.
 Process called "emitter_get_output" takes ctx as EmitterContext returns String:
-    Return ctx.output_buffer
+    If ctx.output_buffer is equal to 0:
+        Return ""
+    End If
+
+    Let output be proc allocate from Layout with ctx.output_length plus 1
+    If output is equal to 0:
+        Return ""
+    End If
+
+    If ctx.output_length is greater than 0:
+        proc memory_copy from MemoryCore with output, ctx.output_buffer, ctx.output_length
+    End If
+    proc memory_set_byte from MemoryCore with output, ctx.output_length, 0
+    Return output
 End Process
 
-Note: True if any error was recorded. Backends should check this before
-Note: returning emitter_get_output to callers.
+Note: True if any error was recorded.
 Process called "emitter_has_errors" takes ctx as EmitterContext returns Integer:
     Return ctx.had_error
 End Process
@@ -218,9 +495,9 @@ Note: RESET
 Note: ============================================================================
 
 Note: Reset all state in-place so a single context can be reused across
-Note: multiple translation invocations without reallocating.
+Note: multiple translation invocations without reallocating the byte buffer.
 Process called "emitter_reset" takes ctx as EmitterContext:
-    Set ctx.output_buffer to ""
+    Set ctx.output_length to 0
     Set ctx.indent_level to 0
     Set ctx.current_line to 1
     Set ctx.current_column to 1

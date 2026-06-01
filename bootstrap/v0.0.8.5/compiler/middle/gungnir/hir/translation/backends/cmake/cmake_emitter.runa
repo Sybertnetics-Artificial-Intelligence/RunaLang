@@ -1,54 +1,34 @@
 Note:
 Copyright 2025 Sybertnetics Artificial Intelligence Solutions
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Licensed under the Apache License, Version 2.0
 :End Note
 
 Note:
-CMake Emitter - Complete CMake code formatting and emission
+CMake Emitter
 
-This file provides comprehensive CMake code generation with proper formatting,
-indentation, and syntax management.
+Buffered output for CMake script generation. Buffer management is
+delegated to the shared byte-buffer foundation in emitter_common.runa.
 
-Features:
-- Indentation management (2-space indent)
-- Line tracking for error reporting
-- Comment emission
-- CMake command formatting
-- Multi-line argument formatting
-- Variable reference formatting (${VAR})
-- Generator expression formatting ($<...>)
-
-Dependencies:
-- compiler/frontend/primitives/memory/layout.runa
-- compiler/frontend/primitives/core/string_core.runa
-- compiler/frontend/primitives/collections/list.runa
+State layout (40 bytes):
+  offset  0: buffer pointer   (managed by emitter_common)
+  offset  8: buffer capacity  (managed by emitter_common)
+  offset 16: buffer length    (managed by emitter_common)
+  offset 24: indent_level     (CMake-specific - 2 spaces per level)
+  offset 32: at_line_start    (1 if next emit begins a fresh line)
 :End Note
 
-Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "../emitter_common.runa" as EmitterCommon
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
-Import "compiler/frontend/primitives/collections/list.runa" as List
-
-Note: ============================================================================
-Note: Emitter State
-Note: ============================================================================
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
 Type called "CMakeEmitter":
-    output as Integer           Note: Accumulated output string
-    indent_level as Integer     Note: Current indentation level (0-based)
-    current_line as Integer     Note: Current line number for tracking
-    at_line_start as Integer    Note: Boolean: 1 if at start of line (for indentation)
-    indent_string as Integer    Note: String to use for each indent level (default: "  ")
+    buffer as Integer
+    capacity as Integer
+    length as Integer
+    indent_level as Integer
+    at_line_start as Integer
 End Type
 
 Note: ============================================================================
@@ -56,55 +36,40 @@ Note: Emitter Creation and Destruction
 Note: ============================================================================
 
 Process called "create_cmake_emitter" returns Integer:
-    Note: Create CMake code emitter with formatting support
-
-    Let emitter_size be 40
-    Let emitter be proc allocate from Layout with emitter_size
-
+    Note: Allocate the 40-byte CMake state, then delegate the first 24 bytes
+    Note: (buffer/capacity/length) to a raw header set up by emitter_common.
+    Let emitter be proc allocate from Layout with 40
     If emitter is equal to 0:
         Return 0
     End If
 
-    Note: Initialize empty output string
-    Let empty_string be proc string_from_cstring from StringCore with ""
-    proc memory_set_int64 from Layout with emitter, 0, empty_string
+    Let buf be proc allocate from Layout with 4096
+    If buf is equal to 0:
+        proc deallocate from Layout with emitter
+        Return 0
+    End If
 
-    Note: Initialize indent level to 0
-    proc memory_set_int64 from Layout with emitter, 8, 0
-
-    Note: Initialize line tracking
-    proc memory_set_int64 from Layout with emitter, 16, 1  Note: Start at line 1
-
-    Note: Initialize at_line_start to 1 (true)
-    proc memory_set_int64 from Layout with emitter, 24, 1
-
-    Note: Initialize indent string (2 spaces)
-    Let indent_str be proc string_from_cstring from StringCore with "  "
-    proc memory_set_int64 from Layout with emitter, 32, indent_str
+    proc memory_set_int64 from MemoryCore with emitter, 0, buf
+    proc memory_set_int64 from MemoryCore with emitter, 8, 4096
+    proc memory_set_int64 from MemoryCore with emitter, 16, 0
+    proc memory_set_int64 from MemoryCore with emitter, 24, 0
+    proc memory_set_int64 from MemoryCore with emitter, 32, 1
 
     Return emitter
 End Process
 
 Process called "destroy_cmake_emitter" takes emitter as Integer returns Integer:
-    Note: Destroy CMake emitter and free all allocated resources
-
+    Note: Release the buffer and the 40-byte state in one shot. The raw
+    Note: header lives at offset 0/8/16 of `emitter`, so we can use the
+    Note: shared destroy after reading offsets directly.
     If emitter is equal to 0:
         Return 0
     End If
 
-    Note: Free output string (offset 0)
-    Let output_ptr be proc memory_get_int64 from Layout with emitter, 0
-    If output_ptr is not equal to 0:
-        proc deallocate from Layout with output_ptr
+    Let buf be proc memory_get_int64 from MemoryCore with emitter, 0
+    If buf is not equal to 0:
+        proc deallocate from Layout with buf
     End If
-
-    Note: Free indent string (offset 32)
-    Let indent_str_ptr be proc memory_get_int64 from Layout with emitter, 32
-    If indent_str_ptr is not equal to 0:
-        proc deallocate from Layout with indent_str_ptr
-    End If
-
-    Note: Deallocate emitter structure itself
     proc deallocate from Layout with emitter
 
     Return 1
@@ -115,23 +80,32 @@ Note: Output Management
 Note: ============================================================================
 
 Process called "get_output" takes emitter as Integer returns Integer:
-    Note: Get generated CMake code
-
-    If emitter is equal to 0:
-        Return 0
-    End If
-
-    Return proc memory_get_int64 from Layout with emitter, 0
+    Note: Returns a fresh null-terminated copy of the emitted bytes.
+    Return proc emitter_raw_get_output from EmitterCommon with emitter
 End Process
 
 Process called "get_line_number" takes emitter as Integer returns Integer:
-    Note: Get current line number
-
+    Note: Scan the byte buffer for newline characters to determine the
+    Note: current 1-based line number. CMake consumers use this purely for
+    Note: diagnostics, so an O(length) scan is acceptable.
     If emitter is equal to 0:
         Return 0
     End If
 
-    Return proc memory_get_int64 from Layout with emitter, 16
+    Let buf be proc memory_get_int64 from MemoryCore with emitter, 0
+    Let length be proc memory_get_int64 from MemoryCore with emitter, 16
+
+    Let line be 1
+    Let i be 0
+    While i is less than length:
+        Let ch be proc memory_get_byte from MemoryCore with buf, i
+        If ch is equal to 10:
+            Set line to line plus 1
+        End If
+        Set i to i plus 1
+    End While
+
+    Return line
 End Process
 
 Note: ============================================================================
@@ -139,56 +113,38 @@ Note: Basic Emission
 Note: ============================================================================
 
 Process called "emit_string" takes emitter as Integer, text as Integer returns Integer:
-    Note: Emit text to output
-
+    Note: Emit text bytes to the buffer, applying indentation if we are at
+    Note: the start of a fresh line and the text does not begin with a
+    Note: newline. Tracks at_line_start by scanning emitted bytes for newlines.
     If emitter is equal to 0:
         Return 0
     End If
-
     If text is equal to 0:
         Return 0
     End If
 
-    Note: Apply indentation if at start of line
-    Let at_line_start be proc memory_get_int64 from Layout with emitter, 24
+    Let text_len be proc string_length from StringCore with text
+    If text_len is equal to 0:
+        Return 1
+    End If
 
+    Let at_line_start be proc memory_get_int64 from MemoryCore with emitter, 32
     If at_line_start is equal to 1:
-        Note: Check if text is not just whitespace or newline
-        Let text_len be proc string_length from StringCore with text
-
-        If text_len is greater than 0:
-            Let first_char be proc string_char_at from StringCore with text, 0
-
-            Note: Only emit indent if text is not a newline (char 10)
-            If first_char is not equal to 10:
-                proc emit_indent_internal from emitter
-                proc memory_set_int64 from Layout with emitter, 24, 0  Note: No longer at line start
-            End If
+        Let first_char be proc string_char_at from StringCore with text, 0
+        If first_char is not equal to 10:
+            proc emit_indent_internal with emitter
+            proc memory_set_int64 from MemoryCore with emitter, 32, 0
         End If
     End If
 
-    Note: Append text to output
-    Let current_output be proc memory_get_int64 from Layout with emitter, 0
-    Let new_output be proc string_concat from StringCore with current_output, text
-    proc memory_set_int64 from Layout with emitter, 0, new_output
+    proc emitter_raw_emit_string from EmitterCommon with emitter, text
 
-    Note: Check if text contains newlines
-    Set text_len to proc string_length from StringCore with text
     Let i be 0
-
     While i is less than text_len:
-        Let char be proc string_char_at from StringCore with text, i
-
-        If char is equal to 10:  Note: Newline character
-            Note: Increment line number
-            Let line_num be proc memory_get_int64 from Layout with emitter, 16
-            Set line_num to line_num plus 1
-            proc memory_set_int64 from Layout with emitter, 16, line_num
-
-            Note: Mark that we're at line start
-            proc memory_set_int64 from Layout with emitter, 24, 1
+        Let ch be proc string_char_at from StringCore with text, i
+        If ch is equal to 10:
+            proc memory_set_int64 from MemoryCore with emitter, 32, 1
         End If
-
         Set i to i plus 1
     End While
 
@@ -196,31 +152,34 @@ Process called "emit_string" takes emitter as Integer, text as Integer returns I
 End Process
 
 Process called "emit_line" takes emitter as Integer, text as Integer returns Integer:
-    Note: Emit text followed by newline
-
+    Note: Emit text followed by a newline. Newline marks at_line_start so
+    Note: subsequent emits re-apply indentation.
     If emitter is equal to 0:
         Return 0
     End If
-
     If text is not equal to 0:
         proc emit_string with emitter, text
     End If
-
-    Let newline be proc string_from_cstring from StringCore with "\n"
-    proc emit_string with emitter, newline
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, 10
+    proc memory_set_int64 from MemoryCore with emitter, 32, 1
 
     Return 1
 End Process
 
 Process called "emit_char" takes emitter as Integer, char_code as Integer returns Integer:
-    Note: Emit single character
-
+    Note: Emit a single byte. Bypasses the indent-on-line-start logic so
+    Note: callers that explicitly emit individual punctuation get exactly
+    Note: the byte they asked for.
     If emitter is equal to 0:
         Return 0
     End If
 
-    Let char_str be proc string_from_char from StringCore with char_code
-    proc emit_string with emitter, char_str
+    proc emitter_raw_emit_byte from EmitterCommon with emitter, char_code
+    If char_code is equal to 10:
+        proc memory_set_int64 from MemoryCore with emitter, 32, 1
+    Otherwise:
+        proc memory_set_int64 from MemoryCore with emitter, 32, 0
+    End If
 
     Return 1
 End Process
@@ -230,20 +189,16 @@ Note: Indentation Management
 Note: ============================================================================
 
 Process called "emit_indent_internal" takes emitter as Integer returns Integer:
-    Note: Emit current indentation (internal use)
-
+    Note: Emit two spaces per level. CMake convention is two-space indent.
     If emitter is equal to 0:
         Return 0
     End If
 
-    Let indent_level be proc memory_get_int64 from Layout with emitter, 8
-    Let indent_str be proc memory_get_int64 from Layout with emitter, 32
-
+    Let indent_level be proc memory_get_int64 from MemoryCore with emitter, 24
     Let i be 0
     While i is less than indent_level:
-        Let current_output be proc memory_get_int64 from Layout with emitter, 0
-        Let new_output be proc string_concat from StringCore with current_output, indent_str
-        proc memory_set_int64 from Layout with emitter, 0, new_output
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
+        proc emitter_raw_emit_byte from EmitterCommon with emitter, 32
         Set i to i plus 1
     End While
 
@@ -251,60 +206,43 @@ Process called "emit_indent_internal" takes emitter as Integer returns Integer:
 End Process
 
 Process called "increase_indent" takes emitter as Integer returns Integer:
-    Note: Increase indentation level by 1
-
     If emitter is equal to 0:
         Return 0
     End If
-
-    Let indent_level be proc memory_get_int64 from Layout with emitter, 8
+    Let indent_level be proc memory_get_int64 from MemoryCore with emitter, 24
     Set indent_level to indent_level plus 1
-    proc memory_set_int64 from Layout with emitter, 8, indent_level
-
+    proc memory_set_int64 from MemoryCore with emitter, 24, indent_level
     Return 1
 End Process
 
 Process called "decrease_indent" takes emitter as Integer returns Integer:
-    Note: Decrease indentation level by 1
-
     If emitter is equal to 0:
         Return 0
     End If
-
-    Let indent_level be proc memory_get_int64 from Layout with emitter, 8
-
+    Let indent_level be proc memory_get_int64 from MemoryCore with emitter, 24
     If indent_level is greater than 0:
         Set indent_level to indent_level minus 1
-        proc memory_set_int64 from Layout with emitter, 8, indent_level
+        proc memory_set_int64 from MemoryCore with emitter, 24, indent_level
     End If
-
     Return 1
 End Process
 
 Process called "set_indent_level" takes emitter as Integer, level as Integer returns Integer:
-    Note: Set indentation level directly
-
     If emitter is equal to 0:
         Return 0
     End If
-
     If level is less than 0:
         Set level to 0
     End If
-
-    proc memory_set_int64 from Layout with emitter, 8, level
-
+    proc memory_set_int64 from MemoryCore with emitter, 24, level
     Return 1
 End Process
 
 Process called "get_indent_level" takes emitter as Integer returns Integer:
-    Note: Get current indentation level
-
     If emitter is equal to 0:
         Return 0
     End If
-
-    Return proc memory_get_int64 from Layout with emitter, 8
+    Return proc memory_get_int64 from MemoryCore with emitter, 24
 End Process
 
 Note: ============================================================================
@@ -312,8 +250,7 @@ Note: CMake-Specific Formatting
 Note: ============================================================================
 
 Process called "emit_comment" takes emitter as Integer, comment_text as Integer returns Integer:
-    Note: Emit CMake comment (# comment)
-
+    Note: Emit a CMake "# comment" line terminated by a newline.
     If emitter is equal to 0:
         Return 0
     End If
@@ -332,8 +269,7 @@ Process called "emit_comment" takes emitter as Integer, comment_text as Integer 
 End Process
 
 Process called "emit_command_start" takes emitter as Integer, command_name as Integer returns Integer:
-    Note: Emit CMake command start (command_name()
-
+    Note: Emit "command_name(" prefix.
     If emitter is equal to 0:
         Return 0
     End If
@@ -349,8 +285,7 @@ Process called "emit_command_start" takes emitter as Integer, command_name as In
 End Process
 
 Process called "emit_command_end" takes emitter as Integer returns Integer:
-    Note: Emit CMake command end ()
-
+    Note: Emit ")" followed by a newline.
     If emitter is equal to 0:
         Return 0
     End If
@@ -362,8 +297,7 @@ Process called "emit_command_end" takes emitter as Integer returns Integer:
 End Process
 
 Process called "emit_command_argument" takes emitter as Integer, argument as Integer, is_last as Integer returns Integer:
-    Note: Emit CMake command argument with proper spacing
-
+    Note: Emit a CMake command argument with optional trailing space.
     If emitter is equal to 0:
         Return 0
     End If
@@ -372,7 +306,6 @@ Process called "emit_command_argument" takes emitter as Integer, argument as Int
         proc emit_string with emitter, argument
     End If
 
-    Note: Add space after argument if not last
     If is_last is equal to 0:
         Let space be proc string_from_cstring from StringCore with " "
         proc emit_string with emitter, space
@@ -382,8 +315,7 @@ Process called "emit_command_argument" takes emitter as Integer, argument as Int
 End Process
 
 Process called "emit_variable_reference" takes emitter as Integer, var_name as Integer returns Integer:
-    Note: Emit CMake variable reference ${VAR}
-
+    Note: Emit ${VAR}.
     If emitter is equal to 0:
         Return 0
     End If
@@ -402,8 +334,7 @@ Process called "emit_variable_reference" takes emitter as Integer, var_name as I
 End Process
 
 Process called "emit_generator_expression" takes emitter as Integer, expr as Integer returns Integer:
-    Note: Emit CMake generator expression $<EXPR>
-
+    Note: Emit $<EXPR>.
     If emitter is equal to 0:
         Return 0
     End If
@@ -422,8 +353,7 @@ Process called "emit_generator_expression" takes emitter as Integer, expr as Int
 End Process
 
 Process called "emit_quoted_string" takes emitter as Integer, str as Integer returns Integer:
-    Note: Emit quoted string argument "str"
-
+    Note: Emit "str" with literal double-quote delimiters.
     If emitter is equal to 0:
         Return 0
     End If
@@ -441,8 +371,7 @@ Process called "emit_quoted_string" takes emitter as Integer, str as Integer ret
 End Process
 
 Process called "emit_blank_line" takes emitter as Integer returns Integer:
-    Note: Emit blank line for readability
-
+    Note: Emit a bare newline for visual separation.
     If emitter is equal to 0:
         Return 0
     End If
@@ -458,8 +387,7 @@ Note: High-Level CMake Command Emission
 Note: ============================================================================
 
 Process called "emit_cmake_minimum_required" takes emitter as Integer, version as Integer returns Integer:
-    Note: Emit cmake_minimum_required(VERSION version)
-
+    Note: Emit cmake_minimum_required(VERSION version).
     If emitter is equal to 0:
         Return 0
     End If
@@ -474,14 +402,13 @@ Process called "emit_cmake_minimum_required" takes emitter as Integer, version a
         proc emit_string with emitter, version
     End If
 
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
 
 Process called "emit_project" takes emitter as Integer, project_name as Integer returns Integer:
-    Note: Emit project(project_name)
-
+    Note: Emit project(project_name).
     If emitter is equal to 0:
         Return 0
     End If
@@ -493,14 +420,13 @@ Process called "emit_project" takes emitter as Integer, project_name as Integer 
         proc emit_string with emitter, project_name
     End If
 
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
 
 Process called "emit_set_command" takes emitter as Integer, var_name as Integer, value as Integer returns Integer:
-    Note: Emit set(VAR value)
-
+    Note: Emit set(VAR value).
     If emitter is equal to 0:
         Return 0
     End If
@@ -516,14 +442,13 @@ Process called "emit_set_command" takes emitter as Integer, var_name as Integer,
         proc emit_command_argument with emitter, value, 1
     End If
 
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
 
 Process called "emit_message" takes emitter as Integer, message_text as Integer returns Integer:
-    Note: Emit message(STATUS "message")
-
+    Note: Emit message(STATUS "message").
     If emitter is equal to 0:
         Return 0
     End If
@@ -538,14 +463,13 @@ Process called "emit_message" takes emitter as Integer, message_text as Integer 
         proc emit_quoted_string with emitter, message_text
     End If
 
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
 
 Process called "emit_if_start" takes emitter as Integer, condition as Integer returns Integer:
-    Note: Emit if(condition)
-
+    Note: Emit if(condition) and increase indent.
     If emitter is equal to 0:
         Return 0
     End If
@@ -557,46 +481,43 @@ Process called "emit_if_start" takes emitter as Integer, condition as Integer re
         proc emit_string with emitter, condition
     End If
 
-    proc emit_command_end from emitter
-    proc increase_indent from emitter
+    proc emit_command_end with emitter
+    proc increase_indent with emitter
 
     Return 1
 End Process
 
 Process called "emit_else" takes emitter as Integer returns Integer:
-    Note: Emit else()
-
+    Note: Emit else() with proper indent dance.
     If emitter is equal to 0:
         Return 0
     End If
 
-    proc decrease_indent from emitter
+    proc decrease_indent with emitter
     Let cmd be proc string_from_cstring from StringCore with "else"
     proc emit_command_start with emitter, cmd
-    proc emit_command_end from emitter
-    proc increase_indent from emitter
+    proc emit_command_end with emitter
+    proc increase_indent with emitter
 
     Return 1
 End Process
 
 Process called "emit_endif" takes emitter as Integer returns Integer:
-    Note: Emit endif()
-
+    Note: Emit endif() and decrease indent.
     If emitter is equal to 0:
         Return 0
     End If
 
-    proc decrease_indent from emitter
+    proc decrease_indent with emitter
     Let cmd be proc string_from_cstring from StringCore with "endif"
     proc emit_command_start with emitter, cmd
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
 
 Process called "emit_foreach_start" takes emitter as Integer, var_name as Integer, items as Integer returns Integer:
-    Note: Emit foreach(var items)
-
+    Note: Emit foreach(var items) and increase indent.
     If emitter is equal to 0:
         Return 0
     End If
@@ -612,30 +533,28 @@ Process called "emit_foreach_start" takes emitter as Integer, var_name as Intege
         proc emit_string with emitter, items
     End If
 
-    proc emit_command_end from emitter
-    proc increase_indent from emitter
+    proc emit_command_end with emitter
+    proc increase_indent with emitter
 
     Return 1
 End Process
 
 Process called "emit_endforeach" takes emitter as Integer returns Integer:
-    Note: Emit endforeach()
-
+    Note: Emit endforeach() and decrease indent.
     If emitter is equal to 0:
         Return 0
     End If
 
-    proc decrease_indent from emitter
+    proc decrease_indent with emitter
     Let cmd be proc string_from_cstring from StringCore with "endforeach"
     proc emit_command_start with emitter, cmd
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
 
 Process called "emit_function_start" takes emitter as Integer, func_name as Integer returns Integer:
-    Note: Emit function(name)
-
+    Note: Emit function(name) and increase indent.
     If emitter is equal to 0:
         Return 0
     End If
@@ -647,23 +566,22 @@ Process called "emit_function_start" takes emitter as Integer, func_name as Inte
         proc emit_string with emitter, func_name
     End If
 
-    proc emit_command_end from emitter
-    proc increase_indent from emitter
+    proc emit_command_end with emitter
+    proc increase_indent with emitter
 
     Return 1
 End Process
 
 Process called "emit_endfunction" takes emitter as Integer returns Integer:
-    Note: Emit endfunction()
-
+    Note: Emit endfunction() and decrease indent.
     If emitter is equal to 0:
         Return 0
     End If
 
-    proc decrease_indent from emitter
+    proc decrease_indent with emitter
     Let cmd be proc string_from_cstring from StringCore with "endfunction"
     proc emit_command_start with emitter, cmd
-    proc emit_command_end from emitter
+    proc emit_command_end with emitter
 
     Return 1
 End Process
