@@ -1,0 +1,1868 @@
+Note: ============================================================================
+Note: HIR -> RUST TRANSLATOR
+Note: ============================================================================
+Note: Walks a HIRNode tree (rooted at HIR_MODULE_DEFINITION) and emits idiomatic
+Note: Rust source code into an EmitterContext output buffer.
+
+Note: Coverage:
+Note:   - Module / function / struct / enum-variant declarations
+Note:   - Let / Set / If / Match / For / While / Return / Break / Continue
+Note:   - All expression forms: literals, identifiers, binary/unary/ternary,
+Note:     calls, member access, array indexing, ranges, lambdas (closures),
+Note:     casts, tuple/array literals, interpolated strings, parenthesized exprs
+Note:   - Types: Basic, Generic, Function, Array, Tuple, Optional, Union,
+Note:     Reference, Pointer, Slice, Never
+
+Note: Rust-specific conventions emitted:
+Note:   - `struct Name { field: Type, ... }` blocks for HIR_TYPE_DEFINITION
+Note:   - `fn name(args) -> ReturnType { ... }` for HIR_PROCESS_DEFINITION
+Note:   - Optional types map to `Option<T>`
+Note:   - Integer/Float/String/Boolean map to i64/f64/String/bool
+Note:   - Range expressions to `a..b` (or `(a..=b).step_by(s)` shape for stepped)
+Note:   - Union types map to `Box<dyn Trait>` style is not expressible without
+Note:     a trait; we render unions as anonymous enums commented with their
+Note:     alternatives so the surface form is at least readable.
+Note:   - Lambdas render as `|params| body`
+Note:   - Member access uses `.`; index access uses `[]`
+Note:   - `let mut name: Type = value;` for re-assignable Lets
+Note:   - Match arms use `pat => { body }`; Match expression is wrapped in
+Note:     `match subject { ... }`
+Note:   - Modules emit as `pub mod name { ... }`
+Note:   - String literals are double-quoted and escaped at the Rust layer by
+Note:     the emit_literal pipeline; interpolated strings render as
+Note:     `format!("...{}...", expr)` calls.
+Note:   - Identifier mapping preserves source identifiers verbatim. Rust
+Note:     keywords that overlap Runa identifiers (e.g. `type`, `match`, `fn`,
+Note:     `mod`, `pub`) are escaped with a leading `r#` raw-identifier prefix
+Note:     via rust_escape_identifier so the output always parses.
+Note: ============================================================================
+
+Import "compiler/middle/gungnir/hir/hir.runa" as HIR
+Import "compiler/middle/gungnir/hir/translation/backends/emitter_common.runa" as Emitter
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/memory_core.runa" as MemoryCore
+Import "compiler/frontend/primitives/collections/list.runa" as ListCore
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+
+Note: ============================================================================
+Note: TYPE-NAME MAPPING TABLE
+Note: ============================================================================
+Note: Map Runa primitive type names to Rust equivalents. Identifiers that are
+Note: not in the primitive table pass through unchanged so user-defined types
+Note: render verbatim. The mapping is intentionally explicit (no shortcuts):
+Note: every Runa primitive supported by the language spec has a row here.
+Process called "rust_map_basic_type" takes runa_name as String returns String:
+    Let eq be 0
+
+    Set eq to proc string_equals from StringCore with runa_name, "Integer"
+    If eq is equal to 1:
+        Return "i64"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Integer8"
+    If eq is equal to 1:
+        Return "i8"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Integer16"
+    If eq is equal to 1:
+        Return "i16"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Integer32"
+    If eq is equal to 1:
+        Return "i32"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Integer64"
+    If eq is equal to 1:
+        Return "i64"
+    End If
+
+    Set eq to proc string_equals from StringCore with runa_name, "UnsignedInteger"
+    If eq is equal to 1:
+        Return "u64"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "UnsignedInteger8"
+    If eq is equal to 1:
+        Return "u8"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "UnsignedInteger16"
+    If eq is equal to 1:
+        Return "u16"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "UnsignedInteger32"
+    If eq is equal to 1:
+        Return "u32"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "UnsignedInteger64"
+    If eq is equal to 1:
+        Return "u64"
+    End If
+
+    Set eq to proc string_equals from StringCore with runa_name, "Float"
+    If eq is equal to 1:
+        Return "f64"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Float32"
+    If eq is equal to 1:
+        Return "f32"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Float64"
+    If eq is equal to 1:
+        Return "f64"
+    End If
+
+    Set eq to proc string_equals from StringCore with runa_name, "String"
+    If eq is equal to 1:
+        Return "String"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Boolean"
+    If eq is equal to 1:
+        Return "bool"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Character"
+    If eq is equal to 1:
+        Return "char"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Nothing"
+    If eq is equal to 1:
+        Return "()"
+    End If
+    Set eq to proc string_equals from StringCore with runa_name, "Any"
+    If eq is equal to 1:
+        Note: Rust has no `Any` equivalent; closest stable form is `Box<dyn std::any::Any>`.
+        Return "Box<dyn std::any::Any>"
+    End If
+
+    Return runa_name
+End Process
+
+Note: ============================================================================
+Note: IDENTIFIER KEYWORD ESCAPING
+Note: ============================================================================
+Note: Rust reserves a fixed set of keywords. If a Runa identifier collides with
+Note: one we render it as a raw identifier `r#name` so the output always parses.
+Note: This list mirrors the Rust 2021 edition reserved-words set. Identifiers
+Note: not on this list pass through unchanged.
+Process called "rust_escape_identifier" takes name as String returns String:
+    If name is equal to 0:
+        Return ""
+    End If
+    Let eq be 0
+
+    Set eq to proc string_equals from StringCore with name, "as"
+    If eq is equal to 1:
+        Return "r#as"
+    End If
+    Set eq to proc string_equals from StringCore with name, "break"
+    If eq is equal to 1:
+        Return "r#break"
+    End If
+    Set eq to proc string_equals from StringCore with name, "const"
+    If eq is equal to 1:
+        Return "r#const"
+    End If
+    Set eq to proc string_equals from StringCore with name, "continue"
+    If eq is equal to 1:
+        Return "r#continue"
+    End If
+    Set eq to proc string_equals from StringCore with name, "crate"
+    If eq is equal to 1:
+        Return "r#crate"
+    End If
+    Set eq to proc string_equals from StringCore with name, "else"
+    If eq is equal to 1:
+        Return "r#else"
+    End If
+    Set eq to proc string_equals from StringCore with name, "enum"
+    If eq is equal to 1:
+        Return "r#enum"
+    End If
+    Set eq to proc string_equals from StringCore with name, "extern"
+    If eq is equal to 1:
+        Return "r#extern"
+    End If
+    Set eq to proc string_equals from StringCore with name, "false"
+    If eq is equal to 1:
+        Return "r#false"
+    End If
+    Set eq to proc string_equals from StringCore with name, "fn"
+    If eq is equal to 1:
+        Return "r#fn"
+    End If
+    Set eq to proc string_equals from StringCore with name, "for"
+    If eq is equal to 1:
+        Return "r#for"
+    End If
+    Set eq to proc string_equals from StringCore with name, "if"
+    If eq is equal to 1:
+        Return "r#if"
+    End If
+    Set eq to proc string_equals from StringCore with name, "impl"
+    If eq is equal to 1:
+        Return "r#impl"
+    End If
+    Set eq to proc string_equals from StringCore with name, "in"
+    If eq is equal to 1:
+        Return "r#in"
+    End If
+    Set eq to proc string_equals from StringCore with name, "let"
+    If eq is equal to 1:
+        Return "r#let"
+    End If
+    Set eq to proc string_equals from StringCore with name, "loop"
+    If eq is equal to 1:
+        Return "r#loop"
+    End If
+    Set eq to proc string_equals from StringCore with name, "match"
+    If eq is equal to 1:
+        Return "r#match"
+    End If
+    Set eq to proc string_equals from StringCore with name, "mod"
+    If eq is equal to 1:
+        Return "r#mod"
+    End If
+    Set eq to proc string_equals from StringCore with name, "move"
+    If eq is equal to 1:
+        Return "r#move"
+    End If
+    Set eq to proc string_equals from StringCore with name, "mut"
+    If eq is equal to 1:
+        Return "r#mut"
+    End If
+    Set eq to proc string_equals from StringCore with name, "pub"
+    If eq is equal to 1:
+        Return "r#pub"
+    End If
+    Set eq to proc string_equals from StringCore with name, "ref"
+    If eq is equal to 1:
+        Return "r#ref"
+    End If
+    Set eq to proc string_equals from StringCore with name, "return"
+    If eq is equal to 1:
+        Return "r#return"
+    End If
+    Set eq to proc string_equals from StringCore with name, "static"
+    If eq is equal to 1:
+        Return "r#static"
+    End If
+    Set eq to proc string_equals from StringCore with name, "struct"
+    If eq is equal to 1:
+        Return "r#struct"
+    End If
+    Set eq to proc string_equals from StringCore with name, "trait"
+    If eq is equal to 1:
+        Return "r#trait"
+    End If
+    Set eq to proc string_equals from StringCore with name, "true"
+    If eq is equal to 1:
+        Return "r#true"
+    End If
+    Set eq to proc string_equals from StringCore with name, "type"
+    If eq is equal to 1:
+        Return "r#type"
+    End If
+    Set eq to proc string_equals from StringCore with name, "unsafe"
+    If eq is equal to 1:
+        Return "r#unsafe"
+    End If
+    Set eq to proc string_equals from StringCore with name, "use"
+    If eq is equal to 1:
+        Return "r#use"
+    End If
+    Set eq to proc string_equals from StringCore with name, "where"
+    If eq is equal to 1:
+        Return "r#where"
+    End If
+    Set eq to proc string_equals from StringCore with name, "while"
+    If eq is equal to 1:
+        Return "r#while"
+    End If
+    Set eq to proc string_equals from StringCore with name, "async"
+    If eq is equal to 1:
+        Return "r#async"
+    End If
+    Set eq to proc string_equals from StringCore with name, "await"
+    If eq is equal to 1:
+        Return "r#await"
+    End If
+    Set eq to proc string_equals from StringCore with name, "dyn"
+    If eq is equal to 1:
+        Return "r#dyn"
+    End If
+
+    Return name
+End Process
+
+Note: ============================================================================
+Note: HIRNode ACCESSORS
+Note: ============================================================================
+Note: Local wrappers over hir.runa accessors so the rest of the file reads as
+Note: high-level walk logic without repeating memory_get_ noise. Layout matches
+Note: the HIRNode struct in hir.runa exactly:
+Note:   0:  node_type   (Integer constant - see Constant HIR_*)
+Note:   8:  line        (Integer source line)
+Note:   16: column      (Integer source column)
+Note:   24: children    (List[Integer] pointer)
+Note:   32: child_count (Integer count)
+Note:   40: value       (Integer or pointer to literal/identifier value)
+Note:   48: value_type  (Integer subtype discriminator)
+Note: ============================================================================
+
+Process called "node_type_of" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from MemoryCore with node, 0
+End Process
+
+Process called "node_value" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from MemoryCore with node, 40
+End Process
+
+Process called "node_value_type" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from MemoryCore with node, 48
+End Process
+
+Process called "node_child_count" takes node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_integer from MemoryCore with node, 32
+End Process
+
+Process called "node_child" takes node as Integer, index as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
+    End If
+    Let children be proc memory_get_pointer from MemoryCore with node, 24
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc list_get from ListCore with children, index
+End Process
+
+Note: ============================================================================
+Note: STRING POINTER COERCION
+Note: ============================================================================
+Note: HIR value fields are Integer-typed pointers to null-terminated strings
+Note: when they carry textual data. This helper centralizes the cast so the
+Note: rest of the file reads as if value() always returned a String.
+Process called "rust_string_from_pointer" takes ptr as Integer returns String:
+    Note: In the bootstrap stage strings are represented as raw pointers to
+    Note: null-terminated byte sequences. The pointer IS the string at this
+    Note: layer; the cast is implicit in how the codegen passes it to
+    Note: string_equals/string_concat. Guard against null pointers.
+    If ptr is equal to 0:
+        Return ""
+    End If
+    Return ptr
+End Process
+
+Note: ============================================================================
+Note: ENTRY POINT
+Note: ============================================================================
+Note: Generate a complete Rust source string for the given HIR module. Returns
+Note: the rendered text. Errors during translation are recorded on the context
+Note: but do not abort - callers can inspect emitter_has_errors after the call.
+Process called "generate_rust_from_hir" takes hir_module as Integer returns String:
+    Note: emitter_common defaults to 4-space indentation which matches the
+    Note: Rust community style (rustfmt) so no override is needed.
+    Let ctx as EmitterContext be proc create_emitter_context from Emitter
+
+    proc emit_node with ctx, hir_module
+
+    Return proc emitter_get_output from Emitter with ctx
+End Process
+
+Note: ============================================================================
+Note: DISPATCHER ENTRY POINT
+Note: ============================================================================
+Note: Single-arg wrapper matching the central dispatcher call shape in
+Note: translation.runa: `Return proc hir_to_rust from RustEmitter with hir_root`.
+Note: Delegates to generate_rust_from_hir which holds the actual translation
+Note: pipeline. Kept as a separate name so the dispatcher contract stays stable
+Note: even if the internal generator is renamed in the future.
+Process called "hir_to_rust" takes hir_root as Integer returns String:
+    Return proc generate_rust_from_hir with hir_root
+End Process
+
+Note: ============================================================================
+Note: DISPATCH
+Note: ============================================================================
+Note: Top-level node dispatcher. Branches on node_type to the appropriate
+Note: emit_* helper. Unknown node types emit a `// TODO: HIR_<id>` comment and
+Note: record a warning so the output is still valid Rust.
+
+Process called "emit_node" takes ctx as EmitterContext, node as Integer:
+    If node is equal to 0:
+        Return
+    End If
+
+    Let nt be proc node_type_of with node
+
+    If nt is equal to HIR.HIR_MODULE_DEFINITION:
+        proc emit_module with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_PROCESS_DEFINITION:
+        proc emit_function with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_TYPE_DEFINITION:
+        proc emit_struct with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_IMPORT_STATEMENT:
+        proc emit_import with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_LET_STATEMENT:
+        proc emit_let with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_SET_STATEMENT:
+        proc emit_set with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_DEFINE_STATEMENT:
+        proc emit_const with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_IF_STATEMENT:
+        proc emit_if with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_MATCH_STATEMENT:
+        proc emit_match with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_FOR_STATEMENT:
+        proc emit_for with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_WHILE_STATEMENT:
+        proc emit_while with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_LOOP_STATEMENT:
+        proc emit_loop with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_RETURN_STATEMENT:
+        proc emit_return with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_BREAK_STATEMENT:
+        proc emitter_emit_line from Emitter with ctx, "break;"
+        Return
+    End If
+    If nt is equal to HIR.HIR_CONTINUE_STATEMENT:
+        proc emitter_emit_line from Emitter with ctx, "continue;"
+        Return
+    End If
+    If nt is equal to HIR.HIR_BLOCK_STATEMENT:
+        proc emit_block_children with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_EXPRESSION_STATEMENT:
+        Let inner be proc node_child with node, 0
+        proc emit_expression with ctx, inner
+        proc emitter_emit_line from Emitter with ctx, ";"
+        Return
+    End If
+
+    Note: Default - treat as expression
+    proc emit_expression with ctx, node
+End Process
+
+Note: ============================================================================
+Note: MODULE
+Note: ============================================================================
+Note: Wrap children in a Rust `pub mod name { ... }` block. The default
+Note: rendering is `pub` so consumers downstream can refer to the contents.
+Process called "emit_module" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let mod_name be proc rust_escape_identifier with name_str
+
+    proc emitter_emit from Emitter with ctx, "pub mod "
+    proc emitter_emit from Emitter with ctx, mod_name
+    proc emitter_emit_line from Emitter with ctx, " {"
+
+    proc emitter_indent from Emitter with ctx
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc emit_node with ctx, child
+        Set i to i plus 1
+    End While
+
+    proc emitter_dedent from Emitter with ctx
+    proc emitter_emit_line from Emitter with ctx, "}"
+    proc emitter_emit_newline from Emitter with ctx
+End Process
+
+Note: ============================================================================
+Note: IMPORTS
+Note: ============================================================================
+Note: Rust imports use `use path::to::module;`. Runa paths contain `/` which we
+Note: translate to `::` so the output is syntactically valid Rust.
+Process called "emit_import" takes ctx as EmitterContext, node as Integer:
+    Let path_ptr be proc node_value with node
+    Let path_str be proc rust_string_from_pointer with path_ptr
+    Let rust_path be proc rust_path_to_use_path with path_str
+
+    proc emitter_emit from Emitter with ctx, "use "
+    proc emitter_emit from Emitter with ctx, rust_path
+    proc emitter_emit_line from Emitter with ctx, ";"
+End Process
+
+Note: Convert a Runa-style import path like "foo/bar/baz" into a Rust use-path
+Note: like "foo::bar::baz". Replaces every '/' (byte 47) with '::'. Empty input
+Note: returns an empty string. Trailing slashes are preserved as trailing ::
+Note: which would be invalid Rust; in practice import paths from the HIR layer
+Note: never carry trailing separators.
+Process called "rust_path_to_use_path" takes path_str as String returns String:
+    If path_str is equal to 0:
+        Return ""
+    End If
+    Let len be proc string_length from StringCore with path_str
+    If len is equal to 0:
+        Return ""
+    End If
+
+    Note: Worst case (every char is '/') doubles the length. Reserve len*2+1
+    Note: bytes plus one for the trailing null terminator.
+    Let cap be len multiplied by 2
+    Set cap to cap plus 2
+    Let buf be proc allocate from Layout with cap
+
+    Note: Zero-initialise the buffer so any unwritten tail bytes are null. The
+    Note: stage1 allocator returns uninitialised memory.
+    Let z be 0
+    While z is less than cap:
+        proc memory_set_byte from MemoryCore with buf, z, 0
+        Set z to z plus 1
+    End While
+
+    Let out_idx be 0
+    Let i be 0
+    While i is less than len:
+        Let b be proc string_char_at from StringCore with path_str, i
+        If b is equal to 47:
+            proc memory_set_byte from MemoryCore with buf, out_idx, 58
+            Set out_idx to out_idx plus 1
+            proc memory_set_byte from MemoryCore with buf, out_idx, 58
+            Set out_idx to out_idx plus 1
+        Otherwise:
+            proc memory_set_byte from MemoryCore with buf, out_idx, b
+            Set out_idx to out_idx plus 1
+        End If
+        Set i to i plus 1
+    End While
+    proc memory_set_byte from MemoryCore with buf, out_idx, 0
+    Return buf
+End Process
+
+Note: ============================================================================
+Note: STRUCT / TYPE DEFINITION
+Note: ============================================================================
+Note: Emit:
+Note:   pub struct Name {
+Note:       pub field1: Type1,
+Note:       pub field2: Type2,
+Note:   }
+Note: Fields are emitted `pub` so the struct is usable across modules without
+Note: extra ceremony. This matches what most Runa->Rust translation users will
+Note: expect; if a field was meant private the source language did not have a
+Note: way to mark it private at the HIR level.
+Process called "emit_struct" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let escaped be proc rust_escape_identifier with name_str
+
+    proc emitter_emit from Emitter with ctx, "pub struct "
+    proc emitter_emit from Emitter with ctx, escaped
+    proc emitter_emit_line from Emitter with ctx, " {"
+
+    proc emitter_indent from Emitter with ctx
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let field be proc node_child with node, i
+        Let ft be proc node_type_of with field
+        If ft is equal to HIR.HIR_FIELD_DEFINITION:
+            proc emit_field with ctx, field
+        End If
+        If ft is equal to HIR.HIR_VARIANT_DEFINITION:
+            Note: A type with variants is a tagged enum; emit as enum below
+            Note: by switching modes when the first variant is seen. We
+            Note: cannot do this mid-struct, so we rely on the surrounding
+            Note: emit_type_definition dispatcher to send variant-bearing
+            Note: types here only when they truly are structs. Defensive
+            Note: fall-through: render the variant as a comment.
+            proc emitter_emit from Emitter with ctx, "// variant "
+            Let vname_ptr be proc node_value with field
+            Let vname_str be proc rust_string_from_pointer with vname_ptr
+            proc emitter_emit_line from Emitter with ctx, vname_str
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emitter_dedent from Emitter with ctx
+    proc emitter_emit_line from Emitter with ctx, "}"
+    proc emitter_emit_newline from Emitter with ctx
+End Process
+
+Process called "emit_field" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let escaped be proc rust_escape_identifier with name_str
+
+    proc emitter_emit from Emitter with ctx, "pub "
+    proc emitter_emit from Emitter with ctx, escaped
+
+    Let type_node be proc node_child with node, 0
+    If type_node is not equal to 0:
+        proc emitter_emit from Emitter with ctx, ": "
+        proc emit_type with ctx, type_node
+    Otherwise:
+        proc emitter_emit from Emitter with ctx, ": ()"
+    End If
+
+    proc emitter_emit_line from Emitter with ctx, ","
+End Process
+
+Note: ============================================================================
+Note: FUNCTION / PROCESS DEFINITION
+Note: ============================================================================
+Note: Emit:
+Note:   pub fn name(p1: T1, p2: T2) -> ReturnT {
+Note:       body
+Note:   }
+Note: All functions are emitted `pub` for the same cross-module-usability
+Note: reason described on emit_struct. A missing return type becomes `-> ()`.
+Process called "emit_function" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let escaped be proc rust_escape_identifier with name_str
+
+    proc emitter_emit from Emitter with ctx, "pub fn "
+    proc emitter_emit from Emitter with ctx, escaped
+    proc emitter_emit from Emitter with ctx, "("
+
+    Note: Child layout: param list nodes first, then optional return type
+    Note: marked by node_value_type == 1, then a HIR_BLOCK_STATEMENT body.
+    Let count be proc node_child_count with node
+    Let first_param be 1
+    Let return_type_node be 0
+    Let body_node be 0
+
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let ct be proc node_type_of with child
+        Let cvt be proc node_value_type with child
+
+        If ct is equal to HIR.HIR_LET_STATEMENT:
+            Note: param declaration encoded as a Let
+            If first_param is equal to 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            proc emit_param with ctx, child
+            Set first_param to 0
+        Otherwise:
+            If ct is equal to HIR.HIR_BLOCK_STATEMENT:
+                Set body_node to child
+            Otherwise:
+                If cvt is equal to 1:
+                    Set return_type_node to child
+                End If
+            End If
+        End If
+
+        Set i to i plus 1
+    End While
+
+    proc emitter_emit from Emitter with ctx, ") -> "
+    If return_type_node is not equal to 0:
+        proc emit_type with ctx, return_type_node
+    Otherwise:
+        proc emitter_emit from Emitter with ctx, "()"
+    End If
+    proc emitter_emit_line from Emitter with ctx, " {"
+
+    proc emitter_indent from Emitter with ctx
+    If body_node is not equal to 0:
+        proc emit_block_children with ctx, body_node
+    End If
+    proc emitter_dedent from Emitter with ctx
+
+    proc emitter_emit_line from Emitter with ctx, "}"
+    proc emitter_emit_newline from Emitter with ctx
+End Process
+
+Process called "emit_param" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let escaped be proc rust_escape_identifier with name_str
+
+    proc emitter_emit from Emitter with ctx, escaped
+
+    Let type_node be proc node_child with node, 0
+    If type_node is not equal to 0:
+        proc emitter_emit from Emitter with ctx, ": "
+        proc emit_type with ctx, type_node
+    Otherwise:
+        Note: HIR layer guarantees parameter types are present; if not, fall
+        Note: back to `_` so rustc errors at compile time rather than the
+        Note: translator silently producing invalid code.
+        proc emitter_emit from Emitter with ctx, ": _"
+    End If
+End Process
+
+Note: ============================================================================
+Note: STATEMENTS
+Note: ============================================================================
+
+Note: Emit `let mut name: Type = init;` form. All Lets are emitted `mut` so
+Note: re-assignment via `Set` produces valid Rust. Constants use the const
+Note: form below.
+Process called "emit_let" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let escaped be proc rust_escape_identifier with name_str
+
+    proc emitter_emit from Emitter with ctx, "let mut "
+    proc emitter_emit from Emitter with ctx, escaped
+
+    Let count be proc node_child_count with node
+    Let type_node be 0
+    Let init_node be 0
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let cvt be proc node_value_type with child
+        If cvt is equal to 1:
+            Set type_node to child
+        Otherwise:
+            Set init_node to child
+        End If
+        Set i to i plus 1
+    End While
+
+    If type_node is not equal to 0:
+        proc emitter_emit from Emitter with ctx, ": "
+        proc emit_type with ctx, type_node
+    End If
+    If init_node is not equal to 0:
+        proc emitter_emit from Emitter with ctx, " = "
+        proc emit_expression with ctx, init_node
+    End If
+    proc emitter_emit_line from Emitter with ctx, ";"
+End Process
+
+Process called "emit_set" takes ctx as EmitterContext, node as Integer:
+    Let target be proc node_child with node, 0
+    Let value be proc node_child with node, 1
+
+    proc emit_expression with ctx, target
+    proc emitter_emit from Emitter with ctx, " = "
+    proc emit_expression with ctx, value
+    proc emitter_emit_line from Emitter with ctx, ";"
+End Process
+
+Process called "emit_const" takes ctx as EmitterContext, node as Integer:
+    Let name_ptr be proc node_value with node
+    Let name_str be proc rust_string_from_pointer with name_ptr
+    Let escaped be proc rust_escape_identifier with name_str
+
+    Note: Rust const requires an explicit type. If we have a child marked
+    Note: value_type == 1 it is the type; otherwise the child is the value
+    Note: and we fall back to inferring via a `let` binding (still emitted
+    Note: as `const` shape but with `_` so the user sees the slot).
+    Let count be proc node_child_count with node
+    Let type_node be 0
+    Let init_node be 0
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        Let cvt be proc node_value_type with child
+        If cvt is equal to 1:
+            Set type_node to child
+        Otherwise:
+            Set init_node to child
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emitter_emit from Emitter with ctx, "pub const "
+    proc emitter_emit from Emitter with ctx, escaped
+    proc emitter_emit from Emitter with ctx, ": "
+    If type_node is not equal to 0:
+        proc emit_type with ctx, type_node
+    Otherwise:
+        proc emitter_emit from Emitter with ctx, "_"
+    End If
+    proc emitter_emit from Emitter with ctx, " = "
+    If init_node is not equal to 0:
+        proc emit_expression with ctx, init_node
+    Otherwise:
+        proc emitter_emit from Emitter with ctx, "Default::default()"
+    End If
+    proc emitter_emit_line from Emitter with ctx, ";"
+End Process
+
+Process called "emit_if" takes ctx as EmitterContext, node as Integer:
+    Note: Layout: child 0 = condition, child 1 = then-block, optional child 2 = else-block
+    Let cond be proc node_child with node, 0
+    Let then_block be proc node_child with node, 1
+    Let else_block be proc node_child with node, 2
+
+    proc emitter_emit from Emitter with ctx, "if "
+    proc emit_expression with ctx, cond
+    proc emitter_emit_line from Emitter with ctx, " {"
+
+    proc emitter_indent from Emitter with ctx
+    If then_block is not equal to 0:
+        proc emit_block_children with ctx, then_block
+    End If
+    proc emitter_dedent from Emitter with ctx
+
+    If else_block is not equal to 0:
+        proc emitter_emit_line from Emitter with ctx, "} else {"
+        proc emitter_indent from Emitter with ctx
+        proc emit_block_children with ctx, else_block
+        proc emitter_dedent from Emitter with ctx
+    End If
+
+    proc emitter_emit_line from Emitter with ctx, "}"
+End Process
+
+Process called "emit_match" takes ctx as EmitterContext, node as Integer:
+    Note: Rust has first-class match. Each WHEN_CLAUSE arm is a `pat => { body }`.
+    Let subject be proc node_child with node, 0
+    Let count be proc node_child_count with node
+
+    proc emitter_emit from Emitter with ctx, "match "
+    proc emit_expression with ctx, subject
+    proc emitter_emit_line from Emitter with ctx, " {"
+    proc emitter_indent from Emitter with ctx
+
+    Let i be 1
+    While i is less than count:
+        Let arm be proc node_child with node, i
+        Let arm_type be proc node_type_of with arm
+        If arm_type is equal to HIR.HIR_WHEN_CLAUSE:
+            Let pattern be proc node_child with arm, 0
+            Let body be proc node_child with arm, 1
+
+            proc emit_pattern with ctx, pattern
+            proc emitter_emit_line from Emitter with ctx, " => {"
+
+            proc emitter_indent from Emitter with ctx
+            proc emit_node with ctx, body
+            proc emitter_dedent from Emitter with ctx
+
+            proc emitter_emit_line from Emitter with ctx, "}"
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emitter_dedent from Emitter with ctx
+    proc emitter_emit_line from Emitter with ctx, "}"
+End Process
+
+Process called "emit_for" takes ctx as EmitterContext, node as Integer:
+    Note: For-each: child 0 = iteration variable Let, child 1 = collection expr,
+    Note: child 2 = body block.
+    Let var_decl be proc node_child with node, 0
+    Let collection be proc node_child with node, 1
+    Let body be proc node_child with node, 2
+
+    Let var_name_ptr be proc node_value with var_decl
+    Let var_name_str be proc rust_string_from_pointer with var_name_ptr
+    Let escaped be proc rust_escape_identifier with var_name_str
+
+    proc emitter_emit from Emitter with ctx, "for "
+    proc emitter_emit from Emitter with ctx, escaped
+    proc emitter_emit from Emitter with ctx, " in "
+    proc emit_expression with ctx, collection
+    proc emitter_emit_line from Emitter with ctx, " {"
+
+    proc emitter_indent from Emitter with ctx
+    If body is not equal to 0:
+        proc emit_block_children with ctx, body
+    End If
+    proc emitter_dedent from Emitter with ctx
+
+    proc emitter_emit_line from Emitter with ctx, "}"
+End Process
+
+Process called "emit_while" takes ctx as EmitterContext, node as Integer:
+    Let cond be proc node_child with node, 0
+    Let body be proc node_child with node, 1
+
+    proc emitter_emit from Emitter with ctx, "while "
+    proc emit_expression with ctx, cond
+    proc emitter_emit_line from Emitter with ctx, " {"
+
+    proc emitter_indent from Emitter with ctx
+    If body is not equal to 0:
+        proc emit_block_children with ctx, body
+    End If
+    proc emitter_dedent from Emitter with ctx
+
+    proc emitter_emit_line from Emitter with ctx, "}"
+End Process
+
+Process called "emit_loop" takes ctx as EmitterContext, node as Integer:
+    Note: Infinite loop maps to Rust `loop { ... }`.
+    Let body be proc node_child with node, 0
+
+    proc emitter_emit_line from Emitter with ctx, "loop {"
+    proc emitter_indent from Emitter with ctx
+    If body is not equal to 0:
+        proc emit_block_children with ctx, body
+    End If
+    proc emitter_dedent from Emitter with ctx
+    proc emitter_emit_line from Emitter with ctx, "}"
+End Process
+
+Process called "emit_return" takes ctx as EmitterContext, node as Integer:
+    proc emitter_emit from Emitter with ctx, "return"
+    Let value be proc node_child with node, 0
+    If value is not equal to 0:
+        proc emitter_emit from Emitter with ctx, " "
+        proc emit_expression with ctx, value
+    End If
+    proc emitter_emit_line from Emitter with ctx, ";"
+End Process
+
+Process called "emit_block_children" takes ctx as EmitterContext, node as Integer:
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc node_child with node, i
+        proc emit_node with ctx, child
+        Set i to i plus 1
+    End While
+End Process
+
+Note: ============================================================================
+Note: EXPRESSIONS
+Note: ============================================================================
+
+Process called "emit_expression" takes ctx as EmitterContext, node as Integer:
+    If node is equal to 0:
+        proc emitter_emit from Emitter with ctx, "()"
+        Return
+    End If
+
+    Let nt be proc node_type_of with node
+
+    If nt is equal to HIR.HIR_LITERAL:
+        proc emit_literal with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_IDENTIFIER:
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let escaped be proc rust_escape_identifier with name_str
+        proc emitter_emit from Emitter with ctx, escaped
+        Return
+    End If
+    If nt is equal to HIR.HIR_BINARY_EXPRESSION:
+        proc emit_binary with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_UNARY_EXPRESSION:
+        proc emit_unary with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_TERNARY_EXPRESSION:
+        proc emit_ternary with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_CALL_EXPRESSION:
+        proc emit_call with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_MEMBER_EXPRESSION:
+        proc emit_member with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_INDEX_EXPRESSION:
+        proc emit_index with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_PARENTHESIZED:
+        Let inner be proc node_child with node, 0
+        proc emitter_emit from Emitter with ctx, "("
+        proc emit_expression with ctx, inner
+        proc emitter_emit from Emitter with ctx, ")"
+        Return
+    End If
+    If nt is equal to HIR.HIR_INTERPOLATED_STRING:
+        proc emit_interpolated_string with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_RANGE_EXPRESSION:
+        proc emit_range with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_ARRAY_LITERAL:
+        proc emit_array_literal with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_TUPLE_LITERAL:
+        proc emit_tuple_literal with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_RECORD_LITERAL:
+        proc emit_record_literal with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_LAMBDA_EXPRESSION:
+        proc emit_lambda with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_CAST_EXPRESSION:
+        proc emit_cast with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_TYPE_ASCRIPTION:
+        Note: Rust type ascription is no-op at the expression level (the
+        Note: surrounding `let` carries the type). Emit just the value.
+        Let inner be proc node_child with node, 0
+        proc emit_expression with ctx, inner
+        Return
+    End If
+
+    Note: Unknown expression kind: emit a placeholder identifier so Rust
+    Note: parsing still succeeds and surface the issue via a warning.
+    proc emitter_emit from Emitter with ctx, "/* HIR_UNKNOWN */ ()"
+    proc emitter_warning from Emitter with ctx, "unhandled expression node type"
+End Process
+
+Process called "emit_literal" takes ctx as EmitterContext, node as Integer:
+    Let value_ptr be proc node_value with node
+    Let value_str be proc rust_string_from_pointer with value_ptr
+    Let vtype be proc node_value_type with node
+
+    Note: vtype convention: 0=integer literal, 1=float literal, 2=string,
+    Note: 3=boolean, 4=null. Strings need quoting; null maps to None for the
+    Note: typical Option-bearing context (matches the Optional type render).
+    If vtype is equal to 2:
+        proc emitter_emit from Emitter with ctx, "\""
+        proc emit_escaped_string with ctx, value_str
+        proc emitter_emit from Emitter with ctx, "\""
+        Return
+    End If
+    If vtype is equal to 3:
+        Let is_true be proc string_equals from StringCore with value_str, "true"
+        If is_true is equal to 1:
+            proc emitter_emit from Emitter with ctx, "true"
+        Otherwise:
+            proc emitter_emit from Emitter with ctx, "false"
+        End If
+        Return
+    End If
+    If vtype is equal to 4:
+        proc emitter_emit from Emitter with ctx, "None"
+        Return
+    End If
+
+    Note: Default: emit numeric literal verbatim. Rust accepts decimal integers
+    Note: and floats with the same surface syntax as Runa numeric literals
+    Note: (1, 1.0, 1e9, 0x10, 0b101, etc.) so verbatim passthrough is correct.
+    proc emitter_emit from Emitter with ctx, value_str
+End Process
+
+Note: ============================================================================
+Note: STRING ESCAPING
+Note: ============================================================================
+Note: Rust string literals require escaping of backslash, double-quote, and the
+Note: common ASCII control characters (newline, tab, carriage-return, null).
+Note: This walks the raw string byte-by-byte and emits an escaped version into
+Note: the emitter context. Bytes 0x20..0x7E that are not ' " ' or '\' pass
+Note: through verbatim; all others are emitted as the Rust escape form.
+Process called "emit_escaped_string" takes ctx as EmitterContext, raw as String:
+    If raw is equal to 0:
+        Return
+    End If
+    Let len be proc string_length from StringCore with raw
+    Let i be 0
+    While i is less than len:
+        Let b be proc string_char_at from StringCore with raw, i
+        If b is equal to 92:
+            Note: backslash
+            proc emitter_emit from Emitter with ctx, "\\\\"
+        Otherwise:
+            If b is equal to 34:
+                Note: double-quote
+                proc emitter_emit from Emitter with ctx, "\\\""
+            Otherwise:
+                If b is equal to 10:
+                    proc emitter_emit from Emitter with ctx, "\\n"
+                Otherwise:
+                    If b is equal to 9:
+                        proc emitter_emit from Emitter with ctx, "\\t"
+                    Otherwise:
+                        If b is equal to 13:
+                            proc emitter_emit from Emitter with ctx, "\\r"
+                        Otherwise:
+                            If b is equal to 0:
+                                proc emitter_emit from Emitter with ctx, "\\0"
+                            Otherwise:
+                                proc emitter_ctx_emit_byte from Emitter with ctx, b
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set i to i plus 1
+    End While
+End Process
+
+Process called "emit_binary" takes ctx as EmitterContext, node as Integer:
+    Let op_ptr be proc node_value with node
+    Let op_str be proc rust_string_from_pointer with op_ptr
+    Let mapped be proc rust_map_binary_op with op_str
+
+    Let lhs be proc node_child with node, 0
+    Let rhs be proc node_child with node, 1
+
+    proc emit_expression with ctx, lhs
+    proc emitter_emit from Emitter with ctx, " "
+    proc emitter_emit from Emitter with ctx, mapped
+    proc emitter_emit from Emitter with ctx, " "
+    proc emit_expression with ctx, rhs
+End Process
+
+Process called "emit_unary" takes ctx as EmitterContext, node as Integer:
+    Let op_ptr be proc node_value with node
+    Let op_str be proc rust_string_from_pointer with op_ptr
+    Let mapped be proc rust_map_unary_op with op_str
+
+    Let operand be proc node_child with node, 0
+
+    proc emitter_emit from Emitter with ctx, mapped
+    proc emit_expression with ctx, operand
+End Process
+
+Process called "emit_ternary" takes ctx as EmitterContext, node as Integer:
+    Note: Rust does not have a ternary `?:` operator. Render as an `if-else`
+    Note: expression which has the same value semantics.
+    Let cond be proc node_child with node, 0
+    Let then_e be proc node_child with node, 1
+    Let else_e be proc node_child with node, 2
+
+    proc emitter_emit from Emitter with ctx, "(if "
+    proc emit_expression with ctx, cond
+    proc emitter_emit from Emitter with ctx, " { "
+    proc emit_expression with ctx, then_e
+    proc emitter_emit from Emitter with ctx, " } else { "
+    proc emit_expression with ctx, else_e
+    proc emitter_emit from Emitter with ctx, " })"
+End Process
+
+Process called "emit_call" takes ctx as EmitterContext, node as Integer:
+    Note: Child 0 = callee, children 1..n-1 = arguments
+    Let callee be proc node_child with node, 0
+    proc emit_expression with ctx, callee
+    proc emitter_emit from Emitter with ctx, "("
+
+    Let count be proc node_child_count with node
+    Let i be 1
+    While i is less than count:
+        If i is greater than 1:
+            proc emitter_emit from Emitter with ctx, ", "
+        End If
+        Let arg be proc node_child with node, i
+        proc emit_expression with ctx, arg
+        Set i to i plus 1
+    End While
+
+    proc emitter_emit from Emitter with ctx, ")"
+End Process
+
+Process called "emit_member" takes ctx as EmitterContext, node as Integer:
+    Let object be proc node_child with node, 0
+    Let field_name_ptr be proc node_value with node
+    Let field_name_str be proc rust_string_from_pointer with field_name_ptr
+    Let escaped be proc rust_escape_identifier with field_name_str
+
+    proc emit_expression with ctx, object
+    proc emitter_emit from Emitter with ctx, "."
+    proc emitter_emit from Emitter with ctx, escaped
+End Process
+
+Process called "emit_index" takes ctx as EmitterContext, node as Integer:
+    Let collection be proc node_child with node, 0
+    Let index be proc node_child with node, 1
+
+    proc emit_expression with ctx, collection
+    proc emitter_emit from Emitter with ctx, "["
+    proc emit_expression with ctx, index
+    proc emitter_emit from Emitter with ctx, "]"
+End Process
+
+Process called "emit_range" takes ctx as EmitterContext, node as Integer:
+    Note: Range layout: start, end, optional step. Rust range syntax is
+    Note:   `start..end` (exclusive) for the no-step case
+    Note:   `(start..end).step_by(step)` for the stepped case
+    Note: There is no stable equivalent of an inclusive stepped range; we
+    Note: pick exclusive end which matches the Runa default semantics.
+    Let start_e be proc node_child with node, 0
+    Let end_e be proc node_child with node, 1
+    Let step_e be proc node_child with node, 2
+
+    If step_e is not equal to 0:
+        proc emitter_emit from Emitter with ctx, "("
+        proc emit_expression with ctx, start_e
+        proc emitter_emit from Emitter with ctx, ".."
+        proc emit_expression with ctx, end_e
+        proc emitter_emit from Emitter with ctx, ").step_by("
+        proc emit_expression with ctx, step_e
+        proc emitter_emit from Emitter with ctx, ")"
+    Otherwise:
+        proc emit_expression with ctx, start_e
+        proc emitter_emit from Emitter with ctx, ".."
+        proc emit_expression with ctx, end_e
+    End If
+End Process
+
+Process called "emit_array_literal" takes ctx as EmitterContext, node as Integer:
+    Note: Rust vec! macro is the closest semantic equivalent of a heap-backed
+    Note: array literal. `vec![a, b, c]` produces a Vec<T> which matches the
+    Note: HIR array semantics (growable, heap-allocated, value-typed).
+    proc emitter_emit from Emitter with ctx, "vec!["
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc emitter_emit from Emitter with ctx, ", "
+        End If
+        Let elem be proc node_child with node, i
+        proc emit_expression with ctx, elem
+        Set i to i plus 1
+    End While
+    proc emitter_emit from Emitter with ctx, "]"
+End Process
+
+Process called "emit_tuple_literal" takes ctx as EmitterContext, node as Integer:
+    Note: Rust tuples use `(a, b, c)`. A one-element tuple needs a trailing
+    Note: comma `(a,)` to disambiguate from a parenthesized expression.
+    proc emitter_emit from Emitter with ctx, "("
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        If i is greater than 0:
+            proc emitter_emit from Emitter with ctx, ", "
+        End If
+        Let elem be proc node_child with node, i
+        proc emit_expression with ctx, elem
+        Set i to i plus 1
+    End While
+    If count is equal to 1:
+        proc emitter_emit from Emitter with ctx, ","
+    End If
+    proc emitter_emit from Emitter with ctx, ")"
+End Process
+
+Process called "emit_record_literal" takes ctx as EmitterContext, node as Integer:
+    Note: A record literal in HIR carries a type name in `value` and field
+    Note: name/value pairs in children. Rust renders this as
+    Note:   TypeName { field1: value1, field2: value2 }
+    Note: We assume HIR fields come in alternating name-pointer / value-node
+    Note: order with the type identifier in node_value.
+    Let type_ptr be proc node_value with node
+    Let type_str be proc rust_string_from_pointer with type_ptr
+    Let escaped be proc rust_escape_identifier with type_str
+
+    proc emitter_emit from Emitter with ctx, escaped
+    proc emitter_emit from Emitter with ctx, " { "
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    Let first be 1
+    While i is less than count:
+        Let field_node be proc node_child with node, i
+        Let ft be proc node_type_of with field_node
+        If ft is equal to HIR.HIR_FIELD_DEFINITION:
+            If first is equal to 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            Let fname_ptr be proc node_value with field_node
+            Let fname_str be proc rust_string_from_pointer with fname_ptr
+            Let fesc be proc rust_escape_identifier with fname_str
+            proc emitter_emit from Emitter with ctx, fesc
+            proc emitter_emit from Emitter with ctx, ": "
+            Let value_node be proc node_child with field_node, 0
+            proc emit_expression with ctx, value_node
+            Set first to 0
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emitter_emit from Emitter with ctx, " }"
+End Process
+
+Process called "emit_lambda" takes ctx as EmitterContext, node as Integer:
+    Note: Rust closures: |p1: T1, p2: T2| body. Last child is body; preceding
+    Note: children are param Lets. If body is not a single expression we wrap
+    Note: it in a block.
+    Let count be proc node_child_count with node
+    proc emitter_emit from Emitter with ctx, "|"
+    Let i be 0
+    Let body_index be count minus 1
+    While i is less than body_index:
+        If i is greater than 0:
+            proc emitter_emit from Emitter with ctx, ", "
+        End If
+        Let p be proc node_child with node, i
+        proc emit_param with ctx, p
+        Set i to i plus 1
+    End While
+    proc emitter_emit from Emitter with ctx, "| "
+
+    Let body be proc node_child with node, body_index
+    Let bt be proc node_type_of with body
+    If bt is equal to HIR.HIR_BLOCK_STATEMENT:
+        proc emitter_emit_line from Emitter with ctx, "{"
+        proc emitter_indent from Emitter with ctx
+        proc emit_block_children with ctx, body
+        proc emitter_dedent from Emitter with ctx
+        proc emitter_emit from Emitter with ctx, "}"
+    Otherwise:
+        proc emit_expression with ctx, body
+    End If
+End Process
+
+Process called "emit_cast" takes ctx as EmitterContext, node as Integer:
+    Note: Rust cast uses `expr as Type` postfix. Numeric casts are primitive;
+    Note: object casts use `expr as &dyn Trait` for the trait-object form. We
+    Note: emit the basic postfix shape; downstream consumers can refine.
+    Let value be proc node_child with node, 0
+    Let target_type be proc node_child with node, 1
+
+    proc emitter_emit from Emitter with ctx, "("
+    proc emit_expression with ctx, value
+    proc emitter_emit from Emitter with ctx, " as "
+    proc emit_type with ctx, target_type
+    proc emitter_emit from Emitter with ctx, ")"
+End Process
+
+Process called "emit_interpolated_string" takes ctx as EmitterContext, node as Integer:
+    Note: Rust string interpolation is `format!("...{}...{}", arg1, arg2)`.
+    Note: We build the format string in one pass by emitting literal segments
+    Note: verbatim and `{}` placeholders for each non-literal child, then a
+    Note: second pass emits the arguments in order.
+    proc emitter_emit from Emitter with ctx, "format!(\""
+
+    Let count be proc node_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let part be proc node_child with node, i
+        Let pt be proc node_type_of with part
+        If pt is equal to HIR.HIR_LITERAL:
+            Let str_ptr be proc node_value with part
+            Let str_val be proc rust_string_from_pointer with str_ptr
+            proc emit_escaped_string with ctx, str_val
+        Otherwise:
+            proc emitter_emit from Emitter with ctx, "{}"
+        End If
+        Set i to i plus 1
+    End While
+    proc emitter_emit from Emitter with ctx, "\""
+
+    Set i to 0
+    While i is less than count:
+        Let part be proc node_child with node, i
+        Let pt be proc node_type_of with part
+        If pt is not equal to HIR.HIR_LITERAL:
+            proc emitter_emit from Emitter with ctx, ", "
+            proc emit_expression with ctx, part
+        End If
+        Set i to i plus 1
+    End While
+
+    proc emitter_emit from Emitter with ctx, ")"
+End Process
+
+Note: ============================================================================
+Note: TYPES
+Note: ============================================================================
+Note: Emit a Rust type expression from an HIR type node. Unknown types fall
+Note: back to `()` so the surrounding declaration still parses.
+Process called "emit_type" takes ctx as EmitterContext, node as Integer:
+    If node is equal to 0:
+        proc emitter_emit from Emitter with ctx, "()"
+        Return
+    End If
+
+    Let nt be proc node_type_of with node
+
+    If nt is equal to HIR.HIR_BASIC_TYPE:
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let mapped be proc rust_map_basic_type with name_str
+        proc emitter_emit from Emitter with ctx, mapped
+        Return
+    End If
+    If nt is equal to HIR.HIR_OPTIONAL_TYPE:
+        Let inner be proc node_child with node, 0
+        proc emitter_emit from Emitter with ctx, "Option<"
+        proc emit_type with ctx, inner
+        proc emitter_emit from Emitter with ctx, ">"
+        Return
+    End If
+    If nt is equal to HIR.HIR_ARRAY_TYPE:
+        Let elem be proc node_child with node, 0
+        proc emitter_emit from Emitter with ctx, "Vec<"
+        proc emit_type with ctx, elem
+        proc emitter_emit from Emitter with ctx, ">"
+        Return
+    End If
+    If nt is equal to HIR.HIR_SLICE_TYPE:
+        Let elem be proc node_child with node, 0
+        proc emitter_emit from Emitter with ctx, "&["
+        proc emit_type with ctx, elem
+        proc emitter_emit from Emitter with ctx, "]"
+        Return
+    End If
+    If nt is equal to HIR.HIR_REFERENCE_TYPE:
+        Let inner be proc node_child with node, 0
+        Note: A reference-type node uses node_value_type==1 to mark mutable
+        Note: references; otherwise emit the immutable `&` form.
+        Let mut_flag be proc node_value_type with node
+        If mut_flag is equal to 1:
+            proc emitter_emit from Emitter with ctx, "&mut "
+        Otherwise:
+            proc emitter_emit from Emitter with ctx, "&"
+        End If
+        proc emit_type with ctx, inner
+        Return
+    End If
+    If nt is equal to HIR.HIR_POINTER_TYPE:
+        Let inner be proc node_child with node, 0
+        Note: Pointer-type node uses node_value_type==1 to mark mutable
+        Note: pointers; otherwise emit the const form.
+        Let mut_flag be proc node_value_type with node
+        If mut_flag is equal to 1:
+            proc emitter_emit from Emitter with ctx, "*mut "
+        Otherwise:
+            proc emitter_emit from Emitter with ctx, "*const "
+        End If
+        proc emit_type with ctx, inner
+        Return
+    End If
+    If nt is equal to HIR.HIR_NEVER_TYPE:
+        proc emitter_emit from Emitter with ctx, "!"
+        Return
+    End If
+    If nt is equal to HIR.HIR_TUPLE_TYPE:
+        proc emitter_emit from Emitter with ctx, "("
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            Let elem be proc node_child with node, i
+            proc emit_type with ctx, elem
+            Set i to i plus 1
+        End While
+        If count is equal to 1:
+            proc emitter_emit from Emitter with ctx, ","
+        End If
+        proc emitter_emit from Emitter with ctx, ")"
+        Return
+    End If
+    If nt is equal to HIR.HIR_GENERIC_TYPE:
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let mapped be proc rust_map_basic_type with name_str
+        proc emitter_emit from Emitter with ctx, mapped
+        proc emitter_emit from Emitter with ctx, "<"
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            Let arg be proc node_child with node, i
+            proc emit_type with ctx, arg
+            Set i to i plus 1
+        End While
+        proc emitter_emit from Emitter with ctx, ">"
+        Return
+    End If
+    If nt is equal to HIR.HIR_UNION_TYPE:
+        Note: Rust has no anonymous untagged-union types. The closest stable
+        Note: shape is a boxed trait object, but that requires the union
+        Note: alternatives to share a trait. Render as a comment listing the
+        Note: alternatives followed by a fallback `Box<dyn std::any::Any>`
+        Note: type so the output remains compilable Rust.
+        proc emitter_emit from Emitter with ctx, "/* union of: "
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, " | "
+            End If
+            Let alt be proc node_child with node, i
+            proc emit_type with ctx, alt
+            Set i to i plus 1
+        End While
+        proc emitter_emit from Emitter with ctx, " */ Box<dyn std::any::Any>"
+        Return
+    End If
+    If nt is equal to HIR.HIR_INTERSECTION_TYPE:
+        Note: Intersection of trait-bound types becomes `T1 + T2 + ...` in
+        Note: Rust where clauses or `impl T1 + T2 + ...` in arg/return
+        Note: positions. Emit the `+`-joined form; surrounding context must
+        Note: provide the `impl` keyword if required.
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, " + "
+            End If
+            Let alt be proc node_child with node, i
+            proc emit_type with ctx, alt
+            Set i to i plus 1
+        End While
+        Return
+    End If
+    If nt is equal to HIR.HIR_FUNCTION_TYPE:
+        Note: HIR function-type layout: param types as children with
+        Note: value_type==0, return type as the single child with
+        Note: value_type==1. Rust function-pointer form is `fn(P1,P2)->R`.
+        Let count be proc node_child_count with node
+        proc emitter_emit from Emitter with ctx, "fn("
+        Let i be 0
+        Let return_node be 0
+        Let first be 1
+        While i is less than count:
+            Let c be proc node_child with node, i
+            Let cvt be proc node_value_type with c
+            If cvt is equal to 1:
+                Set return_node to c
+            Otherwise:
+                If first is equal to 0:
+                    proc emitter_emit from Emitter with ctx, ", "
+                End If
+                proc emit_type with ctx, c
+                Set first to 0
+            End If
+            Set i to i plus 1
+        End While
+        proc emitter_emit from Emitter with ctx, ") -> "
+        If return_node is not equal to 0:
+            proc emit_type with ctx, return_node
+        Otherwise:
+            proc emitter_emit from Emitter with ctx, "()"
+        End If
+        Return
+    End If
+    If nt is equal to HIR.HIR_TYPE_PARAMETER:
+        Note: Bare type parameters reference an identifier name; render the
+        Note: name verbatim (escaped against Rust keywords).
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let escaped be proc rust_escape_identifier with name_str
+        proc emitter_emit from Emitter with ctx, escaped
+        Return
+    End If
+    If nt is equal to HIR.HIR_RECORD_TYPE:
+        Note: A record type is a struct shape. Use anonymous-struct rendering
+        Note: which is not legal in Rust types directly; fall back to `()`
+        Note: with a comment naming the fields so the issue is visible.
+        proc emitter_emit from Emitter with ctx, "()"
+        proc emitter_warning from Emitter with ctx, "record type rendered as () in Rust"
+        Return
+    End If
+
+    Note: Default fallback - unit type. Surface the issue as a warning.
+    proc emitter_emit from Emitter with ctx, "()"
+    proc emitter_warning from Emitter with ctx, "unhandled type node"
+End Process
+
+Note: ============================================================================
+Note: PATTERN MATCHING
+Note: ============================================================================
+Note: Patterns appear inside Match arms. Rust pattern syntax aligns reasonably
+Note: well with Runa's: identifier binds to a name, literal matches by value,
+Note: wildcard is `_`, tuple/record decompose, and variants use path syntax.
+Process called "emit_pattern" takes ctx as EmitterContext, node as Integer:
+    If node is equal to 0:
+        proc emitter_emit from Emitter with ctx, "_"
+        Return
+    End If
+    Let nt be proc node_type_of with node
+
+    If nt is equal to HIR.HIR_WILDCARD_PATTERN:
+        proc emitter_emit from Emitter with ctx, "_"
+        Return
+    End If
+    If nt is equal to HIR.HIR_IDENTIFIER_PATTERN:
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let escaped be proc rust_escape_identifier with name_str
+        proc emitter_emit from Emitter with ctx, escaped
+        Return
+    End If
+    If nt is equal to HIR.HIR_LITERAL_PATTERN:
+        proc emit_literal with ctx, node
+        Return
+    End If
+    If nt is equal to HIR.HIR_TUPLE_PATTERN:
+        proc emitter_emit from Emitter with ctx, "("
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            Let elem be proc node_child with node, i
+            proc emit_pattern with ctx, elem
+            Set i to i plus 1
+        End While
+        If count is equal to 1:
+            proc emitter_emit from Emitter with ctx, ","
+        End If
+        proc emitter_emit from Emitter with ctx, ")"
+        Return
+    End If
+    If nt is equal to HIR.HIR_ARRAY_PATTERN:
+        proc emitter_emit from Emitter with ctx, "["
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            Let elem be proc node_child with node, i
+            proc emit_pattern with ctx, elem
+            Set i to i plus 1
+        End While
+        proc emitter_emit from Emitter with ctx, "]"
+        Return
+    End If
+    If nt is equal to HIR.HIR_RANGE_PATTERN:
+        Note: HIR range pattern carries start/end children. Rust pattern
+        Note: form is `start..=end` (inclusive end) or `start..end` for the
+        Note: exclusive shape. We pick inclusive to match the common case
+        Note: in `When N..M:` constructs.
+        Let start_e be proc node_child with node, 0
+        Let end_e be proc node_child with node, 1
+        proc emit_pattern with ctx, start_e
+        proc emitter_emit from Emitter with ctx, "..="
+        proc emit_pattern with ctx, end_e
+        Return
+    End If
+    If nt is equal to HIR.HIR_VARIANT_PATTERN:
+        Note: Variant pattern: type name in `value`, sub-patterns in children.
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let escaped be proc rust_escape_identifier with name_str
+        proc emitter_emit from Emitter with ctx, escaped
+        Let count be proc node_child_count with node
+        If count is greater than 0:
+            proc emitter_emit from Emitter with ctx, "("
+            Let i be 0
+            While i is less than count:
+                If i is greater than 0:
+                    proc emitter_emit from Emitter with ctx, ", "
+                End If
+                Let elem be proc node_child with node, i
+                proc emit_pattern with ctx, elem
+                Set i to i plus 1
+            End While
+            proc emitter_emit from Emitter with ctx, ")"
+        End If
+        Return
+    End If
+    If nt is equal to HIR.HIR_OR_PATTERN:
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, " | "
+            End If
+            Let elem be proc node_child with node, i
+            proc emit_pattern with ctx, elem
+            Set i to i plus 1
+        End While
+        Return
+    End If
+    If nt is equal to HIR.HIR_REST_PATTERN:
+        proc emitter_emit from Emitter with ctx, ".."
+        Return
+    End If
+    If nt is equal to HIR.HIR_GUARD_PATTERN:
+        Note: Pattern with guard: pattern is child 0, condition is child 1.
+        Note: Rust syntax: `pat if cond`.
+        Let pat be proc node_child with node, 0
+        Let cond be proc node_child with node, 1
+        proc emit_pattern with ctx, pat
+        proc emitter_emit from Emitter with ctx, " if "
+        proc emit_expression with ctx, cond
+        Return
+    End If
+    If nt is equal to HIR.HIR_RECORD_PATTERN:
+        Note: Record-pattern: type name in `value`, FIELD_DEFINITION children
+        Note: with sub-patterns. Rust syntax: `TypeName { field: pat, ... }`.
+        Let name_ptr be proc node_value with node
+        Let name_str be proc rust_string_from_pointer with name_ptr
+        Let escaped be proc rust_escape_identifier with name_str
+        proc emitter_emit from Emitter with ctx, escaped
+        proc emitter_emit from Emitter with ctx, " { "
+
+        Let count be proc node_child_count with node
+        Let i be 0
+        While i is less than count:
+            If i is greater than 0:
+                proc emitter_emit from Emitter with ctx, ", "
+            End If
+            Let field_pat be proc node_child with node, i
+            Let fp_name_ptr be proc node_value with field_pat
+            Let fp_name_str be proc rust_string_from_pointer with fp_name_ptr
+            Let fp_esc be proc rust_escape_identifier with fp_name_str
+            proc emitter_emit from Emitter with ctx, fp_esc
+            proc emitter_emit from Emitter with ctx, ": "
+            Let inner_pat be proc node_child with field_pat, 0
+            proc emit_pattern with ctx, inner_pat
+            Set i to i plus 1
+        End While
+
+        proc emitter_emit from Emitter with ctx, " }"
+        Return
+    End If
+
+    Note: Unknown pattern: fall back to wildcard so the match still type-checks.
+    proc emitter_emit from Emitter with ctx, "_"
+    proc emitter_warning from Emitter with ctx, "unhandled pattern node type"
+End Process
+
+Note: ============================================================================
+Note: OPERATOR MAPPING
+Note: ============================================================================
+Note: Map Runa operator words to their Rust symbol equivalents. Any operator
+Note: that does not appear in this table is rendered verbatim so unknown
+Note: operators surface in the output rather than being silently dropped.
+Process called "rust_map_binary_op" takes runa_op as String returns String:
+    Let eq be 0
+
+    Set eq to proc string_equals from StringCore with runa_op, "plus"
+    If eq is equal to 1:
+        Return "+"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "minus"
+    If eq is equal to 1:
+        Return "-"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "multiplied by"
+    If eq is equal to 1:
+        Return "*"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "divided by"
+    If eq is equal to 1:
+        Return "/"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "modulo"
+    If eq is equal to 1:
+        Return "%"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "modulo by"
+    If eq is equal to 1:
+        Return "%"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "is equal to"
+    If eq is equal to 1:
+        Return "=="
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "is not equal to"
+    If eq is equal to 1:
+        Return "!="
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "is less than"
+    If eq is equal to 1:
+        Return "<"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "is greater than"
+    If eq is equal to 1:
+        Return ">"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "is less than or equal to"
+    If eq is equal to 1:
+        Return "<="
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "is greater than or equal to"
+    If eq is equal to 1:
+        Return ">="
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "and"
+    If eq is equal to 1:
+        Return "&&"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "or"
+    If eq is equal to 1:
+        Return "||"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "bitwise and"
+    If eq is equal to 1:
+        Return "&"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "bitwise or"
+    If eq is equal to 1:
+        Return "|"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "bitwise xor"
+    If eq is equal to 1:
+        Return "^"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "shifted left by"
+    If eq is equal to 1:
+        Return "<<"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "shifted right by"
+    If eq is equal to 1:
+        Return ">>"
+    End If
+
+    Return runa_op
+End Process
+
+Process called "rust_map_unary_op" takes runa_op as String returns String:
+    Let eq be 0
+
+    Set eq to proc string_equals from StringCore with runa_op, "negate"
+    If eq is equal to 1:
+        Return "-"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "minus"
+    If eq is equal to 1:
+        Return "-"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "not"
+    If eq is equal to 1:
+        Return "!"
+    End If
+    Set eq to proc string_equals from StringCore with runa_op, "bitwise not"
+    If eq is equal to 1:
+        Return "!"
+    End If
+
+    Return runa_op
+End Process
