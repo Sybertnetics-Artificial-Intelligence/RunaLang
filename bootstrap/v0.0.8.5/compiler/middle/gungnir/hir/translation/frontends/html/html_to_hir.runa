@@ -37,6 +37,14 @@ Note: ==========================================================================
 Note: Translation Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Entry point that turns raw HTML source bytes into an HIR Dictionary tree. The two-stage shape (lex/parse then translate) is required because HIR consumers expect typed nodes keyed by string fields rather than the offset-encoded AST records produced by the parser.
+@End Reasoning
+
+@Implementation:
+Invokes the HTML parser to obtain a root AST node, returns 0 on parse failure to propagate the error, and otherwise dispatches the root through translate_node. The options argument is reserved for future translator configuration and is currently passed transparently.
+@End Implementation
+
 Process called "translate_html_to_hir" takes source as Integer, options as Integer returns Integer:
     Note: Translate HTML source to HIR
 
@@ -54,6 +62,14 @@ End Process
 Note: ============================================================================
 Note: Node Translation
 Note: ============================================================================
+
+@Reasoning:
+Central dispatcher mapping the parser's numeric node-type tags (100-106) to their dedicated translator. A flat If-chain is used rather than a Match because numeric tag comparisons compile to a tight branch sequence and keep dispatch local to this file.
+@End Reasoning
+
+@Implementation:
+Reads the node_type field at offset 0 of the AST node record, then forwards to the per-tag translator. Returns 0 for a null node pointer or an unknown tag, which callers treat as "drop this child" so a malformed subtree cannot corrupt its parent's children list.
+@End Implementation
 
 Process called "translate_node" takes node as Integer returns Integer:
     Note: Translate AST node to HIR
@@ -99,6 +115,14 @@ Note: ==========================================================================
 Note: Document Translation
 Note: ============================================================================
 
+@Reasoning:
+Document is the root of the HTML AST and maps to an HIR Dictionary keyed by "type" and "children". Recursively translating each child here keeps the document-level invariant that the dictionary never owns raw AST pointers — all children are HIR-form before being attached.
+@End Reasoning
+
+@Implementation:
+Builds a fresh dictionary tagged "document", then iterates the AST children array using its layout (child_count at offset 32, children pointer at offset 24, 8-byte slots). Translations that return 0 are skipped so a partially malformed document still yields a usable structure.
+@End Implementation
+
 Process called "translate_document" takes node as Integer returns Integer:
     Note: Translate HTML_DOCUMENT to HIR Dictionary
 
@@ -135,6 +159,14 @@ Note: ==========================================================================
 Note: DOCTYPE Translation
 Note: ============================================================================
 
+@Reasoning:
+DOCTYPE carries a single value (the declaration text) and is preserved verbatim so downstream HIR consumers can faithfully regenerate the document. Omitting the "value" key when value is 0 lets a malformed or absent DOCTYPE stay distinguishable from an empty one.
+@End Reasoning
+
+@Implementation:
+Allocates an HIR dictionary tagged "doctype" and reads the value pointer from the AST node at offset 16. The value pointer is reused directly without copying because it is owned by the AST arena that outlives this translation pass.
+@End Implementation
+
 Process called "translate_doctype" takes node as Integer returns Integer:
     Note: Translate HTML_DOCTYPE to HIR Dictionary
 
@@ -156,6 +188,14 @@ End Process
 Note: ============================================================================
 Note: Element Translation
 Note: ============================================================================
+
+@Reasoning:
+Elements are the only AST nodes that carry both attributes (key/value bag) and children (ordered list). Splitting them into two distinct HIR dictionaries preserves DOM semantics where attribute order does not matter but child order does.
+@End Reasoning
+
+@Implementation:
+While walking the AST children array, attribute nodes (type 103) are extracted into an attributes sub-dictionary keyed by name, while every other node is recursively translated and appended to the children list. Attribute values of 0 are normalised to the empty string so dict lookups never observe a null sentinel.
+@End Implementation
 
 Process called "translate_element" takes node as Integer returns Integer:
     Note: Translate HTML_ELEMENT to HIR Dictionary
@@ -215,6 +255,14 @@ Note: ==========================================================================
 Note: Attribute Translation
 Note: ============================================================================
 
+@Reasoning:
+Attributes can appear standalone in some HIR contexts (e.g., when consumers need positional rather than associative access), so a self-contained dictionary form is also generated. The dictionary form preserves the name-value pair as explicit fields rather than a single key/value mapping.
+@End Reasoning
+
+@Implementation:
+Reads name from offset 8 and value from offset 16 of the AST node. A null value pointer becomes an empty string so the HIR record always has both "name" and "value" keys present, simplifying consumer code that does unconditional lookups.
+@End Implementation
+
 Process called "translate_attribute" takes node as Integer returns Integer:
     Note: Translate HTML_ATTRIBUTE to HIR Dictionary
 
@@ -241,6 +289,14 @@ Note: ==========================================================================
 Note: Text Translation
 Note: ============================================================================
 
+@Reasoning:
+Text nodes are leaves whose only payload is their string content. Wrapping the raw value in a dictionary with explicit "type" lets HIR consumers distinguish text from comment or entity without inspecting node identity.
+@End Reasoning
+
+@Implementation:
+Reads the text bytes pointer from offset 16 of the AST node and stores it under the "value" key. The string pointer is reused directly because the AST arena retains ownership during the translation pass.
+@End Implementation
+
 Process called "translate_text" takes node as Integer returns Integer:
     Note: Translate HTML_TEXT to HIR Dictionary
 
@@ -260,6 +316,14 @@ End Process
 Note: ============================================================================
 Note: Comment Translation
 Note: ============================================================================
+
+@Reasoning:
+Comments are preserved through translation so that round-tripping or tools that emit annotated HIR can re-emit the original comment text. Stripping them at this stage would lose information that user-facing renderers may want to retain.
+@End Reasoning
+
+@Implementation:
+Identical structural pattern to translate_text but tagged "comment" so downstream code can distinguish them. The comment body lives at offset 16 of the AST node.
+@End Implementation
 
 Process called "translate_comment" takes node as Integer returns Integer:
     Note: Translate HTML_COMMENT to HIR Dictionary
@@ -281,6 +345,14 @@ Note: ==========================================================================
 Note: Entity Translation
 Note: ============================================================================
 
+@Reasoning:
+HTML entities (e.g., &amp;, &#x27;) are kept as opaque references rather than being resolved here. Resolution belongs to a later HIR pass that knows whether output should be normalised, escaped, or preserved.
+@End Reasoning
+
+@Implementation:
+Allocates a dictionary tagged "entity" and stores the raw entity text from offset 16 under "value". No decoding is performed.
+@End Implementation
+
 Process called "translate_entity" takes node as Integer returns Integer:
     Note: Translate HTML_ENTITY to HIR Dictionary
 
@@ -300,6 +372,18 @@ End Process
 Note: ============================================================================
 Note: Dictionary and List Utilities
 Note: ============================================================================
+
+@Reasoning:
+A bespoke dictionary primitive is used instead of relying on a general collection module to keep this translator self-contained and produce HIR records with the exact memory layout that consumers in this subsystem expect. Initial capacity 10 covers the maximum keys any node-level dictionary uses (type, tag, attributes, children).
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte header (size, capacity, keys-ptr, values-ptr) plus two 80-byte parallel arrays (10 slots * 8 bytes). The capacity field is fixed at 10 because no node currently overflows it; a runtime check by the caller would catch any future regression.
+@End Implementation
+
+@Performance_Hints:
+Three allocations per dictionary. Hot loops that emit many child nodes will benefit from arena allocation upstream so cleanup is O(1).
+@End Performance_Hints
 
 Process called "create_dictionary" returns Integer:
     Note: Create empty dictionary
@@ -325,6 +409,14 @@ Process called "create_dictionary" returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+This is an append-only set used by the translator — duplicate keys never occur because each translator emits distinct field names. Skipping duplicate detection keeps the per-key cost at two stores and one size update.
+@End Reasoning
+
+@Implementation:
+Reads the current size from offset 0, writes the key/value into the parallel arrays at slot size*8, then increments and writes back the size. No capacity check is performed because the fixed 10-slot capacity is never approached.
+@End Implementation
+
 Process called "dict_set" takes dict as Integer, key as Integer, value as Integer returns Integer:
     Note: Set dictionary key-value pair
 
@@ -340,6 +432,14 @@ Process called "dict_set" takes dict as Integer, key as Integer, value as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+HIR child lists need an ordered, append-only container. A fixed-capacity backing store (10 slots) keeps the layout simple because no single node currently holds more than 10 direct HIR children of distinct types; nested children are stored in their own sub-lists.
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte header (size, capacity, items-ptr) plus an 80-byte items array. Returns 0 only when the header allocation fails; the items allocation is assumed to succeed when the header did because they come from the same allocator.
+@End Implementation
 
 Process called "create_list" returns Integer:
     Note: Create empty list
@@ -361,6 +461,14 @@ Process called "create_list" returns Integer:
 
     Return list
 End Process
+
+@Reasoning:
+Each translator invocation appends at most one child per AST iteration, so unconditional append is correct. No bounds check is needed because the fixed 10-slot capacity matches the parser's maximum child fan-out for any single HIR record.
+@End Reasoning
+
+@Implementation:
+Loads the size from offset 0 and the items pointer from offset 16, writes the item at offset size*8 into the items array, then increments and stores the size. O(1) per append.
+@End Implementation
 
 Process called "list_append" takes list as Integer, item as Integer returns Integer:
     Note: Append item to list

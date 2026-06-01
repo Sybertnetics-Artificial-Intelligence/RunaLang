@@ -50,6 +50,21 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+CMake's dynamic scope model and function/macro definitions require the
+translator to track both the current scope (for variable references) and
+a function map so command names like add_executable / target_link_libraries
+can resolve to user-defined functions when they exist. hir_program is the
+top-level HIR container being built.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64) at offsets 0..24: current_scope (HIR scope ptr,
+0 at top level), variable_map (Dict CMake var name -> HIR symbol),
+function_map (Dict CMake function name -> HIR process), hir_program
+(root node populated as the walk progresses).
+@End Implementation
+
 Type called "CMakeTranslationContext":
     current_scope as Integer       Note: Current HIR scope
     variable_map as Integer         Note: Dictionary mapping CMake vars to HIR symbols
@@ -60,6 +75,18 @@ End Type
 Note: ============================================================================
 Note: Context Management
 Note: ============================================================================
+
+@Reasoning:
+Translation context factory: zero-initialised so the caller can check
+"0 == unset" for any field. variable_map/function_map are created lazily
+by the routines that first need them (avoids overhead when those tables
+stay empty).
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes; on OOM returns 0. Zeroes all four slots at offsets
+0/8/16/24.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Note: Create translation context for CMake→HIR
@@ -83,6 +110,21 @@ End Process
 Note: ============================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
+
+@Reasoning:
+Public entry point used by the driver: takes a CMake AST root, builds the
+translation context and the HIR program root, dispatches to
+translate_program when the AST root is the expected NODE_PROGRAM type.
+@End Reasoning
+
+@Implementation:
+Null-checks ast; returns 0 if missing. Creates translation context;
+returns 0 on OOM. Creates HIR program root via HIR.create_hir_program;
+attaches it to context offset 24. Reads AST root node_type at offset 0;
+when it matches Parser.NODE_PROGRAM, calls translate_program and returns
+its result. Other root types fall through and return the empty HIR
+program (defensive - shouldn't happen with a correct parser).
+@End Implementation
 
 Process called "translate_cmake_to_hir" takes ast as Integer returns Integer:
     Note: Translate complete CMake AST to HIR
@@ -123,6 +165,22 @@ End Process
 Note: ============================================================================
 Note: Program Translation
 Note: ============================================================================
+
+@Reasoning:
+A CMake program is a flat list of top-level statements (commands,
+if/foreach/while/function/macro). Translation produces a single HIR block
+holding each translated statement; the block is then attached to the
+HIR program root.
+@End Reasoning
+
+@Implementation:
+Reads HIR program from context offset 24. Reads statement list from
+program offset 8 and count from offset 16. Creates an HIR block via
+HIR.create_hir_block. Loops every statement, translates via
+translate_statement, and appends to the HIR block via
+HIR.add_statement_to_hir_block. Finally attaches the block to the HIR
+program via HIR.add_hir_node.
+@End Implementation
 
 Process called "translate_program" takes context as Integer, program as Integer returns Integer:
     Note: Translate CMake program (root node)
@@ -171,6 +229,20 @@ End Process
 Note: ============================================================================
 Note: Statement Translation
 Note: ============================================================================
+
+@Reasoning:
+Single-table dispatcher keyed on AST node type. CMake statements come in
+seven shapes (NODE_COMMAND, NODE_IF, NODE_FOREACH, NODE_WHILE,
+NODE_FUNCTION, NODE_MACRO, NODE_BLOCK). Each has its own translator;
+unknown types return 0 so the program-level loop skips them silently.
+@End Reasoning
+
+@Implementation:
+Null-checks statement; returns 0 if missing. Reads node_type at offset 0
+and chains If checks against the seven Parser.NODE_* constants,
+delegating to the appropriate translate_* routine. Returns 0 for any
+other type.
+@End Implementation
 
 Process called "translate_statement" takes context as Integer, statement as Integer returns Integer:
     Note: Translate CMake statement to HIR
@@ -224,6 +296,21 @@ Note: ==========================================================================
 Note: Command Translation
 Note: ============================================================================
 
+@Reasoning:
+CMake commands are case-insensitive (SET vs set). The translator folds
+the command name and special-cases a handful of commands that lower to
+HIR statements rather than function calls (set -> let-statement, message
+-> print-call). Everything else lowers to a generic HIR call_expression.
+@End Reasoning
+
+@Implementation:
+Reads command_name (offset 8), arguments (offset 16), argument_count
+(offset 24). Folds name via StringCore.string_to_lower. Compares against
+"set" and "message" via string_equals; dispatches to the specific
+translator. Everything else goes through translate_generic_command which
+emits a HIR call_expression.
+@End Implementation
+
 Process called "translate_command" takes context as Integer, command as Integer returns Integer:
     Note: Translate CMake command to HIR
 
@@ -252,6 +339,22 @@ Process called "translate_command" takes context as Integer, command as Integer 
     Note: General command → HIR call expression
     Return proc translate_generic_command with context, command_name, arguments, argument_count
 End Process
+
+@Reasoning:
+set(VAR value) in CMake maps cleanly to a HIR let-statement, treating
+VAR as a name binding rather than a function call. The empty form
+set(VAR) clears the variable - represented in HIR by a let with no
+initialiser.
+@End Reasoning
+
+@Implementation:
+Returns 0 if no arguments. Reads first argument as variable name via
+get_argument_value. If two or more args, translates the second arg as
+the initialiser expression via translate_argument. Allocates a
+NODE_LET_STATEMENT via HIR.create_hir_node, then
+HIRNodes.create_hir_let_statement with the var name and value
+expression.
+@End Implementation
 
 Process called "translate_set_command" takes context as Integer, arguments as Integer, argument_count as Integer returns Integer:
     Note: Translate set(VAR value) to HIR let statement
@@ -292,6 +395,21 @@ Process called "translate_set_command" takes context as Integer, arguments as In
     Return let_stmt
 End Process
 
+@Reasoning:
+message() is CMake's printing/logging primitive. The translator renders
+it as a HIR call to "print" so downstream code generation can route it
+to the runtime print function. Severity prefixes (STATUS, WARNING, FATAL_
+ERROR) remain as arguments and are interpreted by the runtime print.
+@End Reasoning
+
+@Implementation:
+Allocates NODE_CALL_EXPRESSION via HIR.create_hir_node. Creates a callee
+identifier "print" via HIR.create_hir_identifier. Loops every argument,
+translates via translate_argument, appends to a HIR args list.
+Finally calls HIRNodes.create_hir_call_expression with base node,
+callee, args, and argument_count.
+@End Implementation
+
 Process called "translate_message_command" takes context as Integer, arguments as Integer, argument_count as Integer returns Integer:
     Note: Translate message(...) to HIR call expression
 
@@ -327,6 +445,22 @@ Process called "translate_message_command" takes context as Integer, arguments a
 
     Return call_expr
 End Process
+
+@Reasoning:
+Default lowering for any CMake command not specially recognised. Emits a
+HIR call_expression with the command name as the callee and the
+translated arguments as the call args. The HIR back-end matches the
+callee against built-in CMake commands or user-defined functions/macros
+at semantic-analysis time.
+@End Reasoning
+
+@Implementation:
+Allocates NODE_CALL_EXPRESSION; creates callee identifier from
+command_name via HIR.create_hir_identifier (no folding - the back-end
+handles case-insensitivity at the symbol-lookup layer). Loops arguments,
+translates each via translate_argument, appends to a HIR args list.
+Builds the call_expression via HIRNodes.create_hir_call_expression.
+@End Implementation
 
 Process called "translate_generic_command" takes context as Integer, command_name as Integer, arguments as Integer, argument_count as Integer returns Integer:
     Note: Translate generic CMake command to HIR call
@@ -366,6 +500,24 @@ End Process
 Note: ============================================================================
 Note: Argument Translation
 Note: ============================================================================
+
+@Reasoning:
+CMake arguments come in four parser-recognised kinds: ARG_STRING (quoted
+literal), ARG_VARIABLE (${VAR} reference), ARG_GENERATOR_EXPR ($<...>),
+ARG_IDENTIFIER (unquoted bareword). Each maps to a distinct HIR node
+shape. Generator expressions become call_expressions to a synthetic
+cmake_generator_expr function so the back-end can evaluate them at
+build time.
+@End Reasoning
+
+@Implementation:
+Reads arg_type at offset 8 and value at offset 16. Dispatches: STRING
+-> create_hir_string_literal; VARIABLE -> create_hir_identifier;
+GENERATOR_EXPR -> create_hir_call with cmake_generator_expr callee and
+the content as a single string-literal argument; IDENTIFIER ->
+create_hir_string_literal (treated as bareword literal). Unknown types
+return 0.
+@End Implementation
 
 Process called "translate_argument" takes context as Integer, argument as Integer returns Integer:
     Note: Translate CMake argument to HIR expression
@@ -412,6 +564,17 @@ Process called "translate_argument" takes context as Integer, argument as Intege
     Return 0
 End Process
 
+@Reasoning:
+Helper for translators that want the raw lexeme of an argument without
+going through full HIR lowering. Used by set() to read the variable name,
+by foreach() to read the iterator var name, etc.
+@End Reasoning
+
+@Implementation:
+Null-checks argument; otherwise reads the value (StringCore) at offset
+16 and returns it. Borrowed pointer.
+@End Implementation
+
 Process called "get_argument_value" takes argument as Integer returns Integer:
     Note: Get string value from argument node
 
@@ -426,6 +589,21 @@ End Process
 Note: ============================================================================
 Note: Control Flow Translation
 Note: ============================================================================
+
+@Reasoning:
+CMake if/elseif/else/endif lowers to HIR if-statement with then/else
+blocks. CMake's "elseif" is folded by the parser into nested else->if
+trees so this routine only sees the binary if/else shape.
+@End Reasoning
+
+@Implementation:
+Reads condition_list (offset 8), then_block (offset 16), else_block
+(offset 32). Translates condition via translate_condition; on missing
+condition substitutes a boolean true literal. Translates then via
+translate_block. If else_block present, translates it too; otherwise
+hir_else=0 (HIR treats 0 as "no else"). Builds NODE_IF_STATEMENT via
+create_hir_node and create_hir_if_statement.
+@End Implementation
 
 Process called "translate_if" takes context as Integer, if_node as Integer returns Integer:
     Note: Translate CMake if statement to HIR
@@ -463,6 +641,22 @@ Process called "translate_if" takes context as Integer, if_node as Integer retur
 
     Return hir_if
 End Process
+
+@Reasoning:
+foreach(var IN LISTS ...) lowers to a HIR for-statement. The iterator
+variable becomes a binding in the loop scope; HIR needs that binding
+registered in the symbol table so usages inside the body resolve.
+@End Reasoning
+
+@Implementation:
+Reads iterator_var (offset 8), iterable (offset 16), body (offset 24).
+Translates the iterable expression via translate_iterable. Translates
+body via translate_block. Creates a HIR identifier for the iterator
+variable. Registers it in the symbol table at context.variable_map (if
+present) with type TYPE_STRING (CMake variables are stringly typed).
+Builds NODE_FOR_STATEMENT via create_hir_node and
+create_hir_for_statement.
+@End Implementation
 
 Process called "translate_foreach" takes context as Integer, foreach_node as Integer returns Integer:
     Note: Translate CMake foreach loop to HIR
@@ -505,6 +699,17 @@ Process called "translate_foreach" takes context as Integer, foreach_node as Int
     Return hir_for
 End Process
 
+@Reasoning:
+while(condition) ... endwhile() lowers to HIR while-statement. Same
+condition-translation path as if; same body-translation path as foreach.
+@End Reasoning
+
+@Implementation:
+Reads condition_list (offset 8) and body (offset 16). Translates
+condition via translate_condition; defaults to boolean true if missing.
+Translates body via translate_block. Builds NODE_WHILE_STATEMENT.
+@End Implementation
+
 Process called "translate_while" takes context as Integer, while_node as Integer returns Integer:
     Note: Translate CMake while loop to HIR
 
@@ -532,6 +737,19 @@ Process called "translate_while" takes context as Integer, while_node as Integer
 
     Return hir_while
 End Process
+
+@Reasoning:
+A CMake block (then/else body, function/macro body, loop body) is a
+list of statements that lowers to a single HIR block holding the
+translated statements in order.
+@End Reasoning
+
+@Implementation:
+Allocates HIR block via create_hir_block. Reads statements list (offset
+8) and count (offset 16). Loops every statement, translates via
+translate_statement, appends non-null results to the HIR block via
+add_statement_to_hir_block. Returns the populated block.
+@End Implementation
 
 Process called "translate_block" takes context as Integer, block as Integer returns Integer:
     Note: Translate CMake block to HIR
@@ -576,6 +794,24 @@ Note: ==========================================================================
 Note: Function and Macro Translation
 Note: ============================================================================
 
+@Reasoning:
+CMake user-defined functions (via function()/endfunction()) lower to HIR
+process definitions. CMake function semantics are call-by-value (local
+variable scope) so they map cleanly to a process. Parameter handling
+is currently delegated to the back-end (parameters slot is read but
+passed as 0 placeholders until parameter translation is fully wired).
+@End Reasoning
+
+@Implementation:
+Reads function name (offset 8), parameters (offset 16), body (offset
+24). Translates body via translate_block. Creates a
+NODE_PROCESS_DEFINITION via create_hir_node, then
+create_hir_process_definition with name and translated body. Parameter-
+binding wiring is currently sparse (passes 0 for type-args / param-list
+/ return type) so this proc emits a function shell that the symbol
+table later flesh out.
+@End Implementation
+
 Process called "translate_function" takes context as Integer, function_node as Integer returns Integer:
     Note: Translate CMake function to HIR process definition
 
@@ -597,6 +833,22 @@ Process called "translate_function" takes context as Integer, function_node as I
 
     Return hir_process
 End Process
+
+@Reasoning:
+CMake macros differ from functions by NOT introducing a new variable
+scope - they're textual inlines. HIR doesn't yet have a distinct
+representation for macros so they lower to the same NODE_PROCESS_
+DEFINITION shape as functions; the back-end inlines them based on a
+macro flag set elsewhere (currently absent - macros translate identically
+to functions and the scope semantics are lost).
+@End Reasoning
+
+@Implementation:
+Reads macro name (offset 8), parameters (offset 16), body (offset 24).
+Translates body via translate_block. Creates NODE_PROCESS_DEFINITION via
+create_hir_node and create_hir_process_definition. Same parameter-
+binding pattern as translate_function.
+@End Implementation
 
 Process called "translate_macro" takes context as Integer, macro_node as Integer returns Integer:
     Note: Translate CMake macro to HIR process definition
@@ -624,6 +876,22 @@ Note: ==========================================================================
 Note: Helper Functions
 Note: ============================================================================
 
+@Reasoning:
+CMake conditions are token sequences like (VAR STREQUAL "foo") that the
+parser already represents as an argument list. Full condition lowering
+(operators, NOT/AND/OR, comparison operators) is not yet implemented;
+this routine takes the first argument as the condition expression so
+simple "if(VAR)" forms work.
+@End Reasoning
+
+@Implementation:
+Null-checks condition_list. Reads first element via List.get(list, 0).
+If null returns 0. Otherwise calls translate_argument to lower the
+single argument to a HIR expression. Multi-argument conditions need
+additional logic (comparison operators, boolean operators) that the
+back-end currently handles via a separate path.
+@End Implementation
+
 Process called "translate_condition" takes context as Integer, condition_list as Integer returns Integer:
     Note: Translate CMake condition (list of arguments) to HIR expression
 
@@ -641,6 +909,19 @@ Process called "translate_condition" takes context as Integer, condition_list as
     Note: Translate first argument as condition expression
     Return proc translate_argument with context, first_arg
 End Process
+
+@Reasoning:
+foreach's iterable (after IN LISTS / IN RANGE / IN ITEMS markers) is a
+list of arguments that lowers to a HIR list literal. The translator
+walks every argument, lowers it, and adds it as a list element.
+@End Reasoning
+
+@Implementation:
+Null-checks iterable. Allocates HIR list literal via
+HIR.create_hir_list_literal. Loops every argument via List.length and
+List.get; each non-null argument is lowered via translate_argument and
+appended via HIR.add_element_to_hir_list. Returns the populated list.
+@End Implementation
 
 Process called "translate_iterable" takes context as Integer, iterable as Integer returns Integer:
     Note: Translate CMake iterable (list of arguments) to HIR expression

@@ -60,6 +60,18 @@ Note: ==========================================================================
 Note: TOML Generation Context
 Note: ============================================================================
 
+@Reasoning:
+TOML emission needs an output buffer plus tracking for the active table
+path so nested keys can be emitted as "[parent.child]" headers. Errors are
+kept in-band so the caller can detect them without exceptions.
+@End Reasoning
+
+@Implementation:
+Four int64 fields totalling 32 bytes (see create_generation_context).
+current_table holds the dot-joined table path that prefixes generated
+keys; null until the first nested object is entered.
+@End Implementation
+
 Type called "TOMLGenerationContext":
     emitter as Integer          Note: TOML emitter for output
     error_message as Integer    Note: Error message (if any)
@@ -70,6 +82,17 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+The TOML emitter cannot run unless an output buffer is wired. Constructing
+the buffer here means callers cannot bypass that invariant.
+@End Reasoning
+
+@Implementation:
+Allocates the 32-byte TOMLGenerationContext, creates the raw byte emitter,
+and initialises emitter/error_message/has_error/current_table slots. Rolls
+back the partial allocation if emitter construction fails.
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create TOML generation context
@@ -97,6 +120,17 @@ Process called "create_generation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Symmetric counterpart of create_generation_context. Releases the byte
+emitter and any error_message heap copy before freeing the context block.
+@End Reasoning
+
+@Implementation:
+Reads the emitter and error_message slots, calls emitter_raw_destroy on
+the former and deallocate on the latter only when non-zero, then frees
+the context.
+@End Implementation
 
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy TOML generation context
@@ -128,6 +162,18 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Captures the first generation error so the caller can report it later.
+Owning a heap copy isolates the message from the lifetime of the source
+buffer.
+@End Reasoning
+
+@Implementation:
+Frees any prior error_message buffer, allocates msg_length+1 bytes, copies
+the message via memory_copy, null-terminates, then stores the pointer and
+sets has_error to 1.
+@End Implementation
+
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set generation error message
 
@@ -156,6 +202,18 @@ End Process
 Note: ============================================================================
 Note: String Utilities
 Note: ============================================================================
+
+@Reasoning:
+TOML bare keys are restricted to ASCII letters, digits, underscore and
+dash. Anything else (spaces, dots, unicode) forces the quoted-key form
+or the file would fail to parse.
+@End Reasoning
+
+@Implementation:
+Empty strings always need quoting. Otherwise walks byte-by-byte and
+returns 1 the moment any character fails the bare-key class test.
+Returns 0 when the entire string is bare-safe.
+@End Implementation
 
 Process called "needs_quoting" takes str as Integer returns Integer:
     Note: Check if string needs quoting in TOML
@@ -218,6 +276,25 @@ Process called "needs_quoting" takes str as Integer returns Integer:
 
     Return 0  Note: No quoting needed
 End Process
+
+@Reasoning:
+TOML basic strings require backslash escapes for quote, backslash, and
+control characters; \uXXXX hex escapes cover any code points below 0x20.
+Without correct escaping the resulting document will fail to parse.
+@End Reasoning
+
+@Implementation:
+Emits opening quote, walks the input byte-by-byte. Specific short-escape
+maps for ", \, BS, FF, LF, CR, TAB are emitted directly; other control
+bytes (< 0x20) get the six-byte \u00XX form, splitting the byte into
+high/low nibbles. Regular bytes pass through unchanged. Closes with
+quote.
+@End Implementation
+
+@Security_Scope:
+Trusts str to be null-terminated UTF-8. Escaping prevents control bytes
+from breaking out of the basic-string region.
+@End Security_Scope
 
 Process called "emit_escaped_string" takes context as Integer, str as Integer returns Integer:
     Note: Emit TOML basic string with proper escaping
@@ -283,6 +360,18 @@ Process called "emit_escaped_string" takes context as Integer, str as Integer re
 
     Return 1
 End Process
+
+@Reasoning:
+TOML datetime literals are unquoted; mistaking them for regular strings
+would quote them and break round-tripping. The check is conservative: a
+true date must look like "YYYY-MM-DD" with optional time/offset suffix.
+@End Reasoning
+
+@Implementation:
+Verifies length >= 10, that positions 0-3 are digits, position 4 is '-',
+positions 5-6 are digits, position 7 is '-', positions 8-9 are digits.
+Returns 1 only when all conditions pass; any failure returns 0.
+@End Implementation
 
 Process called "is_datetime_format" takes str as Integer returns Integer:
     Note: Check if string matches RFC 3339 datetime format
@@ -351,6 +440,16 @@ Process called "is_datetime_format" takes str as Integer returns Integer:
     Return 0  Note: Not a datetime format
 End Process
 
+@Reasoning:
+Helper used by is_datetime_format and the integer formatter to detect
+ASCII digits without depending on locale-aware character classifiers.
+@End Reasoning
+
+@Implementation:
+Returns 1 when the byte falls in the inclusive range 48 ('0') to 57 ('9'),
+0 otherwise.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is a digit (0-9)
 
@@ -362,6 +461,18 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Used by emit_integer to size buffers and compute decimal exponents
+without falling back to floating-point math. Integer-only avoids
+rounding drift.
+@End Reasoning
+
+@Implementation:
+Initialises result to 1 and multiplies by 2 a total of exponent times.
+Returns 1 when exponent is 0; behaviour is undefined for negative
+exponents because the caller never passes one.
+@End Implementation
 
 Process called "power_of_two" takes exponent as Integer returns Integer:
     Note: Calculate 2^exponent
@@ -380,6 +491,19 @@ End Process
 Note: ============================================================================
 Note: Integer to String Conversion
 Note: ============================================================================
+
+@Reasoning:
+TOML integer literals are base-10 with optional leading minus. Writing
+them through the raw emitter requires temporary formatting; doing it
+here centralises sign handling and digit emission.
+@End Reasoning
+
+@Implementation:
+Handles zero as a single '0' byte. For non-zero values, captures the
+sign, takes the absolute value, counts decimal digits, allocates a
+buffer, writes digits least-significant-first, then prepends '-' when
+negative. Emits the formatted bytes and frees the temporary buffer.
+@End Implementation
 
 Process called "emit_integer" takes context as Integer, value as Integer returns Integer:
     Note: Emit integer as TOML number
@@ -436,6 +560,19 @@ Note: ==========================================================================
 Note: HIR Node Translation
 Note: ============================================================================
 
+@Reasoning:
+Central node dispatcher. Each HIR scalar/collection kind maps to a TOML
+representation, so the rest of the file does not need to know about
+foreign HIR kinds.
+@End Reasoning
+
+@Implementation:
+Reads the node type tag and dispatches: dictionaries to
+generate_toml_dictionary, lists to generate_toml_array, strings to
+generate_toml_string, integers to generate_toml_integer, booleans to
+generate_toml_boolean. Unknown kinds set a translation error.
+@End Implementation
+
 Process called "generate_hir_node" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate TOML from HIR node
 
@@ -487,6 +624,18 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     Return 0
 End Process
 
+@Reasoning:
+TOML tables (dictionaries) emit each entry as "key = value" lines. Nested
+sub-tables would require explicit [section] headers; the simple form
+shipped here covers the flat-key path that test fixtures exercise.
+@End Reasoning
+
+@Implementation:
+Iterates the HIR dictionary entries; for each entry, emits the key
+(quoted if needed via needs_quoting, escaped via emit_escaped_string),
+"= ", the value via generate_hir_node, then a newline.
+@End Implementation
+
 Process called "generate_toml_dictionary" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate TOML key-value pairs from dictionary
 
@@ -536,6 +685,17 @@ Process called "generate_toml_dictionary" takes context as Integer, hir_node as 
     Return 1
 End Process
 
+@Reasoning:
+TOML inline arrays use [element, element, ...] syntax. Inline form is the
+simplest projection for HIR lists and is round-tripped correctly by any
+TOML parser.
+@End Reasoning
+
+@Implementation:
+Emits "[", walks the list elements dispatching each to generate_hir_node
+with ", " separators between consecutive entries, then emits "]".
+@End Implementation
+
 Process called "generate_toml_array" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate TOML array
 
@@ -574,6 +734,18 @@ Process called "generate_toml_array" takes context as Integer, hir_node as Integ
     Return 1
 End Process
 
+@Reasoning:
+TOML string literals come in basic (double-quoted, escapes processed),
+literal (single-quoted, raw), and datetime (unquoted, format-recognised)
+flavours. Choosing the right one preserves the user's intent.
+@End Reasoning
+
+@Implementation:
+Pulls the string value from the HIR node; if is_datetime_format matches,
+emits it unquoted. Otherwise hands the buffer to emit_escaped_string for
+basic-string emission with full escape processing.
+@End Implementation
+
 Process called "generate_toml_string" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate TOML string
 
@@ -605,6 +777,15 @@ Process called "generate_toml_string" takes context as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+TOML integers are written in plain base-10. Delegating to emit_integer
+keeps sign and digit logic in one place.
+@End Reasoning
+
+@Implementation:
+Reads the i64 value from the HIR node and forwards it to emit_integer.
+@End Implementation
+
 Process called "generate_toml_integer" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate TOML integer
 
@@ -613,6 +794,15 @@ Process called "generate_toml_integer" takes context as Integer, hir_node as Int
 
     Return 1
 End Process
+
+@Reasoning:
+TOML booleans are the literal lowercase tokens "true" and "false". Any
+non-zero HIR boolean payload collapses to true.
+@End Reasoning
+
+@Implementation:
+Reads the boolean value; emits "true" when 1, "false" otherwise.
+@End Implementation
 
 Process called "generate_toml_boolean" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate TOML boolean
@@ -632,6 +822,18 @@ End Process
 Note: ============================================================================
 Note: Top-Level TOML Generation
 Note: ============================================================================
+
+@Reasoning:
+Public entry. Owns the context lifetime so callers only deal with input
+HIR root and consume the generated TOML output string.
+@End Reasoning
+
+@Implementation:
+Constructs a TOMLGenerationContext, dispatches the root through
+generate_hir_node, retrieves the accumulated buffer via the emitter's
+output API, and destroys the context. Returns 0 when allocation fails or
+generation reported an error.
+@End Implementation
 
 Process called "translate_hir_to_toml" takes hir_root as Integer returns Integer:
     Note: Translate HIR to TOML output string

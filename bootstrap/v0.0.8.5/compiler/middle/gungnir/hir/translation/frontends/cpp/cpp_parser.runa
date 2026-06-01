@@ -124,6 +124,23 @@ Note: ==========================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+A single AST node type covers expressions, statements, declarations, and
+type specifiers because C++ uses many of the same operators across all four
+families (e.g. ::, ->, .). node_type disambiguates the role; name/value/
+type_info/children/attributes/template_params are populated selectively.
+line/column come straight from the lexer so diagnostics can quote source.
+@End Reasoning
+
+@Implementation:
+72-byte record (9 x i64) at offsets 0..64: node_type (CPP_* constant), name
+(StringCore identifier or 0), value (StringCore literal/operator or 0),
+type_info (CppASTNode* of declared type or 0), children (List of CppASTNode*
+or 0 for leaves), attributes (packed bitfield: access level, virtual,
+static, const), template_params (List of CppASTNode* for template-typed
+nodes), line, column.
+@End Implementation
+
 Type called "CppASTNode":
     node_type as Integer       Note: Node type constant
     name as Integer           Note: Name/identifier (if applicable)
@@ -139,6 +156,24 @@ End Type
 Note: ============================================================================
 Note: Parser State
 Note: ============================================================================
+
+@Reasoning:
+C++ parsing is context-sensitive: foo<int>::bar means template-id only when
+foo is a template, otherwise the < is a less-than. current_class is needed
+for access-control checks during member parsing, template_depth disambiguates
+nested templates and rules out angle-bracket parsing of "<<" as shift.
+error_message + has_error provide sticky first-error reporting consistent
+with the semantic analyzer.
+@End Reasoning
+
+@Implementation:
+48-byte record (6 x i64) at offsets 0..40: lexer (CppLexer handle),
+current_token (token type integer, refreshed on advance_token),
+error_message (owned StringCore or 0), has_error (sticky 0/1),
+current_class (CppASTNode* of enclosing class declaration or 0),
+template_depth (count incremented when entering '<' template arg list,
+decremented on '>').
+@End Implementation
 
 Type called "CppParser":
     lexer as Integer          Note: C++ lexer
@@ -216,6 +251,21 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Centralised AST node allocator so every parser path produces nodes with the
+same zero-initialised slot layout; this lets later passes assume "0 ==
+unset" for every slot without per-call resets. Allocation failure returns 0
+(parent should propagate fatal).
+@End Reasoning
+
+@Implementation:
+Allocates a 72-byte block, writes node_type at offset 0, zeroes the
+remaining eight slots (name, value, type_info, children, attributes,
+template_params, line, column). Caller is expected to populate line/column
+from the lexer immediately after creation; child lists are created lazily
+in add_child_to_cpp_ast_node.
+@End Implementation
+
 Process called "create_cpp_ast_node" takes node_type as Integer returns Integer:
     Note: Create C++ AST node of given type
 
@@ -238,6 +288,19 @@ Process called "create_cpp_ast_node" takes node_type as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Children list is created lazily: nodes that never gain children (most
+leaves, all literals, plain identifiers) never pay for an empty List.
+Allocates the List only when the first child is added.
+@End Reasoning
+
+@Implementation:
+Null-checks both parent and child (the parser may construct nodes after a
+recoverable error). Reads children slot at offset 32; if 0, allocates a
+fresh List via create and stores it. Then pushes child onto the list.
+Ownership of child transfers to parent's children list.
+@End Implementation
 
 Process called "add_child_to_cpp_ast_node" takes parent as Integer, child as Integer:
     Note: Add child node to parent's children list
@@ -264,6 +327,19 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Single-token-of-lookahead is the canonical parser cursor advance. Caches the
+next token type in the parser at offset 8 so peek_token_type is O(1) without
+re-invoking the lexer. The lexer itself maintains lexeme/line/column for
+the current position; this proc only pulls the integer type.
+@End Reasoning
+
+@Implementation:
+Loads lexer handle from offset 0, calls Lexer.next_token to refresh state
+and obtain the next token-type integer, stores it back at offset 8. The
+previous token's lexeme is implicitly discarded by the lexer cursor.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer:
     Note: Advance to next token
 
@@ -272,11 +348,33 @@ Process called "advance_token" takes parser as Integer:
     proc memory_set_int64 from Layout with parser, 8, next_token
 End Process
 
+@Reasoning:
+Read-only accessor for the current lookahead token-type so recursive-descent
+predicates can branch without side effects on the cursor.
+@End Reasoning
+
+@Implementation:
+Single memory_get_int64 from offset 8. Constant-time, no allocation.
+@End Implementation
+
 Process called "peek_token_type" takes parser as Integer returns Integer:
     Note: Get current token type without advancing
 
     Return proc memory_get_int64 from Layout with parser, 8
 End Process
+
+@Reasoning:
+The token type is cached on the parser but the lexeme text lives on the
+lexer. Identifier/literal parses need the raw text to attach to AST nodes;
+this proc bridges to the lexer's current_lexeme accessor without affecting
+the lookahead state.
+@End Reasoning
+
+@Implementation:
+Reads lexer handle from offset 0 and delegates to Lexer.current_lexeme.
+Returns a BORROWED pointer into the lexer's internal storage; AST nodes
+that want to keep the string must copy it via StringCore.
+@End Implementation
 
 Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Note: Get current token lexeme without advancing
@@ -284,6 +382,19 @@ Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Let lexer be proc memory_get_int64 from Layout with parser, 0
     Return proc current_lexeme from Lexer with lexer
 End Process
+
+@Reasoning:
+Canonical "match-or-error" combinator used throughout the recursive-descent
+parser. Advancing only on match keeps the cursor positioned at the offending
+token when an error fires, letting the error recovery layer attempt
+synchronisation on the right context.
+@End Reasoning
+
+@Implementation:
+Compares peek_token_type against expected. Match: advances. Mismatch: calls
+set_parse_error with the supplied message; the parser flips has_error=1
+sticky and recovery may pick up the broken cursor downstream.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected as Integer, message as Integer:
     Note: Expect specific token type or set error
@@ -711,11 +822,33 @@ Process called "set_parse_error" takes parser as Integer, message as Integer:
     proc memory_set_int64 from Layout with parser, 16, error_copy
 End Process
 
+@Reasoning:
+Sticky-flag accessor consumed by every parser combinator that branches on
+success/failure. Returning the raw 0/1 lets callers also use it as a boolean
+guard without an extra is_equal check.
+@End Reasoning
+
+@Implementation:
+Direct read of the has_error slot at offset 24. Constant-time.
+@End Implementation
+
 Process called "has_parse_error" takes parser as Integer returns Integer:
     Note: Check if parser has encountered an error
 
     Return proc memory_get_int64 from Layout with parser, 24
 End Process
+
+@Reasoning:
+Names are user-controlled identifier text and are needed by every later
+pass; the parser owns its own copy so the lexer's lexeme buffer can be
+recycled. Defensive null-check on the node lets callers stay terse.
+@End Reasoning
+
+@Implementation:
+Null-checks node; otherwise copies the name StringCore via StringCore.copy_string
+and stores the new handle at offset 8. The owning AST node frees the copy
+when destroyed.
+@End Implementation
 
 Process called "set_cpp_ast_node_name" takes node as Integer, name as Integer:
     Note: Set AST node name
@@ -728,6 +861,19 @@ Process called "set_cpp_ast_node_name" takes node as Integer, name as Integer:
     proc memory_set_int64 from Layout with node, 8, name_copy
 End Process
 
+@Reasoning:
+The value slot holds operator strings ("+", "++", "->"), literal text, or
+embedded auxiliary handles. Unlike name, value is stored BORROWED because
+operator tokens are constant strings and literal text already lives on an
+already-copied StringCore by the time the parser sets it.
+@End Reasoning
+
+@Implementation:
+Null-checks node and writes value handle at offset 16 verbatim. Caller is
+responsible for ensuring value outlives the node, or for passing a freshly
+copied StringCore.
+@End Implementation
+
 Process called "set_cpp_ast_node_value" takes node as Integer, value as Integer:
     Note: Set AST node value
 
@@ -737,6 +883,18 @@ Process called "set_cpp_ast_node_value" takes node as Integer, value as Integer:
 
     proc memory_set_int64 from Layout with node, 16, value
 End Process
+
+@Reasoning:
+C++ class members are private/protected/public; the parser stamps the level
+on each declaration so the semantic layer can enforce access rules without
+re-walking back to the class scope.
+@End Reasoning
+
+@Implementation:
+Writes the access constant (ACCESS_PRIVATE/PROTECTED/PUBLIC from cpp_semantic)
+into the attributes slot at offset 40. This slot is repurposed across node
+kinds; the semantic layer interprets it according to node_type.
+@End Implementation
 
 Process called "set_cpp_ast_node_access_level" takes node as Integer, access as Integer:
     Note: Set access level for class member
@@ -749,6 +907,18 @@ Process called "set_cpp_ast_node_access_level" takes node as Integer, access as 
     proc memory_set_int64 from Layout with node, 40, access
 End Process
 
+@Reasoning:
+Template parameter lists are parsed eagerly and attached to the template-
+declaration node so HIR emission can specialise the template body against
+those parameters at instantiation time.
+@End Reasoning
+
+@Implementation:
+Null-checks node and writes the parameter-list handle (a List of CppASTNode*
+returned by parse_template_parameters) at offset 48. List ownership
+transfers to the node.
+@End Implementation
+
 Process called "set_cpp_ast_node_template_params" takes node as Integer, params as Integer:
     Note: Set template parameters for node
 
@@ -758,6 +928,16 @@ Process called "set_cpp_ast_node_template_params" takes node as Integer, params 
 
     proc memory_set_int64 from Layout with node, 48, params
 End Process
+
+@Reasoning:
+Read-only accessor for the node's owned name copy; returns 0 for null nodes
+so visitor passes can chain accesses without null-checking the node first.
+@End Reasoning
+
+@Implementation:
+Null-check on node; otherwise returns the StringCore handle at offset 8.
+Borrowed pointer - caller must not free.
+@End Implementation
 
 Process called "get_cpp_ast_node_name" takes node as Integer returns Integer:
     Note: Get AST node name

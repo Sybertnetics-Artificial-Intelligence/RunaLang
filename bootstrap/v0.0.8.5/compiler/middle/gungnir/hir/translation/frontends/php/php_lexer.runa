@@ -174,6 +174,12 @@ Note: ===================================================================
 Note: TOKEN STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+Token record: a TOKEN_* type tag, polymorphic value slot (String for
+identifiers, variables, numbers, strings; integer 0 for keyword/operator
+tokens that need no payload), and 1-based source line/column for
+diagnostic emission.
+@End Reasoning
 Type called "Token":
     token_type as Integer
     value as Integer
@@ -185,6 +191,12 @@ Note: ===================================================================
 Note: LEXER STATE
 Note: ===================================================================
 
+@Reasoning:
+Lexer state with source pointer, byte cursor, 1-based line/column
+diagnostics, cached source length, and the accumulating tokens list.
+length is cached so the inner-loop has_more check is one int64 compare
+instead of a string_length call per byte.
+@End Reasoning
 Type called "Lexer":
     source as Integer
     position as Integer
@@ -198,12 +210,23 @@ Note: ===================================================================
 Note: MAIN LEXER ENTRY POINTS
 Note: ===================================================================
 
+@Reasoning:
+Public one-shot lex driver: constructs a lexer, runs tokenization to
+completion, and returns the resulting token list. Owns the lexer
+lifetime — the lexer struct itself is discarded; only the token list
+escapes.
+@End Reasoning
 Process called "lex_php_source" takes source as Integer returns Integer:
     Let lexer be proc create_lexer from source
     proc tokenize from lexer
     Return lexer.tokens
 End Process
 
+@Reasoning:
+Constructs an empty lexer at the document start (position=0, line=1,
+col=1) with source_length pre-computed and an empty tokens list ready
+for accumulation.
+@End Reasoning
 Process called "create_lexer" takes source as Integer returns Integer:
     Let lexer be a value of type Lexer with
         source as source,
@@ -220,6 +243,13 @@ Note: ===================================================================
 Note: TOKENIZATION
 Note: ===================================================================
 
+@Reasoning:
+Outer tokenization loop. Skips whitespace then attempts to scan one
+token. Defensive forward-progress check: if scan_token did not advance
+the cursor (could happen on a malformed input byte), force a one-byte
+advance to break out of an otherwise infinite loop. EOF token is
+unconditionally appended so the parser can detect end-of-input cleanly.
+@End Reasoning
 Process called "tokenize" takes lexer as Integer:
     While proc has_more from lexer:
         proc skip_whitespace from lexer
@@ -239,9 +269,17 @@ Process called "tokenize" takes lexer as Integer:
     proc add_token with lexer, TOKEN_EOF, ""
 End Process
 
+@Reasoning:
+Per-token dispatch: routes on the leading character. '<' triggers PHP
+open-tag detection; '$' starts a variable; letters start identifier/
+keyword scanning; digits start number scanning; '/' or '#' may start a
+comment (line "//", block "/*", or hash "#"); single/double quotes
+trigger string scanning; anything else falls through to scan_operator
+which handles all single- and multi-byte operator tokens.
+@End Reasoning
 Process called "scan_token" takes lexer as Integer:
     Let char be proc peek_char from lexer
-    
+
     Note: PHP opening tag
     If char is equal to 60:
         Note: '<'
@@ -311,6 +349,12 @@ Note: ===================================================================
 Note: PHP TAG SCANNING
 Note: ===================================================================
 
+@Reasoning:
+Recognizes PHP's two open-tag forms: "<?php" (full) and "<?" (short).
+Both emit TOKEN_PHP_OPEN; the "php" suffix is consumed when present so
+the next token starts immediately after it. The parser does not need to
+distinguish the two forms downstream.
+@End Reasoning
 Process called "scan_php_tag" takes lexer as Integer:
     Note: Check for <?php or <?
     Let char be proc peek_char from lexer
@@ -348,6 +392,12 @@ Note: ===================================================================
 Note: VARIABLE SCANNING
 Note: ===================================================================
 
+@Reasoning:
+PHP variable scanner. Captures "$name" where name starts with a letter
+or underscore followed by letters/digits/underscores. The leading "$" is
+included in the lexeme (PHP convention) so the parser can distinguish
+variables from identifiers without re-prefixing.
+@End Reasoning
 Process called "scan_variable" takes lexer as Integer:
     Let start be lexer.position
     proc advance from lexer
@@ -382,6 +432,14 @@ Note: ===================================================================
 Note: IDENTIFIER AND KEYWORD SCANNING
 Note: ===================================================================
 
+@Reasoning:
+Identifier scanner with embedded keyword detection. Walks letters/digits/
+underscores starting from a letter (the dispatch caller confirmed
+char-class), then routes the captured substring through get_keyword_type.
+If the result is non-zero (it is a keyword), emits with the keyword's
+type tag; otherwise emits as TOKEN_IDENTIFIER. PHP keywords are
+case-insensitive, handled inside get_keyword_type.
+@End Reasoning
 Process called "scan_identifier" takes lexer as Integer:
     Let start be lexer.position
     
@@ -411,6 +469,16 @@ Process called "scan_identifier" takes lexer as Integer:
     proc add_token with lexer, token_type, word
 End Process
 
+@Reasoning:
+Case-insensitive keyword lookup. Lowercases the input then performs
+linear string-equality dispatch across all PHP 7+ keywords
+(abstract..yield), the PHP type keywords (int, float, string-type,
+bool, void, mixed, object, iterable), and the three literal constants
+(null, true, false). Returns the matched TOKEN_* constant or 0 for
+"this word is a user-defined identifier". Linear scan is O(k) per
+lookup where k is the keyword count (~70); a hash table would be
+faster but adds complexity not justified by lexer hot-path profiling.
+@End Reasoning
 Process called "get_keyword_type" takes word as Integer returns Integer:
     Note: Convert to lowercase for case-insensitive matching
     Let lower be proc string_to_lower from StringCore with word
@@ -815,6 +883,13 @@ Note: ===================================================================
 Note: NUMBER SCANNING
 Note: ===================================================================
 
+@Reasoning:
+PHP numeric literal scanner. Captures digit runs, optional decimal point
+plus fractional digits, and optional "[eE][+-]?digits" exponent. Hex,
+octal, and binary literal prefix detection is intentionally simplified
+to share the digit-run code path — PHP's prefix handling lives downstream
+since correct decoding requires parser-level context.
+@End Reasoning
 Process called "scan_number" takes lexer as Integer:
     Let start be lexer.position
     
@@ -858,6 +933,12 @@ Note: ===================================================================
 Note: STRING SCANNING
 Note: ===================================================================
 
+@Reasoning:
+PHP single-quoted string scanner. Single-quoted strings in PHP do NOT
+interpolate variables and only recognize two escape sequences: \\\\ and
+\\'. Everything else (including the literal backslash) is preserved as-is,
+matching PHP's documented single-quote string semantics.
+@End Reasoning
 Process called "scan_single_quoted_string" takes lexer as Integer:
     Let start be lexer.position
     proc advance from lexer
@@ -889,6 +970,13 @@ Process called "scan_single_quoted_string" takes lexer as Integer:
     proc add_token with lexer, TOKEN_STRING, value
 End Process
 
+@Reasoning:
+PHP double-quoted string scanner. Double-quoted strings perform variable
+interpolation and recognize the full set of PHP escape sequences (\n, \t,
+\r, \\, \", \$, \0..\7, \x.., \u{}). The lexer captures the raw source
+slice including interpolation markers; variable expansion is performed
+during HIR translation, not here.
+@End Reasoning
 Process called "scan_double_quoted_string" takes lexer as Integer:
     Let start be lexer.position
     proc advance from lexer
@@ -924,6 +1012,15 @@ Note: ===================================================================
 Note: OPERATOR SCANNING
 Note: ===================================================================
 
+@Reasoning:
+Single dispatching routine for all PHP operators, delimiters, and
+punctuation. Handles multi-character forms via lookahead before
+committing to a token (e.g. "===" requires checking two bytes ahead;
+"<=>" requires two; "?->", "??", "??=", "=>", "->", "&&", "||", "<<",
+">>", "<<=", ">>=", "**", "**=" all require lookahead). Single-character
+tokens (parens, braces, commas, semicolons) emit when no multi-character
+prefix matches.
+@End Reasoning
 Process called "scan_operator" takes lexer as Integer:
     Let char be proc peek_char from lexer
     
@@ -1319,6 +1416,11 @@ Note: ===================================================================
 Note: COMMENT HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Consumes from the current position up to (but not including) the next
+LF or EOF. Used for both "//" and "#" PHP line comments — both behave
+identically once the leading marker is consumed by the caller.
+@End Reasoning
 Process called "skip_line_comment" takes lexer as Integer:
     Note: Skip until end of line
     While proc has_more from lexer:
@@ -1331,6 +1433,13 @@ Process called "skip_line_comment" takes lexer as Integer:
     End While
 End Process
 
+@Reasoning:
+Consumes "/* ... */" block comments, tracking embedded newlines so
+line/column diagnostics outside the comment remain accurate. Does not
+recognize nested block comments — PHP, like C, treats nested /*...*/
+as ending at the first "*/" which is the only PHP-spec-compliant
+behavior.
+@End Reasoning
 Process called "skip_block_comment" takes lexer as Integer:
     Note: Skip '/*'
     proc advance from lexer
@@ -1357,6 +1466,14 @@ Note: ===================================================================
 Note: WHITESPACE HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Skips spaces, tabs, carriage returns, and newlines. Updates line/column
+tracking on newline characters so subsequent token positions are
+accurate. Unlike some PHP lexer implementations that treat newlines as
+significant (for line-aware features), this lexer collapses them into
+the whitespace stream because the parser does not require explicit
+newline tokens.
+@End Reasoning
 Process called "skip_whitespace" takes lexer as Integer:
     While proc has_more from lexer:
         Let char be proc peek_char from lexer
@@ -1391,6 +1508,13 @@ Note: ===================================================================
 Note: CHARACTER UTILITIES
 Note: ===================================================================
 
+@Reasoning:
+ASCII letter predicate (A..Z, a..z, plus '_' since identifiers and
+variables permit leading underscores). Multi-byte Unicode letters are
+deliberately rejected — PHP identifiers are ASCII-only per the language
+spec (with a deprecated Unicode extension that this lexer does not
+support).
+@End Reasoning
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic or underscore
     If char is greater than or equal to 65:
@@ -1413,6 +1537,10 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit predicate (0..9 = bytes 48..57). Used by scan_number and
+scan_identifier for the "letters followed by letters-or-digits" rule.
+@End Reasoning
 Process called "is_digit" takes char as Integer returns Integer:
     If char is greater than or equal to 48:
         If char is less than or equal to 57:
@@ -1426,6 +1554,11 @@ Note: ===================================================================
 Note: LEXER NAVIGATION
 Note: ===================================================================
 
+@Reasoning:
+"Not at EOF" predicate; returns 1 when position < length, 0 otherwise.
+The cached length is used so this check is one int64 compare on the
+hot path inside tokenize.
+@End Reasoning
 Process called "has_more" takes lexer as Integer returns Integer:
     If lexer.position is less than lexer.length:
         Return 1
@@ -1433,6 +1566,11 @@ Process called "has_more" takes lexer as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Non-mutating cursor read. Returns the byte at the current position or
+0 at EOF. The most heavily used primitive in the lexer — every token
+scanner starts with a peek_char dispatch.
+@End Reasoning
 Process called "peek_char" takes lexer as Integer returns Integer:
     If proc has_more from lexer:
         Return proc string_char_at from StringCore with lexer.source, lexer.position
@@ -1440,6 +1578,12 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Lookahead at position+offset. Required for multi-character operator
+detection ("==" vs "=", "===" vs "==", "<=>", "??=", "?->", etc.) where
+the lexer must check the second and sometimes third byte before
+committing to a tokenization path.
+@End Reasoning
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Let pos be lexer.position plus offset
     If pos is less than lexer.length:
@@ -1448,6 +1592,13 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns In
     Return 0
 End Process
 
+@Reasoning:
+Cursor advance by one byte. Note: line/column update logic is intentionally
+NOT in advance — it is performed by scan_identifier/scan_string/etc.
+when they need it. This keeps the inner-loop advance fast and lets the
+specialized scanners do the right thing for embedded newlines in
+strings vs newlines as token separators.
+@End Reasoning
 Process called "advance" takes lexer as Integer:
     If proc has_more from lexer:
         Set lexer.position to lexer.position plus 1
@@ -1455,6 +1606,12 @@ Process called "advance" takes lexer as Integer:
     End If
 End Process
 
+@Reasoning:
+Thin wrapper over StringCore.string_substring that takes (source, start,
+length) instead of (source, start, end). The wrapper exists because the
+lexer hot path always works in length terms (current_position minus
+token_start) and inlining the conversion would clutter every scanner.
+@End Reasoning
 Process called "substring" takes source as Integer, start as Integer, length as Integer returns Integer:
     Return proc string_substring from StringCore with source, start, length
 End Process
@@ -1463,6 +1620,13 @@ Note: ===================================================================
 Note: TOKEN MANAGEMENT
 Note: ===================================================================
 
+@Reasoning:
+Centralized token-emit helper. Constructs a Token with the supplied
+type/value plus the current line/column from the lexer and appends it
+to the tokens list. All scanners route through here so line/column
+capture is consistent and the field layout has a single point of
+change.
+@End Reasoning
 Process called "add_token" takes lexer as Integer, token_type as Integer, value as Integer:
     Let token be a value of type Token with
         token_type as token_type,
@@ -1477,22 +1641,43 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Alias entry point matching the naming convention used across other
+language frontends (cpp_lex, java_lex, etc.). Just calls lex_php_source.
+@End Reasoning
 Process called "php_lex" takes source as Integer returns Integer:
     Return proc lex_php_source from source
 End Process
 
+@Reasoning:
+Accessor for token.token_type so consumers do not depend on Token's
+field layout.
+@End Reasoning
 Process called "php_token_type" takes token as Integer returns Integer:
     Return token.token_type
 End Process
 
+@Reasoning:
+Accessor for token.value. Content-bearing tokens (identifier, variable,
+number, string) return the captured source slice; keyword/operator
+tokens return the empty/zero placeholder set at construction time.
+@End Reasoning
 Process called "php_token_value" takes token as Integer returns Integer:
     Return token.value
 End Process
 
+@Reasoning:
+Accessor for token.line — the 1-based source line of the token's start.
+Used by the parser to attach diagnostics to error sites.
+@End Reasoning
 Process called "php_token_line" takes token as Integer returns Integer:
     Return token.line
 End Process
 
+@Reasoning:
+Accessor for token.column — the 1-based source column of the token's
+start. Paired with php_token_line to form the full source coordinate.
+@End Reasoning
 Process called "php_token_column" takes token as Integer returns Integer:
     Return token.column
 End Process

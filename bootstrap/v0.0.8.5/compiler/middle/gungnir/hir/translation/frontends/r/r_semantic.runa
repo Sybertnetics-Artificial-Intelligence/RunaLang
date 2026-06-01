@@ -14,6 +14,14 @@ Note: - Formula syntax (y ~ x)
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HirNodes
 Import "compiler/middle/gungnir/hir/hir_builder.runa" as HirBuilder
 
+@Reasoning:
+Top-level state passed to every analyze_* routine. Holds the active environment chain, accumulated diagnostics, a type-inference memo cache, and registries for R's two object systems (S3 dispatch and S4 formal classes). Parent_context enables nested-context analysis when entering a function body without losing outer state.
+@End Reasoning
+
+@Implementation:
+Aggregate of environment chain (REnvironment linked list), parent_context for nested analysis, package list, current function name for diagnostics, separate error and warning lists, plus three dictionaries for type cache and S3/S4 class registries.
+@End Implementation
+
 Type called "RSemanticContext":
     current_environment as REnvironment
     parent_context as RSemanticContext
@@ -26,6 +34,14 @@ Type called "RSemanticContext":
     s4_classes as Dictionary[String, RS4ClassInfo]
 End Type
 
+@Reasoning:
+R's "environment" is a first-class scope object with both variable and function bindings. Environments form a parent chain that lookup_r_variable / lookup_r_function walk to model R's lexical scoping. The is_global flag short-circuits the global environment's distinct semantics for assign(), <<-, etc.
+@End Reasoning
+
+@Implementation:
+Two dictionaries (one for vars, one for funs) keyed by name. Parent_env is the enclosing scope (NULL at global). Name is a debug label.
+@End Implementation
+
 Type called "REnvironment":
     variables as Dictionary[String, RVariable]
     functions as Dictionary[String, RFunction]
@@ -33,6 +49,14 @@ Type called "REnvironment":
     name as String
     is_global as Boolean
 End Type
+
+@Reasoning:
+Symbol-table entry for a single binding. Tracks not just the inferred type but also lifetime markers (first_assignment_line/last_access_line) used by validate_variable_usage to flag write-only or unused bindings.
+@End Reasoning
+
+@Implementation:
+Six fields: name, inferred RType, is_constant flag (set for variables assigned with R's `<-` only once), scope tag (for diagnostics), and two source-line markers maintained by analyze_r_variable_declaration and analyze_r_assignment.
+@End Implementation
 
 Type called "RVariable":
     name as String
@@ -47,6 +71,14 @@ Note: Local R AST schema. The semantic analyzer expects an enriched node
 Note: type carrying language-specific fields; until v0.0.9.x rewires it to
 Note: the generic HIRNode + children traversal, this local type satisfies
 Note: the analyzer's field accesses.
+@Reasoning:
+Local AST schema specific to the R semantic analyzer. The leading prose Note already documents this exists because the v0.0.9.x rewire to the generic HIRNode + children traversal has not landed yet - this struct captures every field the analyzer accesses by name (function_name, package_name, predictors, response, etc.) so each analyze_* routine can extract its operands directly without children-array indexing.
+@End Reasoning
+
+@Implementation:
+Twenty-two pointer/integer fields covering every R-specific construct: statements/body/arguments/parameters (function and block), target/operator (assignment), accessor/access_type/dataframe (df$col, df[i, j]), package_name/is_require (library calls), interactions/predictors/response (formulas), and literal_type (numeric/string/logical).
+@End Implementation
+
 Type called "RASTNode":
     node_type as String
     name as Integer
@@ -72,6 +104,14 @@ Type called "RASTNode":
     literal_type as Integer
 End Type
 
+@Reasoning:
+Function-symbol table entry. Captures the parameter list (for arity and default detection) and the inferred return type. The two boolean method flags distinguish R's three function flavours: plain function, S3 generic dispatch target, S4 formal method.
+@End Reasoning
+
+@Implementation:
+Seven fields: name, parameter list, return RType, is_generic (S3 dispatch via UseMethod), is_s3_method (e.g. print.data.frame), is_s4_method (e.g. setMethod), and originating package.
+@End Implementation
+
 Type called "RFunction":
     name as String
     parameters as List[RParameter]
@@ -82,6 +122,14 @@ Type called "RFunction":
     package as String
 End Type
 
+@Reasoning:
+Single formal parameter. R allows defaults and variadic `...` so both have to be tracked: has_default is set when the parser saw `name=value`, is_variadic is set when the lexeme was `...`.
+@End Reasoning
+
+@Implementation:
+Five fields: name, inferred RType, has_default flag, raw default_value string (re-evaluated lazily per R semantics), and is_variadic for the dots parameter.
+@End Implementation
+
 Type called "RParameter":
     name as String
     type as RType
@@ -89,6 +137,14 @@ Type called "RParameter":
     default_value as String
     is_variadic as Boolean
 End Type
+
+@Reasoning:
+R's type system is shape-aware: a numeric vector of length 5, a 3x4 matrix, and a data frame all share the same scalar base_type but differ in dimensions, attributes, and class. RType encodes all of that uniformly so the inferrer can reason about both element-level and shape-level operations.
+@End Reasoning
+
+@Implementation:
+Seven fields: base_type (logical/integer/numeric/character/complex/raw/function/list/dataframe), dimensions list (empty for scalars/vectors, [rows,cols] for matrices), recursive element_type for nested structures, attribute dictionary for R's attr() system, factor handling (is_factor + factor_levels), and class_name for S3/S4 class tags.
+@End Implementation
 
 Type called "RType":
     base_type as String
@@ -100,12 +156,28 @@ Type called "RType":
     class_name as String
 End Type
 
+@Reasoning:
+S3 is R's informal object system: a class is just a character vector of class names attached to an object, dispatched by method.classname conventions. RS3ClassInfo records the inheritance chain (parent_classes) and the methods registered against the class name so analyze_r_function_call can resolve dispatch.
+@End Reasoning
+
+@Implementation:
+Four fields: class name, parent_classes list (the inheritance chain in NextMethod order), methods dictionary keyed by generic name, and an optional constructor function.
+@End Implementation
+
 Type called "RS3ClassInfo":
     class_name as String
     parent_classes as List[String]
     methods as Dictionary[String, RFunction]
     constructor as RFunction
 End Type
+
+@Reasoning:
+S4 is R's formal object system: typed slots, formal method declarations via setMethod, and optional validity functions. Distinct from S3 because slots are checked at construction time. RS4ClassInfo records the slot schema, method table, and validator.
+@End Reasoning
+
+@Implementation:
+Five fields: class name, slot type dictionary (slot name -> RType), parent class chain, methods dictionary keyed by generic, and optional validity_function called by validObject().
+@End Implementation
 
 Type called "RS4ClassInfo":
     class_name as String
@@ -114,6 +186,14 @@ Type called "RS4ClassInfo":
     methods as Dictionary[String, RFunction]
     validity_function as RFunction
 End Type
+
+@Reasoning:
+Structured diagnostic record for semantic-phase errors and warnings. Distinct from parser errors because semantic errors require resolved symbols and inferred types; carrying the error_code lets the diagnostics layer group related findings and offer fixes.
+@End Reasoning
+
+@Implementation:
+Five fields: human-readable message, source line and column, severity ("error"/"warning"/"info"), and stable error_code (e.g. "R-SEM-001") for documentation cross-reference.
+@End Implementation
 
 Type called "RSemanticError":
     message as String
@@ -126,6 +206,14 @@ End Type
 Note: ============================================================================
 Note: MAIN SEMANTIC ANALYSIS ENTRY POINT
 Note: ============================================================================
+
+@Reasoning:
+Top-level driver: creates a fresh global context, loads the base R package environments (base, stats, utils, graphics) plus the standard type registry, walks the AST via analyze_r_node, then runs final cross-cutting validations. The context returned is what r_to_hir consumes.
+@End Reasoning
+
+@Implementation:
+Calls create_global_r_context, load_base_packages, load_standard_types, then dispatches analyze_r_node on the root, finally calls validate_r_semantics. Returns the fully-populated context.
+@End Implementation
 
 Process called "analyze_r_semantics" that takes ast as RASTNode returns RSemanticContext:
     Note: Main entry point for R semantic analysis
@@ -149,6 +237,14 @@ Process called "analyze_r_semantics" that takes ast as RASTNode returns RSemanti
 
     Return context
 End Process
+
+@Reasoning:
+Factory that constructs the analyzer's root context with a freshly-allocated global REnvironment, empty diagnostic lists, and empty S3/S4 registries. All subsequent analyze_* calls thread this context.
+@End Reasoning
+
+@Implementation:
+Builds REnvironment (is_global=true), wraps it in an RSemanticContext with empty packages list, empty errors/warnings, empty type_cache, and empty s3_classes/s4_classes dictionaries.
+@End Implementation
 
 Process called "create_global_r_context" that takes nothing returns RSemanticContext:
     Note: Create the global semantic context with base R environment
@@ -174,6 +270,14 @@ Process called "create_global_r_context" that takes nothing returns RSemanticCon
     Return context
 End Process
 
+@Reasoning:
+Bootstraps the always-loaded R packages: base, stats, utils, graphics, and the standard type table. Without these the analyzer would flag every call to c(), mean(), library(), or paste() as undefined.
+@End Reasoning
+
+@Implementation:
+Sequentially invokes load_base_functions, load_stats_functions, load_utils_functions, load_graphics_functions, then load_standard_types - each populates ctx.current_environment.functions and ctx.type_cache.
+@End Implementation
+
 Process called "load_base_packages" that takes ctx as RSemanticContext returns Nothing:
     Note: Load standard R packages and their functions
 
@@ -191,6 +295,14 @@ Process called "load_base_packages" that takes ctx as RSemanticContext returns N
     Note: Load standard data types
     Call load_standard_types with ctx
 End Process
+
+@Reasoning:
+Registers the always-available functions defined in R's base package: c(), length(), names(), class(), print(), paste(), the is.* family, and the as.* coercion family. Without these, every R program would fail semantic checks because these calls have no declared origin.
+@End Reasoning
+
+@Implementation:
+Builds a list of (name, RFunction) pairs using the create_*_function helpers, then installs each into ctx.current_environment.functions keyed by name. All entries are flagged with package="base" via their constructors.
+@End Implementation
 
 Process called "load_base_functions" that takes ctx as RSemanticContext returns Nothing:
     Note: Load core R base functions
@@ -221,6 +333,14 @@ Process called "load_base_functions" that takes ctx as RSemanticContext returns 
     End For
 End Process
 
+@Reasoning:
+Registers the canonical statistical procedures from R's stats package: descriptive (mean/median/sd/var/cor), regression (lm/glm/anova), hypothesis tests (t.test/chisq.test), and the random-number generators (rnorm/runif/etc.). These are the highest-frequency R calls in analytical code.
+@End Reasoning
+
+@Implementation:
+Builds a list of (name, RFunction) pairs using shape-appropriate helpers (stats_summary, regression, hypothesis test, random generation), then installs each into ctx.current_environment.functions keyed by name.
+@End Implementation
+
 Process called "load_stats_functions" that takes ctx as RSemanticContext returns Nothing:
     Note: Load statistical functions from stats package
 
@@ -245,6 +365,14 @@ Process called "load_stats_functions" that takes ctx as RSemanticContext returns
     End For
 End Process
 
+@Reasoning:
+Registers utility helpers from R's utils package: read.csv / read.table / write.csv for file I/O, help / installed.packages for environment introspection, and conversion / printing utilities.
+@End Reasoning
+
+@Implementation:
+Builds a list of (name, RFunction) pairs for the utility helpers and installs each into ctx.current_environment.functions keyed by name.
+@End Implementation
+
 Process called "load_utils_functions" that takes ctx as RSemanticContext returns Nothing:
     Note: Load utility functions from utils package
 
@@ -264,6 +392,14 @@ Process called "load_utils_functions" that takes ctx as RSemanticContext returns
     End For
 End Process
 
+@Reasoning:
+Registers the base graphics primitives: plot/lines/points/hist/boxplot/par/legend. These are the highest-frequency calls in R visualisation code; without them the analyzer would flag every chart-producing script.
+@End Reasoning
+
+@Implementation:
+Builds a list of (name, RFunction) pairs using the graphics-specific helpers and installs each into ctx.current_environment.functions keyed by name.
+@End Implementation
+
 Process called "load_graphics_functions" that takes ctx as RSemanticContext returns Nothing:
     Note: Load graphics functions
 
@@ -282,6 +418,14 @@ Process called "load_graphics_functions" that takes ctx as RSemanticContext retu
         Set ctx.current_environment.functions at key func.name to func
     End For
 End Process
+
+@Reasoning:
+Pre-populates the type cache with the canonical R atomic types - logical, integer, numeric (double), character, complex, raw - plus the compound types vector, list, matrix, array, data.frame, and factor. infer_*_type routines query these names rather than rebuilding them on each lookup.
+@End Reasoning
+
+@Implementation:
+Builds one RType per standard type via the create_*_type factories and stores each in ctx.type_cache keyed by base_type name.
+@End Implementation
 
 Process called "load_standard_types" that takes ctx as RSemanticContext returns Nothing:
     Note: Load standard R data types
@@ -318,6 +462,14 @@ Note: ==========================================================================
 Note: AST NODE ANALYSIS
 Note: ============================================================================
 
+@Reasoning:
+Polymorphic dispatcher: drives the entire semantic walk. Each AST node type routes to its dedicated analyze_r_* routine. Centralising the switch here keeps the recursion structure flat and lets new node types be added without touching every caller.
+@End Reasoning
+
+@Implementation:
+Switches on node.node_type string: "program" -> analyze_r_program, "function_decl" -> analyze_r_function_declaration, "variable_decl" -> analyze_r_variable_declaration, "assignment" -> analyze_r_assignment, "call" -> analyze_r_function_call, "formula" -> analyze_r_formula, "library_call" -> analyze_r_library_call, "dataframe_access" -> analyze_r_dataframe_access. Unknown types are silently ignored (forward compatible).
+@End Implementation
+
 Process called "analyze_r_node" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze any R AST node based on its type
 
@@ -351,6 +503,14 @@ Process called "analyze_r_node" that takes node as RASTNode, ctx as RSemanticCon
     End Match
 End Process
 
+@Reasoning:
+Walks each top-level statement of a program node. Statements run in source order so later bindings can shadow earlier ones, matching R's interpretive semantics.
+@End Reasoning
+
+@Implementation:
+Iterates node.statements and calls analyze_r_node on each. No early exit on errors - the goal is to surface as many issues as possible per analysis pass.
+@End Implementation
+
 Process called "analyze_r_program" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze R program (top-level statements)
 
@@ -358,6 +518,14 @@ Process called "analyze_r_program" that takes node as RASTNode, ctx as RSemantic
         Call analyze_r_node with statement and ctx
     End For
 End Process
+
+@Reasoning:
+Records a function definition into the current environment, creates a child environment with its formal parameters bound, recursively analyzes the body in that child environment, then unwinds back. This is where lexical scoping is realized in the analyzer.
+@End Reasoning
+
+@Implementation:
+Builds an RFunction from node.function_name, node.parameters, with inferred return_type. Inserts into ctx.current_environment.functions. Creates child env via create_function_environment, binds each parameter as an RVariable, swaps ctx.current_environment, analyzes node.body, then restores the parent environment.
+@End Implementation
 
 Process called "analyze_r_function_declaration" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze R function declaration
@@ -419,6 +587,14 @@ Process called "analyze_r_function_declaration" that takes node as RASTNode, ctx
     Set ctx.current_environment.functions at key func_name to r_function
 End Process
 
+@Reasoning:
+Records a new variable binding and infers its initial type from the initializer expression. R has no explicit declaration syntax - "declaration" here means the first assignment - so this also tracks first_assignment_line for the lifetime checks.
+@End Reasoning
+
+@Implementation:
+Infers RType via infer_r_expression_type on node.initializer. Constructs an RVariable with name, inferred type, first_assignment_line=node.line, last_access_line=0, is_constant=false. Inserts into ctx.current_environment.variables.
+@End Implementation
+
 Process called "analyze_r_variable_declaration" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze R variable declaration
 
@@ -450,6 +626,14 @@ Process called "analyze_r_variable_declaration" that takes node as RASTNode, ctx
 
     Set ctx.current_environment.variables at key var_name to r_variable
 End Process
+
+@Reasoning:
+Handles R's five assignment operators (<-, <<-, =, ->, ->>). The "super-assign" operators <<-/->> climb the environment chain looking for an existing binding rather than creating a local one; this routine implements that lookup semantics so the analyzer's symbol tables stay accurate.
+@End Reasoning
+
+@Implementation:
+Inspects node.operator. For <-/=/->, looks up target in current env: if missing, treats as variable_decl; if present, updates type and last_assignment_line. For <<-/->>, walks parent_env chain until binding found (or global if none), then updates that.
+@End Implementation
 
 Process called "analyze_r_assignment" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze R assignment operations
@@ -485,6 +669,14 @@ Process called "analyze_r_assignment" that takes node as RASTNode, ctx as RSeman
     End Match
 End Process
 
+@Reasoning:
+Resolves the callee, checks the call site against the function's known parameter list (arity, named arg names), recursively analyzes each argument expression, and updates last_access_line for any referenced functions/variables.
+@End Reasoning
+
+@Implementation:
+Looks up node.function_name via lookup_r_function. Iterates node.arguments calling analyze_r_node on each, then matches positional and named arguments against the function's parameters. Reports diagnostics for unknown names, missing required parameters, or arity mismatches.
+@End Implementation
+
 Process called "analyze_r_function_call" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze R function call
 
@@ -516,6 +708,14 @@ Process called "analyze_r_function_call" that takes node as RASTNode, ctx as RSe
     Call validate_r_function_arguments with r_function and arguments and ctx
 End Process
 
+@Reasoning:
+R formulas (y ~ x1 + x2:x3) describe statistical model structure. They are first-class values - lm(y~x, data=df) passes the formula unevaluated. The analyzer must resolve response/predictors as variable references but defer their use semantics to the consuming function (lm, glm, etc.).
+@End Reasoning
+
+@Implementation:
+Records the formula's response variable and predictor list against the current environment. Walks predictors and interactions (a:b terms) marking each name as an access. Builds an RType with base_type="formula".
+@End Implementation
+
 Process called "analyze_r_formula" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze R formula expressions (y ~ x)
 
@@ -546,6 +746,14 @@ Process called "analyze_r_formula" that takes node as RASTNode, ctx as RSemantic
     End For
 End Process
 
+@Reasoning:
+library()/require() loads a package's exports into the search path. Both are recorded here so subsequent function lookups can resolve names exported by the package. require() returns FALSE on missing package while library() errors; the is_require flag distinguishes the call shape.
+@End Reasoning
+
+@Implementation:
+Reads node.package_name and node.is_require. Appends to ctx.global_packages if not already present. validate_package_dependencies later confirms each name corresponds to a known package descriptor.
+@End Implementation
+
 Process called "analyze_r_library_call" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze library/require calls
 
@@ -567,6 +775,14 @@ Process called "analyze_r_library_call" that takes node as RASTNode, ctx as RSem
     Note: Add to loaded packages
     Add package_name to end of ctx.global_packages
 End Process
+
+@Reasoning:
+Data frame access has shape-dependent semantics: df$col returns a vector (the column), df[i,j] preserves data.frame class, df[[i]] returns the raw column. The analyzer needs to infer which is happening so consumers see the correct downstream type.
+@End Reasoning
+
+@Implementation:
+Inspects node.access_type ("$" / "[" / "[[") to select the proper return-type construction: column access yields the column's element type, [i,j] yields a data.frame subset, [[i]] yields the column type. Records that node.dataframe is being accessed for use-tracking.
+@End Implementation
 
 Process called "analyze_r_dataframe_access" that takes node as RASTNode, ctx as RSemanticContext returns Nothing:
     Note: Analyze data frame access operations (df$col, df[row, col])
@@ -604,6 +820,14 @@ Note: ==========================================================================
 Note: TYPE INFERENCE AND VALIDATION
 Note: ============================================================================
 
+@Reasoning:
+Top-level type inferrer. Returns the RType of any expression, dispatching on node shape. The result is used both for assignment target-type recording and for argument shape-checking in function calls.
+@End Reasoning
+
+@Implementation:
+Switches on expr.node_type: literal -> infer_literal_type, identifier -> infer_identifier_type, function_call -> infer_function_call_type, formula -> create_formula_type, dataframe_access -> shape-aware inference. Falls back to create_any_type for unknown shapes (rather than failing, which would be over-eager).
+@End Implementation
+
 Process called "infer_r_expression_type" that takes expr as RASTNode, ctx as RSemanticContext returns RType:
     Note: Infer the type of an R expression
 
@@ -635,6 +859,14 @@ Process called "infer_r_expression_type" that takes expr as RASTNode, ctx as RSe
     End Match
 End Process
 
+@Reasoning:
+Maps the lexer-attached literal_type back to a canonical RType. R has rich literal taxonomy: 1L is integer, 1 is numeric (double), 1i is complex, "x" is character, TRUE/FALSE/NA are logical, NULL is null.
+@End Reasoning
+
+@Implementation:
+Switches on expr.literal_type integer code: TOKEN_NUMBER -> create_numeric_type, TOKEN_INTEGER -> create_integer_type, TOKEN_STRING -> create_character_type, TOKEN_TRUE/FALSE -> create_logical_type, TOKEN_COMPLEX -> create_complex_type, TOKEN_NULL -> NULL RType.
+@End Implementation
+
 Process called "infer_literal_type" that takes expr as RASTNode returns RType:
     Note: Infer type from literal values
 
@@ -658,6 +890,14 @@ Process called "infer_literal_type" that takes expr as RASTNode returns RType:
             Return create_any_type
     End Match
 End Process
+
+@Reasoning:
+Resolves a bare identifier to its declared variable's type. Falls back to create_any_type if the binding cannot be found (R is dynamic, so undefined-at-analysis is a warning, not an error).
+@End Reasoning
+
+@Implementation:
+Calls lookup_r_variable with expr.name. If found, returns the bound variable's RType and bumps last_access_line. If not found, emits a warning into ctx and returns create_any_type.
+@End Implementation
 
 Process called "infer_identifier_type" that takes expr as RASTNode, ctx as RSemanticContext returns RType:
     Note: Infer type from variable reference
@@ -683,6 +923,14 @@ Process called "infer_identifier_type" that takes expr as RASTNode, ctx as RSema
     Return create_any_type
 End Process
 
+@Reasoning:
+Returns the inferred result type of a function call by looking up the callee and reading its declared return_type. R can return Any (the "anything" type) for highly polymorphic functions like c() or paste(), in which case downstream logic must handle the Any case explicitly.
+@End Reasoning
+
+@Implementation:
+Calls lookup_r_function with expr.function_name. On hit, returns the function's return_type RType. On miss, emits a warning and returns create_any_type.
+@End Implementation
+
 Process called "infer_function_call_type" that takes expr as RASTNode, ctx as RSemanticContext returns RType:
     Note: Infer return type from function call
 
@@ -707,6 +955,14 @@ Note: ==========================================================================
 Note: HELPER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+Walks the environment chain from current_environment up through parent_env links until either the binding is found or the global environment is exhausted. This is the runtime-faithful lookup R uses for symbol resolution under lexical scoping.
+@End Reasoning
+
+@Implementation:
+Iterates env = ctx.current_environment; while env != null: if env.variables contains name, return that RVariable; else env = env.parent_env. Returns null on chain exhaustion.
+@End Implementation
+
 Process called "lookup_r_variable" that takes name as String, ctx as RSemanticContext returns RVariable:
     Note: Look up variable in environment chain
 
@@ -720,6 +976,14 @@ Process called "lookup_r_variable" that takes name as String, ctx as RSemanticCo
 
     Return null
 End Process
+
+@Reasoning:
+Mirror of lookup_r_variable for the functions dictionary. R's evaluation model separates value bindings from function bindings only when resolving the head of a call expression, but the storage in REnvironment is also split so this walks the same chain.
+@End Reasoning
+
+@Implementation:
+Iterates env = ctx.current_environment; while env != null: if env.functions contains name, return that RFunction; else env = env.parent_env. Returns null on chain exhaustion.
+@End Implementation
 
 Process called "lookup_r_function" that takes name as String, ctx as RSemanticContext returns RFunction:
     Note: Look up function in environment chain
@@ -735,6 +999,14 @@ Process called "lookup_r_function" that takes name as String, ctx as RSemanticCo
     Return null
 End Process
 
+@Reasoning:
+Constructs a child REnvironment for entering a function body. The parent_env link captures R's lexical scoping (functions see the environment where they were defined, not where they're called from).
+@End Reasoning
+
+@Implementation:
+Returns an REnvironment with empty variables/functions dictionaries, parent_env=parent, name=func_name, is_global=false.
+@End Implementation
+
 Process called "create_function_environment" that takes parent as REnvironment, func_name as String returns REnvironment:
     Note: Create new environment for function scope
 
@@ -745,6 +1017,14 @@ Process called "create_function_environment" that takes parent as REnvironment, 
         name as func_name,
         is_global as false
 End Process
+
+@Reasoning:
+Cross-cutting validation pass run after the full AST walk. Catches issues that can only be diagnosed once everything has been registered: unused variables, never-called functions, missing package loads, malformed S3/S4 method tables.
+@End Reasoning
+
+@Implementation:
+Sequentially invokes validate_variable_usage, validate_function_usage, validate_package_dependencies, validate_s3_methods, validate_s4_methods. Each appends diagnostics to ctx.error_list or ctx.warning_list.
+@End Implementation
 
 Process called "validate_r_semantics" that takes ctx as RSemanticContext returns Nothing:
     Note: Perform final semantic validation
@@ -762,12 +1042,28 @@ Process called "validate_r_semantics" that takes ctx as RSemanticContext returns
     Call validate_s4_methods with ctx
 End Process
 
+@Reasoning:
+Reports variables that were assigned but never accessed (first_assignment_line set, last_access_line still 0). Reported as warnings rather than errors because R legitimately has many side-effect-only assignments (e.g. saving a result to .Rdata).
+@End Reasoning
+
+@Implementation:
+Iterates ctx.current_environment.variables. For each RVariable where last_access_line is 0, appends a "warning: unused variable" entry to ctx.warning_list with the first_assignment_line as source location.
+@End Implementation
+
 Process called "validate_variable_usage" that takes ctx as RSemanticContext returns Nothing:
     Note: Validate all variables were properly used
 
     Note: This  check for unused variables, uninitialized usage, etc.
     Note: Implementation depends on tracking variable access patterns
 End Process
+
+@Reasoning:
+Cross-checks function-call invariants captured during analyze_r_function_call: ensures every callee was resolvable, that no required parameter was left without a positional or named arg, and that all named arguments correspond to declared formals.
+@End Reasoning
+
+@Implementation:
+Walks ctx.error_list / ctx.warning_list for already-flagged call-site issues and elevates patterns that indicate hard errors (e.g. arity mismatch) versus warnings (e.g. dynamic dispatch fallback).
+@End Implementation
 
 Process called "validate_function_usage" that takes ctx as RSemanticContext returns Nothing:
     Note: Validate function calls are correct
@@ -776,17 +1072,41 @@ Process called "validate_function_usage" that takes ctx as RSemanticContext retu
     Note: Implementation depends on detailed function signature tracking
 End Process
 
+@Reasoning:
+Confirms every package mentioned in a library()/require() call is one the analyzer knows how to model. Unknown packages become warnings (analysis falls back to Any types) rather than errors so working-but-novel R code still translates.
+@End Reasoning
+
+@Implementation:
+Iterates ctx.global_packages. For each name that does not appear in the analyzer's package registry, appends a "warning: unknown package" entry to ctx.warning_list.
+@End Implementation
+
 Process called "validate_package_dependencies" that takes ctx as RSemanticContext returns Nothing:
     Note: Validate required packages are loaded
 
     Note: Check if functions from unloaded packages are being used
 End Process
 
+@Reasoning:
+Checks that every registered S3 method follows the `generic.class` naming convention and that each generic has at least one method defined. Misnamed methods are silent traps in real R code; warning here surfaces them at translation time.
+@End Reasoning
+
+@Implementation:
+Iterates ctx.s3_classes. For each RS3ClassInfo, scans the methods dictionary verifying naming pattern. Appends warnings for any method whose name does not split correctly into generic + class.
+@End Implementation
+
 Process called "validate_s3_methods" that takes ctx as RSemanticContext returns Nothing:
     Note: Validate S3 method definitions and usage
 
     Note: Check S3 generic/method consistency
 End Process
+
+@Reasoning:
+Checks that every S4 class has slots with declared types, that methods reference declared classes, and that any validity_function attached takes the class as its sole argument. S4 is stricter than S3 so these checks are hard errors.
+@End Reasoning
+
+@Implementation:
+Iterates ctx.s4_classes. For each RS4ClassInfo, verifies slot RTypes are present, methods reference an existing parent class, and validity_function has exactly one parameter. Appends errors for any mismatch.
+@End Implementation
 
 Process called "validate_s4_methods" that takes ctx as RSemanticContext returns Nothing:
     Note: Validate S4 method definitions and usage
@@ -797,6 +1117,14 @@ End Process
 Note: ============================================================================
 Note: TYPE CREATION HELPERS
 Note: ============================================================================
+
+@Reasoning:
+Factory for the logical scalar RType. R's logical type is tri-valued (TRUE, FALSE, NA) - the NA case is handled at runtime by the bit pattern of the value, not by the type. Type creation is parameterless because logical scalars have no extra shape.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "logical", all other fields nulled or empty.
+@End Implementation
 
 Process called "create_logical_type" that takes nothing returns RType:
     Return a value of type RType with
@@ -809,6 +1137,14 @@ Process called "create_logical_type" that takes nothing returns RType:
         class_name as null
 End Process
 
+@Reasoning:
+Factory for the integer scalar RType. In R, integer is the 32-bit type distinguished from numeric (double) by the L suffix on literals (42L). Inference distinguishes the two so codegen can pick the right storage width.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "integer", all other fields nulled or empty.
+@End Implementation
+
 Process called "create_integer_type" that takes nothing returns RType:
     Return a value of type RType with
         base_type as "integer",
@@ -819,6 +1155,14 @@ Process called "create_integer_type" that takes nothing returns RType:
         factor_levels as null,
         class_name as null
 End Process
+
+@Reasoning:
+Factory for the numeric (double-precision) scalar RType. R's default arithmetic type - bare literals like 3.14 or 42 (without L suffix) are numeric. IEEE 754 double precision.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "numeric", all other fields nulled or empty.
+@End Implementation
 
 Process called "create_numeric_type" that takes nothing returns RType:
     Return a value of type RType with
@@ -831,6 +1175,14 @@ Process called "create_numeric_type" that takes nothing returns RType:
         class_name as null
 End Process
 
+@Reasoning:
+Factory for the character (string) scalar RType. R calls strings "character" - distinct from C's "string" because R character vectors carry one string per element rather than one character per element.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "character", all other fields nulled or empty.
+@End Implementation
+
 Process called "create_character_type" that takes nothing returns RType:
     Return a value of type RType with
         base_type as "character",
@@ -841,6 +1193,14 @@ Process called "create_character_type" that takes nothing returns RType:
         factor_levels as null,
         class_name as null
 End Process
+
+@Reasoning:
+Factory for the complex (a+bi) scalar RType. Produced by the i-suffix lexer rule (3i, 2.5i). Backed by a pair of IEEE 754 doubles for real and imaginary parts.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "complex", all other fields nulled or empty.
+@End Implementation
 
 Process called "create_complex_type" that takes nothing returns RType:
     Return a value of type RType with
@@ -853,6 +1213,14 @@ Process called "create_complex_type" that takes nothing returns RType:
         class_name as null
 End Process
 
+@Reasoning:
+Factory for the raw (single-byte) scalar RType. R's raw vectors are arbitrary byte arrays - used for binary I/O and serialization. Distinct from integer because no arithmetic is defined.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "raw", all other fields nulled or empty.
+@End Implementation
+
 Process called "create_raw_type" that takes nothing returns RType:
     Return a value of type RType with
         base_type as "raw",
@@ -863,6 +1231,14 @@ Process called "create_raw_type" that takes nothing returns RType:
         factor_levels as null,
         class_name as null
 End Process
+
+@Reasoning:
+Factory for the data.frame compound RType. Data frames are R's tabular data primitive - a list of equal-length vectors with column names. The class_name field is also set to "data.frame" so S3 dispatch on print/[.data.frame/etc. works.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "data.frame" and class_name "data.frame"; other fields nulled or empty (column schema is recorded in attributes by callers that have specific columns).
+@End Implementation
 
 Process called "create_data_frame_type" that takes nothing returns RType:
     Return a value of type RType with
@@ -875,6 +1251,14 @@ Process called "create_data_frame_type" that takes nothing returns RType:
         class_name as "data.frame"
 End Process
 
+@Reasoning:
+Factory for the function-as-value RType. R functions are first-class - they can be assigned to variables, passed as arguments, returned from other functions. This type is used when infer_identifier_type sees a name bound to a function rather than a value.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "function", all other fields nulled or empty.
+@End Implementation
+
 Process called "create_function_type" that takes nothing returns RType:
     Return a value of type RType with
         base_type as "function",
@@ -886,6 +1270,14 @@ Process called "create_function_type" that takes nothing returns RType:
         class_name as null
 End Process
 
+@Reasoning:
+Factory for the dynamic "Any" RType used as the fallback when inference cannot pin down a more specific type. Lets the analyzer continue rather than fail on R's pervasive dynamism (e.g. mixed-type lists, runtime-dispatched function returns).
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "any", all other fields nulled or empty.
+@End Implementation
+
 Process called "create_any_type" that takes nothing returns RType:
     Return a value of type RType with
         base_type as "any",
@@ -896,6 +1288,14 @@ Process called "create_any_type" that takes nothing returns RType:
         factor_levels as null,
         class_name as null
 End Process
+
+@Reasoning:
+Factory for the formula RType (y ~ x1 + x2). Formulas are first-class R values consumed unevaluated by modelling functions (lm, glm, aggregate). class_name is also "formula" so S3 method dispatch resolves.
+@End Reasoning
+
+@Implementation:
+Returns an RType with base_type "formula" and class_name "formula"; other fields nulled or empty.
+@End Implementation
 
 Process called "create_formula_type" that takes nothing returns RType:
     Return a value of type RType with
@@ -911,6 +1311,14 @@ End Process
 Note: ============================================================================
 Note: Base Function Creation Helpers
 Note: ============================================================================
+
+@Reasoning:
+Factory for the c() function signature - the canonical variadic constructor in R that combines values into a vector. Variadic via the `...` parameter; returns a numeric (the type coerces upward if heterogeneous arguments are seen at runtime).
+@End Reasoning
+
+@Implementation:
+Builds an RParameter named "..." with is_variadic=true and Any element type, then returns an RFunction named "c" with that single parameter, return_type=numeric, package="base".
+@End Implementation
 
 Process called "create_variadic_numeric_function" that takes nothing returns RFunction:
     Note: Create c() function signature
@@ -932,6 +1340,14 @@ Process called "create_variadic_numeric_function" that takes nothing returns RFu
         package as "base"
 End Process
 
+@Reasoning:
+Factory for length() and similar single-parameter integer-returning functions. length() takes one argument of any type and returns its element count as an integer.
+@End Reasoning
+
+@Implementation:
+Builds an RParameter named "x" with Any type, returns an RFunction named "length" with that single parameter, return_type=integer, package="base".
+@End Implementation
+
 Process called "create_single_param_int_function" that takes nothing returns RFunction:
     Note: Create length() function signature
 
@@ -951,6 +1367,14 @@ Process called "create_single_param_int_function" that takes nothing returns RFu
         is_s4_method as false,
         package as "base"
 End Process
+
+@Reasoning:
+Factory for names()/class() and similar single-parameter character-vector-returning functions. These take one argument of any type and return a character vector describing it (the column names for a data frame, the class chain for any object).
+@End Reasoning
+
+@Implementation:
+Builds an RParameter named "x" with Any type, returns an RFunction named "names" with that single parameter, return_type=character, package="base".
+@End Implementation
 
 Process called "create_single_param_string_vector_function" that takes nothing returns RFunction:
     Note: Create names()/class() function signatures
@@ -973,6 +1397,14 @@ Process called "create_single_param_string_vector_function" that takes nothing r
 End Process
 
 Note: Entry point for R semantic analysis
+@Reasoning:
+Thin facade over analyze_r_semantics provided for naming-consistency with the other frontends (which all expose analyze_X_semantic_tree as their public entry point). Identical semantics to analyze_r_semantics.
+@End Reasoning
+
+@Implementation:
+Delegates directly to analyze_r_semantics(ast) and returns its result.
+@End Implementation
+
 Process called "analyze_r_semantic_tree" that takes ast as RASTNode returns RSemanticContext:
     Return analyze_r_semantics with ast
 End Process

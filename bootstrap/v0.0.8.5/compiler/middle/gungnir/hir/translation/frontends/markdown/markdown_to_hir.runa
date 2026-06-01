@@ -55,6 +55,13 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Translation context threads through every recursive descent of the Markdown
+AST. Carries an owned error_message buffer plus has_error flag for any
+failure (allocation, unknown node type), and tracks the current source line/
+column from the most recently visited node so any error report can pin the
+location even without access to the surrounding AST.
+@End Reasoning
 Type called "MarkdownToHIRContext":
     error_message as Integer    Note: Error message (if any)
     has_error as Integer        Note: Boolean: 1 if error occurred
@@ -66,6 +73,11 @@ Note: ==========================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Allocates a zero-initialized translation context (32 bytes: 4 int64 slots).
+has_error starts at 0 and line/column at 0 until the first node is visited.
+Returns 0 on allocation failure so the top-level caller can abort cleanly.
+@End Reasoning
 Process called "create_translation_context" returns Integer:
     Note: Create Markdown to HIR translation context
 
@@ -85,6 +97,11 @@ Process called "create_translation_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+Frees the context and its owned error message. Null-safe (returns 1 on null
+input) so error paths can call it unconditionally. The Markdown AST and the
+HIR tree being built are independently owned and not freed here.
+@End Reasoning
 Process called "destroy_translation_context" takes context as Integer returns Integer:
     Note: Destroy translation context
 
@@ -108,6 +125,12 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Stores a deep-copied error message into the context. Previous messages are
+freed first so repeated errors don't leak. has_error is set unconditionally
+so even an allocation failure during message copy still propagates the error
+signal to the caller.
+@End Reasoning
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
 
@@ -137,13 +160,15 @@ Note: ==========================================================================
 Note: Markdown Node to HIR Translation
 Note: ============================================================================
 
+@Reasoning:
+Central dispatch — switches on the Markdown node's type tag and delegates to
+the corresponding translator. Also updates the context's line/column from
+each node visited so any nested translator's error message naturally pins
+the deepest source location. Returns 0 with a "Null Markdown node" or
+"Unknown Markdown node type" error for any input the dispatcher cannot route.
+@End Reasoning
 Process called "translate_markdown_node_to_hir" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown AST node to HIR node
-
-    @Reasoning:
-    Dispatches to appropriate translator based on Markdown node type.
-    Creates corresponding HIR dictionary or literal node.
-    @End Reasoning
 
     If md_node is equal to 0:
         proc set_translation_error with context, "Null Markdown node"
@@ -216,12 +241,15 @@ Process called "translate_markdown_node_to_hir" takes context as Integer, md_nod
     Return 0
 End Process
 
+@Reasoning:
+Document root becomes a HIR dictionary {"type": "document", "children":
+List[blocks]}. Children are translated recursively; nulls returned from
+child translation are silently dropped to avoid corrupting the children list,
+while the context's has_error flag preserves the failure signal for the
+top-level caller.
+@End Reasoning
 Process called "translate_markdown_document" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown document to HIR dictionary
-
-    @Reasoning:
-    Markdown documents become dictionaries with a "type" key and "children" list.
-    @End Reasoning
 
     Note: Create HIR dictionary
     Let hir_dict be proc create_hir_dictionary_literal from HIR
@@ -269,6 +297,12 @@ Process called "translate_markdown_document" takes context as Integer, md_node a
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "heading", "level": <1..6>, "text": <string>}. The level is
+preserved as a HIR integer literal (not stringified) so downstream consumers
+can render heading depth directly. Heading content is treated as plain text
+here — inline emphasis inside headings is not re-parsed by this translator.
+@End Reasoning
 Process called "translate_markdown_heading" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown heading to HIR dictionary
 
@@ -307,6 +341,12 @@ Process called "translate_markdown_heading" takes context as Integer, md_node as
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "paragraph", "children": List[inline]} where the children are
+the parser's alternating MD_TEXT / inline element nodes. Recursion is
+necessary because emphasis/strong/code/link/image are independent HIR
+dictionaries, not flat strings.
+@End Reasoning
 Process called "translate_markdown_paragraph" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown paragraph with inline elements to HIR dictionary
 
@@ -356,6 +396,12 @@ Process called "translate_markdown_paragraph" takes context as Integer, md_node 
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "code_block", "code": <verbatim source>, "language": <tag>?}.
+The "language" key is omitted entirely (not set to empty string or null) when
+no language tag was provided, so downstream consumers can distinguish "no
+language specified" from "explicitly tagged as empty".
+@End Reasoning
 Process called "translate_markdown_code_block" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown code block to HIR dictionary
 
@@ -396,6 +442,11 @@ Process called "translate_markdown_code_block" takes context as Integer, md_node
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "blockquote", "children": List[blocks]}. The parser builds
+blockquotes as containers for a single paragraph child (see parse_blockquote);
+multi-line blockquote merging happens above this translator, not here.
+@End Reasoning
 Process called "translate_markdown_blockquote" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown blockquote to HIR dictionary
 
@@ -445,6 +496,14 @@ Process called "translate_markdown_blockquote" takes context as Integer, md_node
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "list_item", "marker": <"-"|"*"|"1.">, "list_type":
+<"unordered"|"ordered">, "children": [...]}. The ordered/unordered flag is
+converted from an integer (0/1) into a human-readable string here so HIR
+consumers do not need to know the parser's encoding. Each list item lives
+independently — list grouping (multiple consecutive items into a single OL/UL
+container) is a higher-level pass.
+@End Reasoning
 Process called "translate_markdown_list_item" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown list item to HIR dictionary
 
@@ -518,6 +577,11 @@ Process called "translate_markdown_list_item" takes context as Integer, md_node 
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "horizontal_rule"} — a leaf dictionary with no other fields
+since the rule's marker character carries no semantic content (---, ***, and
+___ all render identically).
+@End Reasoning
 Process called "translate_markdown_horizontal_rule" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown horizontal rule to HIR dictionary
 
@@ -540,6 +604,13 @@ Process called "translate_markdown_horizontal_rule" takes context as Integer, md
     Return hir_dict
 End Process
 
+@Reasoning:
+Text nodes become bare HIR string literals (NOT dictionaries) — this is the
+one exception in the translator's shape, chosen so paragraph children of pure
+text render as flat strings instead of "{type: text, value: ...}" wrappers.
+A text node with no value triggers an error since the parser invariant says
+MD_TEXT always carries content.
+@End Reasoning
 Process called "translate_markdown_text" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown text to HIR string literal
 
@@ -564,6 +635,12 @@ Note: ==========================================================================
 Note: Inline Element Translation
 Note: ============================================================================
 
+@Reasoning:
+Emits {"type": "emphasis", "text": <content>}. Emphasis content is treated as
+flat text — nested formatting (e.g. emphasis-within-emphasis) is not unwound
+by this translator because the lexer already produced a single
+TOKEN_EMPHASIS slice.
+@End Reasoning
 Process called "translate_markdown_emphasis" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown emphasis (*text* or _text_) to HIR dictionary
 
@@ -595,6 +672,11 @@ Process called "translate_markdown_emphasis" takes context as Integer, md_node a
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "strong", "text": <content>}. Distinct from emphasis only by
+the type tag string so downstream consumers can render bold vs italic; the
+underlying content shape is identical to translate_markdown_emphasis.
+@End Reasoning
 Process called "translate_markdown_strong" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown strong (**text** or __text__) to HIR dictionary
 
@@ -626,6 +708,11 @@ Process called "translate_markdown_strong" takes context as Integer, md_node as 
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "code", "text": <verbatim>}. Inline code uses the "code" type
+tag (not "inline_code") to align with CommonMark/HTML5 <code> nomenclature
+and to distinguish block code via the surrounding "code_block" type tag.
+@End Reasoning
 Process called "translate_markdown_inline_code" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown inline code (`code`) to HIR dictionary
 
@@ -657,6 +744,12 @@ Process called "translate_markdown_inline_code" takes context as Integer, md_nod
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "link", "text": <visible>, "url": <target>}. The link's URL
+lives in the AST node's metadata slot per the parser's encoding; this
+translator promotes it to a first-class HIR dictionary entry so consumers can
+read it without knowing the parser's internal layout.
+@End Reasoning
 Process called "translate_markdown_link" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown link ([text](url)) to HIR dictionary
 
@@ -695,6 +788,11 @@ Process called "translate_markdown_link" takes context as Integer, md_node as In
     Return hir_dict
 End Process
 
+@Reasoning:
+Emits {"type": "image", "alt": <alt_text>, "url": <target>}. Uses "alt"
+rather than "text" to align with HTML's <img alt=...> attribute and to make
+the distinction from links explicit at the dictionary-key level.
+@End Reasoning
 Process called "translate_markdown_image" takes context as Integer, md_node as Integer returns Integer:
     Note: Translate Markdown image (![alt](url)) to HIR dictionary
 
@@ -737,13 +835,22 @@ Note: ==========================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
 
+@Reasoning:
+Top-level pipeline driver: parse Markdown source into AST, then translate AST
+to HIR. On any failure (null source, allocation failure, parse failure, or
+has_error set during translation) frees all created context resources and
+returns 0; otherwise returns the HIR document root. The translation_context
+parameter is currently unused but reserved for the broader Translation system
+to forward diagnostics upstream.
+@End Reasoning
+
+@Implementation:
+The Markdown AST is consumed transiently — parse_markdown allocates the AST
+nodes and the HIR translator only reads them, but the AST is intentionally
+not freed here (HIR strings share lifetime via deep-copy in the parser).
+@End Implementation
 Process called "translate_markdown_to_hir" takes source_code as Integer, translation_context as Integer returns Integer:
     Note: Translate Markdown source code to Runa HIR
-
-    @Reasoning:
-    Entry point for Markdown→HIR translation. Parses Markdown, translates to HIR,
-    handles errors, and reports to Translation context.
-    @End Reasoning
 
     If source_code is equal to 0:
         Note: Report error to Translation context (if available)

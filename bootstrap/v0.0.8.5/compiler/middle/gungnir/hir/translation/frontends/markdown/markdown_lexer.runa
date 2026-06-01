@@ -81,6 +81,14 @@ Note: ==========================================================================
 Note: Token Structure
 Note: ============================================================================
 
+@Reasoning:
+Token record carries a type tag, a pointer/length slice into the source buffer
+(non-owning for plain text, owned heap for buffers built by inline scanners
+that need to strip the closing delimiter), 1-based diagnostic line/column, and
+a polymorphic metadata slot reused by structural tokens (heading level 1-6,
+list ordered/unordered flag, fence run length). Six fixed int64 slots keep the
+struct power-of-two sized at 48 bytes for arena-cache alignment.
+@End Reasoning
 Type called "Token":
     type as Integer           Note: Token type constant
     lexeme as Integer         Note: Pointer to token text
@@ -94,6 +102,14 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Lexer state carries the source pointer/length pair (cached so character-access
+hot paths skip a string_length call per byte), the byte cursor, 1-based
+line/column for diagnostics, and an at_line_start flag that CommonMark requires
+for block-level token disambiguation (an unindented heading marker is only a
+heading when at_line_start = 1). The flag is reset by newline and cleared by
+any non-whitespace byte.
+@End Reasoning
 Type called "MarkdownLexer":
     source as Integer          Note: Source code pointer
     source_length as Integer   Note: Source code length
@@ -107,6 +123,17 @@ Note: ==========================================================================
 Note: Lexer Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Constructor seeds the lexer at the document start: position=0, line=1, col=1,
+at_line_start=1 (the first byte of any document is by definition the start of
+a line, so an opening "# Heading" is recognized as a heading).
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes (6 int64 fields), caches source_length via string_length to
+avoid recomputing it on every peek, and returns 0 on allocation failure so the
+caller can propagate the OOM condition.
+@End Implementation
 Process called "create_markdown_lexer" takes source as Integer returns Integer:
     Note: Create Markdown lexer
 
@@ -130,6 +157,11 @@ Process called "create_markdown_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Destructor releases the lexer struct itself; the source buffer is caller-owned
+and intentionally not freed here, and emitted tokens retain their own buffer
+ownership independently of the lexer's lifetime.
+@End Reasoning
 Process called "destroy_markdown_lexer" takes lexer as Integer returns Integer:
     Note: Destroy Markdown lexer
 
@@ -144,6 +176,17 @@ Note: ==========================================================================
 Note: Character Access
 Note: ============================================================================
 
+@Reasoning:
+Pure read; never mutates position/line/column or at_line_start. Returning 0 on
+position >= source_length collapses physical EOF and the literal null byte to
+the same sentinel — Markdown documents must not legally contain NUL, so this
+ambiguity is acceptable for a text-format lexer.
+@End Reasoning
+
+@Performance_Hints:
+Hot path called by every block- and inline-scanner. O(1): one int64 load for
+position, one for source_length, one byte load. No allocation, no string ops.
+@End Performance_Hints
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without consuming
 
@@ -160,6 +203,11 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Lookahead at position+offset without mutation. Used by inline scanners to peek
+at the second byte of "![" (image start) and ahead of the cursor for emphasis
+delimiter run counting before committing to a tokenization path.
+@End Reasoning
 Process called "peek_char_at" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character at offset from current position
 
@@ -177,6 +225,19 @@ Process called "peek_char_at" takes lexer as Integer, offset as Integer returns 
     Return char
 End Process
 
+@Reasoning:
+The single mutating cursor primitive. Owns the entire position/line/column and
+at_line_start update protocol: newline resets column to 1 and at_line_start to
+1; any non-whitespace byte (not space, not tab) clears at_line_start since
+indented continuation whitespace must keep block-start eligibility live for
+the first non-whitespace marker on the line.
+@End Reasoning
+
+@Implementation:
+Read-then-increment so the returned character is the one just consumed. Bytes
+beyond source_length return 0 without advancing position past the end, so
+repeated calls at EOF are idempotent.
+@End Implementation
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Consume current character and advance position
 
@@ -219,6 +280,12 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+CommonMark distinguishes "whitespace" (space U+0020, tab U+0009) from line
+terminators. List-marker scanners require a whitespace byte immediately after
+the marker to commit to TOKEN_LIST_ITEM, so this predicate must not be widened
+to include newlines.
+@End Reasoning
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace (space or tab)
 
@@ -233,6 +300,12 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Recognizes both LF (Unix) and CR (legacy Mac / first byte of Windows CRLF).
+The CRLF pair is handled by next_token, which emits a single NEWLINE token on
+the CR and then absorbs a following LF; this predicate just answers "is this
+byte a line terminator".
+@End Reasoning
 Process called "is_newline" takes char as Integer returns Integer:
     Note: Check if character is newline
 
@@ -247,6 +320,11 @@ Process called "is_newline" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII 48..57 range check. Markdown's ordered-list grammar only accepts ASCII
+digits, so this deliberately rejects Unicode digit categories (e.g. Arabic-
+Indic numerals) which CommonMark does not treat as list markers.
+@End Reasoning
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit 0-9
 
@@ -259,6 +337,12 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII letter range check (A..Z, a..z). Used by future autolink scheme detection
+and HTML block tag matching; underscore is intentionally excluded here even
+though it is a delimiter for emphasis because emphasis processing has its own
+specialized scanner.
+@End Reasoning
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -281,6 +365,18 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Centralized token constructor — every scanner emits through here so the field
+layout (type/lexeme/length/line/column/metadata) stays a single point of
+change. Diagnostic line/column are captured from caller-supplied values rather
+than the current lexer state because the caller saved them BEFORE consuming
+the marker (e.g. heading's "#" column, not the column after the marker run).
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes, writes six int64 slots in declared order, and propagates
+allocator OOM (returns 0) so callers can free auxiliary buffers and bail.
+@End Implementation
 Process called "create_token" takes token_type as Integer, lexeme as Integer, length as Integer, line as Integer, column as Integer, metadata as Integer returns Integer:
     Note: Create token with all fields
 
@@ -305,6 +401,13 @@ Note: ==========================================================================
 Note: Line Processing Helpers
 Note: ============================================================================
 
+@Reasoning:
+Counts visual indentation in space-equivalents, consuming the whitespace as it
+goes. The 4-space tab expansion follows CommonMark section 2.2: a tab advances
+the indent counter to the next multiple-of-4 column; this implementation
+simplifies that to a flat +4 per tab, which is correct for the common case of
+tabs only appearing at the start of a line.
+@End Reasoning
 Process called "count_leading_spaces" takes lexer as Integer returns Integer:
     Note: Count leading spaces/tabs at current position (4 spaces = 1 tab)
 
@@ -328,6 +431,11 @@ Process called "count_leading_spaces" takes lexer as Integer returns Integer:
     Return count
 End Process
 
+@Reasoning:
+Inline whitespace skipper — discards spaces and tabs without crossing line
+boundaries. Used after a heading or list marker to find the start of the
+content, so newlines must remain visible to the caller as terminators.
+@End Reasoning
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip spaces and tabs (not newlines)
 
@@ -346,6 +454,11 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Advances the cursor up to but not including the next newline (or EOF). Leaves
+the newline in place so next_token will subsequently emit TOKEN_NEWLINE and
+reset at_line_start for the following line's block-level scanning.
+@End Reasoning
 Process called "skip_to_end_of_line" takes lexer as Integer returns Integer:
     Note: Skip to end of current line
 
@@ -370,6 +483,18 @@ Note: ==========================================================================
 Note: Block-Level Token Scanning
 Note: ============================================================================
 
+@Reasoning:
+ATX heading recognizer. Counts up to six leading '#' bytes (CommonMark caps
+heading depth at 6), skips one or more separating spaces, then captures the
+rest of the line as the heading text. The level (1..6) is stored in the
+token's metadata slot. Zero '#' bytes returns 0 to let the caller fall through
+to text-token scanning.
+@End Reasoning
+
+@Implementation:
+The non-owning lexeme slice is a pointer into the source buffer plus a length,
+so heading text shares storage with the document and does not require a copy.
+@End Implementation
 Process called "scan_heading" takes lexer as Integer returns Integer:
     Note: Scan ATX heading: # Heading
 
@@ -418,6 +543,13 @@ Process called "scan_heading" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_HEADING, text_ptr, text_length, line, column, level
 End Process
 
+@Reasoning:
+Fenced code block opener. CommonMark requires a run of at least three backticks
+or tildes; the run length is stored in metadata so the parser can match the
+closing fence, which must use the same character and at least the same count.
+The optional language tag after the opening fence is captured as the token's
+lexeme (used for syntax highlighting downstream).
+@End Reasoning
 Process called "scan_code_fence" takes lexer as Integer returns Integer:
     Note: Scan fenced code block: ``` or ~~~
 
@@ -458,6 +590,12 @@ Process called "scan_code_fence" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_CODE_FENCE, lang_ptr, lang_length, line, column, fence_count
 End Process
 
+@Reasoning:
+Emits a single TOKEN_BLOCKQUOTE for the leading '>' marker on a line. The
+parser is responsible for grouping consecutive blockquote-prefixed lines into
+a containing block; this lexer just hands it one marker per line. Trailing
+whitespace after '>' is consumed to align the cursor with the actual content.
+@End Reasoning
 Process called "scan_blockquote" takes lexer as Integer returns Integer:
     Note: Scan blockquote marker: >
 
@@ -478,6 +616,18 @@ Process called "scan_blockquote" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_BLOCKQUOTE, marker_text, 1, line, column, 0
 End Process
 
+@Reasoning:
+Recognizes both unordered ("-", "*", "+") and ordered ("1.") list markers. A
+marker is only valid if followed by whitespace — otherwise "-rebase" or "*ptr"
+would be misclassified. metadata distinguishes 0 (unordered) vs 1 (ordered)
+so the parser knows whether to emit OL or UL containers.
+@End Reasoning
+
+@Implementation:
+For ordered markers the entire digit run plus the trailing "." is captured as
+the lexeme so the parser can recover the starting number for OL "start"
+attribute generation.
+@End Implementation
 Process called "scan_list_marker" takes lexer as Integer returns Integer:
     Note: Scan list item marker: - or * or + or 1.
 
@@ -552,6 +702,12 @@ Process called "scan_list_marker" takes lexer as Integer returns Integer:
     Return 0  Note: Not a list marker
 End Process
 
+@Reasoning:
+Horizontal rule requires three or more identical marker characters from
+{'-', '*', '_'} with only optional whitespace between them, terminated by end
+of line or EOF. Mixing markers ("-*-") is rejected per CommonMark, as is a
+non-whitespace, non-marker byte appearing in the run.
+@End Reasoning
 Process called "scan_horizontal_rule" takes lexer as Integer returns Integer:
     Note: Scan horizontal rule: --- or *** or ___
 
@@ -612,6 +768,18 @@ Note: ==========================================================================
 Note: Inline Element Scanning
 Note: ============================================================================
 
+@Reasoning:
+Single-backtick inline code scanner. Allocates a 512-byte working buffer for
+the literal content; characters beyond that are silently truncated, which is
+acceptable because legitimate inline code spans rarely exceed half a kilobyte.
+On unterminated code (EOF before closing backtick) the buffer is freed and 0
+is returned so the caller can fall back to literal-text tokenization.
+@End Reasoning
+
+@Security_Scope:
+Inline code content is captured verbatim; downstream HTML emission is
+responsible for entity-escaping. This scanner performs no transformation.
+@End Security_Scope
 Process called "scan_inline_code" takes lexer as Integer returns Integer:
     Note: Scan inline code: `code`
 
@@ -655,6 +823,20 @@ Process called "scan_inline_code" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_CODE, buffer, buffer_pos, line, column, 0
 End Process
 
+@Reasoning:
+Combined emphasis ("*x*", "_x_") and strong ("**x**", "__x__") scanner. Counts
+the opening delimiter run, captures content up to a matching closing run of
+the same character, and uses TOKEN_STRONG vs TOKEN_EMPHASIS based on whether
+the run count is >=2. A newline inside the span aborts, matching CommonMark's
+rule that inline formatting does not cross block boundaries.
+@End Reasoning
+
+@Implementation:
+When a partial run of closing markers is found (fewer than the opening count),
+the lexer position is restored to the pre-scan point and the original markers
+are appended to the buffer as literal characters; this preserves source text
+while letting the outer scan continue searching for a valid close.
+@End Implementation
 Process called "scan_emphasis_or_strong" takes lexer as Integer, marker_char as Integer returns Integer:
     Note: Scan emphasis or strong: * or ** or _ or __
 
@@ -758,6 +940,20 @@ Process called "scan_emphasis_or_strong" takes lexer as Integer, marker_char as 
     Return proc create_token with token_type, buffer, buffer_pos, line, column, 0
 End Process
 
+@Reasoning:
+Unified scanner for "[text](url)" links and "![alt](url)" images. The token
+lexeme is a single combined buffer of the form "text\0url\0" so a downstream
+consumer can find both parts with two C-string reads; metadata stores text_pos
+(the length of the text portion) so the URL portion can be located in O(1).
+A newline anywhere inside either component aborts and returns 0, matching
+CommonMark's restriction that link and image syntax does not span lines.
+@End Reasoning
+
+@Security_Scope:
+URL content is captured verbatim; any URL-scheme filtering (e.g. blocking
+"javascript:" in HTML emission) is the parser/renderer's responsibility, not
+the lexer's.
+@End Security_Scope
 Process called "scan_link_or_image" takes lexer as Integer, is_image as Integer returns Integer:
     Note: Scan link [text](url) or image ![alt](url)
 
@@ -912,6 +1108,12 @@ Process called "scan_link_or_image" takes lexer as Integer, is_image as Integer 
     Return proc create_token with token_type, combined_buffer, total_length, line, column, text_pos
 End Process
 
+@Reasoning:
+Recognizes CommonMark autolinks of the form "<url>" — angle-bracket delimited
+URLs with no spaces or newlines inside. Space inside the brackets aborts
+because that would indicate inline HTML or accidentally captured tag content
+that the downstream HTML-block scanner should claim instead.
+@End Reasoning
 Process called "scan_autolink" takes lexer as Integer returns Integer:
     Note: Scan autolink: <url>
 
@@ -969,6 +1171,20 @@ Note: ==========================================================================
 Note: Main Token Scanning
 Note: ============================================================================
 
+@Reasoning:
+The main dispatch. Order matters: EOF first (so an empty document yields a
+clean TOKEN_EOF), then newline (LF and CRLF normalized to one TOKEN_NEWLINE),
+then block-level scanners are tried only when at_line_start = 1 (the
+CommonMark prerequisite for blocks), then inline scanners are always
+attempted. Anything that no scanner claims becomes a single-character
+TOKEN_TEXT — the parser is responsible for coalescing adjacent text tokens.
+@End Reasoning
+
+@Implementation:
+Block-level scanners that fail (return 0) leave the cursor unchanged so the
+fallthrough to inline scanning sees the same byte. CRLF is collapsed by
+absorbing the LF after emitting NEWLINE on the CR.
+@End Implementation
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from lexer
 

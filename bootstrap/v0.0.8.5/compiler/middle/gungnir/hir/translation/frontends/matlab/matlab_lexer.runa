@@ -119,6 +119,13 @@ Note: ===================================================================
 Note: LEXER STATE
 Note: ===================================================================
 
+@Reasoning:
+Six-field lexer state. source_length is cached so the hot path does not call
+string_length per character access. current_char carries the byte at
+'position' so peek-at-cursor is one struct read instead of two. Line/column
+are 1-based for diagnostic display, separate from the 0-based 'position'
+index into the source buffer.
+@End Reasoning
 Type called "MATLABLexer":
     source as Integer
     position as Integer
@@ -128,6 +135,13 @@ Type called "MATLABLexer":
     current_char as Integer
 End Type
 
+@Reasoning:
+Token record: a numeric type tag (see TOKEN_* constants 100..599), a
+polymorphic value slot (String for identifiers/numbers/literals, integer for
+tokens that need no payload), and 1-based source line/column. The value
+field intentionally holds heap strings for content-bearing tokens so the
+parser can use them without keeping the source buffer alive.
+@End Reasoning
 Type called "MATLABToken":
     token_type as Integer
     value as Integer
@@ -139,6 +153,12 @@ Note: ===================================================================
 Note: LEXER INITIALIZATION
 Note: ===================================================================
 
+@Reasoning:
+Constructs a lexer at the start of source. position=0, line=1, col=1, and
+current_char primed from source_code[0] if the source is non-empty. An empty
+source leaves current_char=0 so matlab_lexer_next_token immediately returns
+TOKEN_EOF.
+@End Reasoning
 Process called "matlab_lexer_create" takes source_code as Integer returns Integer:
     Let lexer be a value of type MATLABLexer with
         source as source_code,
@@ -156,6 +176,11 @@ Process called "matlab_lexer_create" takes source_code as Integer returns Intege
     Return lexer
 End Process
 
+@Reasoning:
+Token factory used by every token-emitting routine. Captures the diagnostic
+line/column at the START of the token (callers save these before advancing
+past the token's characters), not the position after consumption.
+@End Reasoning
 Process called "create_token" takes token_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Let token be a value of type MATLABToken with
         token_type as token_type,
@@ -170,6 +195,13 @@ Note: ===================================================================
 Note: CHARACTER NAVIGATION
 Note: ===================================================================
 
+@Reasoning:
+Single-byte cursor advance. Updates position and column then refreshes
+current_char from the new position; sets current_char to 0 at EOF so scanner
+loops checking "while current_char != 0" terminate naturally. Note: line
+tracking is performed at the call site that sees the newline, not here, to
+avoid double-counting when blocks like skip_block_comment skip past newlines.
+@End Reasoning
 Process called "advance" takes lexer as Integer:
     Set lexer.position to lexer.position plus 1
 
@@ -182,6 +214,12 @@ Process called "advance" takes lexer as Integer:
     Set lexer.column to lexer.column plus 1
 End Process
 
+@Reasoning:
+Pure lookahead at position+offset. Used heavily during multi-character
+operator detection (".^", ".*", "==", "~=", "&&", "||", "...") where the
+lexer needs to commit to a token only after confirming the following byte.
+Out-of-range returns 0 (EOF sentinel) without error.
+@End Reasoning
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Let pos be lexer.position plus offset
 
@@ -193,6 +231,13 @@ Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+Skips inline whitespace (space, tab, carriage return) but deliberately not
+newline (10) — MATLAB uses newlines as statement terminators, so the main
+lexer must see them as NEWLINE tokens. Carriage return is treated as
+whitespace alone so CRLF line endings still produce one NEWLINE per logical
+line.
+@End Reasoning
 Process called "skip_whitespace" takes lexer as Integer:
     While lexer.current_char is not equal to 0:
         Note: Space (32), tab (9), carriage return (13)
@@ -212,6 +257,11 @@ Process called "skip_whitespace" takes lexer as Integer:
     End While
 End Process
 
+@Reasoning:
+Advances the cursor until it reaches LF or EOF, leaving the LF in place so
+the main lexer subsequently emits NEWLINE. Used to consume line comments
+once the leading '%' has been matched.
+@End Reasoning
 Process called "skip_line" takes lexer as Integer:
     Note: Skip until newline or EOF
     While lexer.current_char is not equal to 0:
@@ -227,6 +277,12 @@ Note: ===================================================================
 Note: COMMENT HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Dispatches between MATLAB's two comment forms: "%{ ... %}" block comments
+(consumed by skip_block_comment) versus "%..." line comments (consumed by
+skip_line). Returns early if the cursor is not on '%' so the caller can
+safely invoke this whenever it sees a possible comment start.
+@End Reasoning
 Process called "skip_comment" takes lexer as Integer:
     Note: MATLAB comments start with %
     If lexer.current_char is not equal to 37:
@@ -247,6 +303,12 @@ Process called "skip_comment" takes lexer as Integer:
     proc skip_line from lexer
 End Process
 
+@Reasoning:
+Scans until "%}" or EOF, tracking line/column for embedded newlines so
+diagnostics outside the comment remain accurate. Unterminated block comments
+(EOF before "%}") return silently — the EOF will be handled as an error by
+the next top-level token request.
+@End Reasoning
 Process called "skip_block_comment" takes lexer as Integer:
     Note: Skip until %} or EOF
     While lexer.current_char is not equal to 0:
@@ -274,6 +336,17 @@ Note: ===================================================================
 Note: NUMBER LEXING
 Note: ===================================================================
 
+@Reasoning:
+MATLAB numeric literal scanner. Recognizes three forms:
+- Hexadecimal: "0x" prefix followed by [0-9a-fA-F]+;
+- Floating-point: digit-run, optional ".digits", optional "[eE][+-]?digits";
+- Imaginary: a numeric literal trailed by 'i' or 'j' (e.g. "3.14i" or "2j").
+A '.' is only consumed as a decimal point when the next character is a digit;
+otherwise the '.' is left for the operator scanner (so "1.f" or "1.'"
+correctly produce NUMBER then a dot token). The scanned text slice is
+returned via string_substring without numeric conversion — value parsing is
+the parser's job.
+@End Reasoning
 Process called "lex_number" takes lexer as Integer returns Integer:
     Let start_pos be lexer.position
     Let start_line be lexer.line
@@ -424,6 +497,16 @@ Note: ===================================================================
 Note: STRING/CHAR LEXING
 Note: ===================================================================
 
+@Reasoning:
+Scans both MATLAB string forms: single-quote char-array literals ('hello')
+and double-quote string-class literals ("hello", R2017a+). Token type
+differs (TOKEN_CHAR vs TOKEN_STRING) based on quote_char. A doubled quote
+inside the literal is the MATLAB escape for a single quote — the lexer
+emits one quote character into the buffer and continues. A literal newline
+inside a single-quote string is an error (MATLAB does not allow it); inside
+a double-quote string it is permitted and updates line tracking. EOF before
+the closing quote produces TOKEN_ERROR.
+@End Reasoning
 Process called "lex_string" takes lexer as Integer, quote_char as Integer returns Integer:
     Let start_line be lexer.line
     Let start_column be lexer.column
@@ -481,6 +564,13 @@ Note: ===================================================================
 Note: IDENTIFIER AND KEYWORD LEXING
 Note: ===================================================================
 
+@Reasoning:
+Identifier scanner per MATLAB's lexical rules: first character must be a
+letter (enforced by the caller's dispatch), subsequent characters may be
+letters, digits, or underscores. After the run completes, the captured
+substring is consulted against match_keyword; a keyword match wins and a
+keyword-typed token is emitted, otherwise TOKEN_IDENTIFIER.
+@End Reasoning
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let start_pos be lexer.position
     Let start_line be lexer.line
@@ -553,6 +643,17 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_IDENTIFIER, text, start_line, start_column
 End Process
 
+@Reasoning:
+Linear string-equality scan across all MATLAB reserved words, declaration
+keywords (classdef/properties/methods/events), control keywords
+(if/else/elseif/for/while/switch/case/otherwise/try/catch/break/continue/
+return/global/persistent), parallel extensions (parfor/spmd), GPU helpers
+(gpuArray/gather), MEX bridge (mexFunction), and the magic constants
+(true/false/pi/Inf/NaN/eps/i/j). Returns the matched token-type constant or
+0 for "this identifier is user-defined". Linear search is acceptable because
+MATLAB has a small fixed keyword set and identifiers from user code are
+rare in the keyword space.
+@End Reasoning
 Process called "match_keyword" takes text as Integer returns Integer:
     Note: Keywords
     Let is_function be proc string_equals from StringCore with text, "function"
@@ -741,6 +842,24 @@ Note: ===================================================================
 Note: MAIN LEXER
 Note: ===================================================================
 
+@Reasoning:
+The main token-emitting dispatch. Eats whitespace and comments at the top
+of the loop, then routes on the current character: newline emits NEWLINE
+and updates line tracking; digits route to lex_number; quotes route to
+lex_string with the appropriate quote_char; letters route to lex_identifier;
+operator characters are handled with explicit lookahead for MATLAB's
+two- and three-character operators (.^, .*, ./, .\, .', .., ..., ==, ~=,
+<=, >=, &&, ||). Unknown bytes produce TOKEN_ERROR rather than silently
+skipping. EOF at any point in the outer loop returns TOKEN_EOF.
+@End Reasoning
+
+@Implementation:
+The "." dispatch order matters: ellipsis (3 dots) must be checked before
+2-char dot-operators because all .X forms share the leading dot byte. The
+"'" character is ambiguous between transpose-operator and start-of-char-
+string and is resolved here by precedence rules implicit in the dispatch
+ordering and lookahead.
+@End Implementation
 Process called "matlab_lexer_next_token" takes lexer as Integer returns Integer:
     Note: Skip whitespace and comments
     While lexer.current_char is not equal to 0:
@@ -1046,6 +1165,18 @@ Note: ===================================================================
 Note: UTILITY FUNCTIONS
 Note: ===================================================================
 
+@Reasoning:
+Concatenates a list of single-character codes (built up by lex_string when
+collecting literal content) into a single result string via repeated
+string_concat. Used because the lexer accumulates string content one
+character at a time to handle the doubled-quote escape rule.
+@End Reasoning
+
+@Performance_Hints:
+O(n^2) in literal length due to repeated concat. Acceptable for typical
+literals; rare gigantic literals would benefit from a buffer-based builder,
+but in practice MATLAB code does not contain multi-megabyte string literals.
+@End Performance_Hints
 Process called "build_string" takes char_list as Integer returns Integer:
     Let result be ""
     Let count be proc list_length from ListCore with char_list
@@ -1061,18 +1192,35 @@ Process called "build_string" takes char_list as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning:
+Field accessor for token.token_type. Provided so parser code does not need
+to know the MATLABToken struct layout (so the layout can evolve without
+breaking callers).
+@End Reasoning
 Process called "matlab_token_type" takes token as Integer returns Integer:
     Return token.token_type
 End Process
 
+@Reasoning:
+Field accessor for token.value. Same encapsulation rationale as
+matlab_token_type — keeps consumers decoupled from struct field offsets.
+@End Reasoning
 Process called "matlab_token_value" takes token as Integer returns Integer:
     Return token.value
 End Process
 
+@Reasoning:
+Field accessor for token.line — the 1-based source line where the token
+began. Used by the parser to attach diagnostics to error sites.
+@End Reasoning
 Process called "matlab_token_line" takes token as Integer returns Integer:
     Return token.line
 End Process
 
+@Reasoning:
+Field accessor for token.column — the 1-based source column where the token
+began. Paired with matlab_token_line to form the full source coordinate.
+@End Reasoning
 Process called "matlab_token_column" takes token as Integer returns Integer:
     Return token.column
 End Process

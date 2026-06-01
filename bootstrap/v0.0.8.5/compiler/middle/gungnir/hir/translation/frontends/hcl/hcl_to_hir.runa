@@ -18,12 +18,28 @@ Note: ===================================================================
 Note: TRANSLATION CONTEXT
 Note: ===================================================================
 
+@Reasoning:
+HCL translation is block-scoped (resources, modules, variables, locals all introduce nested namespaces), so the translator needs a mutable context that grows and shrinks as blocks are entered. Bundling hir_module, current_scope, block_stack, and a metadata dictionary into one record lets every translator function take a single ctx parameter.
+@End Reasoning
+
+@Implementation:
+Four integer slots: hir_module is the root module being built, current_scope is the currently active HIR scope (set by block translators), block_stack tracks nested HCL block ancestry, and metadata stores translator-wide flags used by helpers like splat and for-expr.
+@End Implementation
+
 Type called "HCLTranslationContext":
     hir_module as Integer
     current_scope as Integer
     block_stack as Integer
     metadata as Integer
 End Type
+
+@Reasoning:
+Constructor seeded with a fresh HIR module named "hcl_config" because every HCL file produces exactly one logical configuration root. Empty block_stack and metadata are initialised eagerly so subsequent translators never have to null-check them.
+@End Reasoning
+
+@Implementation:
+Allocates an HCLTranslationContext value, calls HIR.hir_create_module with the literal "hcl_config" name, sets current_scope to 0 (top-level), and primes block_stack via list_create and metadata via dict_create.
+@End Implementation
 
 Process called "create_translation_context" returns Integer:
     Let ctx be a value of type HCLTranslationContext with
@@ -39,6 +55,14 @@ Note: ===================================================================
 Note: MAIN TRANSLATION ENTRY POINT
 Note: ===================================================================
 
+@Reasoning:
+Single entry point that owns the lifetime of the translation context. Returning ctx.hir_module after translation surfaces only the result, hiding the transient block stack and metadata used during translation.
+@End Reasoning
+
+@Implementation:
+Creates a fresh context, walks the AST top-level via translate_configuration, then returns the populated hir_module field from ctx.
+@End Implementation
+
 Process called "translate_hcl_to_hir" takes hcl_ast as Integer returns Integer:
     Let ctx be proc create_translation_context
 
@@ -51,6 +75,14 @@ End Process
 Note: ===================================================================
 Note: CONFIGURATION TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+The top-level of an HCL document is a flat sequence of either blocks (resource, variable, output, module, provider, data, locals, terraform, dynamic) or bare attributes. Dispatching by HCL_* tag keeps each block flavour translated by its dedicated routine that knows the exact label and body shape for that flavour.
+@End Reasoning
+
+@Implementation:
+Iterates AST children of config_node, reads each child's node type, and forwards to the matching block translator. Bare attributes at the top level go through translate_attribute. Unknown tags are silently dropped which keeps the translator robust to future HCL extensions.
+@End Implementation
 
 Process called "translate_configuration" takes ctx as Integer, config_node as Integer:
     Let child_count be proc ast_node_child_count from HCLParser with config_node
@@ -108,6 +140,14 @@ End Process
 Note: ===================================================================
 Note: BLOCK TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+A Terraform/HCL resource carries two string labels (provider type and instance name) before its body. The translator concatenates these into a single HIR class name and stamps both labels as metadata so downstream tooling can recover the original identity.
+@End Reasoning
+
+@Implementation:
+Walks block_node children, treating leading HCL_LITERAL children as labels until a non-literal child stops the label phase (the loop sets i to 999999 as a break sentinel). Concatenates type and name with an underscore for the HIR class name, attaches metadata, then forwards remaining children to translate_block_body_item under the new class. Finally registers the class on ctx.hir_module.
+@End Implementation
 
 Process called "translate_resource_block" takes ctx as Integer, block_node as Integer:
     Note: resource "type" "name" { ... }
@@ -167,6 +207,14 @@ Process called "translate_resource_block" takes ctx as Integer, block_node as In
     proc hir_add_declaration from HIR with ctx.hir_module, hir_class
 End Process
 
+@Reasoning:
+An HCL variable block declares a typed parameter with optional default, type, and description attributes. It maps cleanly to a single HIR variable record whose attributes survive as metadata so the eventual emitter can reproduce or query them.
+@End Reasoning
+
+@Implementation:
+Reads the single label as variable name, creates a HIR variable of HIR_TYPE_ANY, then iterates children from index 1 onward looking for HCL_ATTRIBUTE entries. For each attribute, stores the first child expression as metadata keyed by the attribute name.
+@End Implementation
+
 Process called "translate_variable_block" takes ctx as Integer, block_node as Integer:
     Note: variable "name" { ... }
     Let child_count be proc ast_node_child_count from HCLParser with block_node
@@ -211,6 +259,14 @@ Process called "translate_variable_block" takes ctx as Integer, block_node as In
     proc hir_add_declaration from HIR with ctx.hir_module, hir_var
 End Process
 
+@Reasoning:
+HCL output blocks publish a value computed from other resources. The translator records them as HIR constants — the value is set by the "value" attribute discovered during body iteration via translate_block_body_item.
+@End Reasoning
+
+@Implementation:
+Captures the single output name label, creates a HIR constant with HIR_TYPE_ANY and initial value 0, marks it with "hcl_block_type"="output" metadata, then forwards each remaining child to translate_block_body_item so any attributes (value, description, sensitive) become HIR fields on the constant.
+@End Implementation
+
 Process called "translate_output_block" takes ctx as Integer, block_node as Integer:
     Note: output "name" { value = ... }
     Let child_count be proc ast_node_child_count from HCLParser with block_node
@@ -243,6 +299,14 @@ Process called "translate_output_block" takes ctx as Integer, block_node as Inte
     proc hir_add_declaration from HIR with ctx.hir_module, hir_output
 End Process
 
+@Reasoning:
+Module blocks in HCL load and parameterise external modules. Modeling them as HIR classes preserves the namespacing of their inputs (each attribute is a field). The single label gives the local module instance name.
+@End Reasoning
+
+@Implementation:
+Reads the module instance name from the first label child, creates an HIR class with that name, stamps "hcl_block_type" and "hcl_module_name" metadata, then iterates children from index 1 and forwards each to translate_block_body_item which adds attributes/nested blocks as members.
+@End Implementation
+
 Process called "translate_module_block" takes ctx as Integer, block_node as Integer:
     Note: module "name" { source = "..." }
     Let child_count be proc ast_node_child_count from HCLParser with block_node
@@ -272,6 +336,14 @@ Process called "translate_module_block" takes ctx as Integer, block_node as Inte
     proc hir_add_declaration from HIR with ctx.hir_module, hir_class
 End Process
 
+@Reasoning:
+Provider configuration blocks describe Terraform provider plugins. Like module blocks they have one name label and a body of attributes; the body shape is provider-specific so the translator simply preserves attributes as class members rather than imposing schema.
+@End Reasoning
+
+@Implementation:
+Extracts the provider name from the first label child, creates an HIR class named after the provider, stamps "hcl_block_type" and "hcl_provider_name" metadata, then walks children from index 1 through translate_block_body_item which converts attributes to HIR fields.
+@End Implementation
+
 Process called "translate_provider_block" takes ctx as Integer, block_node as Integer:
     Note: provider "name" { ... }
     Let child_count be proc ast_node_child_count from HCLParser with block_node
@@ -299,6 +371,14 @@ Process called "translate_provider_block" takes ctx as Integer, block_node as In
 
     proc hir_add_declaration from HIR with ctx.hir_module, hir_class
 End Process
+
+@Reasoning:
+Data sources have the same two-label shape as resources (type and name) but are read-only lookups rather than managed resources. The translator distinguishes them by prefixing the HIR class name with "data_" and tagging "hcl_block_type"="data" so downstream code can split create-vs-read concerns.
+@End Reasoning
+
+@Implementation:
+Mirrors translate_resource_block's two-label loop, breaking out by setting the index past child_count once a non-literal child appears. Builds an HIR class with name "data_<type>_<name>", stamps three metadata keys, then forwards remaining children to translate_block_body_item.
+@End Implementation
 
 Process called "translate_data_block" takes ctx as Integer, block_node as Integer:
     Note: data "type" "name" { ... }
@@ -350,6 +430,14 @@ Process called "translate_data_block" takes ctx as Integer, block_node as Intege
     proc hir_add_declaration from HIR with ctx.hir_module, hir_class
 End Process
 
+@Reasoning:
+A locals block declares multiple named local values in one HCL block. Rather than creating a single HIR aggregate, the translator promotes each attribute to its own top-level HIR constant tagged "hcl_local" so each local is independently addressable from later expressions.
+@End Reasoning
+
+@Implementation:
+Iterates the block's children; for each HCL_ATTRIBUTE child, creates a fresh HIR constant named after the attribute, translates the attribute's first child expression to HIR, sets that as the constant's value, and registers the constant on ctx.hir_module.
+@End Implementation
+
 Process called "translate_locals_block" takes ctx as Integer, block_node as Integer:
     Note: locals { ... }
     Let child_count be proc ast_node_child_count from HCLParser with block_node
@@ -379,6 +467,14 @@ Process called "translate_locals_block" takes ctx as Integer, block_node as Inte
     End While
 End Process
 
+@Reasoning:
+The terraform settings block is a single labelless block whose attributes (required_version, backend, etc.) configure tooling rather than infrastructure. Translating it as a HIR class named "terraform_config" gives it a stable identity for emitters.
+@End Reasoning
+
+@Implementation:
+Creates the HIR class with the fixed name "terraform_config", stamps "hcl_block_type"="terraform" metadata, then forwards every child to translate_block_body_item starting from index 0 (no label children to skip).
+@End Implementation
+
 Process called "translate_terraform_block" takes ctx as Integer, block_node as Integer:
     Note: terraform { required_version = "..." }
     Let hir_class be proc hir_create_class from HIR with "terraform_config"
@@ -396,6 +492,14 @@ Process called "translate_terraform_block" takes ctx as Integer, block_node as I
 
     proc hir_add_declaration from HIR with ctx.hir_module, hir_class
 End Process
+
+@Reasoning:
+Dynamic blocks expand at runtime over for_each iterations. The translator preserves them as HIR classes named after the dynamic block's label, with metadata identifying them as dynamic so a later HIR pass can implement the expansion semantics.
+@End Reasoning
+
+@Implementation:
+Reads the block name from the first label, creates an HIR class with that name, stamps "hcl_block_type"="dynamic" and "hcl_dynamic_block"=<name> metadata, then forwards remaining children (for_each, iterator, labels, content) to translate_block_body_item.
+@End Implementation
 
 Process called "translate_dynamic_block" takes ctx as Integer, block_node as Integer:
     Note: dynamic "block_name" { for_each = ... content { ... } }
@@ -425,6 +529,14 @@ Process called "translate_dynamic_block" takes ctx as Integer, block_node as Int
     proc hir_add_declaration from HIR with ctx.hir_module, hir_class
 End Process
 
+@Reasoning:
+Shared helper used by every block translator to convert one body item into an HIR member of the surrounding class. Centralising attribute-vs-nested-block dispatch keeps each block translator from duplicating the same six lines of If/Otherwise glue.
+@End Reasoning
+
+@Implementation:
+For HCL_ATTRIBUTE items: extracts the attribute name and translates its first child expression to HIR, wraps the result as a HIR field with initializer, and adds it as a member of parent_hir. For nested HCL_RESOURCE_BLOCK or HCL_DYNAMIC_BLOCK items, defers to the corresponding block translator so they appear as siblings on the module rather than being misnested.
+@End Implementation
+
 Process called "translate_block_body_item" takes ctx as Integer, item_node as Integer, parent_hir as Integer:
     Let item_type be proc ast_node_type from HCLParser with item_node
 
@@ -453,6 +565,14 @@ Process called "translate_block_body_item" takes ctx as Integer, item_node as In
     End If
 End Process
 
+@Reasoning:
+A bare attribute at the top level of an HCL file (outside any block) is treated as a module-level constant. This handles legacy HCL where settings could appear at file scope.
+@End Reasoning
+
+@Implementation:
+Reads the attribute name from the AST node, translates its first child expression to HIR, then creates an HIR constant initialised with that value and registers it on ctx.hir_module.
+@End Implementation
+
 Process called "translate_attribute" takes ctx as Integer, attr_node as Integer:
     Let attr_name be proc ast_node_value from HCLParser with attr_node
     Let child_count be proc ast_node_child_count from HCLParser with attr_node
@@ -469,6 +589,14 @@ End Process
 Note: ===================================================================
 Note: EXPRESSION TRANSLATION
 Note: ===================================================================
+
+@Reasoning:
+HCL expression grammar covers 12 distinct node types (literals, identifiers, collections, operators, conditionals, calls, member/index access, splat, for-comprehensions). A flat dispatch by node-type tag keeps each variant's translator independently testable.
+@End Reasoning
+
+@Implementation:
+Reads the expression's tag and forwards to the corresponding translate_* helper. Returns 0 for unknown tags, which propagates as an HIR null sentinel and lets the surrounding statement decide whether to fail or skip.
+@End Implementation
 
 Process called "translate_expression" takes ctx as Integer, expr_node as Integer returns Integer:
     Let expr_type be proc ast_node_type from HCLParser with expr_node
@@ -528,6 +656,14 @@ Process called "translate_expression" takes ctx as Integer, expr_node as Integer
     Return 0
 End Process
 
+@Reasoning:
+HCL literals are textually polymorphic — "true"/"false"/"null"/digits/quoted strings all surface as HCL_LITERAL with a string value. The translator must reclassify them so HIR sees Boolean, Null, Number, or String as distinct variants.
+@End Reasoning
+
+@Implementation:
+Tests value against the keywords "true", "false", "null" (using string_equals) in turn, emitting hir_create_boolean_literal/null_literal as appropriate. Otherwise reads the first byte; if it is an ASCII digit (48-57) emits hir_create_number_literal, else falls through to hir_create_string_literal.
+@End Implementation
+
 Process called "translate_literal" takes ctx as Integer, literal_node as Integer returns Integer:
     Let value be proc ast_node_value from HCLParser with literal_node
 
@@ -560,10 +696,26 @@ Process called "translate_literal" takes ctx as Integer, literal_node as Integer
     Return proc hir_create_string_literal from HIR with value
 End Process
 
+@Reasoning:
+Identifier references in HCL flow directly to HIR identifiers with the same name; later semantic passes resolve them against the variable/local/resource scopes. No transformation is needed here.
+@End Reasoning
+
+@Implementation:
+Reads the identifier name from the AST node and forwards to hir_create_identifier.
+@End Implementation
+
 Process called "translate_identifier" takes ctx as Integer, ident_node as Integer returns Integer:
     Let name be proc ast_node_value from HCLParser with ident_node
     Return proc hir_create_identifier from HIR with name
 End Process
+
+@Reasoning:
+HCL list literals translate directly to HIR array literals; each element is itself an expression and must be recursively translated to preserve nested structure.
+@End Reasoning
+
+@Implementation:
+Creates an empty HIR array literal, iterates list_node children, translates each child through translate_expression, and appends the result via hir_add_array_element. Preserves order because the AST iterator yields children in source order.
+@End Implementation
 
 Process called "translate_list" takes ctx as Integer, list_node as Integer returns Integer:
     Let hir_list be proc hir_create_array_literal from HIR
@@ -581,9 +733,25 @@ Process called "translate_list" takes ctx as Integer, list_node as Integer retur
     Return hir_list
 End Process
 
+@Reasoning:
+HCL distinguishes maps from objects syntactically but they share the same HIR dictionary representation. Aliasing translate_map to translate_object avoids duplicating the conversion logic.
+@End Reasoning
+
+@Implementation:
+Single delegation to translate_object, passing the same context and node.
+@End Implementation
+
 Process called "translate_map" takes ctx as Integer, map_node as Integer returns Integer:
     Return proc translate_object with ctx, map_node
 End Process
+
+@Reasoning:
+HCL objects/maps map to HIR dictionary literals. Each child is an HCL_ATTRIBUTE; the attribute name becomes a string-literal key (HCL maps allow only string keys at this layer) and the attribute's first child expression becomes the value.
+@End Reasoning
+
+@Implementation:
+Creates an empty HIR dictionary literal, iterates obj_node children, processes only HCL_ATTRIBUTE entries (silently skipping anything else), translates the value expression, wraps the key as a string literal, and appends the pair via hir_add_dictionary_pair.
+@End Implementation
 
 Process called "translate_object" takes ctx as Integer, obj_node as Integer returns Integer:
     Let hir_object be proc hir_create_dictionary_literal from HIR
@@ -614,6 +782,14 @@ Process called "translate_object" takes ctx as Integer, obj_node as Integer retu
     Return hir_object
 End Process
 
+@Reasoning:
+HCL binary operators (arithmetic, comparison, logical) need to be remapped from HCL's textual representation to HIR's enumerated HIR_OP_* constants. Translating operands first keeps the HIR construction call atomic at the end.
+@End Reasoning
+
+@Implementation:
+Validates that binary_node has at least 2 children, translates both operands recursively, maps the operator string to HIR_OP_* via map_hcl_operator_to_hir, then creates a HIR binary expression. Returns 0 for malformed nodes with fewer than two children.
+@End Implementation
+
 Process called "translate_binary_expr" takes ctx as Integer, binary_node as Integer returns Integer:
     Let operator be proc ast_node_value from HCLParser with binary_node
     Let child_count be proc ast_node_child_count from HCLParser with binary_node
@@ -632,6 +808,14 @@ Process called "translate_binary_expr" takes ctx as Integer, binary_node as Inte
 
     Return proc hir_create_binary_expr from HIR with hir_op, hir_left, hir_right
 End Process
+
+@Reasoning:
+A single point of truth for HCL-to-HIR operator translation prevents drift between the various expression translators that need it. Falling back to HIR_OP_ADD on unknown operators is a deliberate non-throwing choice — HIR validation will catch genuinely invalid expressions later.
+@End Reasoning
+
+@Implementation:
+Linear sequence of string_equals tests against each supported operator token ("+", "-", "*", "/", "==", "!=", "<", "<=", ">", ">=", "&&", "||"), returning the matching HIR_OP_* constant on the first hit. Returns HIR_OP_ADD as a default when nothing matches.
+@End Implementation
 
 Process called "map_hcl_operator_to_hir" takes operator as Integer returns Integer:
     Let is_plus be proc string_equals from StringCore with operator, "+"
@@ -697,6 +881,14 @@ Process called "map_hcl_operator_to_hir" takes operator as Integer returns Integ
     Return HIR.HIR_OP_ADD
 End Process
 
+@Reasoning:
+HCL unary operators are limited to logical-not ("!") and arithmetic negation ("-"). Translating the operand once and then branching on operator avoids duplicating recursion in each operator arm.
+@End Reasoning
+
+@Implementation:
+Validates child_count >= 1, translates the single operand, then dispatches on operator: "!" -> HIR_OP_LOGICAL_NOT, "-" -> HIR_OP_NEGATE, default -> return operand unchanged (safe identity for unknown unary).
+@End Implementation
+
 Process called "translate_unary_expr" takes ctx as Integer, unary_node as Integer returns Integer:
     Let operator be proc ast_node_value from HCLParser with unary_node
     Let child_count be proc ast_node_child_count from HCLParser with unary_node
@@ -721,6 +913,14 @@ Process called "translate_unary_expr" takes ctx as Integer, unary_node as Intege
     Return hir_operand
 End Process
 
+@Reasoning:
+HCL ternary expressions ("cond ? a : b") are stored as three child nodes; HIR has a dedicated conditional expression that maps one-to-one, so translation is just three sub-translations and a constructor call.
+@End Reasoning
+
+@Implementation:
+Validates at least three children, translates condition/true-branch/false-branch in order via translate_expression, then constructs an HIR conditional expression. Returns 0 on malformed nodes.
+@End Implementation
+
 Process called "translate_conditional" takes ctx as Integer, cond_node as Integer returns Integer:
     Let child_count be proc ast_node_child_count from HCLParser with cond_node
 
@@ -738,6 +938,14 @@ Process called "translate_conditional" takes ctx as Integer, cond_node as Intege
 
     Return proc hir_create_conditional_expr from HIR with hir_condition, hir_true, hir_false
 End Process
+
+@Reasoning:
+HCL function calls store the callee as the first child and arguments as subsequent children. Extracting the callee name from an identifier-typed first child works for the common case where callee is a bare function name; member-callee forms would need a future extension.
+@End Reasoning
+
+@Implementation:
+Validates at least one child (the callee). Reads the callee child's type; if it is HCL_IDENTIFIER, extracts its name. Creates an HIR identifier and a call expression around it, then iterates remaining children (index 1..n) translating each as an argument and appending via hir_add_argument.
+@End Implementation
 
 Process called "translate_function_call" takes ctx as Integer, call_node as Integer returns Integer:
     Let child_count be proc ast_node_child_count from HCLParser with call_node
@@ -768,6 +976,14 @@ Process called "translate_function_call" takes ctx as Integer, call_node as Inte
     Return hir_call
 End Process
 
+@Reasoning:
+HCL member access ("a.b") splits into an object expression and an identifier-shaped member name. The translator only reads the name from identifier-typed second children to avoid producing garbled HIR if the parser ever yields a non-identifier member.
+@End Reasoning
+
+@Implementation:
+Validates at least two children, translates the object subexpression, then reads the second child's type and extracts its value only when it is HCL_IDENTIFIER. Builds an HIR member expression with the translated object and the member name string.
+@End Implementation
+
 Process called "translate_member_expr" takes ctx as Integer, member_node as Integer returns Integer:
     Let child_count be proc ast_node_child_count from HCLParser with member_node
 
@@ -789,6 +1005,14 @@ Process called "translate_member_expr" takes ctx as Integer, member_node as Inte
     Return proc hir_create_member_expr from HIR with hir_object, member_name
 End Process
 
+@Reasoning:
+HCL index access ("a[i]") translates to HIR index expressions. Both the object and the index can be arbitrary expressions (the index can be a string for map access or a number for list access), so both are translated through the general translate_expression dispatcher.
+@End Reasoning
+
+@Implementation:
+Validates at least two children, translates object and index sub-expressions, then constructs an HIR index expression with both.
+@End Implementation
+
 Process called "translate_index_expr" takes ctx as Integer, index_node as Integer returns Integer:
     Let child_count be proc ast_node_child_count from HCLParser with index_node
 
@@ -804,6 +1028,14 @@ Process called "translate_index_expr" takes ctx as Integer, index_node as Intege
 
     Return proc hir_create_index_expr from HIR with hir_object, hir_index
 End Process
+
+@Reasoning:
+HCL splat ("a.*.b") has no direct HIR equivalent because HIR member expressions don't model wildcard projection. Representing it as a member expression with name "*" plus an "hcl_splat" metadata flag lets later passes recognise and expand it.
+@End Reasoning
+
+@Implementation:
+Validates at least one child, translates the object subexpression, builds an HIR member expression with "*" as the member name, then stamps the result with "hcl_splat"=1 metadata before returning.
+@End Implementation
 
 Process called "translate_splat_expr" takes ctx as Integer, splat_node as Integer returns Integer:
     Let child_count be proc ast_node_child_count from HCLParser with splat_node
@@ -821,6 +1053,14 @@ Process called "translate_splat_expr" takes ctx as Integer, splat_node as Intege
 
     Return hir_splat
 End Process
+
+@Reasoning:
+HCL for-expressions ("for v in xs : transform(v)") are comprehensions, not statements. HIR's for-expression construct accepts a sequence of "components" (iterator var, source, body, optional filter, optional key); the translator simply forwards each AST child as a component and tags the result with "hcl_for_expr"=1 metadata so the eventual emitter knows the source semantics.
+@End Reasoning
+
+@Implementation:
+Creates an empty HIR for-expression, stamps the metadata flag, iterates all for_node children, translates each as a generic expression via translate_expression, and appends through hir_add_for_component preserving source order.
+@End Implementation
 
 Process called "translate_for_expr" takes ctx as Integer, for_node as Integer returns Integer:
     Let child_count be proc ast_node_child_count from HCLParser with for_node
@@ -846,6 +1086,14 @@ End Process
 Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
+
+@Reasoning:
+The public API name uses the "<frontend>_to_hir_translate" convention that the universal translation framework expects when wiring frontends together. Exposing this thin alias decouples the internal naming (translate_hcl_to_hir) from the framework contract.
+@End Reasoning
+
+@Implementation:
+Single-line delegation to translate_hcl_to_hir.
+@End Implementation
 
 Process called "hcl_to_hir_translate" takes hcl_ast as Integer returns Integer:
     Return proc translate_hcl_to_hir from hcl_ast

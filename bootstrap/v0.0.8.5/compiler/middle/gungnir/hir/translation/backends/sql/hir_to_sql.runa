@@ -32,10 +32,31 @@ Generator context manages the SQL emitter and generation state.
 This provides consistent state management during SQL generation.
 @End Reasoning
 
+@Reasoning:
+SQL generation needs only an emitter handle and an indent cursor; there
+are no per-translation tables or other large bookkeeping, so the context
+stays compact at two int64 fields.
+@End Reasoning
+
+@Implementation:
+Two int64 fields, 16 bytes total. emitter is owned by the context and
+destroyed in destroy_generator_context; indent_level starts at 0.
+@End Implementation
+
 Type called "SQLGeneratorContext":
     emitter as Integer          Note: SQL emitter instance
     indent_level as Integer     Note: Current indentation level (for pretty printing)
 End Type
+
+@Reasoning:
+Bundles emitter creation with context allocation so the rest of the file
+can assume a fully-wired context.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes for the context, constructs an SQL emitter, then
+writes the emitter handle and initial indent_level=0.
+@End Implementation
 
 Process called "create_generator_context" returns Integer:
     Note: Create new SQL generator context
@@ -49,6 +70,16 @@ Process called "create_generator_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Releases the owned SQL emitter before freeing the context block. Order
+matters because the emitter pointer lives inside the context memory.
+@End Reasoning
+
+@Implementation:
+Reads the emitter pointer at offset 0, calls destroy_sql_emitter on it,
+then deallocates the context block.
+@End Implementation
 
 Process called "destroy_generator_context" takes context as Integer:
     Note: Destroy generator context and free resources
@@ -67,6 +98,17 @@ Note: ========================================
 Main entry point for HIR→SQL generation. Takes HIR dictionary
 and returns generated SQL as a string pointer.
 @End Reasoning
+
+@Reasoning:
+Public entry. Owns the context lifetime so callers only deal with input
+HIR root and consume the generated SQL string.
+@End Reasoning
+
+@Implementation:
+Creates a generator context, dispatches the root through
+generate_hir_node, retrieves the buffer via Emitter.get_output, then
+destroys the context. The output string is caller-owned.
+@End Implementation
 
 Process called "generate_sql_from_hir" takes hir_node as Integer returns Integer:
     Note: Generate SQL from HIR dictionary representation
@@ -92,6 +134,21 @@ Note: ========================================
 Dispatch HIR dictionary to appropriate generator based on "type" field.
 This provides a clean separation of concerns for different SQL constructs.
 @End Reasoning
+
+@Reasoning:
+Central dispatch driven off the HIR dictionary's "type" key. SQL has many
+statement shapes (select, insert, update, delete, create_table, etc.) and
+many expression shapes (binary_op, function, column, literal); routing
+them through this single point keeps the call graph predictable.
+@End Reasoning
+
+@Implementation:
+First checks the node tag - non-dictionary HIR nodes are forwarded
+straight to generate_literal. For dictionaries, looks up the "type"
+string key and runs a sequence of string_equals checks against the
+supported SQL constructs, dispatching to the matching generator.
+Unrecognised types fall through to generate_literal.
+@End Implementation
 
 Process called "generate_hir_node" takes context as Integer, hir_node as Integer:
     Note: Generate SQL for any HIR node (dictionary dispatch)
@@ -222,6 +279,20 @@ Generate complete SELECT statements with all clauses:
 SELECT [DISTINCT] columns FROM table [JOIN...] [WHERE...]
 [GROUP BY...] [HAVING...] [ORDER BY...] [LIMIT...] [OFFSET...]
 @End Reasoning
+
+@Reasoning:
+SELECT statements have a well-defined clause order: SELECT [DISTINCT]
+columns FROM tables [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...]
+[ORDER BY ...] [LIMIT ...] [OFFSET ...]. Emitting them in this order
+matches SQL-92 grammar.
+@End Reasoning
+
+@Implementation:
+Reads the matching field from the HIR dictionary for each clause and
+emits it only when present. Columns and joins are walked through the
+list helpers; conditions and limits recurse via generate_hir_node so
+nested expressions (binary ops, function calls) emit correctly.
+@End Implementation
 
 Process called "generate_select_statement" takes context as Integer, select_dict as Integer:
     Note: Generate SELECT statement from HIR dictionary
@@ -387,6 +458,18 @@ Generate INSERT statements:
 INSERT INTO table (col1, col2, ...) VALUES (val1, val2, ...)
 @End Reasoning
 
+@Reasoning:
+INSERT statements take the form "INSERT INTO table (cols) VALUES
+(values)" or "INSERT INTO table SELECT ..."; the dispatcher picks the
+shape based on which HIR fields are present.
+@End Reasoning
+
+@Implementation:
+Emits "INSERT INTO <table>", optional column list in parentheses, then
+either "VALUES (...)" using generate_expression_list or a nested SELECT
+via generate_hir_node when the HIR carries a "select" key.
+@End Implementation
+
 Process called "generate_insert_statement" takes context as Integer, insert_dict as Integer:
     Note: Generate INSERT statement from HIR dictionary
 
@@ -449,6 +532,19 @@ Generate JOIN clauses:
 [INNER|LEFT|RIGHT|FULL OUTER] JOIN table ON condition
 @End Reasoning
 
+@Reasoning:
+JOINs have variants (INNER, LEFT, RIGHT, FULL, CROSS) and an optional ON
+condition. Emitting the join kind keyword before the table name keeps
+ANSI-compliant syntax.
+@End Reasoning
+
+@Implementation:
+Reads the "kind" string to pick the keyword, the "table" identifier, and
+the "on" expression. Emits "<kind> JOIN <table> ON <condition>" with the
+condition routed through generate_hir_node so complex predicates emit
+correctly.
+@End Implementation
+
 Process called "generate_join_clause" takes context as Integer, join_dict as Integer:
     Note: Generate JOIN clause from HIR dictionary
 
@@ -510,6 +606,18 @@ Generate SQL expressions including binary operations,
 function calls, column references, and literals.
 @End Reasoning
 
+@Reasoning:
+Binary operations in SQL cover both arithmetic (+, -, *, /, %) and
+comparison (=, <>, <, >, AND, OR, LIKE). A single generic emitter handles
+all of them.
+@End Reasoning
+
+@Implementation:
+Recurses on the "left" operand via generate_hir_node, emits the operator
+via emit_operator (which routes word operators through emit_keyword for
+uppercase), then recurses on the "right" operand.
+@End Implementation
+
 Process called "generate_binary_operation" takes context as Integer, binary_op_dict as Integer:
     Note: Generate binary operation (e.g., a = b, x > 5, p AND q)
 
@@ -549,6 +657,18 @@ Process called "generate_binary_operation" takes context as Integer, binary_op_d
     End If
 End Process
 
+@Reasoning:
+SQL function calls follow the standard "name(arg, arg, ...)" syntax for
+both built-ins (COUNT, MAX, COALESCE) and user-defined functions; one
+emitter handles both because the SQL grammar is uniform here.
+@End Reasoning
+
+@Implementation:
+Reads the "name" identifier, emits it through emit_identifier, then "(",
+recurses through generate_expression_list on the "arguments" list, and
+closes with ")".
+@End Implementation
+
 Process called "generate_function_call" takes context as Integer, function_dict as Integer:
     Note: Generate function call: function_name(arg1, arg2, ...)
 
@@ -577,6 +697,18 @@ Process called "generate_function_call" takes context as Integer, function_dict 
 
     proc emit_char from Emitter with emitter, 41  Note: )
 End Process
+
+@Reasoning:
+Column references are emitted as "table.column" or just "column"
+depending on whether a "table" qualifier is present in the HIR. Optional
+aliasing ("AS alias") is appended when the alias slot is set.
+@End Reasoning
+
+@Implementation:
+Reads "table", "name", and "alias" from the dict. Emits "<table>." when
+the table prefix is present, then the column name through
+emit_identifier. Appends " AS <alias>" when alias is set.
+@End Implementation
 
 Process called "generate_column_reference" takes context as Integer, column_dict as Integer:
     Note: Generate column reference: [table.]column
@@ -626,6 +758,20 @@ Note: ========================================
 @Reasoning:
 Generate SQL literals: integers, floats, strings, booleans, NULL.
 @End Reasoning
+
+@Reasoning:
+SQL literals span strings (single-quoted, with embedded apostrophes
+doubled), integers (bare), floats (bare), booleans (TRUE/FALSE/NULL), and
+NULL. A dispatcher emitter keeps the literal-emission logic close to
+the type checks.
+@End Reasoning
+
+@Implementation:
+Reads the HIR node type tag and dispatches: STRING via
+emit_string_literal (which double-escapes apostrophes), INTEGER via
+emit_integer, FLOAT via emit_float, BOOLEAN to "TRUE"/"FALSE", and NULL
+to "NULL".
+@End Implementation
 
 Process called "generate_literal" takes context as Integer, hir_node as Integer:
     Note: Generate literal value
@@ -678,6 +824,17 @@ Note: ========================================
 Helper functions to generate comma-separated lists of various elements.
 @End Reasoning
 
+@Reasoning:
+SELECT column lists are comma-separated expressions; each may be a
+column reference, function call, literal, or arbitrary expression so
+the elements are routed through the general dispatcher.
+@End Reasoning
+
+@Implementation:
+Iterates the HIR list of column expressions; for each element, dispatches
+through generate_hir_node and emits ", " between consecutive entries.
+@End Implementation
+
 Process called "generate_column_list" takes context as Integer, columns_list as Integer:
     Note: Generate comma-separated column list for SELECT
 
@@ -699,6 +856,17 @@ Process called "generate_column_list" takes context as Integer, columns_list as 
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+INSERT column lists and CREATE TABLE column lists are pure identifiers,
+not full expressions. Routing them through emit_identifier (which quotes
+reserved words) avoids the broader dispatcher overhead.
+@End Reasoning
+
+@Implementation:
+Iterates the list pulling each entry as a string. Emits each through
+emit_identifier with ", " separators between entries.
+@End Implementation
 
 Process called "generate_identifier_list" takes context as Integer, identifiers_list as Integer:
     Note: Generate comma-separated identifier list
@@ -731,6 +899,17 @@ Process called "generate_identifier_list" takes context as Integer, identifiers_
     End While
 End Process
 
+@Reasoning:
+VALUES clauses and function argument lists are comma-separated
+expressions that may include complex subexpressions; recursing through
+generate_hir_node handles the recursion uniformly.
+@End Reasoning
+
+@Implementation:
+Iterates the list; for each entry dispatches through generate_hir_node
+and emits ", " between consecutive entries.
+@End Implementation
+
 Process called "generate_expression_list" takes context as Integer, expressions_list as Integer:
     Note: Generate comma-separated expression list
 
@@ -752,6 +931,18 @@ Process called "generate_expression_list" takes context as Integer, expressions_
         Set i to i plus 1
     End While
 End Process
+
+@Reasoning:
+ORDER BY entries pair a column expression with an optional direction
+(ASC / DESC). Dedicated formatting keeps the direction keyword
+properly placed after the expression.
+@End Reasoning
+
+@Implementation:
+Iterates the list. For each entry, dispatches the "expression" child
+through generate_hir_node, then emits " ASC" or " DESC" when the
+"direction" field is present. Inserts ", " separators between entries.
+@End Implementation
 
 Process called "generate_order_by_list" takes context as Integer, order_by_list as Integer:
     Note: Generate comma-separated ORDER BY list with optional ASC/DESC
@@ -804,6 +995,18 @@ End Process
 Note: ========================================
 Note: UPDATE Statement Generation
 Note: ========================================
+
+@Reasoning:
+UPDATE statements take the form "UPDATE table SET col=expr, ... [WHERE
+condition]"; the SET assignments need their own list shape because each
+entry is a column-expression pair.
+@End Reasoning
+
+@Implementation:
+Emits "UPDATE <table> SET", walks the assignments list emitting
+"col = expr" pairs separated by commas, then if a where clause is
+present emits " WHERE " and recurses on the condition.
+@End Implementation
 
 Process called "generate_update_statement" takes context as Integer, hir_node as Integer:
     Note: Generate UPDATE table SET col=val WHERE condition
@@ -865,6 +1068,17 @@ Note: ========================================
 Note: DELETE Statement Generation
 Note: ========================================
 
+@Reasoning:
+DELETE statements are the simplest mutator: "DELETE FROM table [WHERE
+condition]". A dedicated emitter is needed because the keyword order
+differs from UPDATE / INSERT.
+@End Reasoning
+
+@Implementation:
+Emits "DELETE FROM <table>", and when a where clause is present, emits
+" WHERE " and dispatches the condition through generate_hir_node.
+@End Implementation
+
 Process called "generate_delete_statement" takes context as Integer, hir_node as Integer:
     Note: Generate DELETE FROM table WHERE condition
 
@@ -900,6 +1114,17 @@ End Process
 Note: ========================================
 Note: CREATE TABLE Statement Generation
 Note: ========================================
+
+@Reasoning:
+CREATE TABLE produces a DDL form "CREATE TABLE name (col TYPE [CONSTRAINTS]
+, ...)" that needs per-column type and constraint emission.
+@End Reasoning
+
+@Implementation:
+Emits "CREATE TABLE <name> (", walks the columns list emitting each as
+"<name> <type> <constraints...>" with comma separators, and closes with
+")".
+@End Implementation
 
 Process called "generate_create_table_statement" takes context as Integer, hir_node as Integer:
     Note: Generate CREATE TABLE name (columns...)
@@ -952,6 +1177,18 @@ Note: ========================================
 Note: ALTER TABLE Statement Generation
 Note: ========================================
 
+@Reasoning:
+ALTER TABLE supports ADD COLUMN, DROP COLUMN, ALTER COLUMN and constraint
+changes; each variant has its own clause shape after the common "ALTER
+TABLE <table>" prefix.
+@End Reasoning
+
+@Implementation:
+Emits "ALTER TABLE <table>", reads the "action" key, then emits the
+appropriate sub-clause: "ADD COLUMN <col> <type>", "DROP COLUMN <col>",
+or "ALTER COLUMN <col> <changes>" based on the action string.
+@End Implementation
+
 Process called "generate_alter_table_statement" takes context as Integer, hir_node as Integer:
     Note: Generate ALTER TABLE name action
 
@@ -986,6 +1223,18 @@ End Process
 Note: ========================================
 Note: DROP Statement Generation
 Note: ========================================
+
+@Reasoning:
+DROP applies to multiple object kinds (TABLE, INDEX, VIEW); the kind
+keyword changes but the rest of the statement does not, so a single
+emitter parameterises on the kind.
+@End Reasoning
+
+@Implementation:
+Reads the "object_kind" string (TABLE/INDEX/VIEW) and the object name,
+emits "DROP <kind> <name>", appending optional " IF EXISTS" when the
+flag is set in the HIR.
+@End Implementation
 
 Process called "generate_drop_statement" takes context as Integer, hir_node as Integer:
     Note: Generate DROP TABLE/INDEX name

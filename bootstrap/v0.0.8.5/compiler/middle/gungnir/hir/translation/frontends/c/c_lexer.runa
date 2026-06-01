@@ -152,6 +152,23 @@ Note: ==========================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
+@Reasoning:
+C is ASCII-clean (the spec allows trigraphs and UCNs but the practical
+corpus avoids them). The lexer's cursor is byte-positioned. token_start
+records the start of the lexeme currently being built; token_type and
+token_lexeme cache the last token emitted so the parser can re-read them
+without re-lexing. error_message is sticky on first lexing failure.
+@End Reasoning
+
+@Implementation:
+72-byte record (9 x i64) at offsets 0..64: source (StringCore handle),
+length (cached source byte count), position (byte cursor, 0-based),
+line (1-based), column (1-based), token_start (cursor at last token
+start), token_type (last emitted token type), token_lexeme (owned
+StringCore copy of last lexeme - freed by destroy_c_lexer),
+error_message (owned StringCore).
+@End Implementation
+
 Type called "CLexer":
     source as Integer          Note: Source code string
     length as Integer          Note: Source length
@@ -226,6 +243,15 @@ Note: ==========================================================================
 Note: Character Access
 Note: ============================================================================
 
+@Reasoning:
+Cursor read; returns 0 at EOF (no real NUL bytes in C source).
+@End Reasoning
+
+@Implementation:
+Reads position/length from offsets 16/8. If past EOF returns 0. Otherwise
+reads byte at source+position via memory_get_byte.
+@End Implementation
+
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -241,6 +267,20 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+Cursor-advancing read with line/column maintenance. Column is always
+bumped first; LF (0x0A) then resets column to 1 and bumps line so the
+next byte starts on the new line at column 1. This ordering matters for
+EOF reporting where the cursor is past-end but column should still
+reflect the last consumed byte.
+@End Reasoning
+
+@Implementation:
+Reads position/length. If past EOF returns 0. Reads byte at
+source+position; bumps position by 1. Bumps column by 1. On LF (10)
+bumps line by 1 and resets column to 1. Returns the byte.
+@End Implementation
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
@@ -269,6 +309,17 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+One-byte-ahead peek. Used for multi-byte operators ("==", "!=", "<=",
+">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "<<", ">>",
+"->") and for distinguishing line/block comments from division.
+@End Reasoning
+
+@Implementation:
+Reads position/length. If position+1 >= length returns 0 (EOF before the
+next byte). Otherwise reads source+position+1 via memory_get_byte.
+@End Implementation
+
 Process called "peek_next_char" takes lexer as Integer returns Integer:
     Note: Peek at next character without advancing
 
@@ -289,6 +340,15 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII digit classifier used by integer/float literal scanning and as a
+component of is_alnum for identifier tail.
+@End Reasoning
+
+@Implementation:
+Single range check '0'..'9' (48..57). Returns 1 on match.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -300,6 +360,16 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Hex classifier for 0xNN literals and \xNN string escapes. Accepts 0..9,
+A..F, a..f.
+@End Reasoning
+
+@Implementation:
+Calls is_digit; on match returns 1. Otherwise checks 'A'..'F' (65..70)
+and 'a'..'f' (97..102) via nested range checks.
+@End Implementation
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hex digit (0-9, a-f, A-F)
@@ -325,6 +395,17 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+C identifier-start classifier per C99/C11 spec: letter or underscore.
+Universal Character Names (\uXXXX, \UXXXXXXXX) and implementation-
+defined characters are not supported by this lexer; production C code
+rarely uses them.
+@End Reasoning
+
+@Implementation:
+'_' (95) -> 1; 'A'..'Z' (65..90) -> 1; 'a'..'z' (97..122) -> 1; else 0.
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is letter (a-z, A-Z) or underscore
 
@@ -347,6 +428,14 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier extending is_alpha with digits.
+@End Reasoning
+
+@Implementation:
+is_alpha then is_digit; either returns 1 gives 1.
+@End Implementation
+
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric or underscore
 
@@ -360,6 +449,15 @@ Process called "is_alnum" takes char as Integer returns Integer:
 
     Return digit
 End Process
+
+@Reasoning:
+C whitespace per spec: space, tab, LF, CR. Form-feed and vertical-tab
+are also whitespace in C99 but the practical corpus excludes them.
+@End Reasoning
+
+@Implementation:
+Four equality checks against 32, 9, 10, 13.
+@End Implementation
 
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
@@ -387,6 +485,15 @@ Note: ==========================================================================
 Note: Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Inter-token whitespace skip. Consumes spaces/tabs/newlines/CRs via
+advance_char so line/column stay accurate.
+@End Reasoning
+
+@Implementation:
+Loop: peek + is_whitespace; on non-ws break; else advance_char.
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -403,6 +510,17 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+C99+ allows // line comments. Caller has already consumed the leading
+"//" so this routine drains to end-of-line. The newline is NOT consumed
+so line counting through advance_char stays correct via skip_whitespace
+in the next loop iteration.
+@End Reasoning
+
+@Implementation:
+Loop: 0 (EOF) breaks; LF (10) breaks; otherwise advance_char.
+@End Implementation
 
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip // comment until end of line
@@ -423,6 +541,18 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+C /* ... */ block comments. C does NOT permit nesting so this routine
+matches the first '*/' after the opening '/*' (which caller has already
+consumed). EOF before the terminator returns 0 to signal unterminated.
+@End Reasoning
+
+@Implementation:
+Loop: 0 (EOF) returns 0 (unterminated); '*' (42) peeks next; if '/' (47)
+consumes both and returns 1 (success). Otherwise advance_char and
+continue.
+@End Implementation
 
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip /* */ block comment
@@ -453,6 +583,23 @@ End Process
 Note: ============================================================================
 Note: Keyword Recognition
 Note: ============================================================================
+
+@Reasoning:
+Byte-exact lexeme/keyword equality. C keywords are case-sensitive (int vs
+INT) so no folding is needed. Length is compared first as a fast-fail to
+skip the byte loop when sizes don't match.
+@End Reasoning
+
+@Implementation:
+length != kw_length returns 0 immediately. Otherwise loops index 0..length
+comparing memory_get_byte(lexeme, i) against memory_get_byte(keyword, i);
+any mismatch returns 0. Full match returns 1.
+@End Implementation
+
+@Performance_Hints:
+O(L) where L is the lexeme length. Called once per identifier from
+next_token's keyword dispatch path.
+@End Performance_Hints
 
 Process called "check_keyword" takes lexeme as Integer, length as Integer, keyword as Integer, kw_length as Integer returns Integer:
     Note: Check if lexeme matches keyword
@@ -952,6 +1099,25 @@ Process called "scan_char_literal" takes lexer as Integer returns Integer:
     Return TOKEN_CHAR_LITERAL
 End Process
 
+@Reasoning:
+C string literals are "..." with backslash escapes (\n, \t, \", \\, \xNN,
+\0NN, etc.). Unterminated strings or newlines inside strings return
+TOKEN_ERROR per spec (multi-line strings require explicit \).
+@End Reasoning
+
+@Implementation:
+Records token_start at current position. Consumes the opening '"'. Loops:
+0 (EOF) returns TOKEN_ERROR; LF (10) returns TOKEN_ERROR (no multi-line
+strings without continuation); '"' (34) consumes and breaks; '\\' (92)
+consumes both itself and the next byte (escape sequence). Sets token_type
+to TOKEN_STRING_LITERAL.
+@End Implementation
+
+@Security_Scope:
+Untrusted source; defensive EOF and newline checks prevent infinite
+loops or run-past-buffer.
+@End Security_Scope
+
 Process called "scan_string_literal" takes lexer as Integer returns Integer:
     Note: Scan string literal ("string")
 
@@ -991,6 +1157,22 @@ End Process
 Note: ============================================================================
 Note: Preprocessor Directives
 Note: ============================================================================
+
+@Reasoning:
+The C preprocessor "#" directives (#include, #define, #ifdef, #ifndef,
+#else, #endif, #pragma, etc.) are recognised at the lexer layer and
+emitted as distinct token types so the parser can route them to the
+preprocessor pipeline before normal parsing.
+@End Reasoning
+
+@Implementation:
+Records token_start at the '#'. Consumes '#'. Skips whitespace (allows
+'# include'). Records dir_start at the directive name; scans alpha
+characters via is_alpha loop. Compares the resulting dir lexeme against
+"include"/"define"/"ifdef"/"ifndef"/"else"/"endif"/"pragma" via
+check_keyword and emits the corresponding TOKEN_* constant. Unknown
+directive returns TOKEN_ERROR.
+@End Implementation
 
 Process called "scan_preprocessor" takes lexer as Integer returns Integer:
     Note: Scan preprocessor directive (#include, #define, etc.)
@@ -1487,6 +1669,21 @@ Process called "get_token_type" takes lexer as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+After a successful token scan, the parser needs the lexeme text to build
+the AST node. This routine carves a null-terminated copy out of the
+source between token_start and current position so the parser can treat
+it as a C-style string.
+@End Reasoning
+
+@Implementation:
+Reads token_start (offset 40) and position (offset 16); their difference
+is token_length. Allocates token_length+1 bytes; on OOM returns 0. If
+token_length > 0 copies bytes from source+token_start into the new
+buffer via memory_copy. Writes a 0 byte at the end. Returns the new
+buffer (owned by the caller).
+@End Implementation
+
 Process called "get_token_lexeme" takes lexer as Integer returns Integer:
     Note: Get current token lexeme as null-terminated string
 
@@ -1510,6 +1707,15 @@ Process called "get_token_lexeme" takes lexer as Integer returns Integer:
     Return lexeme
 End Process
 
+@Reasoning:
+Diagnostic accessor: parser uses this to stamp AST nodes with the source
+line where the current token started.
+@End Reasoning
+
+@Implementation:
+Reads line at offset 24. Constant time.
+@End Implementation
+
 Process called "get_token_line" takes lexer as Integer returns Integer:
     Note: Get current token line number
 
@@ -1517,6 +1723,15 @@ Process called "get_token_line" takes lexer as Integer returns Integer:
 
     Return line
 End Process
+
+@Reasoning:
+Diagnostic accessor symmetric to get_token_line; pairs with it for
+exact source-position errors.
+@End Reasoning
+
+@Implementation:
+Reads column at offset 32.
+@End Implementation
 
 Process called "get_token_column" takes lexer as Integer returns Integer:
     Note: Get current token column number

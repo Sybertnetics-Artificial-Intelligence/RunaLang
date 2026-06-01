@@ -47,6 +47,18 @@ Note: ==========================================================================
 Note: Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Protobuf generation needs an emitter handle, an indent cursor for the
+indented "message { ... }" form, and an in-band error channel for
+diagnostics. Four int64 slots cover that.
+@End Reasoning
+
+@Implementation:
+Four int64 fields, 32 bytes total. emitter is owned by the context and
+freed in destroy_generation_context; error_message is heap-owned when
+non-zero.
+@End Implementation
+
 Type called "ProtobufGenerationContext":
     emitter as Integer        Note: Protocol Buffers emitter
     indent_level as Integer   Note: Current indentation level
@@ -57,6 +69,17 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Allocates and wires the context plus its protobuf emitter so the rest of
+the file can assume a valid state.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes for the context, constructs a protobuf emitter, then
+writes the four fields (emitter, indent_level=0, error_message=null,
+has_error=false). Rolls back partial allocation on emitter failure.
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create Protocol Buffers generation context
@@ -84,6 +107,16 @@ Process called "create_generation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Releases the owned emitter and any error_message heap copy before freeing
+the context block. Null-tolerant for unconditional cleanup.
+@End Reasoning
+
+@Implementation:
+Reads emitter and error_message slots; calls destroy_protobuf_emitter /
+deallocate only when non-zero, then deallocates the context.
+@End Implementation
 
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy generation context
@@ -115,6 +148,17 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Captures the first generation error in a heap-owned copy so the message
+survives the source buffer's lifetime.
+@End Reasoning
+
+@Implementation:
+Frees any prior error string. Copies the message into msg_length+1 bytes,
+null-terminates, stores the pointer at offset 16, and sets has_error to
+1 at offset 24.
+@End Implementation
+
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set generation error message
 
@@ -144,6 +188,16 @@ Note: ==========================================================================
 Note: Indentation Helpers
 Note: ============================================================================
 
+@Reasoning:
+Protobuf style uses two spaces per indent level. Centralising the helper
+keeps the per-level whitespace consistent across every emitter.
+@End Reasoning
+
+@Implementation:
+Reads indent_level and emits two ASCII spaces (32) per level through
+the protobuf emitter.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation (2 spaces per level)
 
@@ -161,6 +215,15 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Called when entering "message { ... }", "service { ... }", and similar
+nested blocks so subsequent emit_indent calls produce deeper whitespace.
+@End Reasoning
+
+@Implementation:
+Reads indent_level, increments by 1, writes back.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -170,6 +233,15 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Counterpart to increase_indent. Clamps at zero so a mismatched call
+cannot break later indent arithmetic.
+@End Reasoning
+
+@Implementation:
+Reads indent_level; if greater than zero, decrements and writes back.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -187,6 +259,19 @@ End Process
 Note: ============================================================================
 Note: Helper Functions
 Note: ============================================================================
+
+@Reasoning:
+HIR field, message and service nodes store their metadata as keyed
+attributes. A local dictionary lookup avoids the heavier Dict module
+import.
+@End Reasoning
+
+@Implementation:
+Walks the HIR dictionary entries by index using its size/keys/values
+fields, compares each key byte-wise against the requested key, and
+returns the matching value pointer when the value is a string literal.
+Returns 0 when no match exists.
+@End Implementation
 
 Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary
@@ -214,6 +299,18 @@ Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer
     Return 0  Note: Key not found
 End Process
 
+@Reasoning:
+Protobuf field numbers, enum values and similar integer attributes need
+a typed lookup that returns the raw i64 payload without going through a
+string conversion.
+@End Reasoning
+
+@Implementation:
+Same walk as get_dict_string_value but when a key matches, extracts the
+integer value from the HIR integer literal and returns it. Returns 0
+when no key matches.
+@End Implementation
+
 Process called "get_dict_integer_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get integer value from HIR dictionary
 
@@ -240,6 +337,17 @@ Process called "get_dict_integer_value" takes hir_dict as Integer, key as Intege
     Return 0  Note: Key not found
 End Process
 
+@Reasoning:
+Boolean attributes ("repeated", "optional", "deprecated") flow through
+the same dictionary path. A boolean-typed extraction keeps call sites
+short.
+@End Reasoning
+
+@Implementation:
+Same walk as get_dict_string_value; on a matching key, reads the HIR
+boolean literal value. Returns 0 (false) when the key is missing.
+@End Implementation
+
 Process called "get_dict_boolean_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get boolean value from HIR dictionary
 
@@ -265,6 +373,16 @@ Process called "get_dict_boolean_value" takes hir_dict as Integer, key as Intege
 
     Return 0  Note: Key not found
 End Process
+
+@Reasoning:
+List-valued attributes ("fields", "values", "options") need to be
+extracted as raw list pointers so the caller can iterate them.
+@End Reasoning
+
+@Implementation:
+Same walk as get_dict_string_value; on a matching key, returns the raw
+HIR list pointer for the value. Returns 0 when no key matches.
+@End Implementation
 
 Process called "get_dict_list_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get list value from HIR dictionary
@@ -295,6 +413,19 @@ End Process
 Note: ============================================================================
 Note: Protocol Buffers Generation Functions
 Note: ============================================================================
+
+@Reasoning:
+A protobuf message field follows "[label] type name = number;" with
+optional "repeated" / "optional" label and optional "[option=value, ...]"
+suffix. Threading all three pieces through one emitter keeps the syntax
+order tight.
+@End Reasoning
+
+@Implementation:
+Reads label (repeated/optional), type, name, number and options off the
+HIR dictionary. Emits indent, optional label keyword, type, name,
+" = <number>", optional " [<options>]", and closes with ";\n".
+@End Implementation
 
 Process called "generate_protobuf_field" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers field
@@ -353,6 +484,20 @@ Process called "generate_protobuf_field" takes context as Integer, hir_dict as I
 
     Return 1
 End Process
+
+@Reasoning:
+Protobuf messages take the form "message Name { field; field;
+nested... }". Nested messages, enums, oneofs and maps can appear inside,
+so the emitter recurses into generate_protobuf_field, _message, _enum,
+_oneof, and _map_field.
+@End Reasoning
+
+@Implementation:
+Reads the name plus body list. Emits indent + "message Name {\n", bumps
+indent, walks the body dispatching each entry through the appropriate
+helper based on its HIR kind, restores indent, and closes with indent +
+"}\n".
+@End Implementation
 
 Process called "generate_protobuf_message" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers message
@@ -414,6 +559,19 @@ Process called "generate_protobuf_message" takes context as Integer, hir_dict as
 
     Return 1
 End Process
+
+@Reasoning:
+Protobuf enums declare a name and a list of "VALUE = number;" entries.
+The wire format requires explicit numbers and the spec mandates VALUE_0
+be present, so the emitter trusts the HIR to have already validated
+this.
+@End Reasoning
+
+@Implementation:
+Reads name and values. Emits indent + "enum Name {\n", bumps indent,
+walks the values list emitting indent + "VALUE = number;\n" for each,
+restores indent, and closes with indent + "}\n".
+@End Implementation
 
 Process called "generate_protobuf_enum" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers enum
@@ -505,6 +663,17 @@ Process called "generate_protobuf_enum" takes context as Integer, hir_dict as In
     Return 1
 End Process
 
+@Reasoning:
+Protobuf services declare gRPC-style RPC endpoints. The "service Name {
+rpc Method(...) returns (...); ... }" form wraps a list of RPC entries.
+@End Reasoning
+
+@Implementation:
+Reads name and rpcs list. Emits indent + "service Name {\n", bumps
+indent, walks the rpcs list dispatching each through
+generate_protobuf_rpc, restores indent, and closes with indent + "}\n".
+@End Implementation
+
 Process called "generate_protobuf_service" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers service definition
 
@@ -565,6 +734,18 @@ Process called "generate_protobuf_service" takes context as Integer, hir_dict as
 
     Return 1
 End Process
+
+@Reasoning:
+gRPC RPC declarations are "rpc Name(Request) returns (Response);" with
+optional "stream" markers on either side for streaming endpoints. The
+emitter handles all four streaming combinations.
+@End Reasoning
+
+@Implementation:
+Reads name, input_type, output_type, client_streaming and
+server_streaming flags. Emits indent + "rpc Name(", optional "stream ",
+input_type, ") returns (", optional "stream ", output_type, ");\n".
+@End Implementation
 
 Process called "generate_protobuf_rpc" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers RPC method
@@ -647,6 +828,18 @@ Process called "generate_protobuf_rpc" takes context as Integer, hir_dict as Int
     Return 1
 End Process
 
+@Reasoning:
+"oneof Name { field; field; ... }" lets at most one field be set at a
+time inside a message. It is its own syntactic block with nested fields.
+@End Reasoning
+
+@Implementation:
+Reads name and fields list. Emits indent + "oneof Name {\n", bumps
+indent, walks the fields dispatching each through
+generate_protobuf_field, restores indent, and closes with indent +
+"}\n".
+@End Implementation
+
 Process called "generate_protobuf_oneof" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers oneof
 
@@ -706,6 +899,17 @@ Process called "generate_protobuf_oneof" takes context as Integer, hir_dict as I
 
     Return 1
 End Process
+
+@Reasoning:
+"map<KeyType, ValueType> name = number;" defines an associative field.
+Distinct from regular fields because the key and value types are
+parameters of the "map" generic rather than free-form labels.
+@End Reasoning
+
+@Implementation:
+Reads key_type, value_type, name, and field number. Emits indent +
+"map<key_type, value_type> name = number;\n".
+@End Implementation
 
 Process called "generate_protobuf_map_field" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers map field
@@ -774,6 +978,20 @@ Process called "generate_protobuf_map_field" takes context as Integer, hir_dict 
 
     Return 1
 End Process
+
+@Reasoning:
+A .proto file has a strict header order: syntax, package, imports,
+options, then top-level messages / enums / services. Emitting them in
+spec order keeps the output parseable by protoc.
+@End Reasoning
+
+@Implementation:
+Reads syntax (defaults to "proto3"), package name, imports list, options
+list, and declarations list. Emits "syntax = \"proto3\";", optional
+"package <name>;", each import as "import \"path\";", each option as
+"option k = v;", then walks the declarations dispatching each to its
+generator (message, enum, service).
+@End Implementation
 
 Process called "generate_protobuf_file" takes context as Integer, hir_dict as Integer returns Integer:
     Note: Generate Protocol Buffers file
@@ -918,6 +1136,17 @@ Note: ==========================================================================
 Note: HIR Node Dispatch
 Note: ============================================================================
 
+@Reasoning:
+Central dispatcher. Routes any HIR node to the matching protobuf
+emitter based on its tag.
+@End Reasoning
+
+@Implementation:
+Reads the HIR node "kind" tag and dispatches to generate_protobuf_file,
+_message, _enum, _service, _rpc, _oneof, _map_field, or _field. Unknown
+kinds set a generation error.
+@End Implementation
+
 Process called "generate_hir_node" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate Protocol Buffers from HIR node (dispatch to specific generator)
 
@@ -1011,6 +1240,16 @@ Note: ==========================================================================
 Note: Top-Level Generation
 Note: ============================================================================
 
+@Reasoning:
+Top-level entry that drives generation across the entire HIR program
+node tree.
+@End Reasoning
+
+@Implementation:
+Reads the "declarations" list off the HIR root and dispatches each
+declaration through generate_hir_node.
+@End Implementation
+
 Process called "generate_protobuf" takes context as Integer, hir_root as Integer returns Integer:
     Note: Generate Protocol Buffers from HIR root
 
@@ -1027,6 +1266,17 @@ Process called "generate_protobuf" takes context as Integer, hir_root as Integer
 
     Return result
 End Process
+
+@Reasoning:
+Pulls the accumulated protobuf source from the emitter so the caller
+can consume it.
+@End Reasoning
+
+@Implementation:
+Reads the emitter at offset 0 and forwards the call to the protobuf
+emitter's get_output, which returns a caller-owned heap copy of the
+buffer.
+@End Implementation
 
 Process called "get_output" takes context as Integer returns Integer:
     Note: Get generated Protocol Buffers output

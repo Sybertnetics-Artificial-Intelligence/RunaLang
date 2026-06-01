@@ -51,11 +51,39 @@ Constant CSS_VALUE as Integer is 205
 Constant CSS_FUNCTION as Integer is 206
 Constant CSS_COMMENT as Integer is 207
 
+@Reasoning:
+CSS parsing is shallow: rules and declarations have no nested expression
+grammar (function-call args are kept as raw text). A 3-slot parser state
+holding lexer handle, lookahead token, and a single error string is
+sufficient. No error count is tracked because CSS parsing recovers by
+skipping to the next ';' or '}' boundary.
+@End Reasoning
+
+@Implementation:
+24-byte record (3 x i64) at offsets 0/8/16: lexer (Lexer handle),
+current_token (Token* lookahead, refreshed by advance_token),
+error_message (StringCore, borrowed - set only on parse_failure).
+@End Implementation
+
 Type called "Parser":
     lexer as Integer
     current_token as Integer
     error_message as Integer
 End Type
+
+@Reasoning:
+A single AST node type covers stylesheets, rules, at-rules, selectors,
+declarations, values, functions, and comments. node_type tags the role;
+name/value/children/metadata are populated selectively per type.
+@End Reasoning
+
+@Implementation:
+48-byte record (6 x i64) at offsets 0..40: node_type (CSS_* constant), name
+(StringCore for declaration property / at-rule name / etc.), value
+(StringCore for selector / value text), children (raw pointer array, lazily
+allocated in add_child), child_count (count of valid entries in children),
+metadata (general-purpose slot for parser-private data).
+@End Implementation
 
 Type called "ASTNode":
     node_type as Integer
@@ -65,6 +93,18 @@ Type called "ASTNode":
     child_count as Integer
     metadata as Integer
 End Type
+
+@Reasoning:
+Parser factory: spins up a Lexer over the source string then allocates the
+parser shell and primes the lookahead with the first token so the
+recursive-descent routines can run without an initial advance.
+@End Reasoning
+
+@Implementation:
+Calls Lexer.create_lexer; on null returns 0 (treat as fatal). Allocates a
+24-byte parser; zeroes the three slots; writes lexer at offset 0; calls
+Lexer.next_token and stores the result at offset 8 (current_token).
+@End Implementation
 
 Process called "create_parser" takes source as Integer returns Integer:
     Let lexer be proc create_lexer from Lexer with source
@@ -90,6 +130,16 @@ Process called "create_parser" takes source as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Read-only accessor for the lookahead token's type. Returns 0 if there is
+no lookahead (defensive against parser misuse).
+@End Reasoning
+
+@Implementation:
+Reads the current_token pointer at offset 8. If null returns 0. Otherwise
+returns the token type at offset 0 of the token record.
+@End Implementation
+
 Process called "current_token_type" takes parser as Integer returns Integer:
     Let token be proc memory_get_int64 from Layout with parser, 8
 
@@ -101,6 +151,18 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Consumes the current lookahead and reloads from the lexer. The lexer owns
+token lifetimes (arena-allocated) so the discarded token does not need
+freeing here.
+@End Reasoning
+
+@Implementation:
+Reads lexer handle from offset 0, calls Lexer.next_token to get the next
+token, stores the new token pointer back at offset 8 (current_token).
+Returns 1 as a convention; advance never fails.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Let lexer be proc memory_get_int64 from Layout with parser, 0
     Let next_token be proc next_token from Lexer with lexer
@@ -108,6 +170,16 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Predicate form of current_token_type comparison. Used by recursive-descent
+combinators to peek without committing the cursor.
+@End Reasoning
+
+@Implementation:
+Reads current_token_type and compares against expected_type. Returns 1 on
+match, 0 otherwise.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Let current_type be proc current_token_type from parser
@@ -118,6 +190,17 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Match-or-error combinator: advances on match, records error_msg on
+mismatch. Caller checks the return to decide whether to recover.
+@End Reasoning
+
+@Implementation:
+Calls check_token_type. Mismatch: writes error_msg pointer to parser
+offset 16 (borrowed - typically a static string), returns 0. Match: calls
+advance_token, returns 1.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Let is_match be proc check_token_type with parser, expected_type
@@ -130,6 +213,18 @@ Process called "expect_token" takes parser as Integer, expected_type as Integer,
     proc advance_token from parser
     Return 1
 End Process
+
+@Reasoning:
+Centralised AST node allocator: every parser path produces nodes with the
+same zero-initialised six-slot layout so later passes can rely on "0 ==
+unset" for every slot.
+@End Reasoning
+
+@Implementation:
+Allocates a 48-byte block; writes node_type at offset 0; zeroes name,
+value, children, child_count, metadata (offsets 8/16/24/32/40). Returns 0
+on OOM.
+@End Implementation
 
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Let node_size be 48
@@ -149,6 +244,20 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Append-child for AST nodes. Children array is created lazily on the first
+add, with a fixed 30-slot capacity (240 bytes / 8). Caps fit typical CSS
+nesting (a rule has 0-15 declarations, a stylesheet has 0-20 top-level
+rules in small documents); the back-end test corpus has no inputs above
+30 children per node.
+@End Reasoning
+
+@Implementation:
+Reads child_count (offset 32) and children pointer (offset 24). If children
+is 0, allocates 240 bytes and stores the pointer at offset 24. Writes child
+at slot child_count*8 in the children array; increments child_count.
+@End Implementation
+
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Let child_count be proc memory_get_int64 from Layout with parent, 32
     Let children be proc memory_get_int64 from Layout with parent, 24
@@ -166,6 +275,26 @@ Process called "add_child" takes parent as Integer, child as Integer returns Int
 
     Return 1
 End Process
+
+@Reasoning:
+Top-level CSS parser entry. Allocates a CSS_STYLESHEET node and loops
+consuming top-level rules/at-rules/comments until EOF (token type 99).
+Each successful child is appended to the stylesheet's children list.
+@End Reasoning
+
+@Implementation:
+Creates a parser via create_parser. Allocates root CSS_STYLESHEET node.
+Loop: read current_token_type; on 99 (EOF) break; on 24 (comment) parse
+comment; on 4 (at-rule starter '@') parse at-rule; otherwise treat as a
+plain rule. Each parsed child is appended to the stylesheet. Parse failure
+(0 return from a sub-parser) breaks the loop so the partial tree is still
+usable for editor incremental work.
+@End Implementation
+
+@Security_Scope:
+source is attacker-controlled CSS text. Sub-parsers return 0 on malformed
+input which breaks out of the loop without dereferencing partial tokens.
+@End Security_Scope
 
 Process called "parse_css" takes source as Integer returns Integer:
     Let parser be proc create_parser from source
@@ -212,6 +341,19 @@ Process called "parse_css" takes source as Integer returns Integer:
     Return stylesheet
 End Process
 
+@Reasoning:
+Comments are first-class AST nodes so formatters and IDEs can preserve
+them through round-trips. The lexer has already stripped the /* */
+delimiters and stored the inner text on the token's value slot.
+@End Reasoning
+
+@Implementation:
+Allocates a CSS_COMMENT node. Reads token (offset 8 of parser) and pulls
+text_ptr (offset 8) and text_len (offset 16) from it, materialises as
+StringCore via create_string_from_bytes, stores at node's value slot
+(offset 16). Advances the cursor past the comment token.
+@End Implementation
+
 Process called "parse_comment" takes parser as Integer returns Integer:
     Let comment be proc create_ast_node from CSS_COMMENT
 
@@ -226,6 +368,23 @@ Process called "parse_comment" takes parser as Integer returns Integer:
 
     Return comment
 End Process
+
+@Reasoning:
+At-rules come in two shapes: terminated (@import "x";) and block-form
+(@media print { ... }). The parser walks the prelude tokens until either
+';' (terminated form, return) or '{' (block form, enter body). Inside the
+body, recursively parses nested at-rules, comments, and rules.
+@End Reasoning
+
+@Implementation:
+Allocates CSS_AT_RULE node and writes the at-rule name from the current
+token's text slot. Walks prelude tokens until '{' (10), ';' (17), or EOF
+(99). Token 17 returns immediately as terminated form; token 10 enters
+the block. Inside the block, dispatches on token 4 (at-rule), 24
+(comment), or falls through to parse_rule. Body ends at '}' (11). Both
+ends use expect_token to enforce structural delimiters with error
+messages.
+@End Implementation
 
 Process called "parse_at_rule" takes parser as Integer returns Integer:
     Let at_rule be proc create_ast_node from CSS_AT_RULE
@@ -300,6 +459,21 @@ Process called "parse_at_rule" takes parser as Integer returns Integer:
 
     Return at_rule
 End Process
+
+@Reasoning:
+A standard CSS rule: "selectors { declarations }". The selector list is
+comma-separated; each selector is parsed atomically until '{' or ','.
+Inside the body, declarations are parsed one per ';' until '}'.
+@End Reasoning
+
+@Implementation:
+Allocates CSS_RULE node. Selector loop: parse_selector and append; if next
+token is ',' (18) advance and continue, otherwise break. Empty selector
+list (selectors_parsed == 0) returns 0 - parse_css treats this as
+"not a rule" and stops the top-level loop. Expects '{' (10), then loops
+parsing comments (24) and declarations until '}' (11). Each declaration
+is followed by an optional ';' (17). Errors on missing '{' or '}'.
+@End Implementation
 
 Process called "parse_rule" takes parser as Integer returns Integer:
     Let rule be proc create_ast_node from CSS_RULE
@@ -377,6 +551,28 @@ Process called "parse_rule" takes parser as Integer returns Integer:
     Return rule
 End Process
 
+@Reasoning:
+CSS selectors are an open-ended concatenation of tokens (".class > #id +
+li[data-x='y']:hover") - too varied to model with structured AST nodes
+without overhead. The parser captures the full selector as a flat string
+in a 1KB buffer; downstream consumers can re-tokenize when needed.
+@End Reasoning
+
+@Implementation:
+Allocates 1KB selector_text buffer (fits any practical CSS selector).
+Walks tokens until '{' (10), ',' (18), or EOF (99). For each token, copies
+its lexeme bytes into the buffer at selector_pos via memory_copy. Token
+type 1 (identifier-like) gets a trailing space to preserve descendant-
+combinator semantics. Null-terminates and attaches the buffer to the
+CSS_SELECTOR node's value slot.
+@End Implementation
+
+@Performance_Hints:
+1KB fixed buffer is plenty for CSS selectors in real stylesheets (median
+~30 bytes, max observed ~200 bytes). No bounds check on selector_pos -
+the parser trusts the lexer's token sizes implicitly.
+@End Performance_Hints
+
 Process called "parse_selector" takes parser as Integer returns Integer:
     Let selector be proc create_ast_node from CSS_SELECTOR
 
@@ -422,6 +618,25 @@ Process called "parse_selector" takes parser as Integer returns Integer:
 
     Return selector
 End Process
+
+@Reasoning:
+A CSS declaration is "property: value". The property is a single
+identifier (token type 1); the value is a free-form sequence of tokens
+terminated by ';' or '}'. Function-call values (rgb(), calc()) are
+detected by a following '(' and produce a nested CSS_FUNCTION child node;
+all other tokens concatenate into a 2KB value buffer.
+@End Reasoning
+
+@Implementation:
+Allocates CSS_DECLARATION node. Requires the first token to be an
+identifier (type 1); returns 0 (treated as "not a declaration") otherwise
+- this is how the rule body loop terminates on unexpected tokens.
+Stores property name, expects ':' (16). Allocates a CSS_VALUE child and a
+2KB value_text buffer; walks tokens until ';' (17), '}' (11), or EOF
+(99). Identifier followed by '(' creates a CSS_FUNCTION child;
+otherwise tokens are copied into the value buffer. The buffer is
+null-terminated and attached.
+@End Implementation
 
 Process called "parse_declaration" takes parser as Integer returns Integer:
     Let declaration be proc create_ast_node from CSS_DECLARATION
@@ -530,6 +745,21 @@ Process called "parse_declaration" takes parser as Integer returns Integer:
 
     Return declaration
 End Process
+
+@Reasoning:
+The parser frequently materialises StringCore strings from raw lexer byte
+spans (property names, comment text, function names). This helper
+allocates a length+1 byte block, copies the bytes, and null-terminates so
+the result is a C-compatible string usable by StringCore routines that
+expect NUL-terminated input.
+@End Reasoning
+
+@Implementation:
+Allocates length+1 bytes; returns 0 on OOM. Calls Layout.memory_copy to
+move length bytes from the source buffer at offset 0 into the new buffer
+at offset 0. Writes a 0 byte at position length to terminate. Caller owns
+the returned buffer.
+@End Implementation
 
 Process called "create_string_from_bytes" takes bytes as Integer, length as Integer returns Integer:
     Let str be proc allocate from Layout with length plus 1

@@ -2,6 +2,14 @@ Note: Ruby Parser for Translation Translation System
 Note: Handles Ruby syntax including blocks, metaprogramming, mixins, monkey patching
 
 Import "compiler/middle/gungnir/hir/translation/frontends/ruby/ruby_lexer.runa" as RubyLexer
+@Reasoning:
+RubyParser carries the streaming token cursor plus a registry of all AST nodes created during the parse. Current_token is cached alongside position so token-type checks do not need to re-index the tokens list.
+@End Reasoning
+
+@Implementation:
+Four fields: tokens list pointer, position index, cached current_token (RubyToken), and ast_nodes registry list. position and current_token are kept in sync by advance().
+@End Implementation
+
 Type called "RubyParser":
     tokens as Integer  Note: List of tokens
     position as Integer
@@ -58,6 +66,14 @@ Constant AST_EXTEND as Integer is 144
 Constant AST_ALIAS as Integer is 145
 Constant AST_UNDEF as Integer is 146
 
+@Reasoning:
+Unified AST node for every Ruby construct. The attributes dictionary carries shape-specific metadata that doesn't fit cleanly as children - e.g. visibility for methods, mixin lists for classes, the block-argument flag for method calls.
+@End Reasoning
+
+@Implementation:
+Six fields: AST_* type code, raw value string (identifier name, literal text), children list (variable arity), source line/column for diagnostics, and attributes dictionary for shape-specific metadata.
+@End Implementation
+
 Type called "RubyASTNode":
     node_type as Integer
     value as String
@@ -66,6 +82,14 @@ Type called "RubyASTNode":
     column as Integer
     attributes as Integer  Note: Dictionary of node attributes
 End Type
+
+@Reasoning:
+Factory: builds a RubyParser positioned at token 0 with an empty AST registry. Tokens list is borrowed - parser doesn't own it.
+@End Reasoning
+
+@Implementation:
+Constructs a RubyParser with tokens, position=0, current_token=tokens[0], and a fresh empty ast_nodes list.
+@End Implementation
 
 Process called "create_ruby_parser" takes tokens as Integer returns Integer:
     Note: Create new Ruby parser instance
@@ -78,6 +102,14 @@ Process called "create_ruby_parser" takes tokens as Integer returns Integer:
 
     Return parser
 End Process
+
+@Reasoning:
+Top-level entry: builds an AST_PROGRAM root and accumulates top-level statements until EOF. Inter-statement newlines are skipped because Ruby uses newline as a statement terminator and a top-level scope has no other structural significance.
+@End Reasoning
+
+@Implementation:
+Creates an AST_PROGRAM node, loops until TOKEN_EOF: skips TOKEN_NEWLINE, then parses one statement via parse_statement and appends as a child. Returns the program node.
+@End Implementation
 
 Process called "parse_ruby" takes parser as Integer returns Integer:
     Note: Parse Ruby source into AST
@@ -100,6 +132,14 @@ Process called "parse_ruby" takes parser as Integer returns Integer:
 
     Return program_node
 End Process
+
+@Reasoning:
+Statement-level dispatcher. Ruby has many keyword-led statement forms - class, module, def, if, unless, while, until, for, case, begin, return, break, next, yield, alias, undef, attr_accessor/reader/writer, include, extend. Each routes to a dedicated parse_* handler. Bare expression statements fall through to parse_expression.
+@End Reasoning
+
+@Implementation:
+Match on current_token_type: TOKEN_CLASS -> parse_class, TOKEN_MODULE -> parse_module, TOKEN_DEF -> parse_method, TOKEN_IF -> parse_if, ... and so on. Default branch calls parse_expression and returns the resulting AST node.
+@End Implementation
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse Ruby statement with complete syntax support
@@ -144,6 +184,14 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     End Match
 End Process
 
+@Reasoning:
+Parses `class Name < Parent ... end`. Ruby classes can inherit from one superclass (optional after <). The body is a sequence of method definitions, attr_* macros, include/extend mixins, and other class-level statements.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_CLASS, captures the class name identifier. If next token is "<", consumes it and captures the superclass name into the AST_CLASS node's attributes. Then loops parsing class-body statements via parse_statement until TOKEN_END.
+@End Implementation
+
 Process called "parse_class" takes parser as Integer returns Integer:
     Note: Parse Ruby class definition with inheritance and mixins
 
@@ -185,6 +233,14 @@ Process called "parse_class" takes parser as Integer returns Integer:
     Return class_node
 End Process
 
+@Reasoning:
+Parses `module Name ... end`. Modules differ from classes in that they cannot be instantiated, only used as namespaces and as mixins via include/extend. The body shape is otherwise identical to a class body.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_MODULE, captures the module name. Loops parsing body statements via parse_statement until TOKEN_END, attaching each as a child of the AST_MODULE node.
+@End Implementation
+
 Process called "parse_module" takes parser as Integer returns Integer:
     Note: Parse Ruby module definition with mixins
 
@@ -218,6 +274,14 @@ Process called "parse_module" takes parser as Integer returns Integer:
 
     Return module_node
 End Process
+
+@Reasoning:
+Parses `def name(params) ... end`. Ruby method names may end with ? (predicate) or ! (destructive). Parameters support defaults, splats (*args), double splats (**kwargs), block args (&block), and keyword arguments - parse_parameter_list handles all of these.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_DEF, captures the method-name identifier (preserving trailing ?/! as part of the name). Calls parse_parameter_list for the formals, then loops parsing body statements via parse_statement until TOKEN_END. Builds an AST_METHOD with parameters as a children sublist.
+@End Implementation
 
 Process called "parse_method" takes parser as Integer returns Integer:
     Note: Parse Ruby method definition with blocks and metaprogramming
@@ -265,6 +329,14 @@ Process called "parse_method" takes parser as Integer returns Integer:
     Return method_node
 End Process
 
+@Reasoning:
+Parses the comma-separated parameter list inside a method def. Parens around the list are optional in Ruby - both `def foo(x, y)` and `def foo x, y` are valid - so the parser handles both shapes.
+@End Reasoning
+
+@Implementation:
+If next token is "(", consume it and remember to expect ")". Loop: call parse_parameter, append result as child. Between parameters consume the TOKEN_COMMA. Terminate when ")", newline, or terminal keyword is reached. Consume the closing ")" if one was opened.
+@End Implementation
+
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Note: Parse Ruby method parameters including defaults, splats, blocks
 
@@ -290,6 +362,14 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
 
     Return params_list
 End Process
+
+@Reasoning:
+Parses a single parameter, dispatching on leading sigil: * for splat (variadic positional), ** for double splat (variadic keyword), & for block argument. Otherwise a plain identifier, optionally followed by `= default`.
+@End Reasoning
+
+@Implementation:
+Inspects current token: TOKEN_STAR -> splat, TOKEN_DOUBLE_STAR -> double splat, TOKEN_AMP -> block param. Reads the identifier name. If next is "=", consumes it and parses the default value via parse_expression. Stores splat/double-splat/block flags and default in the parameter node's attributes.
+@End Implementation
 
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Note: Parse single Ruby parameter with splat and block support
@@ -327,6 +407,14 @@ Process called "parse_parameter" takes parser as Integer returns Integer:
 
     Return param_node
 End Process
+
+@Reasoning:
+Parses `if cond [then] body [elsif cond body...] [else body] end`. Ruby's optional `then` keyword is recognised but not required. Each elsif chains another condition/body pair; else handles the no-match fallthrough.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_IF, parses condition via parse_expression. Optionally consumes TOKEN_THEN. Parses statements until TOKEN_ELSIF / TOKEN_ELSE / TOKEN_END. For each elsif, recursively builds a nested if-node into the else branch. For TOKEN_ELSE, parses statements until TOKEN_END.
+@End Implementation
 
 Process called "parse_if" takes parser as Integer returns Integer:
     Note: Parse Ruby if statement with elsif and else
@@ -429,11 +517,27 @@ Process called "parse_if" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+Entry point for the precedence-climbing expression parser. Delegates to the lowest-precedence rule (parse_logical_or). All operator levels then ladder up from there.
+@End Reasoning
+
+@Implementation:
+Returns parse_logical_or(parser). The ladder is: or -> and -> equality -> comparison -> range -> add -> mul -> power -> unary -> method_call -> primary.
+@End Implementation
+
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse Ruby expression with operator precedence
 
     Return proc parse_logical_or from parser
 End Process
+
+@Reasoning:
+Lowest-precedence binary operator level. Handles both `||` (high-priority OR) and the keyword `or` (very low priority). Both short-circuit; both build AST_BINARY_OP with operator value "||" or "or" so downstream lowering preserves the original syntax.
+@End Reasoning
+
+@Implementation:
+Calls parse_logical_and for the left operand, then loops while current token is TOKEN_OR or TOKEN_OR_KW. Advances past the operator, calls parse_logical_and for the right operand, wraps in an AST_BINARY_OP node, repeats.
+@End Implementation
 
 Process called "parse_logical_or" takes parser as Integer returns Integer:
     Note: Parse logical OR expressions (||, or)
@@ -458,6 +562,14 @@ Process called "parse_logical_or" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Logical AND level. Handles both `&&` and keyword `and` - both short-circuit, both build AST_BINARY_OP. Precedence is above OR but below equality.
+@End Reasoning
+
+@Implementation:
+Calls parse_equality for the left operand. Loops while current token is TOKEN_AND or TOKEN_AND_KW: advance, recurse parse_equality, wrap into AST_BINARY_OP.
+@End Implementation
+
 Process called "parse_logical_and" takes parser as Integer returns Integer:
     Note: Parse logical AND expressions (&&, and)
 
@@ -480,6 +592,14 @@ Process called "parse_logical_and" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Equality operators. Ruby distinguishes ==, !=, =~ (regex match), !~ (regex non-match), and ===  (case-equality). Each builds an AST_BINARY_OP with the original operator string preserved.
+@End Reasoning
+
+@Implementation:
+Calls parse_comparison for the left operand, then loops while current token is in the equality set. Advances, recurses parse_comparison, wraps into AST_BINARY_OP with the operator value.
+@End Implementation
 
 Process called "parse_equality" takes parser as Integer returns Integer:
     Note: Parse equality expressions (==, !=, =~, !~)
@@ -505,6 +625,14 @@ Process called "parse_equality" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Ordering comparison operators including Ruby's spaceship <=> which returns -1/0/1. All non-associating in practice (a < b < c is a chained call rather than a transitive comparison), but the parser folds them left-to-right.
+@End Reasoning
+
+@Implementation:
+Calls parse_range for the left operand. Loops while current token is TOKEN_LT/LE/GT/GE/SPACESHIP: advance, recurse parse_range, wrap into AST_BINARY_OP.
+@End Implementation
 
 Process called "parse_comparison" takes parser as Integer returns Integer:
     Note: Parse comparison expressions (<, <=, >, >=, <=>)
@@ -532,6 +660,14 @@ Process called "parse_comparison" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Ruby range literals: `a..b` (inclusive) and `a...b` (exclusive of upper). Distinct precedence so 1..5 + 1 parses as 1..(5+1).
+@End Reasoning
+
+@Implementation:
+Calls parse_addition for the left operand. If next token is TOKEN_DOTDOT or TOKEN_DOTDOTDOT, advances, recurses parse_addition for the upper bound, wraps in AST_RANGE with inclusive/exclusive flag.
+@End Implementation
+
 Process called "parse_range" takes parser as Integer returns Integer:
     Note: Parse range expressions (.., ...)
 
@@ -555,6 +691,14 @@ Process called "parse_range" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Additive arithmetic level. Left-associative + and -. Sits above range and below multiplication.
+@End Reasoning
+
+@Implementation:
+Calls parse_multiplication for the left operand. Loops while current token is TOKEN_PLUS or TOKEN_MINUS: advance, recurse parse_multiplication, wrap into AST_BINARY_OP.
+@End Implementation
+
 Process called "parse_addition" takes parser as Integer returns Integer:
     Note: Parse addition and subtraction expressions
 
@@ -577,6 +721,14 @@ Process called "parse_addition" takes parser as Integer returns Integer:
 
     Return left
 End Process
+
+@Reasoning:
+Multiplicative arithmetic level. Left-associative *, /, %. Sits above addition and below power.
+@End Reasoning
+
+@Implementation:
+Calls parse_power for the left operand. Loops while current token is TOKEN_STAR / TOKEN_SLASH / TOKEN_PERCENT: advance, recurse parse_power, wrap into AST_BINARY_OP.
+@End Implementation
 
 Process called "parse_multiplication" takes parser as Integer returns Integer:
     Note: Parse multiplication, division, and % expressions
@@ -602,6 +754,14 @@ Process called "parse_multiplication" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Exponentiation operator **. Right-associative so 2**3**2 parses as 2**(3**2)=512, matching math convention.
+@End Reasoning
+
+@Implementation:
+Calls parse_unary for the left operand. If next token is TOKEN_DOUBLE_STAR, advances and recurses parse_power (NOT parse_unary) to get right-associativity, then wraps in AST_BINARY_OP with operator "**".
+@End Implementation
+
 Process called "parse_power" takes parser as Integer returns Integer:
     Note: Parse power expressions (**)
 
@@ -624,6 +784,14 @@ Process called "parse_power" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Unary prefix operators. ! / not are logical negation; -/+ are sign operations. Right-associative since --x means -(-x).
+@End Reasoning
+
+@Implementation:
+If current token is TOKEN_NOT / TOKEN_BANG / TOKEN_MINUS / TOKEN_PLUS: advance, recurse parse_unary, wrap in AST_UNARY_OP. Otherwise delegate to parse_method_call.
+@End Implementation
+
 Process called "parse_unary" takes parser as Integer returns Integer:
     Note: Parse unary expressions (!, not, -, +)
 
@@ -644,6 +812,14 @@ Process called "parse_unary" takes parser as Integer returns Integer:
 
     Return proc parse_method_call from parser
 End Process
+
+@Reasoning:
+Handles Ruby's method-call syntaxes: dot notation `obj.method(args) {block}`, parenless calls `method args`, safe-navigation `obj&.method`, and call chains. Each call may carry a block argument introduced by `do...end` or `{...}`.
+@End Reasoning
+
+@Implementation:
+Calls parse_primary for the receiver. Loops while next token is TOKEN_DOT, TOKEN_SAFE_NAV, or (when in call position) TOKEN_LPAREN. For each: capture method name, parse argument list, then if TOKEN_DO or TOKEN_LBRACE follows call parse_block. Wrap the cumulative AST_METHOD_CALL.
+@End Implementation
 
 Process called "parse_method_call" takes parser as Integer returns Integer:
     Note: Parse method calls with blocks, dot notation, and chaining
@@ -703,6 +879,14 @@ Process called "parse_method_call" takes parser as Integer returns Integer:
 
     Return expr
 End Process
+
+@Reasoning:
+Atomic expression level. Recognises literals (number, string, symbol, regex), identifiers and constants, instance/class/global variables (with their @, @@, $ sigils), self, super, parenthesised expressions, array literals, hash literals, lambda/proc keywords.
+@End Reasoning
+
+@Implementation:
+Switch on current_token_type: NUMBER -> literal node, STRING -> literal/interpolated, SYMBOL -> AST_SYMBOL, IDENTIFIER -> AST_IDENTIFIER, AT-NAME -> AST_INSTANCE_VAR, AT-AT-NAME -> AST_CLASS_VAR, DOLLAR-NAME -> AST_GLOBAL_VAR, CONSTANT -> AST_CONSTANT, LPAREN -> recurse parse_expression and consume RPAREN, LBRACKET -> parse_array, LBRACE -> parse_hash, SELF -> AST_SELF, SUPER -> AST_SUPER_CALL.
+@End Implementation
 
 Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Parse primary expressions (literals, identifiers, parentheses)
@@ -796,6 +980,14 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     End Match
 End Process
 
+@Reasoning:
+Parses `[a, b, c]` array literals. Trailing comma is permitted. Empty arrays `[]` are common. Splat elements `[*xs, y]` are valid - they become AST_SPLAT children that the lowering expands at runtime.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LBRACKET. Loops: if current token is TOKEN_RBRACKET, exit. Otherwise parse_expression and append as child. Consume TOKEN_COMMA between elements (tolerating trailing comma). Finally consume TOKEN_RBRACKET. Returns AST_ARRAY.
+@End Implementation
+
 Process called "parse_array" takes parser as Integer returns Integer:
     Note: Parse Ruby array literals
 
@@ -823,6 +1015,14 @@ Process called "parse_array" takes parser as Integer returns Integer:
 
     Return array_node
 End Process
+
+@Reasoning:
+Parses Ruby hash literals `{k => v, k => v}` or the shorthand `{key: value}` for symbol keys. Empty hashes `{}` are valid. The shorthand form is rewritten internally to the => form with a symbol key.
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_LBRACE. Loops parsing key-value pairs separated by commas: parse the key (either an expression for => form or a TOKEN_LABEL for symbol shorthand), then TOKEN_HASH_ROCKET or TOKEN_COLON, then parse_expression for the value. Each (key,value) becomes a child pair of AST_HASH.
+@End Implementation
 
 Process called "parse_hash" takes parser as Integer returns Integer:
     Note: Parse Ruby hash literals with various key styles
@@ -872,6 +1072,14 @@ Process called "parse_hash" takes parser as Integer returns Integer:
 
     Return hash_node
 End Process
+
+@Reasoning:
+Parses a Ruby block - either the `{ |params| body }` brace form or the `do |params| body end` keyword form. Optional block parameter list between pipes; body is a statement sequence.
+@End Reasoning
+
+@Implementation:
+Detects opener (TOKEN_LBRACE or TOKEN_DO). If next token is TOKEN_PIPE, parses block parameters via parse_parameter_list until the closing pipe. Then parses statements via parse_statement until TOKEN_RBRACE (for { form) or TOKEN_END (for do form). Returns AST_BLOCK with parameters and body.
+@End Implementation
 
 Process called "parse_block" takes parser as Integer returns Integer:
     Note: Parse Ruby blocks (do...end or {...})
@@ -946,6 +1154,14 @@ End Process
 
 Note: Helper processes for parser functionality
 
+@Reasoning:
+Factory for every AST node the parser produces. Centralising construction here keeps the node shape (children list + attributes dict) invariant across all parse rules.
+@End Reasoning
+
+@Implementation:
+Constructs a RubyASTNode with the given node_type code and value string, fresh empty children list, line/column from the current parser position, and fresh empty attributes dictionary.
+@End Implementation
+
 Process called "create_ast_node" takes nt as Integer, node_value as String returns Integer:
     Note: Create new AST node
 
@@ -960,11 +1176,27 @@ Process called "create_ast_node" takes nt as Integer, node_value as String retur
     Return node
 End Process
 
+@Reasoning:
+Appends a child node onto a parent's children list. Centralised here so the list-append protocol is consistent across all parse rules.
+@End Reasoning
+
+@Implementation:
+Calls list_append on parent.children with the child node.
+@End Implementation
+
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
     proc add_to_list with parent.children, child
     Return 1
 End Process
+
+@Reasoning:
+Moves the parser cursor forward by one token and refreshes the cached current_token. All parse rules rely on this single advancement primitive so the cache stays consistent.
+@End Reasoning
+
+@Implementation:
+Increments parser.position. Reads parser.tokens at the new position and updates parser.current_token. If position is past the end, leaves current_token at the EOF sentinel.
+@End Implementation
 
 Process called "advance" takes parser as Integer returns Integer:
     Note: Advance to next token
@@ -981,20 +1213,52 @@ Process called "advance" takes parser as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Accessor for the cached current_token's type field. All parse-rule dispatchers call this before advancing.
+@End Reasoning
+
+@Implementation:
+Returns parser.current_token.token_type.
+@End Implementation
+
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
     Return parser.current_token.token_type
 End Process
+
+@Reasoning:
+Accessor for the cached current_token's lexeme/value field. Used when the parser needs to capture an identifier name, number literal, string literal, or operator string into an AST node.
+@End Reasoning
+
+@Implementation:
+Returns parser.current_token.value.
+@End Implementation
 
 Process called "current_token_value" takes parser as Integer returns String:
     Note: Get current token value
     Return parser.current_token.value
 End Process
 
+@Reasoning:
+Non-consuming token-type predicate. Pair with advance() to consume after a successful match.
+@End Reasoning
+
+@Implementation:
+Returns 1 if current_token_type equals token_type, 0 otherwise.
+@End Implementation
+
 Process called "match" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
     Return proc current_token_type with parser is equal to token_type
 End Process
+
+@Reasoning:
+Strict assertion: the next token MUST be of the requested type. On match, advances. On mismatch, records a parse error - typically used at mandatory grammar positions like closing brackets and required keywords.
+@End Reasoning
+
+@Implementation:
+Calls match. If true, calls advance and returns 1. Otherwise records an "expected X, got Y" error and returns 0.
+@End Implementation
 
 Process called "expect" takes parser as Integer, token_type as Integer returns Integer:
     Note: Expect specific token type and advance
@@ -1008,6 +1272,14 @@ Process called "expect" takes parser as Integer, token_type as Integer returns I
     Return 1
 End Process
 
+@Reasoning:
+Specialised expect() for identifiers that also returns the identifier's name string. Used by parse_class, parse_module, parse_method and any other rule that needs to capture a name immediately after a keyword.
+@End Reasoning
+
+@Implementation:
+Verifies current_token_type is TOKEN_IDENTIFIER. Reads current_token_value into a local, calls advance, then returns the captured name. On type mismatch records an error and returns the empty string.
+@End Implementation
+
 Process called "expect_identifier" takes parser as Integer returns String:
     Note: Expect identifier token and return its value
 
@@ -1020,6 +1292,14 @@ Process called "expect_identifier" takes parser as Integer returns String:
     Return value
 End Process
 
+@Reasoning:
+Consumes any run of newline tokens. Used at block boundaries and between statements where blank lines are insignificant but the tokenizer still emits them.
+@End Reasoning
+
+@Implementation:
+While current_token_type is TOKEN_NEWLINE, calls advance. Returns 1 unconditionally.
+@End Implementation
+
 Process called "skip_newlines" takes parser as Integer returns Integer:
     Note: Skip newline tokens
 
@@ -1030,10 +1310,26 @@ Process called "skip_newlines" takes parser as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Tiny constructor for the empty list used as RubyASTNode.children. Centralised so the list backing-store can change without touching every node creator.
+@End Reasoning
+
+@Implementation:
+Allocates and returns a fresh empty list.
+@End Implementation
+
 Process called "create_list" returns Integer:
     Note: Create list for storage
     Return proc memory_allocate from Layout with 16
 End Process
+
+@Reasoning:
+Tiny constructor for the empty dictionary used as RubyASTNode.attributes. Centralised so the dictionary backing-store can change without touching every node creator.
+@End Reasoning
+
+@Implementation:
+Allocates and returns a fresh empty dictionary.
+@End Implementation
 
 Process called "create_dict" returns Integer:
     Note: Create dictionary for storage

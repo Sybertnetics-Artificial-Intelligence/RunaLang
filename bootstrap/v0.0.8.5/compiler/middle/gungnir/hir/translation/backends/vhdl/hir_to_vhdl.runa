@@ -10,6 +10,20 @@ Import "compiler/frontend/primitives/collections/list.runa" as ListCore
 
 Note: ==================== Backend Context ====================
 
+@Reasoning:
+Per-translation state for the VHDL backend: an emitter, the entity and
+architecture names currently being generated (VHDL ties signals to a
+specific architecture), a deferred signal declaration list (collected during
+expression walks and flushed at architecture start), and an indent cursor.
+A type_map dictionary memoises HIR -> VHDL type lookups.
+@End Reasoning
+
+@Implementation:
+Six fields, all int64 handles. signal_declarations and type_map are
+heap-allocated collections owned by the context. Constructed in
+create_backend_context.
+@End Implementation
+
 Type called "HirToVhdlContext":
     emitter as Integer           Note: VHDL code emitter
     current_entity as Integer    Note: Current entity name
@@ -18,6 +32,19 @@ Type called "HirToVhdlContext":
     indent_level as Integer      Note: Current indentation level
     type_map as Integer          Note: Map of HIR types to VHDL types
 End Type
+
+@Reasoning:
+A code-gen walker cannot share state with the emitter; bundling them here
+gives the rest of the file a single context to thread instead of half a
+dozen parameters per call.
+@End Reasoning
+
+@Implementation:
+Constructs an HirToVhdlContext via the canonical record literal, attaches
+the supplied emitter, and creates empty signal_declarations list and
+type_map dictionary. current_entity and current_architecture start as null
+so an unconditioned generate_module can install them.
+@End Implementation
 
 Process called "create_backend_context" that takes emitter as Integer returns Integer:
     Note: Create new backend translation context
@@ -33,6 +60,21 @@ Process called "create_backend_context" that takes emitter as Integer returns In
 End Process
 
 Note: ==================== Type Generation ====================
+
+@Reasoning:
+VHDL has a richer type taxonomy than HIR (arrays carry range syntax, records
+nest fields, enums list values inline). Each HIR type kind needs its own
+emission shape; falling through to std_logic gives a safe default for any
+unknown kind so generation never crashes.
+@End Reasoning
+
+@Implementation:
+Reads the HIR "type" tag and dispatches: simple HIR_TYPE looks up the VHDL
+name through map_hir_type_to_vhdl; HIR_ARRAY_TYPE emits "array (natural
+range <>) of <element>"; HIR_STRUCT_TYPE emits a record block with one
+field per line at indented level; HIR_ENUM_TYPE emits a parenthesised
+comma-separated value list.
+@End Implementation
 
 Process called "generate_type" that takes ctx as Integer, hir_type as Integer returns Integer:
     Note: Generate VHDL type from HIR type
@@ -113,6 +155,19 @@ Process called "generate_type" that takes ctx as Integer, hir_type as Integer re
     Return 1
 End Process
 
+@Reasoning:
+HIR uses Runa primitive names (Integer, Float, Boolean, etc.), but VHDL has
+its own lower-case canonical names (integer, real, boolean) plus
+hardware-specific types (std_logic, std_logic_vector, signed, unsigned).
+A central mapping keeps the rest of the file free of per-type conditionals.
+@End Reasoning
+
+@Implementation:
+Linear chain of string_equals comparisons against the supported Runa names,
+returning the matching VHDL type string. Unknown names fall through to
+"std_logic" as a safe synthesisable default.
+@End Implementation
+
 Process called "map_hir_type_to_vhdl" that takes hir_type_name as Integer returns Integer:
     Note: Map HIR type names to VHDL type names
 
@@ -190,6 +245,20 @@ Process called "map_hir_type_to_vhdl" that takes hir_type_name as Integer return
 End Process
 
 Note: ==================== Expression Generation ====================
+
+@Reasoning:
+Expressions are the densest production in any backend; centralising them
+behind one dispatcher means each statement kind can recurse without
+knowing which expression flavours exist.
+@End Reasoning
+
+@Implementation:
+Reads the HIR expression's "type" tag and emits the matching VHDL form for
+literals (integer/float/string/bool), identifiers, binary/unary ops via
+the operator map, function calls via the function map, array/record access,
+and conditional expressions. Falls back to an empty emission for unknown
+tags so traversal does not abort.
+@End Implementation
 
 Process called "generate_expression" that takes ctx as Integer, hir_expr as Integer returns Integer:
     Note: Generate VHDL expression from HIR expression
@@ -394,6 +463,19 @@ Process called "generate_expression" that takes ctx as Integer, hir_expr as Inte
     Return 1
 End Process
 
+@Reasoning:
+HIR operators are spelled in Runa style (=, &&, ||) while VHDL uses its own
+keywords (=, and, or, xor). Centralising the mapping keeps generate_expression
+free of operator-specific branches.
+@End Reasoning
+
+@Implementation:
+String_equals chain comparing the HIR operator token against the supported
+HIR forms, returning the matching VHDL operator string. Unknown operators
+return the input unchanged so the caller can still emit something - the HIR
+validator catches truly invalid operators upstream.
+@End Implementation
+
 Process called "map_hir_operator_to_vhdl" that takes hir_op as Integer returns Integer:
     Note: Map HIR operators to VHDL operators
 
@@ -494,6 +576,18 @@ Process called "map_hir_operator_to_vhdl" that takes hir_op as Integer returns I
     Return hir_op
 End Process
 
+@Reasoning:
+HIR function calls reference Runa stdlib names (sin, sqrt, abs, ...) which
+typically have a VHDL equivalent in ieee.math_real or numeric_std. The map
+isolates that name translation so generate_expression stays generic.
+@End Reasoning
+
+@Implementation:
+String_equals chain mapping each supported Runa stdlib function to its
+VHDL equivalent. Unmapped names are returned unchanged so user-defined
+VHDL functions emit through transparently.
+@End Implementation
+
 Process called "map_hir_function_to_vhdl" that takes func_name as Integer returns Integer:
     Note: Map HIR function names to VHDL equivalents
 
@@ -558,6 +652,21 @@ Process called "map_hir_function_to_vhdl" that takes func_name as Integer return
 End Process
 
 Note: ==================== Statement Generation ====================
+
+@Reasoning:
+Statements drive VHDL behavioural blocks: assignments, conditionals, loops,
+case selects, process and component instantiations. Like generate_expression
+this is a tagged-dispatch router, but the output is line-oriented because
+VHDL statements terminate with semicolons and live inside indented blocks.
+@End Reasoning
+
+@Implementation:
+Reads the HIR statement type tag and emits the matching VHDL form: signal
+assignments use "<= ", variable assignments use ":= ", if/elsif/else uses
+indented blocks with "end if", case statements emit "case ... is / when
+... =>" arms, while and for loops emit named iteration blocks. The
+dispatcher uses indent/dedent on the emitter for nested constructs.
+@End Implementation
 
 Process called "generate_statement" that takes ctx as Integer, hir_stmt as Integer returns Integer:
     Note: Generate VHDL statement from HIR statement
@@ -969,6 +1078,17 @@ Process called "generate_statement" that takes ctx as Integer, hir_stmt as Integ
     Return 1
 End Process
 
+@Reasoning:
+Most VHDL constructs (process body, if/else arms, case arms) wrap an
+ordered sequence of statements. A shared list-walker prevents the per-
+statement caller from duplicating loop boilerplate.
+@End Reasoning
+
+@Implementation:
+Iterates the supplied list by index using list_length / list_get and
+dispatches each entry through generate_statement.
+@End Implementation
+
 Process called "generate_statement_list" that takes ctx as Integer, statements as Integer returns Integer:
     Note: Generate list of VHDL statements
 
@@ -984,6 +1104,19 @@ Process called "generate_statement_list" that takes ctx as Integer, statements a
 End Process
 
 Note: ==================== Module Generation ====================
+
+@Reasoning:
+A VHDL design unit consists of an entity declaration (ports, generics) and
+a paired architecture body (signals, processes, concurrent statements).
+Emitting both from one HIR module keeps the two halves in sync.
+@End Reasoning
+
+@Implementation:
+Sets current_entity and current_architecture from the HIR module name,
+emits the library/use prelude, the entity header with port and generic
+declarations, then the architecture body with signal declarations followed
+by the concurrent statement block produced by generate_statement_list.
+@End Implementation
 
 Process called "generate_module" that takes ctx as Integer, hir_module as Integer returns Integer:
     Note: Generate VHDL entity or architecture from HIR module
@@ -1151,6 +1284,18 @@ Process called "generate_module" that takes ctx as Integer, hir_module as Intege
 End Process
 
 Note: ==================== Main Generation Entry Point ====================
+
+@Reasoning:
+Top-level public entry. Owns the lifetime of the emitter and context so
+callers only need to pass the HIR program root in and read the produced
+VHDL source out.
+@End Reasoning
+
+@Implementation:
+Constructs a vhdl emitter, wraps it in a fresh HirToVhdlContext, walks the
+module list off the HIR program node dispatching each through
+generate_module, then retrieves the accumulated source from the emitter.
+@End Implementation
 
 Process called "generate" that takes hir_program as Integer returns Integer:
     Note: Main code generation function - Generate VHDL from HIR

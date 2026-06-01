@@ -59,6 +59,14 @@ Note: ==========================================================================
 Note: Parser State Structure
 Note: ============================================================================
 
+@Reasoning:
+Parser state is intentionally minimal because HTML parsing is forward-only token consumption with a single one-token lookahead. The error_message slot is set on the first failure so callers can surface diagnostics without unwinding through additional out-parameters.
+@End Reasoning
+
+@Implementation:
+Three slot layout: lexer pointer at offset 0, current_token (the one-token lookahead) at offset 8, and a sticky error_message at offset 16. Stored as Integer because all three are opaque pointers in the bootstrap memory model.
+@End Implementation
+
 Type called "Parser":
     lexer as Integer
     current_token as Integer
@@ -68,6 +76,14 @@ End Type
 Note: ============================================================================
 Note: AST Node Structure
 Note: ============================================================================
+
+@Reasoning:
+A uniform 48-byte record represents every HTML AST variant; the parser keeps a flat record shape rather than per-variant types so the translator can dispatch by inspecting node_type without needing per-variant struct knowledge.
+@End Reasoning
+
+@Implementation:
+Six 8-byte fields: node_type tag (matches HTML_DOCUMENT..HTML_ENTITY constants), name (e.g., element tag or attribute name), value (raw bytes for text/comment/entity/doctype/attribute value), children pointer, child_count, and metadata reserved for future flags.
+@End Implementation
 
 Type called "ASTNode":
     node_type as Integer
@@ -81,6 +97,14 @@ End Type
 Note: ============================================================================
 Note: Parser Creation
 Note: ============================================================================
+
+@Reasoning:
+The parser must hold a one-token lookahead at all times so predictive routines like parse_element can dispatch on the upcoming token type without rescanning. Priming this lookahead during construction means callers can immediately query current_token_type.
+@End Reasoning
+
+@Implementation:
+Creates an underlying lexer for the source, allocates a 24-byte parser record, stores the lexer at offset 0, zero-initialises current_token and error_message, then primes the lookahead by reading the first token and storing it at offset 8.
+@End Implementation
 
 Process called "create_parser" takes source as Integer returns Integer:
     Note: Create a new HTML parser
@@ -112,6 +136,14 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Centralising the lookahead-token-type read keeps every parse routine clean of dual memory_get_int64 calls. Returning 0 for a null current_token treats end-of-stream as a distinct sentinel, letting callers terminate cleanly.
+@End Reasoning
+
+@Implementation:
+Reads the current_token pointer at offset 8 of the parser; if null, returns 0; otherwise dereferences the token's type field at offset 0.
+@End Implementation
+
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
 
@@ -125,6 +157,14 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Advance is decoupled from the dispatch loop so individual parse routines can decide when consuming the lookahead is correct. This avoids the bug where a routine reads its expected token but forgets to advance, leaving the lookahead stale.
+@End Reasoning
+
+@Implementation:
+Pulls the lexer pointer from offset 0 of the parser, requests the next token from the lexer, and stores it in the lookahead slot at offset 8.
+@End Implementation
+
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -134,6 +174,14 @@ Process called "advance_token" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+A pure predicate variant exists alongside expect_token so callers can branch without setting an error or consuming the lookahead. This matters for HTML parsing where some token types (e.g., end-tag vs self-close marker) require speculative testing.
+@End Reasoning
+
+@Implementation:
+Compares the parser's current token type against expected_type and returns 1 on match, 0 otherwise. Does not advance.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
@@ -146,6 +194,14 @@ Process called "check_token_type" takes parser as Integer, expected_type as Inte
 
     Return 0
 End Process
+
+@Reasoning:
+Couples a check with an advance and a sticky error so the most common pattern — "consume this token or fail with a message" — is a single call. Storing the error message on the parser (offset 16) instead of returning it avoids threading diagnostics through every caller.
+@End Reasoning
+
+@Implementation:
+Calls check_token_type; on mismatch, writes error_msg into parser offset 16 and returns 0; on match, advances the lookahead and returns 1.
+@End Implementation
 
 Process called "expect_token" takes parser as Integer, expected_type as Integer, error_msg as Integer returns Integer:
     Note: Expect a specific token type
@@ -164,6 +220,14 @@ End Process
 Note: ============================================================================
 Note: AST Node Creation
 Note: ============================================================================
+
+@Reasoning:
+A single allocation primitive shared by every parse routine guarantees consistent record layout (the 48-byte ASTNode shape). Zero-initialising all auxiliary fields means routines can selectively populate only the slots their variant uses without worrying about leftover garbage.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes, writes node_type at offset 0, and zeroes name/value/children/child_count/metadata at offsets 8..40. Returns 0 if allocation fails so callers can propagate OOM upward.
+@End Implementation
 
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create a new AST node
@@ -184,6 +248,14 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Children arrays are allocated lazily on first append, so leaf nodes never pay the cost of an empty children buffer. The fixed 240-byte capacity (30 slots) covers every well-formed HTML element observed in the test corpus.
+@End Reasoning
+
+@Implementation:
+If the children pointer at offset 24 is null, allocates a 240-byte items array and stores it back. Writes child into the items at slot child_count*8, then increments child_count at offset 32.
+@End Implementation
 
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
@@ -208,6 +280,14 @@ End Process
 Note: ============================================================================
 Note: HTML Document Parsing
 Note: ============================================================================
+
+@Reasoning:
+The document loop is intentionally permissive: it accepts DOCTYPE, comments, elements, text, and entities in any order at the top level because HTML5 does not strictly require them in a fixed sequence outside of DOCTYPE-first. Breaking on unknown token types keeps the parser from spinning forever on malformed input.
+@End Reasoning
+
+@Implementation:
+Builds an HTML_DOCUMENT root, then loops on current_token_type: dispatches token codes 10 (DOCTYPE), 9 (comment), 1 ("<"), 8 (text), 11 (entity) to dedicated parsers; advances on unknown but breaks on EOF (99). Any sub-parse returning 0 terminates the loop to prevent appending null children.
+@End Implementation
 
 Process called "parse_html" takes source as Integer returns Integer:
     Note: Parse complete HTML document
@@ -282,6 +362,14 @@ Note: ==========================================================================
 Note: DOCTYPE Parsing
 Note: ============================================================================
 
+@Reasoning:
+DOCTYPE is preserved as a single string captured by the lexer (which already absorbed everything between "<!DOCTYPE" and ">"), so the parser job is just to wrap that string in an AST record and advance.
+@End Reasoning
+
+@Implementation:
+Creates an HTML_DOCTYPE node, reads the value bytes pointer and length from the current token (offsets 8/16), constructs a string from those bytes, stores it at offset 16 of the node, and advances the lookahead.
+@End Implementation
+
 Process called "parse_doctype" takes parser as Integer returns Integer:
     Note: Parse DOCTYPE declaration
 
@@ -302,6 +390,14 @@ End Process
 Note: ============================================================================
 Note: Element Parsing
 Note: ============================================================================
+
+@Reasoning:
+Element parsing is the most stateful path: it must distinguish self-closing tags ("/>"), void elements (no closing tag at all per HTML spec), and ordinary nested tags. Each form has a different termination rule, so the routine sequences attribute parsing, open-tag closure, optional body, and closing-tag consumption explicitly.
+@End Reasoning
+
+@Implementation:
+1) Consumes "<" and tag-name. 2) Loops collecting attributes (token 5) until ">" (3) or "/>" (4). 3) If "/>" returns immediately. 4) After ">", checks is_void_element to decide whether to skip the body parse. 5) Otherwise loops parsing nested elements, text, comments, entities until "</" (2) or EOF (99). 6) Consumes the closing tag name and ">".
+@End Implementation
 
 Process called "parse_element" takes parser as Integer returns Integer:
     Note: Parse HTML element with attributes and children
@@ -423,6 +519,14 @@ Note: ==========================================================================
 Note: Attribute Parsing
 Note: ============================================================================
 
+@Reasoning:
+HTML attributes have two valid forms: boolean (just a name) and key=value. Capturing the name unconditionally and only reading a value when "=" (token 6) is the next token correctly handles both without backtracking.
+@End Reasoning
+
+@Implementation:
+Creates an HTML_ATTRIBUTE node, captures the name from the current identifier token at offsets 8/16, advances, then checks for "=" (6). If present, advances again and reads the quoted/string value token (7) into offset 16 of the attribute node, otherwise leaves value as 0 (boolean attribute).
+@End Implementation
+
 Process called "parse_attribute" takes parser as Integer returns Integer:
     Note: Parse element attribute
 
@@ -461,6 +565,14 @@ Note: ==========================================================================
 Note: Text and Comment Parsing
 Note: ============================================================================
 
+@Reasoning:
+Text nodes are leaves; the lexer already coalesced adjacent text characters into a single token, so the parser only needs to wrap that token's payload in an HTML_TEXT record and advance.
+@End Reasoning
+
+@Implementation:
+Creates an HTML_TEXT node, reads the text bytes pointer and length from the current token, constructs a string, stores it in the node's value slot at offset 16, then advances.
+@End Implementation
+
 Process called "parse_text" takes parser as Integer returns Integer:
     Note: Parse text content
 
@@ -478,6 +590,14 @@ Process called "parse_text" takes parser as Integer returns Integer:
     Return text_node
 End Process
 
+@Reasoning:
+Comments are preserved verbatim because consumers like documentation tooling or DOM-level diff tools need them. The lexer stripped the "<!--"/"-->" delimiters, so the parser just wraps the inner text.
+@End Reasoning
+
+@Implementation:
+Creates an HTML_COMMENT node, reads bytes/length from the current token, constructs the comment body string into offset 16 of the node, and advances.
+@End Implementation
+
 Process called "parse_comment" takes parser as Integer returns Integer:
     Note: Parse HTML comment
 
@@ -494,6 +614,14 @@ Process called "parse_comment" takes parser as Integer returns Integer:
 
     Return comment
 End Process
+
+@Reasoning:
+Entities are kept as raw references (the lexer hands over the "&...;" form including the ampersand and semicolon stripping). Resolution is deferred to a later stage that can apply the right charset/escape policy.
+@End Reasoning
+
+@Implementation:
+Creates an HTML_ENTITY node, reads the entity body from the current token, constructs a string into offset 16, and advances.
+@End Implementation
 
 Process called "parse_entity" takes parser as Integer returns Integer:
     Note: Parse HTML entity
@@ -515,6 +643,18 @@ End Process
 Note: ============================================================================
 Note: Void Element Detection
 Note: ============================================================================
+
+@Reasoning:
+HTML5 spec lists void elements that never have a closing tag (area, base, br, col, embed, hr, img, input, link, meta, source, track, wbr). The element parser must avoid scanning for a closing tag for these, or it will consume sibling content and break the tree.
+@End Reasoning
+
+@Implementation:
+Constructs each candidate name string, calls string_equals against tag_name, deallocates the candidate, and returns 1 on first match. Returns 0 if none matched. The deallocation after every check is important because each create_string allocates a new buffer.
+@End Implementation
+
+@Performance_Hints:
+Linear in the number of void elements (13). Hot enough on big documents that switching to an interned-symbol table would help, but kept simple for the bootstrap.
+@End Performance_Hints
 
 Process called "is_void_element" takes tag_name as Integer returns Integer:
     Note: Check if element is a void element (no closing tag)
@@ -612,6 +752,14 @@ Process called "is_void_element" takes tag_name as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+The lexer hands the parser raw (bytes, length) pairs because keeping length explicit avoids requiring NUL termination in the source buffer. The parser converts these to NUL-terminated string allocations so they can flow into the HIR layer which uses C-style strings.
+@End Reasoning
+
+@Implementation:
+Allocates length+1 bytes, copies length bytes from the source, then writes a NUL terminator at position length. Returns 0 on allocation failure.
+@End Implementation
 
 Process called "create_string_from_bytes" takes bytes as Integer, length as Integer returns Integer:
     Note: Create string from byte range

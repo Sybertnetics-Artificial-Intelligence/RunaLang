@@ -120,6 +120,19 @@ Note: ==========================================================================
 Note: Lexer State
 Note: ============================================================================
 
+@Reasoning:
+CMake source is ASCII-compatible (UTF-8 OK in string/comment bodies). The
+lexer is byte-positioned with cached length for O(1) bounds checks. line
+and column track 1-based positions for diagnostics that match CMake's
+own error messages.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64) at offsets 0..32: source (StringCore handle),
+length (cached byte count), position (byte cursor, 0-based), line
+(1-based), column (1-based).
+@End Implementation
+
 Type called "CMakeLexer":
     source as Integer
     length as Integer
@@ -127,6 +140,19 @@ Type called "CMakeLexer":
     line as Integer
     column as Integer
 End Type
+
+@Reasoning:
+CMake tokens carry only type, value (StringCore for identifiers/strings/
+numbers/variables/genexpr), and source position. No metadata slot because
+CMake tokens have no sub-type discriminators (unlike CSS numbers which
+carry units).
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64) at offsets 0..24: token_type (TOKEN_*), value
+(StringCore handle owned by the token; lexer copies the lexeme into a
+fresh StringCore so source can be released after lexing), line, column.
+@End Implementation
 
 Type called "CMakeToken":
     token_type as Integer
@@ -138,6 +164,18 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation
 Note: ============================================================================
+
+@Reasoning:
+Lexer factory. Caches source_length so the per-character bounds check is
+constant time. Sets line=column=1 to match CMake's 1-based diagnostic
+output.
+@End Reasoning
+
+@Implementation:
+Computes source length via StringCore.string_length. Allocates 40-byte
+block; on OOM returns 0. Writes source/length/position=0/line=1/column=1
+at offsets 0/8/16/24/32.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create CMake lexer
@@ -164,6 +202,16 @@ Note: ==========================================================================
 Note: Character Helpers
 Note: ============================================================================
 
+@Reasoning:
+Cursor-read accessor; returns 0 at EOF so scanners distinguish past-end
+from real NULs (CMake source generally contains no NUL bytes anyway).
+@End Reasoning
+
+@Implementation:
+Reads position/length. If position >= length returns 0. Otherwise reads
+the byte at source+position via memory_get_byte and returns it.
+@End Implementation
+
 Process called "current_char" takes lexer as Integer returns Integer:
     Note: Get current character
 
@@ -179,6 +227,16 @@ Process called "current_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+Single-byte lookahead for delimiter disambiguation. CMake's grammar has
+few multi-byte operators so a fixed 1-ahead peek suffices.
+@End Reasoning
+
+@Implementation:
+Reads position/length. Computes next_pos = position + 1. If next_pos >=
+length returns 0. Otherwise returns the byte at source+next_pos.
+@End Implementation
 
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek next character
@@ -196,6 +254,18 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+Cursor-advancing read with line/column maintenance. LF (0x0A) increments
+line and resets column to 1; any other byte increments column. CMake
+source typically uses LF endings; CR is treated as a normal byte.
+@End Reasoning
+
+@Implementation:
+Reads current_char (returns 0 at EOF). Increments position. On LF (10)
+bumps line and resets column to 1; otherwise bumps column. Returns the
+byte that was at the original cursor.
+@End Implementation
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
@@ -219,6 +289,20 @@ Process called "advance_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+CMake whitespace per spec is space (0x20), tab (0x09), LF (0x0A), CR
+(0x0D). All four are skipped by this routine. No CMake-specific tokens
+(unlike Python) depend on whitespace, so inter-token whitespace is
+silently consumed.
+@End Reasoning
+
+@Implementation:
+Loops keep_skipping flag. Each iteration reads current_char and dispatches
+on the four whitespace bytes (32/9/10/13). Any other byte sets
+keep_skipping=0 to exit. Uses advance_char to consume so line/column
+stay accurate.
+@End Implementation
 
 Process called "skip_whitespace" takes lexer as Integer:
     Note: Skip whitespace
@@ -249,6 +333,15 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII digit classifier; used by tokenize_number for the leading-digit
+check and by is_alnum for identifier-tail classification.
+@End Reasoning
+
+@Implementation:
+Single range check '0'..'9' (48..57). Returns 1 on match.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     If char is greater than or equal to 48:
         If char is less than or equal to 57:
@@ -257,6 +350,18 @@ Process called "is_digit" takes char as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning:
+Identifier-start classifier: CMake identifiers may start with a letter
+('A'..'Z' or 'a'..'z') or underscore. Identifier rules are case-sensitive
+when stored but CMake command names are folded to lowercase by the
+parser layer.
+@End Reasoning
+
+@Implementation:
+Range checks 'A'..'Z' (65..90), 'a'..'z' (97..122), plus the '_' (95)
+equality check. Returns 1 on match.
+@End Implementation
 
 Process called "is_alpha" takes char as Integer returns Integer:
     If char is greater than or equal to 65:
@@ -275,6 +380,17 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier: CMake identifiers after the first character
+may include digits. Composes is_alpha and is_digit.
+@End Reasoning
+
+@Implementation:
+Calls is_alpha; on match returns 1. Otherwise returns is_digit's result
+directly (so digits-only input is also classified as alnum, matching
+the union semantics).
+@End Implementation
+
 Process called "is_alnum" takes char as Integer returns Integer:
     Let alpha be proc is_alpha from char
     If alpha is equal to 1:
@@ -286,6 +402,17 @@ End Process
 Note: ============================================================================
 Note: Token Creation
 Note: ============================================================================
+
+@Reasoning:
+Centralised token allocator. All scanners route through this so token
+layout stays uniform.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes; on OOM returns 0. Writes token_type/value/line/column
+at offsets 0/8/16/24. value is a borrowed StringCore pointer; caller is
+responsible for ensuring value outlives the token.
+@End Implementation
 
 Process called "create_token" takes token_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Let token_size be 32
@@ -306,6 +433,19 @@ End Process
 Note: ============================================================================
 Note: Tokenization
 Note: ============================================================================
+
+@Reasoning:
+CMake numeric literals are integer or decimal (no exponent form, no hex
+in the lexer - hex values appear only as quoted strings). Scans digits,
+optional decimal point, more digits.
+@End Reasoning
+
+@Implementation:
+Captures start_pos/line/column. Loops scanning digits via is_digit. On
+'.' (46) consumes and scans the fractional part. value is materialised
+via StringCore.substring with [start_pos, end_pos) range. Emits
+TOKEN_NUMBER with the new StringCore.
+@End Implementation
 
 Process called "tokenize_number" takes lexer as Integer returns Integer:
     Note: Tokenize number
@@ -340,6 +480,23 @@ Process called "tokenize_number" takes lexer as Integer returns Integer:
 
     Return proc create_token with TOKEN_NUMBER, value, line, column
 End Process
+
+@Reasoning:
+CMake quoted strings ("..." or '...') support backslash escapes for \n,
+\t, \r. Unlike the bracket-string form, content is processed through a
+1KB byte buffer with escape resolution so the emitted StringCore is the
+DECODED string (not the raw source slice).
+@End Reasoning
+
+@Implementation:
+Captures line/column. Consumes the opening quote. Loops: matching quote
+breaks; 0 (EOF) breaks unterminated; '\\' (92) reads next byte and
+substitutes 'n'->LF, 't'->Tab, 'r'->CR, anything else stays as-is. Each
+byte is written to the buffer at buffer_len which increments. At end,
+null-terminates the buffer, materialises StringCore via
+StringCore.create_string, deallocates the temporary buffer. Emits
+TOKEN_STRING.
+@End Implementation
 
 Process called "tokenize_string" takes lexer as Integer, quote as Integer returns Integer:
     Note: Tokenize quoted string
@@ -402,6 +559,22 @@ Process called "tokenize_string" takes lexer as Integer, quote as Integer return
     Return proc create_token with TOKEN_STRING, value, line, column
 End Process
 
+@Reasoning:
+CMake bracket strings [[...]] are raw (no escape processing). The opening
+[[ and closing ]] are tokenised together. Used for embedding shell
+scripts, code snippets, or strings containing quotes that would otherwise
+need escaping.
+@End Reasoning
+
+@Implementation:
+Captures line/column. Consumes the two '[' opening bytes; records
+start_pos at the first content byte. Loops: 0 (EOF) returns TOKEN_ERROR
+with "Unterminated bracket string"; ']' (93) followed by ']' breaks. On
+break, materialises StringCore via substring with [start_pos, end_pos)
+(the closing ]] is not in the value), consumes the closing ]], emits
+TOKEN_STRING.
+@End Implementation
+
 Process called "tokenize_bracket_string" takes lexer as Integer returns Integer:
     Note: Tokenize bracket string [[...]]
 
@@ -437,6 +610,21 @@ Process called "tokenize_bracket_string" takes lexer as Integer returns Integer:
 
     Return proc create_token with TOKEN_ERROR, "Unterminated bracket string", line, column
 End Process
+
+@Reasoning:
+CMake variable references ${VAR} substitute the variable's value at
+expansion time. The lexer emits a TOKEN_VARIABLE with the bare variable
+name (without ${ }); the parser/evaluator resolves the value. $ENV{VAR}
+and $CACHE{VAR} variants are detected in next_token.
+@End Reasoning
+
+@Implementation:
+Captures line/column. Consumes "${" (two advances). Records start_pos at
+the variable name's first byte. Loops: '}' (125) breaks; 0 (EOF) breaks
+unterminated. Materialises name via StringCore.substring with
+[start_pos, end_pos) (closing '}' excluded). Consumes the closing '}'.
+Emits TOKEN_VARIABLE.
+@End Implementation
 
 Process called "tokenize_variable" takes lexer as Integer returns Integer:
     Note: Tokenize variable ${VAR}
@@ -474,6 +662,20 @@ Process called "tokenize_variable" takes lexer as Integer returns Integer:
 
     Return proc create_token with TOKEN_VARIABLE, value, line, column
 End Process
+
+@Reasoning:
+Generator expressions $<...> are CMake's build-time conditional/value
+language. They can nest ($<IF:$<CONFIG:Debug>,a,b>) so the lexer must
+track depth and find the MATCHING '>' rather than the first one.
+@End Reasoning
+
+@Implementation:
+Captures line/column. Consumes "$<" (two advances). Records start_pos.
+depth=1. Loops while depth > 0: '<' (60) increments depth; '>' (62)
+decrements depth. EOF (0) exits. When depth reaches 0, materialises
+value via substring with [start_pos, end_pos) (closing '>' excluded),
+consumes the closing '>', emits TOKEN_GENERATOR_EXPR.
+@End Implementation
 
 Process called "tokenize_generator_expr" takes lexer as Integer returns Integer:
     Note: Tokenize generator expression $<...>
@@ -521,6 +723,20 @@ Process called "tokenize_generator_expr" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_GENERATOR_EXPR, value, line, column
 End Process
 
+@Reasoning:
+Scans the longest alphanumeric/underscore run starting at the current
+cursor. Caller has already checked is_alpha so the first byte is valid.
+keyword_type then disambiguates identifiers from CMake control-flow and
+command keywords (case-insensitive).
+@End Reasoning
+
+@Implementation:
+Captures start_pos/line/column. Loops scanning is_alnum bytes until a
+non-alnum byte. Materialises value via substring with [start_pos,
+end_pos). Calls keyword_type(value) which returns either TOKEN_IDENTIFIER
+or one of the specific keyword token constants (TOKEN_IF/TOKEN_SET/etc.).
+@End Implementation
+
 Process called "tokenize_identifier" takes lexer as Integer returns Integer:
     Note: Tokenize identifier or keyword
 
@@ -545,6 +761,28 @@ Process called "tokenize_identifier" takes lexer as Integer returns Integer:
 
     Return proc create_token with token_type, value, line, column
 End Process
+
+@Reasoning:
+CMake commands and keywords are case-insensitive (IF, If, if all parse
+identically). This routine folds the lexeme to lowercase then linearly
+compares against every recognised keyword. Returns TOKEN_IDENTIFIER if no
+keyword match. The linear search is acceptable because CMake has few
+keywords and keyword_type is called once per identifier token.
+@End Reasoning
+
+@Implementation:
+Folds text to lowercase via StringCore.string_to_lower. Chains
+string_equals comparisons against every CMake keyword in token-constant
+order (control flow first, then function/macro keywords, then common
+commands like set/list/string/message, then target commands). Returns
+the matching TOKEN_* constant on hit; default is TOKEN_IDENTIFIER.
+@End Implementation
+
+@Performance_Hints:
+O(K) where K is the number of CMake keywords (~50). Hot only in source
+with many bare identifiers; mitigation would be a perfect-hash table
+keyed on length+content.
+@End Performance_Hints
 
 Process called "keyword_type" takes text as Integer returns Integer:
     Note: Determine keyword type (case-insensitive)
@@ -688,6 +926,24 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+Top-level dispatcher for CMake tokenisation. Walks through whitespace and
+comments transparently then routes on the first non-skip byte to the
+appropriate scanner. CMake has a lot of single-byte operators (parens,
+brackets, semicolons) handled inline; multi-byte forms ($-prefixed
+variables/genexprs, [[ bracket strings) are detected via peek_char.
+@End Reasoning
+
+@Implementation:
+Skips inter-token whitespace. Reads current byte. Dispatch: 0 (EOF) ->
+TOKEN_EOF; '#' (35) -> consume to end-of-line as comment then recurse;
+'$' followed by '{' -> tokenize_variable; '$' followed by '<' ->
+tokenize_generator_expr; '"' or "'" -> tokenize_string; '[' followed by
+'[' -> tokenize_bracket_string; alpha/underscore -> tokenize_identifier
+(may resolve to keyword); digit -> tokenize_number; parens/brackets ->
+single-byte tokens. Unknown bytes return TOKEN_ERROR.
+@End Implementation
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token

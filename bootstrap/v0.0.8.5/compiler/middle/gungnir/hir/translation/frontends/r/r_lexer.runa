@@ -140,6 +140,14 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+RLexer is the streaming cursor state for R tokenization. Fields are integer-coded to match the 40-byte layout the lexer's allocator (create_r_lexer) writes; position advances monotonically up to length, line/column track for diagnostics.
+@End Reasoning
+
+@Implementation:
+Five 8-byte fields, total 40 bytes, accessed via memory_get_int64/memory_set_int64 at offsets 0,8,16,24,32. Source pointer is borrowed (lexer does not own the string).
+@End Implementation
+
 Type called "RLexer":
     source as Integer           Note: Source code string
     position as Integer         Note: Current position in source
@@ -147,6 +155,14 @@ Type called "RLexer":
     line as Integer             Note: Current line number
     column as Integer           Note: Current column number
 End Type
+
+@Reasoning:
+RToken is the unit produced by next_token: it carries the token kind plus the originating source position so the parser and downstream diagnostics can point back to the exact span.
+@End Reasoning
+
+@Implementation:
+Five 8-byte fields, total 40 bytes, allocated by create_token. lexeme is an owning pointer to a heap-copied substring; line/column/length encode the span.
+@End Implementation
 
 Type called "RToken":
     token_type as Integer       Note: Token type constant
@@ -159,6 +175,18 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation and Management
 Note: ============================================================================
+
+@Reasoning:
+Allocates an RLexer cursor seeded at line 1, column 1, position 0. The borrowed source pointer is captured once so subsequent peek/advance calls do not re-measure the string. Returns 0 on allocation failure so callers can detect OOM without exceptions.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes via Layout, stores source pointer, computes source_length once via StringCore.string_length, and zero-initialises position while seeding line=1, column=1.
+@End Implementation
+
+@Security_Scope:
+Allocates from the layout heap; caller owns the returned lexer and must call destroy_r_lexer to release. Does not copy source.
+@End Security_Scope
 
 Process called "create_r_lexer" takes source as Integer returns Integer:
     Note: Create R lexer from source code
@@ -186,6 +214,18 @@ Process called "create_r_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Releases the 40-byte RLexer block. Tolerates a null pointer so callers can blindly destroy after failure paths. The borrowed source string is not freed - the original owner retains responsibility.
+@End Reasoning
+
+@Implementation:
+Null-checks the pointer, then calls Layout.deallocate. Always returns 1 (success) since deallocation is unconditional once the null check passes.
+@End Implementation
+
+@Security_Scope:
+Frees lexer heap memory. Double-free protection relies on the caller not calling twice.
+@End Security_Scope
+
 Process called "destroy_r_lexer" takes lexer as Integer returns Integer:
     Note: Destroy R lexer
 
@@ -200,6 +240,14 @@ End Process
 Note: ============================================================================
 Note: Character Classification
 Note: ============================================================================
+
+@Reasoning:
+R identifier alphabet: ASCII letters plus underscore plus dot. The dot is significant because R identifiers like data.frame are legal single names, distinct from member access in other languages.
+@End Reasoning
+
+@Implementation:
+Pure ASCII range check on codepoints 65-90 (A-Z), 97-122 (a-z), 95 (_), and 46 (.). Returns 1 for match, 0 otherwise.
+@End Implementation
 
 Process called "is_alpha" takes ch as Integer returns Integer:
     Note: Check if character is alphabetic or underscore
@@ -230,6 +278,14 @@ Process called "is_alpha" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Decimal digit classification used by tokenize_number. Hex digits are handled separately inside tokenize_number's 0x branch.
+@End Reasoning
+
+@Implementation:
+ASCII range check on codepoints 48-57. Returns 1 for digit, 0 otherwise.
+@End Implementation
+
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -241,6 +297,14 @@ Process called "is_digit" takes ch as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Horizontal whitespace only - newlines are handled separately because they participate in R statement termination and need to update the line counter via advance_line.
+@End Reasoning
+
+@Implementation:
+Matches space (32), tab (9), and carriage return (13). Newline (10) is intentionally excluded.
+@End Implementation
 
 Process called "is_whitespace" takes ch as Integer returns Integer:
     Note: Check if character is whitespace (excluding newline)
@@ -264,6 +328,14 @@ Note: ==========================================================================
 Note: Lexer Utilities
 Note: ============================================================================
 
+@Reasoning:
+Non-destructive lookahead used by every multi-character token recognizer. Returns 0 at EOF so callers can use a single sentinel for both EOF and the (illegal) NUL byte 0.
+@End Reasoning
+
+@Implementation:
+Reads position and length from the lexer struct, bounds-checks, and dereferences source[position] via memory_get_byte.
+@End Implementation
+
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -279,6 +351,14 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return ch
 End Process
+
+@Reasoning:
+Two-character lookahead for R's compound operators: <-, <<-, ->, ->>, |>, ==, !=, >=, <=, %%, %/% all need the second character to disambiguate.
+@End Reasoning
+
+@Implementation:
+Reads position and length, bounds-checks position+1, and returns source[position+1] via memory_get_byte. Returns 0 if peeking past EOF.
+@End Implementation
 
 Process called "peek_next_char" takes lexer as Integer returns Integer:
     Note: Peek at next character
@@ -296,6 +376,14 @@ Process called "peek_next_char" takes lexer as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+Moves position forward by one and bumps column for diagnostics. Newline-aware advancement uses advance_line instead, which resets column.
+@End Reasoning
+
+@Implementation:
+Writes position+1 and column+1 back to the lexer struct. Does not bounds-check - callers must peek first.
+@End Implementation
+
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
 
@@ -307,6 +395,14 @@ Process called "advance_char" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Newline-aware position advance: bumps position, increments the line counter, and resets column to 1 so diagnostics on subsequent tokens point at the right column.
+@End Reasoning
+
+@Implementation:
+Writes position+1 and line+1 to the struct, then forcibly sets column to 1. Caller must have verified the current byte is \n before invoking.
+@End Implementation
 
 Process called "advance_line" takes lexer as Integer returns Integer:
     Note: Advance to next line
@@ -324,6 +420,18 @@ End Process
 Note: ============================================================================
 Note: Token Creation
 Note: ============================================================================
+
+@Reasoning:
+Factory for RToken: every tokenizer (number/string/identifier/operator) funnels through here so the 40-byte layout stays consistent and downstream consumers can assume the field offsets.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes via Layout, then writes the 5 fields at offsets 0,8,16,24,32. Returns 0 on allocation failure for the caller to detect.
+@End Implementation
+
+@Security_Scope:
+Returns heap-allocated token; ownership transfers to caller. The lexeme pointer is captured as-is and not duplicated here.
+@End Security_Scope
 
 Process called "create_token" takes token_type as Integer, lexeme as Integer, line as Integer, column as Integer, length as Integer returns Integer:
     Note: Create token
@@ -351,6 +459,18 @@ End Process
 Note: ============================================================================
 Note: Keyword Recognition
 Note: ============================================================================
+
+@Reasoning:
+After tokenize_identifier captures a name, this disambiguates keyword vs user identifier. R's reserved word list is small (function/if/else/for/while/repeat/break/next/return plus NA/NULL/TRUE/FALSE/Inf/NaN), so a linear chain of string compares is faster than building a hashtable.
+@End Reasoning
+
+@Implementation:
+Sequential strings_equal checks against the reserved set; returns the matching TOKEN_* constant or TOKEN_IDENTIFIER if no keyword matches.
+@End Implementation
+
+@Performance_Hints:
+O(k) where k is the number of keywords (~15); each comparison is O(len). Hot path - called once per identifier token.
+@End Performance_Hints
 
 Process called "check_keyword" takes lexeme as Integer returns Integer:
     Note: Check if identifier is an R keyword
@@ -436,6 +556,18 @@ End Process
 Note: ============================================================================
 Note: Number Tokenization
 Note: ============================================================================
+
+@Reasoning:
+R numeric literals are richer than most languages: decimal (3.14), scientific (1e10, 1.5E-3), hex (0xFF), long-integer suffix L (42L), and complex imaginary suffix i (3i, 2.5i). All four shapes are recognized in one pass to keep the lexer single-state.
+@End Reasoning
+
+@Implementation:
+Drives advance_char in phases - optional 0x prefix detection, integer body, optional decimal point with fractional body, optional e/E exponent with sign, optional L (integer) or i (complex) suffix - then emits TOKEN_NUMBER, TOKEN_INTEGER, or TOKEN_COMPLEX accordingly.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the digit count. Hot path - called for every numeric literal.
+@End Performance_Hints
 
 Process called "tokenize_number" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize numeric literal (decimal, scientific, hex, complex)
@@ -583,6 +715,18 @@ Note: ==========================================================================
 Note: String Tokenization
 Note: ============================================================================
 
+@Reasoning:
+R strings allow both ' and " as delimiters interchangeably; the closing quote must match the opener. Backslash escape sequences (\n, \t, \", \\, \uXXXX) are consumed as part of the lexeme but not yet interpreted - the parser/codegen will unescape later.
+@End Reasoning
+
+@Implementation:
+Captures the opening quote byte, then loops advancing through the source until the matching quote is found, treating backslash as a two-char swallow so escaped quotes don't terminate the literal. Reports an unterminated-string error if EOF or newline is reached first.
+@End Implementation
+
+@Performance_Hints:
+O(n) in the string length plus escape count.
+@End Performance_Hints
+
 Process called "tokenize_string" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize string literal (single or double quotes)
 
@@ -687,6 +831,18 @@ Note: ==========================================================================
 Note: Identifier Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Captures R identifier characters greedily, then delegates to check_keyword to decide whether the captured lexeme is a reserved word or a user identifier. R identifiers may include letters, digits, underscore, and dot (e.g. data.frame, my_var.2).
+@End Reasoning
+
+@Implementation:
+Advances while peek_char satisfies is_alpha or is_digit, slices the lexeme from start_pos, and emits via create_token. The token type comes from check_keyword - falling back to TOKEN_IDENTIFIER if no keyword matches.
+@End Implementation
+
+@Performance_Hints:
+O(n) in identifier length; keyword check is O(k*len) but k is small (~15).
+@End Performance_Hints
+
 Process called "tokenize_identifier" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize identifier or keyword
 
@@ -733,6 +889,18 @@ End Process
 Note: ============================================================================
 Note: Special Operator Tokenization
 Note: ============================================================================
+
+@Reasoning:
+R's most distinctive syntax: %anything% is a user-defined infix operator. Built-ins %%, %/%, %*%, %in%, %o%, %>% all follow the same shape. The lexer treats them as one token so the parser can dispatch on the inner name.
+@End Reasoning
+
+@Implementation:
+Already consumed the leading %; scans forward until the closing % is found, then emits TOKEN_PERCENT_OP carrying the full lexeme (including both % delimiters). Falls back to specific tokens (TOKEN_PERCENT, TOKEN_INT_DIV, TOKEN_MAGRITTR_PIPE) for the well-known shapes.
+@End Implementation
+
+@Performance_Hints:
+O(n) in operator name length; rare relative to identifiers and numbers.
+@End Performance_Hints
 
 Process called "tokenize_percent_operator" takes lexer as Integer, start_pos as Integer returns Integer:
     Note: Tokenize %custom% infix operator (or %%, %/%)
@@ -835,6 +1003,18 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+Top-level dispatcher: skips whitespace and # comments, then peeks one character to choose the appropriate tokenizer. Returns TOKEN_EOF when source is exhausted. This is the only routine the parser ever calls directly.
+@End Reasoning
+
+@Implementation:
+Loops over whitespace (calls advance_char or advance_line as appropriate) and # line comments. Then peek_char selects a branch: digit -> tokenize_number, alpha -> tokenize_identifier, quote -> tokenize_string, % -> tokenize_percent_operator, and an explicit table for all operator and delimiter characters (assignment arrows, brackets, comparison ops).
+@End Implementation
+
+@Performance_Hints:
+O(1) dispatch plus the cost of whichever tokenizer is called. Hot path - called once per token in the source.
+@End Performance_Hints
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from R source

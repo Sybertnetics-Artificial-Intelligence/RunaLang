@@ -163,6 +163,12 @@ Note: ==========================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
+@Reasoning:
+Lexer state carries source pointer, length cache, current byte position, and
+1-based line/column for diagnostics. Fields are laid out contiguously so that
+character-access hot paths can use fixed memory_get_int64 offsets without
+indirection through helper accessors.
+@End Reasoning
 Type called "JavaLexer":
     source as Integer
     source_length as Integer
@@ -171,6 +177,12 @@ Type called "JavaLexer":
     column as Integer
 End Type
 
+@Reasoning:
+Token record carries a token_type tag, a non-owning pointer/length slice into
+the source buffer (no copying for identifiers/literals), the originating
+line/column for diagnostics, and a literal value slot reused by numeric
+keywords. The slice form avoids heap churn during lexing.
+@End Reasoning
 Type called "JavaToken":
     token_type as Integer
     text as Integer
@@ -184,6 +196,16 @@ Note: ==========================================================================
 Note: Lexer Creation
 Note: ============================================================================
 
+@Reasoning:
+Constructs a JavaLexer with position 0, line 1, column 1, caching source
+length once so the hot path never recomputes it. Returns 0 on allocation
+failure rather than aborting, leaving caller to handle OOM.
+@End Reasoning
+@Implementation:
+Allocates a 40-byte JavaLexer record via Layout.allocate and writes the five
+int64 fields using fixed offsets (0/8/16/24/32). Source length is computed
+once via StringCore.string_length.
+@End Implementation
 Process called "create_java_lexer" takes source as Integer returns Integer:
     Note: Create a new Java lexer for source code
 
@@ -209,6 +231,15 @@ Note: ==========================================================================
 Note: Character Access
 Note: ============================================================================
 
+@Reasoning:
+Returns the byte at the current scan position without advancing. Returns 0
+(treated as EOF sentinel) past the source end so callers can run a single
+EOF branch instead of a separate bounds check.
+@End Reasoning
+@Performance_Hints:
+O(1). Called from every scan step — kept branch-light: one bounds compare,
+one int64 load, one byte load.
+@End Performance_Hints
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -225,6 +256,15 @@ Process called "peek_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Lookahead variant used for multi-byte operator disambiguation (>=, ==, /*,
+//, +=, etc.). Returns 0 if look_position is past EOF so two-char checks
+collapse cleanly even at end of buffer.
+@End Reasoning
+@Performance_Hints:
+O(1); used per-token but not per-byte. Single bounds compare against cached
+source_length.
+@End Performance_Hints
 Process called "peek_char_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character at position + offset
 
@@ -242,6 +282,13 @@ Process called "peek_char_ahead" takes lexer as Integer, offset as Integer retur
     Return char
 End Process
 
+@Reasoning:
+Consumes one byte, returning it for caller convenience. On LF (10) line is
+incremented and column reset to 1; otherwise column is incremented. Position
+always advances by exactly one regardless of CR/LF — bare CR is not treated
+as a line terminator here because the whitespace skipper handles CRLF as two
+characters.
+@End Reasoning
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
 
@@ -270,6 +317,15 @@ Note: ==========================================================================
 Note: Whitespace and Comments
 Note: ============================================================================
 
+@Reasoning:
+Consumes runs of space (32), tab (9), LF (10), and CR (13). Line counting
+is delegated to advance_char so newline tracking remains consistent with
+other consumers.
+@End Reasoning
+@Performance_Hints:
+Tight loop; each byte costs one peek + one advance. No branching on form
+feed or vertical tab — Java treats only the four canonical whitespace bytes.
+@End Performance_Hints
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
 
@@ -292,6 +348,11 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Discards a // line comment up to but not including the LF; the LF itself is
+left for skip_whitespace to consume so line counting stays centralized. Two
+initial advance_char calls skip the // pair without re-peeking.
+@End Reasoning
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip single-line comment starting with //
 
@@ -315,6 +376,12 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes a /* ... */ block comment, terminating on the closing */. Handles
+JavaDoc /** ... */ implicitly because /** opens identically. Unterminated
+blocks (EOF before */) exit via the char-zero break — caller treats the
+trailing tokens as missing rather than producing a runaway scan.
+@End Reasoning
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip multi-line comment /* ... */
 
@@ -347,6 +414,11 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates a 48-byte JavaToken and packs the six int64 fields at fixed
+offsets. Returns 0 on OOM. text is a non-owning pointer into the lexer's
+source buffer — token lifetime must not outlive that buffer.
+@End Reasoning
 Process called "create_token" takes token_type as Integer, text as Integer, length as Integer, line as Integer, column as Integer, value as Integer returns Integer:
     Note: Create a new token
 
@@ -371,6 +443,12 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII identifier-start classifier: A-Z (65..90), a-z (97..122), underscore
+(95), and dollar (36). Java identifiers per JLS allow $ and _ as start
+characters, both included here. Unicode identifier starts are deferred —
+this lexer handles ASCII source.
+@End Reasoning
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic or underscore
 
@@ -397,6 +475,10 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII decimal digit classifier: 48..57. Used both for numeric-literal entry
+and for continued-identifier characters (in combination with is_alpha).
+@End Reasoning
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is digit
 
@@ -409,6 +491,10 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Hexadecimal digit classifier: 0-9 (48..57), A-F (65..70), a-f (97..102).
+Both cases accepted since Java permits either in 0xFF / 0xff literals.
+@End Reasoning
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hexadecimal digit
 
@@ -433,6 +519,10 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Octal digit classifier: 0-7 (48..55). Used to scan leading-zero numeric
+literals (0123 form) which Java treats as octal — distinct from 0x for hex.
+@End Reasoning
 Process called "is_octal_digit" takes char as Integer returns Integer:
     Note: Check if character is octal digit
 
@@ -445,6 +535,10 @@ Process called "is_octal_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Binary digit classifier: 0 or 1. Used by 0b/0B literal scanning (Java 7+
+binary numeric literals).
+@End Reasoning
 Process called "is_binary_digit" takes char as Integer returns Integer:
     Note: Check if character is binary digit
 
@@ -459,6 +553,11 @@ Process called "is_binary_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-continue classifier — composes is_alpha (letters/underscore/$)
+with is_digit. Used for the second-and-later characters of an identifier
+once the first is known to be alpha.
+@End Reasoning
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric or valid identifier char
 
@@ -475,6 +574,12 @@ Note: ==========================================================================
 Note: Identifier and Keyword Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans contiguous identifier characters, captures start_position/line/column
+before consuming, then defers to check_java_keyword to classify the slice
+as either a keyword token or a generic TOKEN_IDENTIFIER. Identifier text is
+emitted as a slice of the source — no copy.
+@End Reasoning
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -503,6 +608,18 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
     Return proc create_token with token_type, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Length-bucketed keyword lookup over all 53 Java reserved words. Bucketing by
+length avoids comparing against unrelated keywords (e.g. a 3-char identifier
+never tests against "abstract"). Returns the matching TOKEN_* constant or
+TOKEN_IDENTIFIER on no match.
+@End Reasoning
+@Performance_Hints:
+O(k) where k is the number of keywords of the identifier's length. Each
+candidate involves a transient string allocation for comparison — sufficient
+for translator/lexer throughput, where call rate is bounded by identifier
+count.
+@End Performance_Hints
 Process called "check_java_keyword" takes text as Integer, length as Integer returns Integer:
     Note: Check if identifier is a Java keyword
 
@@ -900,6 +1017,16 @@ Process called "check_java_keyword" takes text as Integer, length as Integer ret
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Byte-wise compares length bytes of str1 starting at offset 'start' against
+str2 starting at offset 0. Returns 1 on match, 0 otherwise. Used by the
+length-bucketed keyword scanner to compare a slice into the source buffer
+against canonical keyword strings without allocating new substrings.
+@End Reasoning
+@Performance_Hints:
+O(length). No early exit on length mismatch — caller is responsible for
+selecting equal-length candidates.
+@End Performance_Hints
 Process called "string_equals_range" takes str1 as Integer, str2 as Integer, start as Integer, length as Integer returns Integer:
     Note: Compare string range for equality
 
@@ -923,6 +1050,13 @@ Note: ==========================================================================
 Note: String Literal Scanning
 Note: ============================================================================
 
+@Reasoning:
+Scans a double-quoted string literal, consuming the opening quote, the
+body (handling backslash escapes as two-character runs without decoding),
+and the closing quote. Returns a TOKEN_STRING whose text slice excludes the
+quotes. Unterminated strings (EOF or LF before closing quote) terminate via
+the char-zero break; the literal text remains valid up to the cutoff.
+@End Reasoning
 Process called "scan_string" takes lexer as Integer returns Integer:
     Note: Scan string literal with escape sequences
 
@@ -960,6 +1094,12 @@ Process called "scan_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_STRING, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Scans a Java character literal 'x' or '\\x'. Consumes opening quote, one
+or two body bytes (escape sequence treated as a two-byte run), and closing
+quote. Emits TOKEN_CHAR with a text slice of the body. Decoding the escape
+into the actual code point is left to the parser/AST builder.
+@End Reasoning
 Process called "scan_char" takes lexer as Integer returns Integer:
     Note: Scan character literal with escape sequences
 
@@ -995,6 +1135,14 @@ Note: ==========================================================================
 Note: Numeric Literal Scanning
 Note: ============================================================================
 
+@Reasoning:
+Master dispatcher for Java numeric literals. Recognizes 0x/0X (hex), 0b/0B
+(binary), and leading-zero (octal) prefixes, delegating each to a
+specialized scanner. Otherwise scans decimal digits, an optional fractional
+part on '.', an optional exponent (e/E with optional sign), and trailing
+type suffix (l/L for long, f/F for float, d/D for double) to pick the
+correct TOKEN_INT/TOKEN_LONG/TOKEN_FLOAT/TOKEN_DOUBLE.
+@End Reasoning
 Process called "scan_number" takes lexer as Integer returns Integer:
     Note: Scan numeric literal (int, long, float, double) including hex, octal, binary
 
@@ -1149,6 +1297,11 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return proc create_token with token_type, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Scans the body of an 0x/0X hex literal already past the prefix. Consumes
+hex digits (is_hex_digit) and an optional L/l suffix for hex long literals.
+Emits TOKEN_INT or TOKEN_LONG as appropriate.
+@End Reasoning
 Process called "scan_hex_number" takes lexer as Integer returns Integer:
     Note: Scan hexadecimal number
 
@@ -1194,6 +1347,12 @@ Process called "scan_hex_number" takes lexer as Integer returns Integer:
     Return proc create_token with token_type, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Scans the body of an octal literal whose leading 0 has already been seen.
+Consumes 0-7 digits and optional L/l suffix. Java octal interpretation
+applies only to integer literals; floats with leading 0 are decimal under
+JLS, which the dispatcher handles before calling here.
+@End Reasoning
 Process called "scan_octal_number" takes lexer as Integer returns Integer:
     Note: Scan octal number
 
@@ -1238,6 +1397,10 @@ Process called "scan_octal_number" takes lexer as Integer returns Integer:
     Return proc create_token with token_type, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Scans the body of an 0b/0B binary literal (Java 7+) past the prefix. Only
+0 and 1 are valid digits; optional L/l suffix selects long type.
+@End Reasoning
 Process called "scan_binary_number" takes lexer as Integer returns Integer:
     Note: Scan binary number
 
@@ -1287,6 +1450,14 @@ Note: ==========================================================================
 Note: Main Tokenization
 Note: ============================================================================
 
+@Reasoning:
+Main tokenizer entry: skips inter-token whitespace and comments, then
+dispatches on the first non-whitespace character to identifier/keyword,
+numeric, string, char, annotation (@), or operator/punctuation scanners.
+Returns 0 when source is exhausted; otherwise returns a freshly allocated
+JavaToken pointer. Operator dispatch handles maximal-munch (>=, ==, +=,
+<<=, >>>=, etc.) by peek-ahead.
+@End Reasoning
 Process called "next_java_token" takes lexer as Integer returns Integer:
     Note: Get next token from lexer
 

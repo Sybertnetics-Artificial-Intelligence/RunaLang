@@ -71,6 +71,14 @@ Note: ==========================================================================
 Note: AST Node Structure
 Note: ============================================================================
 
+@Reasoning:
+Unified six-slot AST node: a type tag, a text payload (owned heap string for
+heading/code/text bodies; null for container nodes), a child list, a
+polymorphic metadata slot reused per node kind (heading level, list
+ordered/unordered, code language pointer, link URL pointer), and source
+diagnostics. One shape per node avoids the cost of per-kind struct branching
+during HIR translation traversal.
+@End Reasoning
 Type called "MarkdownNode":
     type as Integer           Note: Node type constant
     text as Integer           Note: Text content (for text nodes)
@@ -84,6 +92,13 @@ Note: ==========================================================================
 Note: Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+Parser carries the upstream lexer, a single lookahead slot (LL(1) is sufficient
+for CommonMark block structure), and an owned error_message buffer plus
+has_error flag. The single lookahead is initialized by create_markdown_parser
+calling next_token once during construction so the invariant "current_token is
+populated when not at EOF" holds at every entry point.
+@End Reasoning
 Type called "MarkdownParser":
     lexer as Integer          Note: Markdown lexer
     current_token as Integer  Note: Current token
@@ -95,6 +110,11 @@ Note: ==========================================================================
 Note: Parser Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Constructs the parser and primes the lookahead slot. After this returns,
+current_token holds the document's first token (or TOKEN_EOF for an empty
+input) so all subsequent dispatch can read current_token directly.
+@End Reasoning
 Process called "create_markdown_parser" takes lexer as Integer returns Integer:
     Note: Create Markdown parser
 
@@ -118,6 +138,11 @@ Process called "create_markdown_parser" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+Frees the parser struct and its owned error message buffer. The lexer is
+intentionally not destroyed here — its lifetime is controlled by the caller
+(parse_markdown) which owns both objects in parallel.
+@End Reasoning
 Process called "destroy_markdown_parser" takes parser as Integer returns Integer:
     Note: Destroy Markdown parser
 
@@ -141,6 +166,17 @@ Note: ==========================================================================
 Note: AST Node Creation
 Note: ============================================================================
 
+@Reasoning:
+Centralized node constructor. Always allocates a fresh empty children list
+even for leaf nodes (text, code, horizontal rule) because the cost of one
+extra empty-list allocation is dwarfed by the simplification it grants AST
+visitors: no nullness check before iterating children.
+@End Reasoning
+
+@Implementation:
+On allocation failure for either the node or its children list, frees what
+was allocated so OOM does not produce a half-initialized node.
+@End Implementation
 Process called "create_markdown_node" takes node_type as Integer, text as Integer, metadata as Integer, line as Integer, column as Integer returns Integer:
     Note: Create Markdown AST node
 
@@ -170,6 +206,11 @@ Process called "create_markdown_node" takes node_type as Integer, text as Intege
     Return node
 End Process
 
+@Reasoning:
+Defensive child append: silently no-ops on null parent or null child to keep
+parser dispatch sites simple. The children list is grown by List.append which
+handles its own resizing.
+@End Reasoning
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
 
@@ -191,6 +232,11 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Reads the type tag of the lookahead token, treating a null lookahead as
+TOKEN_EOF so callers never need to distinguish "lexer exhausted" from "end of
+source"; both surface as EOF and terminate block-loop scanning.
+@End Reasoning
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
 
@@ -205,6 +251,12 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Pulls the next token from the lexer into the lookahead slot and returns it.
+The previous current_token is dropped — the parser only ever needs one
+token of lookahead, and emitted AST nodes have already copied any needed
+content out of tokens before this is called.
+@End Reasoning
 Process called "advance_token" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -216,6 +268,11 @@ Process called "advance_token" takes parser as Integer returns Integer:
     Return new_token
 End Process
 
+@Reasoning:
+Non-consuming type predicate returning 1/0. Used after parsing a block to
+opportunistically consume a trailing newline without committing to it (the
+caller advances only when the check passes).
+@End Reasoning
 Process called "check_token_type" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Check if current token matches expected type
 
@@ -232,6 +289,17 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Captures an error message by deep-copying it into a parser-owned heap buffer.
+A previous error message, if any, is freed first so repeated set_parser_error
+calls cannot leak. has_error is unconditionally set to 1 even if the message
+copy itself failed, so the caller's error signal is preserved.
+@End Reasoning
+
+@Security_Scope:
+Trusts the message pointer to be a valid null-terminated string of length
+string_length bytes; over-reading would corrupt heap state.
+@End Security_Scope
 Process called "set_parser_error" takes parser as Integer, message as Integer returns Integer:
     Note: Set parser error message
 
@@ -261,6 +329,13 @@ Note: ==========================================================================
 Note: Block-Level Parsing
 Note: ============================================================================
 
+@Reasoning:
+Converts a lexer-emitted TOKEN_HEADING into an MD_HEADING node. The heading
+level (1..6) is preserved from the token's metadata slot into the node's
+metadata slot. The text payload is deep-copied because the source-slice token
+text would be invalidated when the lexer is destroyed in parse_markdown's
+cleanup.
+@End Reasoning
 Process called "parse_heading" takes parser as Integer returns Integer:
     Note: Parse heading node
 
@@ -290,6 +365,18 @@ Process called "parse_heading" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Consumes tokens between an opening TOKEN_CODE_FENCE and the matching closing
+fence, concatenating their text into a single owned content buffer. The
+language tag (if any) is also deep-copied and stored in the node's metadata
+slot. The buffer starts at 4096 bytes and doubles geometrically; the doubling
+strategy keeps amortized append cost at O(1) per byte.
+@End Reasoning
+
+@Performance_Hints:
+For very large code blocks this is O(n) in source size with O(n) auxiliary
+heap; the doubling resize is the only operation more expensive than O(1).
+@End Performance_Hints
 Process called "parse_code_block" takes parser as Integer returns Integer:
     Note: Parse fenced code block
 
@@ -395,6 +482,12 @@ Process called "parse_code_block" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Emits an MD_BLOCKQUOTE wrapping a single MD_PARAGRAPH containing the rest of
+the line. This is a one-line blockquote model — multi-line blockquote
+aggregation is intentionally deferred to a higher-level pass, keeping the
+parser focused on per-line block-element shape.
+@End Reasoning
 Process called "parse_blockquote" takes parser as Integer returns Integer:
     Note: Parse blockquote
 
@@ -471,6 +564,12 @@ Process called "parse_blockquote" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Builds an MD_LIST_ITEM whose lexeme stores the marker (e.g. "-", "1.") and
+whose metadata stores the ordered/unordered flag from the lexer. The marker
+buffer is deep-copied. The post-marker whitespace skip handles cases where the
+lexer left one or more space/tab text tokens between the marker and content.
+@End Reasoning
 Process called "parse_list_item" takes parser as Integer returns Integer:
     Note: Parse list item
 
@@ -580,6 +679,11 @@ Note: ==========================================================================
 Note: Inline Element Parsing
 Note: ============================================================================
 
+@Reasoning:
+Wraps the lexer's TOKEN_EMPHASIS into MD_EMPHASIS. The token text already
+excludes the delimiter markers (lexer stripped them), so this is a thin
+type-tag conversion.
+@End Reasoning
 Process called "parse_emphasis" takes parser as Integer returns Integer:
     Note: Parse emphasis: *text* or _text_
 
@@ -596,6 +700,11 @@ Process called "parse_emphasis" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Wraps the lexer's TOKEN_STRONG into MD_STRONG. Symmetric to parse_emphasis;
+they exist as separate procs so future per-kind transformations (e.g. nested
+inline parsing) can specialize without affecting each other.
+@End Reasoning
 Process called "parse_strong" takes parser as Integer returns Integer:
     Note: Parse strong: **text** or __text__
 
@@ -612,6 +721,10 @@ Process called "parse_strong" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Wraps TOKEN_CODE into MD_CODE. Inline code spans contain no further
+markdown — their content is preserved verbatim from the lexer-owned buffer.
+@End Reasoning
 Process called "parse_inline_code" takes parser as Integer returns Integer:
     Note: Parse inline code: `code`
 
@@ -628,6 +741,12 @@ Process called "parse_inline_code" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Decodes the lexer's combined "text\0url\0" buffer (see scan_link_or_image)
+into separate text and URL pointers using the text length stored in the
+token's metadata slot. The URL pointer is stored in the node's metadata slot
+so renderers can read both halves from a single MD_LINK.
+@End Reasoning
 Process called "parse_link" takes parser as Integer returns Integer:
     Note: Parse link: [text](url)
 
@@ -650,6 +769,11 @@ Process called "parse_link" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Symmetric to parse_link but produces an MD_IMAGE: alt text in the text slot,
+URL pointer in the metadata slot. The shared "alt\0url\0" lexer layout means
+this proc is byte-compatible with parse_link aside from the node type tag.
+@End Reasoning
 Process called "parse_image" takes parser as Integer returns Integer:
     Note: Parse image: ![alt](url)
 
@@ -672,6 +796,11 @@ Process called "parse_image" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Autolinks are produced as MD_LINK where text and URL are the same pointer —
+renderers can detect this aliasing if they want to emit the URL as visible
+text, matching CommonMark's "<url>" semantics.
+@End Reasoning
 Process called "parse_autolink" takes parser as Integer returns Integer:
     Note: Parse autolink: <url>
 
@@ -693,6 +822,11 @@ Note: ==========================================================================
 Note: Block Element Parsing
 Note: ============================================================================
 
+@Reasoning:
+Emits a leaf MD_HORIZONTAL_RULE node with no text or children. The actual
+marker characters are not preserved — every horizontal rule renders the same
+regardless of whether the source used "---", "***", or "___".
+@End Reasoning
 Process called "parse_horizontal_rule" takes parser as Integer returns Integer:
     Note: Parse horizontal rule
 
@@ -714,6 +848,26 @@ Process called "parse_horizontal_rule" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+The most complex parsing routine. Constructs an MD_PARAGRAPH whose children
+are an alternating sequence of MD_TEXT runs and inline element nodes
+(emphasis/strong/code/link/image/autolink). A single newline inside the
+paragraph is collapsed to a space (per CommonMark); a blank line (two
+consecutive newlines) or any block-level token terminates the paragraph.
+@End Reasoning
+
+@Implementation:
+Plain text is accumulated in a doubling-growth buffer. When an inline element
+token is encountered, the accumulated text is flushed as an MD_TEXT child,
+the buffer is replaced with a fresh allocation, and the inline node is
+parsed and appended. Any final tail text is flushed once the loop exits;
+otherwise the unused buffer is freed to avoid the leak.
+@End Implementation
+
+@Performance_Hints:
+O(n) over paragraph length. Each Otherwise-If branch's flush incurs one node
+allocation plus one buffer rotation, both amortized constant.
+@End Performance_Hints
 Process called "parse_paragraph" takes parser as Integer returns Integer:
     Note: Parse paragraph with inline elements (collect text and inline nodes until blank line)
 
@@ -900,6 +1054,19 @@ Note: ==========================================================================
 Note: Top-Level Parsing
 Note: ============================================================================
 
+@Reasoning:
+Top-level entry. Creates a lexer/parser pair, builds an MD_DOCUMENT root,
+and drives the block-dispatch loop until EOF. Standalone blank-line newlines
+are skipped at the document level. Any unexpected token type falls through
+to parse_paragraph, which provides the universal fallback for free-form text.
+@End Reasoning
+
+@Implementation:
+On any failure during construction (lexer, parser, or document allocation)
+all earlier allocations are torn down so the caller sees a clean 0 return
+with no leaks. The lexer/parser are destroyed on the normal exit path; the
+returned document AST is owned by the caller.
+@End Implementation
 Process called "parse_markdown" takes source as Integer returns Integer:
     Note: Parse Markdown source into AST
 

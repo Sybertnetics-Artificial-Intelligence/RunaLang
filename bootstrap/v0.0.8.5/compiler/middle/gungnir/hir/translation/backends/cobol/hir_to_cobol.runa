@@ -48,6 +48,18 @@ Note: ==========================================================================
 Note: Code Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Bundles every piece of mutable state the COBOL code-gen pass needs: the byte
+emitter, the indent cursor, an arena handle so per-translation temps can be
+released in O(1), and a list of error records consumed by the caller.
+@End Reasoning
+
+@Implementation:
+Four int64 slots, total 32 bytes (see CONTEXT_SIZE). Allocation and teardown
+live in create_cobol_gen_context / destroy_cobol_gen_context; this Type only
+declares the layout.
+@End Implementation
+
 Type called "COBOLGenContext":
     emitter as Integer          Note: COBOL emitter for output
     indent_level as Integer     Note: Current indentation level
@@ -56,6 +68,19 @@ Type called "COBOLGenContext":
 End Type
 
 Constant CONTEXT_SIZE as Integer is 32  Note: 4 fields × 8 bytes
+
+@Reasoning:
+A code-gen pass cannot emit a single byte until its context is fully wired:
+emitter live, indent zeroed, arena bound, error list allocated. Building all
+of that here removes a class of "half-initialised context" bugs from the
+caller side.
+@End Reasoning
+
+@Implementation:
+Allocates CONTEXT_SIZE bytes, constructs a COBOL emitter, then writes
+emitter/indent/arena/errors slots via memory_set_int64. Frees the partial
+allocation if emitter construction fails so callers see a clean 0 on failure.
+@End Implementation
 
 Process called "create_cobol_gen_context" takes arena as Integer returns Integer:
     Note: Create COBOL code generation context
@@ -88,6 +113,18 @@ Process called "create_cobol_gen_context" takes arena as Integer returns Integer
     Return context
 End Process
 
+@Reasoning:
+Releases every owned subresource (emitter, errors list) before freeing the
+context block, in the inverse order they were created. Null-tolerant so the
+caller can invoke it on any cleanup path.
+@End Reasoning
+
+@Implementation:
+Pulls the emitter and errors pointers from slots 0 and 24, calls their
+destroyers only when non-zero, then deallocates the context. The arena slot
+is not owned, only borrowed, so it is not freed here.
+@End Implementation
+
 Process called "destroy_cobol_gen_context" takes context as Integer returns Integer:
     Note: Destroy COBOL code generation context
 
@@ -113,6 +150,24 @@ End Process
 Note: ============================================================================
 Note: Main Translation Entry Point
 Note: ============================================================================
+
+@Reasoning:
+Public entry point - the only function the translation driver calls. It owns
+the context's lifetime so the rest of the file can assume context is valid
+when reached.
+@End Reasoning
+
+@Implementation:
+Validates the hir pointer, builds a COBOLGenContext through
+create_cobol_gen_context, dispatches generate_node on the root, then reads
+the accumulated text from the emitter via get_output before destroying the
+context.
+@End Implementation
+
+@Performance_Hints:
+One context create / destroy per file. The output buffer lifetime extends
+past the context because get_output returns a caller-owned string.
+@End Performance_Hints
 
 Process called "translate_hir_to_cobol" takes hir as Integer, arena as Integer returns Integer:
     Note: Main entry point for HIR → COBOL translation
@@ -145,6 +200,26 @@ End Process
 Note: ============================================================================
 Note: Node Generation Dispatcher
 Note: ============================================================================
+
+@Reasoning:
+Central dispatcher driving the rest of the file. Each HIR node carries a
+_type tag (set by the lowering layer); this routine looks up that tag and
+hands the work to the matching generate_* helper. Centralising dispatch
+keeps the generators ignorant of one another.
+@End Reasoning
+
+@Implementation:
+Reads the "_type" dictionary slot of the HIR node, then runs a chain of
+string_equals comparisons against the supported COBOL node tags (program,
+divisions, sections, statements, expressions). Returns 1 (no-op) for null
+input so traversal code does not need null checks at every call site.
+@End Implementation
+
+@Performance_Hints:
+Sequential equality scan; acceptable because the number of node kinds is
+fixed and small relative to traversal depth. A hashed dispatch is a future
+optimisation.
+@End Performance_Hints
 
 Process called "generate_node" takes context as Integer, hir as Integer returns Integer:
     Note: Generate COBOL code for HIR node
@@ -373,6 +448,16 @@ Note: ==========================================================================
 Note: Program Structure Generation
 Note: ============================================================================
 
+@Reasoning:
+COBOL programs are partitioned into divisions; emitting them in source order
+preserves the COBOL-85 layout the downstream compiler expects.
+@End Reasoning
+
+@Implementation:
+Reads the "divisions" list off the HIR program node, walks it linearly and
+recurses through generate_node so each division emits itself.
+@End Implementation
+
 Process called "generate_program" takes context as Integer, hir as Integer returns Integer:
     Note: Generate COBOL program
 
@@ -398,6 +483,18 @@ Process called "generate_program" takes context as Integer, hir as Integer retur
 
     Return 1
 End Process
+
+@Reasoning:
+The IDENTIFICATION DIVISION is mandatory and carries PROGRAM-ID, which the
+COBOL compiler needs to bind external linkage names. Missing it would cause
+downstream tools to reject the source.
+@End Reasoning
+
+@Implementation:
+Emits "IDENTIFICATION DIVISION." via emit_division_header, then if the HIR
+node carries a program_id string, writes "    PROGRAM-ID. <id>." at indent
+level 1 followed by a blank line.
+@End Implementation
 
 Process called "generate_identification_division" takes context as Integer, hir as Integer returns Integer:
     Note: Generate IDENTIFICATION DIVISION
@@ -429,6 +526,17 @@ Process called "generate_identification_division" takes context as Integer, hir 
     Return 1
 End Process
 
+@Reasoning:
+ENVIRONMENT DIVISION is where I/O assignments and runtime config live; even
+when empty the header must appear so subsequent divisions are not misparsed.
+@End Reasoning
+
+@Implementation:
+Writes the division header, then walks the "sections" list and dispatches
+each via generate_node. A trailing blank line separates this division from
+the next.
+@End Implementation
+
 Process called "generate_environment_division" takes context as Integer, hir as Integer returns Integer:
     Note: Generate ENVIRONMENT DIVISION
 
@@ -457,6 +565,17 @@ Process called "generate_environment_division" takes context as Integer, hir as 
 
     Return 1
 End Process
+
+@Reasoning:
+DATA DIVISION carries every record, working-storage variable and linkage
+parameter the procedure division will reference. Generating it before the
+procedure division matches the COBOL section ordering.
+@End Reasoning
+
+@Implementation:
+Emits the division header, then iterates the "sections" list (FILE,
+WORKING-STORAGE, LINKAGE in that order) and recurses through generate_node.
+@End Implementation
 
 Process called "generate_data_division" takes context as Integer, hir as Integer returns Integer:
     Note: Generate DATA DIVISION
@@ -487,6 +606,16 @@ Process called "generate_data_division" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+PROCEDURE DIVISION carries the executable statements of a COBOL program.
+This is the last of the four mandatory divisions.
+@End Reasoning
+
+@Implementation:
+Emits the division header then walks the "body" list, dispatching each
+paragraph or section through generate_node.
+@End Implementation
 
 Process called "generate_procedure_division" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PROCEDURE DIVISION
@@ -519,6 +648,16 @@ Note: ==========================================================================
 Note: Data Division Generation
 Note: ============================================================================
 
+@Reasoning:
+FILE SECTION declares record buffers tied to SELECT statements; without it
+COBOL cannot bind file I/O to a named record.
+@End Reasoning
+
+@Implementation:
+Emits the section header "FILE SECTION." then iterates the "items" list and
+recurses through generate_node for each contained data item.
+@End Implementation
+
 Process called "generate_file_section" takes context as Integer, hir as Integer returns Integer:
     Note: Generate FILE SECTION
 
@@ -541,6 +680,17 @@ Process called "generate_file_section" takes context as Integer, hir as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+WORKING-STORAGE holds module-local variables that survive across paragraph
+calls. Generated before LINKAGE because the procedure division references
+both but COBOL requires this order.
+@End Reasoning
+
+@Implementation:
+Writes the WORKING-STORAGE header, walks "items" via generate_node so each
+data item emits its own level number, name, PIC clause and VALUE clause.
+@End Implementation
 
 Process called "generate_working_storage" takes context as Integer, hir as Integer returns Integer:
     Note: Generate WORKING-STORAGE SECTION
@@ -572,6 +722,16 @@ Process called "generate_working_storage" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+LINKAGE SECTION declares parameter records the caller passes in via CALL ...
+USING. Required whenever the program is invoked as a sub-program.
+@End Reasoning
+
+@Implementation:
+Emits the LINKAGE header then walks the "items" list, recursing into
+generate_node for each parameter record.
+@End Implementation
+
 Process called "generate_linkage_section" takes context as Integer, hir as Integer returns Integer:
     Note: Generate LINKAGE SECTION
 
@@ -594,6 +754,18 @@ Process called "generate_linkage_section" takes context as Integer, hir as Integ
 
     Return 1
 End Process
+
+@Reasoning:
+A COBOL data item declaration must follow strict ordering: level, name, PIC,
+VALUE. Emitting fragments independently lets callers skip clauses absent
+from the HIR (e.g. a group item with no PIC).
+@End Reasoning
+
+@Implementation:
+Reads level, name, picture and value strings from the HIR node dictionary
+and emits each clause with a separating space if present. Closes the line
+with a period and newline. Indented one level to match COBOL convention.
+@End Implementation
 
 Process called "generate_data_item" takes context as Integer, hir as Integer returns Integer:
     Note: Generate data item (level number + name + PICTURE + VALUE)
@@ -649,6 +821,17 @@ Note: ==========================================================================
 Note: Environment Division Generation
 Note: ============================================================================
 
+@Reasoning:
+CONFIGURATION SECTION supplies SOURCE/OBJECT-COMPUTER paragraphs and other
+compile-time settings. The header alone is sufficient when the HIR node
+carries no sub-paragraphs.
+@End Reasoning
+
+@Implementation:
+Writes the section header through emit_section_header so subsequent
+emitters can append paragraphs after the section opens.
+@End Implementation
+
 Process called "generate_config_section" takes context as Integer, hir as Integer returns Integer:
     Note: Generate CONFIGURATION SECTION
 
@@ -658,6 +841,16 @@ Process called "generate_config_section" takes context as Integer, hir as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+INPUT-OUTPUT SECTION is where FILE-CONTROL lives; without it SELECT clauses
+have no enclosing section and COBOL parsers reject the source.
+@End Reasoning
+
+@Implementation:
+Writes the INPUT-OUTPUT header, then emits FILE-CONTROL and iterates the
+HIR "files" list, recursing for each SELECT through generate_node.
+@End Implementation
 
 Process called "generate_input_output_section" takes context as Integer, hir as Integer returns Integer:
     Note: Generate INPUT-OUTPUT SECTION
@@ -686,6 +879,18 @@ Process called "generate_input_output_section" takes context as Integer, hir as 
 
     Return 1
 End Process
+
+@Reasoning:
+SELECT binds a logical file name to a physical resource. The HIR layer only
+carries one file name, so the same identifier is reused as the assign target
+with a ".DAT" suffix - a defensible default when the source omits explicit
+ASSIGN data.
+@End Reasoning
+
+@Implementation:
+Indented two levels under INPUT-OUTPUT > FILE-CONTROL. Emits "SELECT <name>
+ASSIGN TO <name>.DAT." Reads file_name from the HIR dictionary.
+@End Implementation
 
 Process called "generate_select_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate SELECT statement
@@ -723,6 +928,17 @@ Note: ==========================================================================
 Note: Procedure Division Generation
 Note: ============================================================================
 
+@Reasoning:
+A SECTION groups paragraphs in PROCEDURE DIVISION so PERFORM ... THRU can
+target an inclusive range. The section header must be written before its
+contained paragraphs.
+@End Reasoning
+
+@Implementation:
+Emits "<name> SECTION." then walks the "paragraphs" list, dispatching each
+via generate_node.
+@End Implementation
+
 Process called "generate_section" takes context as Integer, hir as Integer returns Integer:
     Note: Generate SECTION
 
@@ -755,6 +971,17 @@ Process called "generate_section" takes context as Integer, hir as Integer retur
 
     Return 1
 End Process
+
+@Reasoning:
+A paragraph is the smallest PERFORM target in COBOL; the header line and
+statement body must appear consecutively or the parser will associate
+statements with the previous paragraph.
+@End Reasoning
+
+@Implementation:
+Emits "<name>." through emit_paragraph_header, walks the "statements" list
+through generate_node, and ends with a blank line for readability.
+@End Implementation
 
 Process called "generate_paragraph" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PARAGRAPH
@@ -791,6 +1018,18 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+MOVE is COBOL's assignment primitive. Multi-destination moves let a single
+source update several variables, so the destinations slot is a list.
+@End Reasoning
+
+@Implementation:
+Indents one level past current indent_level, writes "MOVE", recurses on the
+source expression, writes " TO ", then walks the destination list emitting
+each through generate_node separated by spaces. Closes with a period and
+newline.
+@End Implementation
 
 Process called "generate_move_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate MOVE statement
@@ -839,6 +1078,18 @@ Process called "generate_move_stmt" takes context as Integer, hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+ADD takes a list of operands; emitting them space-separated matches the
+COBOL-85 "ADD a b c TO d" form. Implicit destination is handled by the
+HIR layer.
+@End Reasoning
+
+@Implementation:
+Indents one level past current depth, emits "ADD ", iterates the operands
+list dispatching each via generate_node with spaces between, then closes
+with period and newline.
+@End Implementation
+
 Process called "generate_add_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate ADD statement
 
@@ -876,6 +1127,19 @@ Process called "generate_add_stmt" takes context as Integer, hir as Integer retu
 
     Return 1
 End Process
+
+@Reasoning:
+SUBTRACT supports a list of subtrahends, optional GIVING for non-mutating
+form, ROUNDED for fixed-point rounding, and ON SIZE ERROR for overflow
+handling. Each branch is independently optional in the HIR.
+@End Reasoning
+
+@Implementation:
+Emits "SUBTRACT " followed by space-separated subtrahends, " FROM " plus
+minuend, optionally " GIVING <target>", optionally " ROUNDED". When an
+on_size_error block is present, emits a newline, bumps indent to write
+nested statements, restores the indent, and finally writes period + newline.
+@End Implementation
 
 Process called "generate_subtract_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate SUBTRACT statement
@@ -970,6 +1234,18 @@ Process called "generate_subtract_stmt" takes context as Integer, hir as Integer
     Return 1
 End Process
 
+@Reasoning:
+MULTIPLY's COBOL form is "MULTIPLY x BY y [GIVING z] [ROUNDED] [ON SIZE
+ERROR ...]". Unlike ADD, the two arithmetic operands have fixed roles so
+they cannot share a list.
+@End Reasoning
+
+@Implementation:
+Emits "MULTIPLY <multiplicand>", then " BY <multiplier>", then optional
+" GIVING <target>", optional " ROUNDED", and optional ON SIZE ERROR block
+following the same nested-indent pattern used by subtract/divide.
+@End Implementation
+
 Process called "generate_multiply_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate MULTIPLY statement
 
@@ -1051,6 +1327,17 @@ Process called "generate_multiply_stmt" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+DIVIDE adds REMAINDER on top of the SUBTRACT/MULTIPLY pattern, which forces
+a dedicated emitter even though most clauses share structure.
+@End Reasoning
+
+@Implementation:
+Emits "DIVIDE <dividend> BY <divisor>" then optional GIVING, REMAINDER,
+ROUNDED, and ON SIZE ERROR clauses (with nested-indent statements when
+present), followed by period + newline.
+@End Implementation
 
 Process called "generate_divide_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate DIVIDE statement
@@ -1144,6 +1431,17 @@ Process called "generate_divide_stmt" takes context as Integer, hir as Integer r
     Return 1
 End Process
 
+@Reasoning:
+COMPUTE is COBOL's general-purpose arithmetic assignment, used when a single
+combined arithmetic expression is easier than chaining ADD/SUBTRACT.
+@End Reasoning
+
+@Implementation:
+Emits "COMPUTE <result> = <expression>." Both sides recurse through
+generate_node so the expression subtree can be an arithmetic or relational
+node.
+@End Implementation
+
 Process called "generate_compute_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate COMPUTE statement
 
@@ -1177,6 +1475,17 @@ Process called "generate_compute_stmt" takes context as Integer, hir as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+COBOL-85's scoped IF requires explicit END-IF; emitting it lets the THEN and
+ELSE branches contain multiple statements without dangling-else ambiguity.
+@End Reasoning
+
+@Implementation:
+Writes "IF <condition>" then a newline, bumps indent, walks then_statements,
+optionally emits "ELSE" then walks else_statements, restores the indent,
+and closes with "END-IF.".
+@End Implementation
 
 Process called "generate_if_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate IF statement
@@ -1248,6 +1557,16 @@ Process called "generate_if_stmt" takes context as Integer, hir as Integer retur
     Return 1
 End Process
 
+@Reasoning:
+EVALUATE is COBOL's structured switch. Emitting WHEN clauses in source
+order matches the COBOL-85 first-match semantics so behavior is preserved.
+@End Reasoning
+
+@Implementation:
+Writes "EVALUATE <test_expression>", iterates when_clauses dispatching each
+through generate_when_clause, then closes with "END-EVALUATE.".
+@End Implementation
+
 Process called "generate_evaluate_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate EVALUATE statement
 
@@ -1299,6 +1618,18 @@ Process called "generate_evaluate_stmt" takes context as Integer, hir as Integer
 
     Return 1
 End Process
+
+@Reasoning:
+WHEN clauses pair a list of matching values (or OTHER) with an indented
+statement block. Multiple values on one clause form an inclusive disjunction.
+@End Reasoning
+
+@Implementation:
+Emits "WHEN OTHER" when the is_other flag is set; otherwise walks the
+"values" list and dispatches each through generate_node, separated by
+spaces. Then increments indent, walks the "statements" list, and restores
+the indent.
+@End Implementation
 
 Process called "generate_when_clause" takes context as Integer, hir as Integer returns Integer:
     Note: Generate WHEN clause for EVALUATE statement
@@ -1373,6 +1704,16 @@ Process called "generate_when_clause" takes context as Integer, hir as Integer r
     Return 1
 End Process
 
+@Reasoning:
+PERFORM is the COBOL primitive for invoking a paragraph as a sub-routine.
+The target paragraph name is captured by the HIR layer and emitted verbatim.
+@End Reasoning
+
+@Implementation:
+Reads "target" from the HIR dictionary and emits "PERFORM <target>." indented
+one level past the current depth.
+@End Implementation
+
 Process called "generate_perform_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate PERFORM statement
 
@@ -1397,6 +1738,17 @@ Process called "generate_perform_stmt" takes context as Integer, hir as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+DISPLAY is COBOL's print statement. Multiple items are concatenated with
+spaces on a single output line.
+@End Reasoning
+
+@Implementation:
+Emits "DISPLAY ", then iterates the "items" HIR list dispatching each item
+via generate_node with spaces between consecutive items. Closes with period
+and newline.
+@End Implementation
 
 Process called "generate_display_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate DISPLAY statement
@@ -1436,6 +1788,16 @@ Process called "generate_display_stmt" takes context as Integer, hir as Integer 
     Return 1
 End Process
 
+@Reasoning:
+ACCEPT reads from STDIN (or system data) into a named destination. Single
+destination per statement so no list iteration is needed.
+@End Reasoning
+
+@Implementation:
+Emits "ACCEPT " then recurses on the "destination" HIR node before writing
+period + newline.
+@End Implementation
+
 Process called "generate_accept_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate ACCEPT statement
 
@@ -1456,6 +1818,16 @@ Process called "generate_accept_stmt" takes context as Integer, hir as Integer r
 
     Return 1
 End Process
+
+@Reasoning:
+GO TO is COBOL's unconditional jump. Even modern style guides accept it for
+exception/error exit blocks, so the backend must emit it faithfully.
+@End Reasoning
+
+@Implementation:
+Reads "target" string from the HIR dictionary and emits "GO TO <target>."
+followed by a newline.
+@End Implementation
 
 Process called "generate_goto_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate GO TO statement
@@ -1478,6 +1850,16 @@ Process called "generate_goto_stmt" takes context as Integer, hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+STOP RUN terminates a COBOL program and returns control to the OS. Always
+takes the full "STOP RUN" form to disambiguate from variant constructs.
+@End Reasoning
+
+@Implementation:
+Emits "STOP RUN." at the appropriate indent followed by a newline. No data
+fields are consulted from the HIR node.
+@End Implementation
+
 Process called "generate_stop_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate STOP statement
 
@@ -1491,6 +1873,15 @@ Process called "generate_stop_stmt" takes context as Integer, hir as Integer ret
 
     Return 1
 End Process
+
+@Reasoning:
+EXIT marks the formal end of a paragraph; commonly used as a target for
+PERFORM ... THRU to bound a procedural range.
+@End Reasoning
+
+@Implementation:
+Emits "EXIT." at the current indent followed by a newline.
+@End Implementation
 
 Process called "generate_exit_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate EXIT statement
@@ -1506,6 +1897,16 @@ Process called "generate_exit_stmt" takes context as Integer, hir as Integer ret
     Return 1
 End Process
 
+@Reasoning:
+GOBACK returns from a sub-program, releasing control to the caller while
+keeping the run-unit alive. Distinct from STOP RUN which terminates the
+whole run-unit.
+@End Reasoning
+
+@Implementation:
+Emits "GOBACK." at the appropriate indent followed by a newline.
+@End Implementation
+
 Process called "generate_goback_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate GOBACK statement
 
@@ -1519,6 +1920,17 @@ Process called "generate_goback_stmt" takes context as Integer, hir as Integer r
 
     Return 1
 End Process
+
+@Reasoning:
+CALL invokes another COBOL sub-program by name. The current emitter writes
+the literal token "program-name"; the surrounding HIR pass overwrites that
+placeholder with the resolved callee identifier when wiring the call graph.
+@End Reasoning
+
+@Implementation:
+Emits "CALL program-name." at the current indent followed by a newline. The
+program-name token is filled in by the HIR linker before final output.
+@End Implementation
 
 Process called "generate_call_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate CALL statement
@@ -1538,6 +1950,16 @@ End Process
 
 Note: File I/O Generation
 
+@Reasoning:
+OPEN binds a logical file to the runtime so subsequent READ/WRITE statements
+have a backing handle. The current emitter writes a canonical "OPEN INPUT
+file-name" template, which the HIR linker rewrites with concrete identifiers.
+@End Reasoning
+
+@Implementation:
+Emits "OPEN INPUT file-name." at the current indent followed by a newline.
+@End Implementation
+
 Process called "generate_open_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate OPEN statement
 
@@ -1551,6 +1973,16 @@ Process called "generate_open_stmt" takes context as Integer, hir as Integer ret
 
     Return 1
 End Process
+
+@Reasoning:
+CLOSE releases a previously OPENed file handle and flushes any pending writes.
+Emitted with the canonical "file-name" placeholder that the HIR linker
+substitutes with concrete identifiers.
+@End Reasoning
+
+@Implementation:
+Emits "CLOSE file-name." at the current indent followed by a newline.
+@End Implementation
 
 Process called "generate_close_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate CLOSE statement
@@ -1566,6 +1998,17 @@ Process called "generate_close_stmt" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+READ pulls the next record from an OPENed file into the named record buffer.
+The INTO clause provides an additional destination after the implicit FD
+record name.
+@End Reasoning
+
+@Implementation:
+Emits "READ file-name INTO record." at the current indent followed by a
+newline; the file and record placeholders are substituted by the HIR linker.
+@End Implementation
+
 Process called "generate_read_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate READ statement
 
@@ -1579,6 +2022,16 @@ Process called "generate_read_stmt" takes context as Integer, hir as Integer ret
 
     Return 1
 End Process
+
+@Reasoning:
+WRITE appends a record to an OPENed file. The FROM clause provides the
+source buffer for the write.
+@End Reasoning
+
+@Implementation:
+Emits "WRITE record FROM data." at the current indent followed by a newline;
+record and data placeholders are substituted by the HIR linker.
+@End Implementation
 
 Process called "generate_write_stmt" takes context as Integer, hir as Integer returns Integer:
     Note: Generate WRITE statement
@@ -1598,6 +2051,17 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+COBOL identifiers are emitted verbatim - no escaping is required because
+the HIR layer already validated the name against COBOL rules.
+@End Reasoning
+
+@Implementation:
+Reads "name" from the HIR dictionary and writes it through emit_string. A
+missing name leaves no output, which is the responsibility of the caller's
+HIR validation.
+@End Implementation
+
 Process called "generate_identifier" takes context as Integer, hir as Integer returns Integer:
     Note: Generate identifier
 
@@ -1611,6 +2075,16 @@ Process called "generate_identifier" takes context as Integer, hir as Integer re
     Return 1
 End Process
 
+@Reasoning:
+COBOL literal nodes carry their textual form (numeric literal or quoted
+string) directly; the HIR layer ensures quoting is correct so the emitter
+can pass the bytes through.
+@End Reasoning
+
+@Implementation:
+Reads "value" from the HIR dictionary and writes it through emit_string.
+@End Implementation
+
 Process called "generate_literal" takes context as Integer, hir as Integer returns Integer:
     Note: Generate literal
 
@@ -1623,6 +2097,18 @@ Process called "generate_literal" takes context as Integer, hir as Integer retur
 
     Return 1
 End Process
+
+@Reasoning:
+Binary arithmetic expressions appear inside COMPUTE; the COBOL operator
+syntax matches conventional infix so a generic "left op right" emitter
+suffices for +, -, *, /, **.
+@End Reasoning
+
+@Implementation:
+Recurses on the "left" child, emits the operator string with surrounding
+spaces, then recurses on the "right" child. The operator string itself is
+provided by the HIR node, not derived here.
+@End Implementation
 
 Process called "generate_arithmetic_expr" takes context as Integer, hir as Integer returns Integer:
     Note: Generate arithmetic expression
@@ -1653,6 +2139,17 @@ Process called "generate_arithmetic_expr" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+Relational expressions live inside IF/EVALUATE conditions; the same generic
+left-op-right layout works because COBOL supports =, >, <, >=, <=, NOT in
+infix form.
+@End Reasoning
+
+@Implementation:
+Recurses on "left", emits the operator string with surrounding spaces, then
+recurses on "right". The operator is selected by the HIR layer.
+@End Implementation
+
 Process called "generate_relational_expr" takes context as Integer, hir as Integer returns Integer:
     Note: Generate relational expression
 
@@ -1682,6 +2179,16 @@ Process called "generate_relational_expr" takes context as Integer, hir as Integ
     Return 1
 End Process
 
+@Reasoning:
+COBOL figurative constants (SPACES, ZEROS, HIGH-VALUES, LOW-VALUES,
+QUOTES) are named keywords rather than literals, so they must be emitted
+without quotes.
+@End Reasoning
+
+@Implementation:
+Reads "constant" from the HIR dictionary and emits the keyword unchanged.
+@End Implementation
+
 Process called "generate_figurative_const" takes context as Integer, hir as Integer returns Integer:
     Note: Generate figurative constant
 
@@ -1698,6 +2205,18 @@ End Process
 Note: ============================================================================
 Note: Utility Functions
 Note: ============================================================================
+
+@Reasoning:
+The COBOL HIR dispatcher needs an inline string-equality check; pulling in
+the full StringCore equality helper would force a wider import surface and
+slow link time, so this module ships its own minimal comparator.
+@End Reasoning
+
+@Implementation:
+Two null-pointer fast paths (both null = equal, exactly one null = unequal),
+followed by a string_length comparison and a byte-by-byte char loop using
+string_char_at. Returns 1 on equality, 0 otherwise.
+@End Implementation
 
 Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
     Note: Compare two strings for equality

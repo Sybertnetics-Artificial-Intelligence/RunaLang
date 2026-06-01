@@ -61,6 +61,19 @@ Note: ==========================================================================
 Note: YAML Generation Context
 Note: ============================================================================
 
+@Reasoning:
+YAML can be rendered in block (indented, multi-line) or flow ({a: b})
+style; the same context handles both via use_flow_style. Indentation is
+tracked as a logical level plus a per-level space count so callers can
+configure two-space or four-space output.
+@End Reasoning
+
+@Implementation:
+Six int64 fields, 48 bytes total. emitter holds the raw byte buffer;
+current_indent the depth in levels; indent_size the spaces per level
+(default 2); use_flow_style chooses style; error fields capture problems.
+@End Implementation
+
 Type called "YAMLGenerationContext":
     emitter as Integer          Note: YAML emitter for output
     current_indent as Integer   Note: Current indentation level
@@ -73,6 +86,17 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Wires the YAML emitter and default formatting (block style, 2-space
+indent) so the rest of the file can assume a valid context.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes for the context, creates a raw byte emitter, then
+writes all six fields. Rolls back the partial allocation if the emitter
+cannot be created.
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create YAML generation context
@@ -102,6 +126,17 @@ Process called "create_generation_context" returns Integer:
 
     Return context
 End Process
+
+@Reasoning:
+Releases the emitter and any held error_message heap copy before freeing
+the context block. Null-tolerant so callers can invoke unconditionally
+from cleanup paths.
+@End Reasoning
+
+@Implementation:
+Reads the emitter and error_message slots; calls emitter_raw_destroy /
+deallocate only when non-zero, then deallocates the context.
+@End Implementation
 
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy YAML generation context
@@ -133,6 +168,18 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Captures the first generation error in a heap-owned copy so the message
+survives past the source buffer's lifetime and can be reported by the
+caller.
+@End Reasoning
+
+@Implementation:
+Frees any prior error string, copies the incoming message into a fresh
+msg_length+1 buffer with a null terminator, stores the pointer in the
+context, and sets has_error to 1.
+@End Implementation
+
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set generation error message
 
@@ -162,6 +209,16 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+YAML block style requires precise leading whitespace at every line; the
+indent multiplier converts logical depth into the actual byte count.
+@End Reasoning
+
+@Implementation:
+Reads current_indent and indent_size, multiplies them, then writes that
+many ASCII spaces (32) through the raw emitter.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit current indentation
 
@@ -180,6 +237,15 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Called when entering a nested mapping or sequence so subsequent
+emit_indent calls produce deeper leading whitespace.
+@End Reasoning
+
+@Implementation:
+Reads current_indent, adds 1, writes the new value back.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -189,6 +255,16 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Counterpart to increase_indent. Clamps at zero so a mismatched call does
+not drive the counter negative and break later indent arithmetic.
+@End Reasoning
+
+@Implementation:
+Reads current_indent; if greater than zero, decrements and writes back;
+otherwise leaves the value at zero.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -206,6 +282,21 @@ End Process
 Note: ============================================================================
 Note: String Utilities
 Note: ============================================================================
+
+@Reasoning:
+YAML plain scalars are ambiguous: a bare string can be misread as null,
+true, false, a number, or a complex structure if it starts with the wrong
+character. The conservative check forces quotes whenever ambiguity is
+possible.
+@End Reasoning
+
+@Implementation:
+Empty strings always quote. Otherwise inspects the first byte against
+reserved prefixes (-, ?, :, |, >, &, *, !, %, @, `, ", '), checks for
+embedded special characters and reserved keywords (null, true, false, ~),
+and tests whether the string looks like a number. Any positive match
+returns 1.
+@End Implementation
 
 Process called "needs_quoting" takes str as Integer returns Integer:
     Note: Check if string needs quoting in YAML
@@ -345,6 +436,18 @@ Process called "needs_quoting" takes str as Integer returns Integer:
     Return 0  Note: No quoting needed
 End Process
 
+@Reasoning:
+Needs_quoting compares the candidate against several YAML reserved words.
+A local string-equality routine avoids depending on a heavier StringCore
+import surface.
+@End Reasoning
+
+@Implementation:
+Null-handling fast paths (both null = equal, exactly one null = unequal),
+then a length comparison, then a byte-by-byte loop. Returns 1 on full
+match, 0 otherwise.
+@End Implementation
+
 Process called "string_equals" takes str1 as Integer, str2 as Integer returns Integer:
     Note: Check if two strings are equal
 
@@ -370,6 +473,23 @@ Process called "string_equals" takes str1 as Integer, str2 as Integer returns In
 
     Return 1
 End Process
+
+@Reasoning:
+YAML double-quoted strings use the same backslash escapes as JSON for
+quote, backslash, and control characters. Emitting the quoted form
+avoids the dozen edge cases that bare scalars would expose.
+@End Reasoning
+
+@Implementation:
+Emits a leading quote, walks the input byte-by-byte. Quote (34) and
+backslash (92) take \" / \\; LF, CR, TAB use \n, \r, \t; other control
+bytes (< 0x20) use the six-byte \xNN form. Bytes >= 0x20 pass through
+unchanged. Closes with a final quote.
+@End Implementation
+
+@Security_Scope:
+Trusts str to be null-terminated UTF-8 from the HIR layer.
+@End Security_Scope
 
 Process called "emit_escaped_string" takes context as Integer, str as Integer returns Integer:
     Note: Emit double-quoted YAML string with proper escaping
@@ -433,6 +553,18 @@ Note: ==========================================================================
 Note: Integer to String Conversion
 Note: ============================================================================
 
+@Reasoning:
+YAML integers are unquoted base-10 numbers; the helper handles sign and
+digit count so the emitter never has to.
+@End Reasoning
+
+@Implementation:
+Zero is emitted as a single '0' byte. For non-zero values, records the
+sign, takes the absolute value, counts digits, allocates a buffer, writes
+digits from least- to most-significant, prepends '-' when negative, then
+emits the buffer and frees it.
+@End Implementation
+
 Process called "emit_integer" takes context as Integer, value as Integer returns Integer:
     Note: Emit integer as YAML numeric scalar
 
@@ -488,6 +620,20 @@ Note: ==========================================================================
 Note: HIR Node Translation
 Note: ============================================================================
 
+@Reasoning:
+Central dispatcher. The is_mapping_value flag matters because YAML emits
+mapping values either inline (after the ": ") or on the next line at a
+deeper indent depending on the value's shape, and individual emitters
+need that context.
+@End Reasoning
+
+@Implementation:
+Reads the HIR node tag and routes dictionaries to generate_yaml_mapping,
+lists to generate_yaml_sequence, strings to generate_yaml_string,
+integers to generate_yaml_integer, booleans to generate_yaml_boolean, and
+nulls to generate_yaml_null. Unknown kinds set a generation error.
+@End Implementation
+
 Process called "generate_hir_node" takes context as Integer, hir_node as Integer, is_mapping_value as Integer returns Integer:
     Note: Generate YAML from HIR node
 
@@ -539,6 +685,20 @@ Process called "generate_hir_node" takes context as Integer, hir_node as Integer
     proc set_generation_error with context, "Unsupported HIR node type"
     Return 0
 End Process
+
+@Reasoning:
+YAML mappings render as "key: value" lines at the current indent depth.
+When the mapping is itself a value of a parent mapping, the first key
+sits on a new indented line; when it is the document root, it starts at
+column 0.
+@End Reasoning
+
+@Implementation:
+For each entry, emits indent, the key (quoted via emit_escaped_string if
+needs_quoting returns 1), ": ", then dispatches the value through
+generate_hir_node with is_mapping_value=1. Increments / restores indent
+around nested values to keep child indentation consistent.
+@End Implementation
 
 Process called "generate_yaml_mapping" takes context as Integer, hir_node as Integer, is_mapping_value as Integer returns Integer:
     Note: Generate YAML mapping (block style)
@@ -610,6 +770,19 @@ Process called "generate_yaml_mapping" takes context as Integer, hir_node as Int
     Return 1
 End Process
 
+@Reasoning:
+YAML sequences render each element with a leading "- " at the current
+indent. When the sequence is itself a value, the dash sits on a new
+indented line.
+@End Reasoning
+
+@Implementation:
+Iterates the list elements; for each, emits indent, "- ", then dispatches
+the element through generate_hir_node. Increments / restores indent
+around nested compound elements (mappings or sequences) so they appear
+beneath the dash.
+@End Implementation
+
 Process called "generate_yaml_sequence" takes context as Integer, hir_node as Integer, is_mapping_value as Integer returns Integer:
     Note: Generate YAML sequence (block style)
 
@@ -669,6 +842,18 @@ Process called "generate_yaml_sequence" takes context as Integer, hir_node as In
 
     Return 1
 End Process
+
+@Reasoning:
+YAML strings can be plain (no quotes), single-quoted, or double-quoted.
+This emitter picks plain when needs_quoting returns 0, otherwise falls
+back to double-quoted with escape processing.
+@End Reasoning
+
+@Implementation:
+Reads the string value off the HIR node, then calls needs_quoting; if 0,
+emits the bytes verbatim through the raw emitter; otherwise hands them
+to emit_escaped_string for full double-quoted escaping.
+@End Implementation
 
 Process called "generate_yaml_string" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate YAML string scalar
@@ -749,6 +934,15 @@ Process called "generate_yaml_string" takes context as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+YAML integers are unquoted base-10 tokens; delegates the formatting to
+emit_integer so sign and digit logic stay in one place.
+@End Reasoning
+
+@Implementation:
+Reads the i64 value from the HIR node and forwards it to emit_integer.
+@End Implementation
+
 Process called "generate_yaml_integer" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate YAML integer scalar
 
@@ -757,6 +951,15 @@ Process called "generate_yaml_integer" takes context as Integer, hir_node as Int
 
     Return 1
 End Process
+
+@Reasoning:
+YAML booleans render as the lowercase literals "true" and "false". Any
+non-zero HIR boolean payload collapses to true.
+@End Reasoning
+
+@Implementation:
+Reads the boolean value; emits "true" when 1, "false" otherwise.
+@End Implementation
 
 Process called "generate_yaml_boolean" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate YAML boolean scalar
@@ -773,6 +976,15 @@ Process called "generate_yaml_boolean" takes context as Integer, hir_node as Int
     Return 1
 End Process
 
+@Reasoning:
+YAML null is the literal token "null"; the tilde "~" is equivalent but
+"null" is more readable for tooling that ingests the output.
+@End Reasoning
+
+@Implementation:
+Emits the four-byte string "null" through the raw emitter.
+@End Implementation
+
 Process called "generate_yaml_null" takes context as Integer returns Integer:
     Note: Generate YAML null scalar
 
@@ -785,6 +997,18 @@ End Process
 Note: ============================================================================
 Note: Top-Level YAML Generation
 Note: ============================================================================
+
+@Reasoning:
+Public entry. Owns the YAMLGenerationContext lifecycle so callers only
+provide an HIR root and consume the generated text.
+@End Reasoning
+
+@Implementation:
+Constructs a generation context, dispatches the root through
+generate_hir_node with is_mapping_value=0, retrieves the output buffer
+through the emitter, and destroys the context. Returns 0 on allocation
+or generation failure.
+@End Implementation
 
 Process called "translate_hir_to_yaml" takes hir_root as Integer returns Integer:
     Note: Translate HIR to YAML output string

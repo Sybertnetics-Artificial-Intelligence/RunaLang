@@ -15,6 +15,15 @@ Note: - MATLAB App Designer
 Import from "compiler/middle/gungnir/hir/hir_nodes.runa" use HIRNode, HIRStatement, HIRExpression, HIRType
 Import from "compiler/middle/gungnir/hir/hir_builder.runa" use HIRBuilder
 
+@Reasoning:
+The semantic-analysis state object. Models MATLAB's hierarchical workspace
+(current + parent_context), the loaded toolbox names, the function being
+analyzed, diagnostic lists, a memoized type cache to avoid recomputing
+type signatures for repeatedly-referenced functions, registries for class
+definitions and function handles, the MATLAB path search list, and the
+persistent-variable table separate from the workspace because persistent
+vars survive function returns while regular workspace vars do not.
+@End Reasoning
 Type called "MatlabSemanticContext":
     current_workspace as MatlabWorkspace
     parent_context as MatlabSemanticContext
@@ -29,6 +38,13 @@ Type called "MatlabSemanticContext":
     persistent_variables as Dictionary[String, MatlabVariable]
 End Type
 
+@Reasoning:
+A MATLAB scope frame holding variable and function bindings. parent_workspace
+implements the chain from a function's local workspace back to base; the
+is_base flag identifies the top-of-chain frame and is_function_workspace
+distinguishes function-local frames from script-style frames where
+assignments persist to the base workspace.
+@End Reasoning
 Type called "MatlabWorkspace":
     variables as Dictionary[String, MatlabVariable]
     functions as Dictionary[String, MatlabFunction]
@@ -40,6 +56,14 @@ End Type
 
 Note: Local Matlab AST schema used by this semantic analyzer until v0.0.9.x
 Note: replaces the field-rich placeholder with generic HIRNode traversal.
+@Reasoning:
+Wide-field AST view for the semantic analyzer. Unlike the parser's compact
+ASTNode, this exposes named slots per node-kind (function_name, rows,
+elements, etc.) so the semantic analyzer can read structure without
+knowing positional child layouts. The node_type string is read by
+analyze_matlab_node to dispatch; unused fields for a given node-kind
+remain at their default integer value (0).
+@End Reasoning
 Type called "MatlabSemNode":
     node_type as String
     name as Integer
@@ -58,12 +82,25 @@ Type called "MatlabSemNode":
 End Type
 
 Note: A matlab parameter referenced by analyze functions.
+@Reasoning:
+Lightweight parameter triple (name, type, source line) used by the
+analyzer's signature-checking paths. Distinct from the richer
+MatlabParameter (which carries varargin/optional flags) so internal
+traversals avoid carrying unused fields.
+@End Reasoning
 Type called "MatlabParam":
     name as Integer
     type as Integer
     line as Integer
 End Type
 
+@Reasoning:
+Symbol record for one MATLAB variable. Tracks the declared type plus
+storage-class flags (global/persistent), source-position bounds (first
+assignment / last access) for usage-warning checks, and matrix-specific
+runtime traits (dimensions, sparse, complex) needed to choose correct
+codegen paths.
+@End Reasoning
 Type called "MatlabVariable":
     name as String
     type as MatlabType
@@ -77,6 +114,13 @@ Type called "MatlabVariable":
     is_complex as Boolean
 End Type
 
+@Reasoning:
+Function metadata covering user-defined, built-in, MEX bridge, and
+anonymous (lambda) functions. The toolbox field is set only for built-ins
+loaded via load_matlab_builtins so the analyzer can validate "function
+exists only after toolbox X has been loaded". has_variable_inputs/outputs
+track MATLAB's varargin/varargout for arity checking.
+@End Reasoning
 Type called "MatlabFunction":
     name as String
     input_parameters as List[MatlabParameter]
@@ -91,6 +135,12 @@ Type called "MatlabFunction":
     has_variable_outputs as Boolean
 End Type
 
+@Reasoning:
+A formal-parameter record for MatlabFunction.input_parameters. The
+is_varargin flag distinguishes MATLAB's varargin sentinel from a normal
+named parameter; default_value is a source-form string that is re-parsed
+on demand when a call site omits the parameter.
+@End Reasoning
 Type called "MatlabParameter":
     name as String
     type as MatlabType
@@ -99,6 +149,14 @@ Type called "MatlabParameter":
     default_value as String
 End Type
 
+@Reasoning:
+MATLAB's type model rolled into a single record: scalar/matrix base type
+plus dimension list, element_type for nested cell arrays, boolean flags for
+the "is X-style container" determinations (cell, struct, function handle),
+storage qualifiers (sparse, complex), an optional class_name for OOP types,
+and struct_fields for record-style data. A null element_type / empty
+dimensions denotes a scalar.
+@End Reasoning
 Type called "MatlabType":
     base_type as String
     dimensions as List[Integer]
@@ -112,6 +170,12 @@ Type called "MatlabType":
     struct_fields as Dictionary[String, MatlabType]
 End Type
 
+@Reasoning:
+A classdef registration. is_handle_class distinguishes MATLAB's two class
+kinds (value vs handle) which have different copy semantics; is_abstract
+prevents instantiation; is_sealed prevents further subclassing. The
+superclass list supports MATLAB's multiple inheritance.
+@End Reasoning
 Type called "MatlabClassInfo":
     class_name as String
     superclasses as List[String]
@@ -123,6 +187,14 @@ Type called "MatlabClassInfo":
     is_sealed as Boolean
 End Type
 
+@Reasoning:
+One property in a classdef. The access string is "public" / "protected" /
+"private"; is_dependent marks getter-computed properties; is_observable
+triggers listener notification; is_transient excludes the property from
+serialization. default_value is captured as source text since MATLAB
+defaults can be arbitrary expressions evaluated lazily at instance
+construction.
+@End Reasoning
 Type called "MatlabProperty":
     name as String
     type as MatlabType
@@ -134,6 +206,12 @@ Type called "MatlabProperty":
     default_value as String
 End Type
 
+@Reasoning:
+One method on a classdef. Constructor/destructor are flagged explicitly
+because MATLAB infers them from name-matching the class (constructor) and
+the special "delete" name (destructor). is_static methods do not receive an
+implicit "obj" first parameter, which affects how calls are lowered.
+@End Reasoning
 Type called "MatlabMethod":
     name as String
     input_parameters as List[MatlabParameter]
@@ -146,12 +224,25 @@ Type called "MatlabMethod":
     is_destructor as Boolean
 End Type
 
+@Reasoning:
+A MATLAB class event with separate notify_access and listen_access
+attributes — MATLAB allows the trigger and listener-registration
+permissions to differ (e.g. private notify, public listen for a one-way
+broadcast pattern).
+@End Reasoning
 Type called "MatlabEvent":
     name as String
     notify_access as String
     listen_access as String
 End Type
 
+@Reasoning:
+Tracks a "@func" reference or "@(x) expr" anonymous function. The captured
+variables list is populated only for anonymous functions — MATLAB captures
+the current workspace values into the closure at the @() expression's
+evaluation site, so codegen must know which names need to be packaged
+into the closure record.
+@End Reasoning
 Type called "MatlabFunctionHandle":
     name as String
     target_function as String
@@ -160,6 +251,11 @@ Type called "MatlabFunctionHandle":
     captured_variables as List[String]
 End Type
 
+@Reasoning:
+A semantic diagnostic record. severity is "error"/"warning"/"info" and
+error_code is a stable identifier (e.g. "MATLAB:undefined") that downstream
+tools can pattern-match on without parsing the human-readable message.
+@End Reasoning
 Type called "MatlabSemanticError":
     message as String
     line as Integer
@@ -195,6 +291,13 @@ Process called "analyze_matlab_semantics" that takes ast as MatlabSemNode return
     Return context
 End Process
 
+@Reasoning:
+Constructs the empty analyzer state with the base workspace pre-installed
+and the canonical set of MATLAB toolbox names ("matlab", "signal", "image",
+"control", "optim", "stats", "symbolic") pre-loaded so toolbox-gated
+function lookups succeed by default. Subsequent calls to load_matlab_*
+populate the registries with built-in symbols.
+@End Reasoning
 Process called "create_base_matlab_context" that takes nothing returns MatlabSemanticContext:
     Note: Create the base semantic context with MATLAB workspace
 
@@ -246,6 +349,13 @@ Process called "load_matlab_builtins" that takes ctx as MatlabSemanticContext re
     Call load_standard_classes with ctx
 End Process
 
+@Reasoning:
+Registers MATLAB's core matrix-construction, query, reshape, transpose,
+and decomposition built-ins (zeros, ones, eye, rand/randn, size, length,
+reshape, transpose, ctranspose, inv, det, eig, svd, qr, chol, pinv). Each
+gets a typed signature via create_matlab_function so call sites can be
+type-checked against the right number/kind of arguments.
+@End Reasoning
 Process called "load_matrix_functions" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load matrix and array manipulation functions
 
@@ -273,6 +383,13 @@ Process called "load_matrix_functions" that takes ctx as MatlabSemanticContext r
     End For
 End Process
 
+@Reasoning:
+Registers the standard scalar/elementwise math and statistical built-ins:
+trig (sin/cos/tan + inverses), transcendental (exp/log/log10/sqrt),
+absolute/real/imag/conj/round/floor/ceil, and reductions (sum, mean, std,
+var, max, min). These all accept matrix inputs in MATLAB's elementwise
+broadcasting semantics.
+@End Reasoning
 Process called "load_mathematical_functions" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load mathematical and statistical functions
 
@@ -306,6 +423,11 @@ Process called "load_mathematical_functions" that takes ctx as MatlabSemanticCon
     End For
 End Process
 
+@Reasoning:
+Registers string manipulation built-ins: formatted I/O (sprintf, fprintf),
+comparison (strcmp, strcmpi), concatenation/trim/split/join, and the
+String / Char / Double / num2str / str2num conversion family.
+@End Reasoning
 Process called "load_string_functions" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load string manipulation functions
 
@@ -329,6 +451,13 @@ Process called "load_string_functions" that takes ctx as MatlabSemanticContext r
     End For
 End Process
 
+@Reasoning:
+Registers I/O built-ins: console (disp/fprintf/input), MAT-file
+(load/save), delimited text (csvread/csvwrite), spreadsheet (xlsread/
+xlswrite), and tabular (readtable/writetable). Note fprintf appears here
+and in load_string_functions — MATLAB exposes the same function in both
+contexts, and re-registering with the same key is idempotent.
+@End Reasoning
 Process called "load_io_functions" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load input/output functions
 
@@ -350,6 +479,13 @@ Process called "load_io_functions" that takes ctx as MatlabSemanticContext retur
     End For
 End Process
 
+@Reasoning:
+Registers MATLAB's plotting and graphics primitives: 2D (plot, scatter,
+bar, histogram), 3D (surf, mesh, contour), figure/subplot/hold/axis
+management, and label/title/legend/grid annotations. Necessary so calls
+like "plot(x,y)" pass arity checks even though the translator does not
+emit any actual graphics code.
+@End Reasoning
 Process called "load_graphics_functions" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load graphics and plotting functions
 
@@ -376,6 +512,13 @@ Process called "load_graphics_functions" that takes ctx as MatlabSemanticContext
     End For
 End Process
 
+@Reasoning:
+Registers error-handling (error/warning/assert), try/catch as
+function-like (MATLAB also has them as statements but exposes
+identifiers), and the debugger built-ins (keyboard, dbstop, dbcont,
+dbstep, dbquit) so debugger references in user code pass undefined-name
+checks.
+@End Reasoning
 Process called "load_control_flow_functions" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load control flow and debugging functions
 
@@ -431,6 +574,13 @@ Process called "load_matlab_types" that takes ctx as MatlabSemanticContext retur
     Set ctx.type_cache at key "duration" to create_duration_type
 End Process
 
+@Reasoning:
+Orchestrates registration of MATLAB's built-in class hierarchy in three
+phases: handle classes (reference semantics), value classes (copy
+semantics), and graphics classes (Figure, Axes, Line, etc.). The split
+exists because each phase has distinct registration paths in the underlying
+register_*_classes helpers.
+@End Reasoning
 Process called "load_standard_classes" that takes ctx as MatlabSemanticContext returns Nothing:
     Note: Load standard MATLAB classes
 
@@ -448,6 +598,14 @@ Note: ==========================================================================
 Note: AST NODE ANALYSIS
 Note: ============================================================================
 
+@Reasoning:
+Polymorphic dispatch on the node's type string. Routes every recognized
+AST node kind (Program, function/class/property/method declarations,
+all expression forms, control flow) to a specialized analyzer. Unknown
+node kinds fall through to analyze_generic_matlab_node which recurses
+generically — keeping the dispatch tolerant of new node kinds added by
+future parser updates.
+@End Reasoning
 Process called "analyze_matlab_node" that takes node as MatlabSemNode, ctx as MatlabSemanticContext returns Nothing:
     Note: Analyze any MATLAB AST node based on its type
 
@@ -493,6 +651,12 @@ Process called "analyze_matlab_node" that takes node as MatlabSemNode, ctx as Ma
     End Match
 End Process
 
+@Reasoning:
+Walks every statement in a Program node, recursing through analyze_node so
+each statement gets its kind-specific handling. The context's
+current_workspace mutates as analysis enters/exits function and class
+scopes, but at program top-level it is the base workspace.
+@End Reasoning
 Process called "analyze_matlab_program" that takes node as MatlabSemNode, ctx as MatlabSemanticContext returns Nothing:
     Note: Analyze MATLAB program (script or function file)
 
@@ -625,6 +789,14 @@ Process called "analyze_matlab_matrix_construction" that takes node as MatlabSem
     End For
 End Process
 
+@Reasoning:
+Resolves a function-call site against the workspace chain. If the bare
+lookup fails, falls back to check_method_call to handle dispatch through
+class instances or constructor invocation. Truly undefined names produce
+an "Undefined function or variable" error matching MATLAB's own
+diagnostic. After resolution, each argument is recursively analyzed and
+the full call is validated against the function's declared arity/types.
+@End Reasoning
 Process called "analyze_matlab_function_call" that takes node as MatlabSemNode, ctx as MatlabSemanticContext returns Nothing:
     Note: Analyze MATLAB function call
 
@@ -701,6 +873,12 @@ Process called "infer_matlab_expression_type" that takes expr as MatlabSemNode, 
     End Match
 End Process
 
+@Reasoning:
+Maps literal_type strings ("double", "single", "logical", "char", "string",
+"integer") to constructed MatlabType records. Integer literals default to
+double per MATLAB's "all numerics start as double unless cast" rule;
+explicit casts produce different literal_type tags from the parser.
+@End Reasoning
 Process called "infer_matlab_literal_type" that takes expr as MatlabSemNode returns MatlabType:
     Note: Infer type from literal values
 
@@ -729,6 +907,13 @@ Note: ==========================================================================
 Note: HELPER FUNCTIONS
 Note: ============================================================================
 
+@Reasoning:
+Walks the workspace chain (current_workspace -> parent_workspace -> ...
+-> base) looking for a function binding. The chain walk implements MATLAB's
+lexical-scope resolution for function definitions. Returns null when the
+name is not found in any frame so the caller can issue a precise
+diagnostic.
+@End Reasoning
 Process called "lookup_matlab_function" that takes name as String, ctx as MatlabSemanticContext returns MatlabFunction:
     Note: Look up function in workspace chain
 
@@ -743,6 +928,12 @@ Process called "lookup_matlab_function" that takes name as String, ctx as Matlab
     Return null
 End Process
 
+@Reasoning:
+Workspace chain walk for variable bindings, with a post-loop fallback to
+the persistent_variables registry. Persistent variables live outside the
+normal workspace chain because they survive function returns — so a chain
+walk would not find them and the second lookup handles that case.
+@End Reasoning
 Process called "lookup_matlab_variable" that takes name as String, ctx as MatlabSemanticContext returns MatlabVariable:
     Note: Look up variable in workspace chain
 
@@ -762,6 +953,12 @@ Process called "lookup_matlab_variable" that takes name as String, ctx as Matlab
     Return null
 End Process
 
+@Reasoning:
+Constructs a new function-local workspace linked to its caller (parent).
+Functions get is_function_workspace=true so analyze code can distinguish
+function-scoped assignments (which die at return) from script-scoped
+assignments (which persist).
+@End Reasoning
 Process called "create_function_workspace" that takes parent as MatlabWorkspace, func_name as String returns MatlabWorkspace:
     Note: Create new workspace for function scope
 
@@ -794,6 +991,12 @@ Note: ==========================================================================
 Note: TYPE CREATION HELPERS
 Note: ============================================================================
 
+@Reasoning:
+Factory for MATLAB's primary numeric type: scalar double (no dimensions,
+not sparse, not complex). All numeric literals default to this; callers
+mutate the result to attach dimensions if they later determine the value
+is matrix-shaped.
+@End Reasoning
 Process called "create_double_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "double",
@@ -808,6 +1011,12 @@ Process called "create_double_type" that takes nothing returns MatlabType:
         struct_fields as null
 End Process
 
+@Reasoning:
+Factory for MATLAB's "logical" type — a 1-bit Boolean produced by
+comparison operators, logical functions, and the true/false constants.
+Distinct from "double" with values 0/1 because MATLAB allows logical
+arrays to index into other arrays.
+@End Reasoning
 Process called "create_logical_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "logical",
@@ -822,6 +1031,12 @@ Process called "create_logical_type" that takes nothing returns MatlabType:
         struct_fields as null
 End Process
 
+@Reasoning:
+Factory for MATLAB's "char" type — the character-array form produced by
+single-quoted literals. Distinct from "string" because MATLAB historically
+had only char arrays; string-class was added in R2017a as a separate
+type with object-like semantics.
+@End Reasoning
 Process called "create_char_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "char",
@@ -836,6 +1051,11 @@ Process called "create_char_type" that takes nothing returns MatlabType:
         struct_fields as null
 End Process
 
+@Reasoning:
+Factory for MATLAB's "cell" type — a heterogeneous container indexed with
+curly braces (a{i,j}). is_cell_array=true is set so consumers can branch
+between matrix indexing and cell extraction at codegen.
+@End Reasoning
 Process called "create_cell_array_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "cell",
@@ -850,6 +1070,11 @@ Process called "create_cell_array_type" that takes nothing returns MatlabType:
         struct_fields as null
 End Process
 
+@Reasoning:
+Factory for MATLAB's "struct" type — named-field records accessed via
+"obj.field". is_struct=true. struct_fields is left null on creation and
+populated later as field assignments are observed during AST walk.
+@End Reasoning
 Process called "create_struct_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "struct",
@@ -864,6 +1089,13 @@ Process called "create_struct_type" that takes nothing returns MatlabType:
         struct_fields as a dictionary containing nothing
 End Process
 
+@Reasoning:
+Factory for MATLAB's "function_handle" type — the result of "@name" or
+"@(x) body". is_function_handle=true. Used by infer_matlab_expression_type
+to type FunctionHandle AST nodes; the actual captured-name/lambda-body
+details live in a MatlabFunctionHandle entry registered separately in
+ctx.function_handles.
+@End Reasoning
 Process called "create_function_handle_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "function_handle",
@@ -878,6 +1110,13 @@ Process called "create_function_handle_type" that takes nothing returns MatlabTy
         struct_fields as null
 End Process
 
+@Reasoning:
+Factory for the "any" sentinel type. Returned when type inference cannot
+determine a more specific type (e.g. for unbound output variables before
+their first assignment, or for the result of an unresolved function call).
+The "any" type passes all type checks, deferring the actual narrowing to
+runtime — matching MATLAB's dynamic-typing semantics.
+@End Reasoning
 Process called "create_any_matlab_type" that takes nothing returns MatlabType:
     Return a value of type MatlabType with
         base_type as "any",
@@ -893,6 +1132,11 @@ Process called "create_any_matlab_type" that takes nothing returns MatlabType:
 End Process
 
 Note: Entry point for MATLAB semantic analysis
+@Reasoning:
+Thin wrapper over analyze_matlab_semantics that exposes a stable public
+name. Provided so callers can use the more descriptive "semantic_tree"
+verb without depending on the internal "semantics" entry point name.
+@End Reasoning
 Process called "analyze_matlab_semantic_tree" that takes ast as MatlabSemNode returns MatlabSemanticContext:
     Return analyze_matlab_semantics with ast
 End Process

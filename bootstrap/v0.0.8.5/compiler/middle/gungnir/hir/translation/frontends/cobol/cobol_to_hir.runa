@@ -45,6 +45,21 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+COBOL-to-HIR translation is allocation-heavy (each PIC clause, each WORKING-
+STORAGE record becomes one or more HIR nodes) so a single arena is threaded
+through every translation call to keep cleanup O(1). current_scope tracks
+the PROCEDURE DIVISION paragraph being walked so PERFORM statements can
+resolve forward references; errors collects diagnostics so the walk does
+not abort on the first issue.
+@End Reasoning
+
+@Implementation:
+24-byte record (3 x i64) at offsets 0/8/16: arena (handle to caller-owned
+arena), current_scope (paragraph descriptor or 0 at top level), errors
+(List of error message StringCores; analyzer destructor frees the list).
+@End Implementation
+
 Type called "COBOLToHIRContext":
     arena as Integer            Note: Memory arena for allocations
     current_scope as Integer    Note: Current scope context
@@ -600,6 +615,22 @@ Process called "translate_config_section" takes context as Integer, node as Inte
 
     Return hir
 End Process
+
+@Reasoning:
+INPUT-OUTPUT SECTION in COBOL's ENVIRONMENT DIVISION declares all files the
+program will read or write, primarily through nested SELECT statements that
+bind logical file names to external assignments. HIR captures the section as
+a single node with a "files" array of children rather than flattening so the
+back-end can emit per-file open/close glue.
+@End Reasoning
+
+@Implementation:
+Builds a Dict with _type="cobol_input_output_section" and recurses via
+translate_children to translate every nested SELECT (or FD/SD) into its own
+HIR Dict; the resulting List is stored under the "files" key. Empty
+sections produce an empty list, preserving the section as a syntactic
+landmark for back-end and printer alike.
+@End Implementation
 
 Process called "translate_input_output_section" takes context as Integer, node as Integer returns Integer:
     Note: Translate INPUT-OUTPUT SECTION to HIR
@@ -1422,6 +1453,19 @@ Process called "translate_stop_stmt" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+EXIT in COBOL is a structured-exit marker rather than a value-bearing
+return; it falls out of the innermost paragraph (or PERFORM range in newer
+dialects). HIR captures it as a typed marker node so the back-end can
+lower it to the appropriate jump.
+@End Reasoning
+
+@Implementation:
+Builds a Dict with _type="cobol_exit" and no payload fields. The HIR back-end
+is responsible for choosing between paragraph-exit and PERFORM-range-exit
+based on enclosing context tracked elsewhere.
+@End Implementation
+
 Process called "translate_exit_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate EXIT statement to HIR
 
@@ -1474,6 +1518,18 @@ Process called "translate_open_stmt" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+CLOSE in COBOL releases the file connection established by OPEN; the file
+identifier is taken from the statement node. HIR captures the action as a
+typed marker that the back-end lowers to the runtime's file_close primitive.
+@End Reasoning
+
+@Implementation:
+Builds Dict with _type="cobol_close". File identifiers are resolved when
+the back-end consumes the statement (the AST node still carries the file
+name list under its child slots).
+@End Implementation
+
 Process called "translate_close_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate CLOSE statement to HIR
 
@@ -1483,6 +1539,19 @@ Process called "translate_close_stmt" takes context as Integer, node as Integer 
 
     Return hir
 End Process
+
+@Reasoning:
+READ moves the next record from the file into the record area declared in
+FD. HIR captures the operation as a typed node; sequential-vs-random access
+and INTO/AT END/INVALID KEY phrases are folded into the statement node's
+child slots which the back-end consumes.
+@End Reasoning
+
+@Implementation:
+Builds Dict with _type="cobol_read"; back-end pulls the file id, INTO
+target, and end/invalid-key handlers from the AST node directly when it
+lowers the operation.
+@End Implementation
 
 Process called "translate_read_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate READ statement to HIR
@@ -1494,6 +1563,18 @@ Process called "translate_read_stmt" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+WRITE emits the current record contents to the file. COBOL distinguishes
+WRITE for sequential output from WRITE...AFTER ADVANCING for report writers;
+HIR captures both forms under the same typed marker so the back-end can
+inspect ADVANCING and FROM phrases on the original AST.
+@End Reasoning
+
+@Implementation:
+Builds Dict with _type="cobol_write"; payload (FROM record, ADVANCING
+clause, AT END-OF-PAGE handler) is read from the AST node by the back-end.
+@End Implementation
+
 Process called "translate_write_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate WRITE statement to HIR
 
@@ -1504,6 +1585,18 @@ Process called "translate_write_stmt" takes context as Integer, node as Integer 
     Return hir
 End Process
 
+@Reasoning:
+REWRITE replaces the last record read from a randomly-accessed file. It is
+semantically distinct from WRITE because the file must be OPEN I-O and the
+key must match; HIR keeps it as a separate marker so the back-end emits the
+correct runtime primitive (rewrite vs write).
+@End Reasoning
+
+@Implementation:
+Builds Dict with _type="cobol_rewrite"; the AST node retains FROM and
+INVALID KEY handler children for back-end consumption.
+@End Implementation
+
 Process called "translate_rewrite_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate REWRITE statement to HIR
 
@@ -1513,6 +1606,17 @@ Process called "translate_rewrite_stmt" takes context as Integer, node as Intege
 
     Return hir
 End Process
+
+@Reasoning:
+DELETE removes the last-read record from an indexed or relative file. Like
+REWRITE it requires OPEN I-O. Captured as a typed marker so the back-end
+can lower to the runtime's file_delete primitive distinct from WRITE/REWRITE.
+@End Reasoning
+
+@Implementation:
+Builds Dict with _type="cobol_delete"; INVALID KEY handler stays on the AST
+node and is consumed downstream.
+@End Implementation
 
 Process called "translate_delete_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate DELETE statement to HIR
@@ -1528,6 +1632,19 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Identifiers in COBOL reference data items declared in the DATA DIVISION
+(WORKING-STORAGE, LINKAGE, FILE). Qualifier suffixes ("OF / IN") and
+subscripts are handled separately; this proc emits the bare identifier node
+so the semantic layer can later attach the resolved declaration.
+@End Reasoning
+
+@Implementation:
+Reads the name slot from the AST node at offset 8 and stores it under "name"
+in a Dict typed "cobol_identifier". A missing name slot (raw 0) produces an
+unbound identifier node which the semantic layer flags later.
+@End Implementation
+
 Process called "translate_identifier" takes context as Integer, node as Integer returns Integer:
     Note: Translate identifier to HIR
 
@@ -1542,6 +1659,19 @@ Process called "translate_identifier" takes context as Integer, node as Integer 
 
     Return hir
 End Process
+
+@Reasoning:
+COBOL literals span numeric (1, 1.5, +1E2), alphanumeric ('text', "text"),
+figurative (ZERO/SPACES/HIGH-VALUES/etc), and Boolean (TRUE/FALSE in newer
+dialects). At this layer the parser has already classified them; HIR simply
+carries the raw literal text under "value" and leaves typing to semantic.
+@End Reasoning
+
+@Implementation:
+Reads the literal payload from offset 16 of the AST node (the parser stores
+the lexeme string there, not at offset 8 which is the literal kind tag) and
+stores it under "value" in a Dict typed "cobol_literal".
+@End Implementation
 
 Process called "translate_literal" takes context as Integer, node as Integer returns Integer:
     Note: Translate literal to HIR

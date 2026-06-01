@@ -19,6 +19,25 @@ Note: ===================================================================
 Note: SEMANTIC ANALYZER STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+Dockerfile semantic analysis tracks per-instruction state that matters
+across the build: base images (FROM directives, possibly multi-stage),
+named stages, exposed ports (EXPOSE), runtime ENV vars, declared VOLUMEs,
+WORKDIRs, USERs, LABELs, build ARGs, the current stage cursor, and a layer
+count for image-size warnings. Three parallel diagnostic streams keep
+security issues, optimization advice, and hard validation errors apart so
+the reporter can apply distinct severity rules.
+@End Reasoning
+
+@Implementation:
+17 x i64 record (136 bytes, offsets 0..128): each registry slot is a Dict
+(string-keyed lookups like environment_vars) or List (ordered streams like
+exposed_ports/security_issues). current_stage points to the active stage
+Dict during a walk; layer_count is bumped on every RUN/ADD/COPY/etc. The
+error_message + has_error pair behaves identically to the cmake/cpp
+analyzers (sticky first-error).
+@End Implementation
+
 Type called "DockerfileSemanticAnalyzer":
     base_images as Integer
     stages as Integer
@@ -747,6 +766,18 @@ Note: ===================================================================
 Note: ERROR HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Records the first fatal failure that aborts further analysis (e.g. impossible
+AST shape). Distinct from add_dockerfile_validation_error which collects
+recoverable issues; this one trips the sticky has_error flag.
+@End Reasoning
+
+@Implementation:
+Writes the error_message string handle into offset 120 and sets has_error=1
+at offset 128. Caller's StringCore is borrowed - the analyzer's destructor
+frees it.
+@End Implementation
+
 Process called "set_dockerfile_semantic_error" takes analyzer as Integer, error_message as Integer:
     Note: Set semantic analysis error
 
@@ -754,12 +785,35 @@ Process called "set_dockerfile_semantic_error" takes analyzer as Integer, error_
     proc memory_set_int64 from Layout with analyzer, 128, 1
 End Process
 
+@Reasoning:
+Validation errors accumulate without aborting analysis so the user gets the
+full set in one pass (missing FROM, bare ADD without --chown, etc.).
+Append-only ordering preserves source-document order in the report.
+@End Reasoning
+
+@Implementation:
+Reads validation_errors List from offset 104 and appends the error_message
+string handle. The analyzer's destructor walks the list and frees each
+string.
+@End Implementation
+
 Process called "add_dockerfile_validation_error" takes analyzer as Integer, error_message as Integer:
     Note: Add validation error to error list
 
     Let errors be proc memory_get_int64 from Layout with analyzer, 104
     proc add from List with errors, error_message
 End Process
+
+@Reasoning:
+Mirror of the error-add path for warning-level issues (e.g. apt-get without
+--no-install-recommends, root USER in production). Kept in a separate List
+so warning-only builds proceed and the reporter applies distinct formatting.
+@End Reasoning
+
+@Implementation:
+Reads validation_warnings List from offset 112 and appends the warning
+message string. Same ownership semantics as add_dockerfile_validation_error.
+@End Implementation
 
 Process called "add_dockerfile_validation_warning" takes analyzer as Integer, warning_message as Integer:
     Note: Add validation warning to warning list
@@ -771,6 +825,26 @@ End Process
 Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
+
+@Reasoning:
+One-shot facade used by the build driver: allocates analyzer + runs analysis
++ returns the populated analyzer for downstream consumption. Caller owns the
+returned analyzer and must free it via destroy_dockerfile_semantic_analyzer.
+@End Reasoning
+
+@Implementation:
+Calls create_dockerfile_semantic_analyzer; on OOM returns 0 (analyzer is the
+public artifact, so a null result means analysis could not even start).
+Otherwise runs analyze_dockerfile which walks the AST and populates every
+registry/diagnostic stream, then returns the analyzer.
+@End Implementation
+
+@Security_Scope:
+dockerfile_ast originates from user-supplied Dockerfiles which often contain
+URLs, secrets in ARG defaults, and shell commands. Analysis itself is read-
+only over the AST; the diagnostic stream may carry attacker-controlled
+strings which the reporter must escape before display.
+@End Security_Scope
 
 Process called "dockerfile_semantic_analyze" takes dockerfile_ast as Integer returns Integer:
     Note: Perform semantic analysis on Dockerfile AST
@@ -784,6 +858,18 @@ Process called "dockerfile_semantic_analyze" takes dockerfile_ast as Integer ret
     Return analyzer
 End Process
 
+@Reasoning:
+Public accessor for the validation_errors stream so the diagnostic emitter
+or IDE bridge can render the full error set without poking analyzer
+internals. Null analyzer returns 0 (treated as no-errors) so callers can
+chain accessors safely.
+@End Reasoning
+
+@Implementation:
+Reads offset 104 (validation_errors List). Borrowed pointer - analyzer
+retains ownership.
+@End Implementation
+
 Process called "dockerfile_semantic_get_errors" takes analyzer as Integer returns Integer:
     Note: Get validation errors from semantic analysis
 
@@ -793,6 +879,16 @@ Process called "dockerfile_semantic_get_errors" takes analyzer as Integer return
 
     Return proc memory_get_int64 from Layout with analyzer, 104
 End Process
+
+@Reasoning:
+Public accessor for warnings list. Separation from errors is preserved at
+the API surface so IDEs can group/filter independently and reporters can
+emit distinct exit codes.
+@End Reasoning
+
+@Implementation:
+Reads offset 112 (validation_warnings List). Borrowed pointer.
+@End Implementation
 
 Process called "dockerfile_semantic_get_warnings" takes analyzer as Integer returns Integer:
     Note: Get validation warnings from semantic analysis
@@ -804,6 +900,16 @@ Process called "dockerfile_semantic_get_warnings" takes analyzer as Integer retu
     Return proc memory_get_int64 from Layout with analyzer, 112
 End Process
 
+@Reasoning:
+Security findings (e.g. USER root, ADD instead of COPY with checksum, ENV
+secrets, --privileged hints) are collected on their own stream so security
+tooling can subscribe to them without parsing free-form warning text.
+@End Reasoning
+
+@Implementation:
+Reads offset 88 (security_issues List). Borrowed pointer.
+@End Implementation
+
 Process called "dockerfile_semantic_get_security_issues" takes analyzer as Integer returns Integer:
     Note: Get security issues found during analysis
 
@@ -814,6 +920,16 @@ Process called "dockerfile_semantic_get_security_issues" takes analyzer as Integ
     Return proc memory_get_int64 from Layout with analyzer, 88
 End Process
 
+@Reasoning:
+Layer-count and instruction-ordering advice (combine RUNs, place COPY late,
+multi-stage builds, etc.) lives on a dedicated optimization stream so users
+can opt into "size hints" without seeing them in a normal warning report.
+@End Reasoning
+
+@Implementation:
+Reads offset 96 (optimization_warnings List). Borrowed pointer.
+@End Implementation
+
 Process called "dockerfile_semantic_get_optimization_warnings" takes analyzer as Integer returns Integer:
     Note: Get optimization warnings from analysis
 
@@ -823,6 +939,18 @@ Process called "dockerfile_semantic_get_optimization_warnings" takes analyzer as
 
     Return proc memory_get_int64 from Layout with analyzer, 96
 End Process
+
+@Reasoning:
+Drivers need a single integer "did analysis pass" signal. Returns the actual
+error count rather than 0/1 so reporters can pretty-print "N errors". A
+null analyzer is treated as 1 error to keep the "analyzer-failed" path
+indistinguishable from "errors found" at the call site.
+@End Reasoning
+
+@Implementation:
+Null analyzer returns 1. Otherwise reads validation_errors at offset 104 and
+returns its List.size, which is 0 when analysis succeeded with no errors.
+@End Implementation
 
 Process called "dockerfile_semantic_has_errors" takes analyzer as Integer returns Integer:
     Note: Check if semantic analysis found any errors

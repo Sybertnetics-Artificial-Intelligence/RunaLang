@@ -34,6 +34,19 @@ Constant TOKEN_TEMPLATE as Integer is 20
 Constant TOKEN_NAMESPACE as Integer is 21
 Constant TOKEN_EOF as Integer is 0
 
+@Reasoning:
+C++ tokens carry a borrowed pointer + length into source rather than a
+defensively copied string. position is the byte offset where the token
+started (for diagnostics). No line/column slot because they're computed
+on demand by walking source[..position] when an error fires.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64) at offsets 0..24: token_type (TOKEN_*), value
+(byte pointer into source), value_length (count), position (byte offset
+of token start).
+@End Implementation
+
 Type called "CppToken":
     token_type as Integer
     value as Integer
@@ -41,12 +54,37 @@ Type called "CppToken":
     position as Integer
 End Type
 
+@Reasoning:
+Pre-pass lexer: tokenises ALL of source up-front into a List rather than
+streaming one token at a time. This is appropriate for C++ because the
+parser repeatedly backtracks (greatest-prefix template-id parsing) and
+re-lexing on every speculation would be wasteful.
+@End Reasoning
+
+@Implementation:
+32-byte record (4 x i64) at offsets 0..24: source (StringCore handle),
+source_length (cached byte count), position (current scan cursor),
+tokens (List of CppToken pointers, owned by the lexer and freed by
+destroy_lexer via destroy from List).
+@End Implementation
+
 Type called "CppLexer":
     source as Integer
     source_length as Integer
     position as Integer
     tokens as Integer
 End Type
+
+@Reasoning:
+Lexer factory: allocates the lexer record, caches source_length, and
+creates the empty tokens list.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes. Writes source at offset 0; computes and stores
+source_length at offset 8; zeroes position at offset 16; creates a List
+via List.create and stores at offset 24. Returns the lexer.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create new lexer for C++ source
@@ -61,6 +99,16 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Releases the token list and the lexer record. Source string is NOT
+owned by the lexer (caller passed it in) so it's not freed here.
+@End Reasoning
+
+@Implementation:
+Reads tokens at offset 24, destroys via List.destroy (which iterates and
+frees each token entry as well). Then deallocates the lexer record.
+@End Implementation
+
 Process called "destroy_lexer" takes lexer as Integer:
     Note: Free lexer and token list
 
@@ -68,6 +116,18 @@ Process called "destroy_lexer" takes lexer as Integer:
     proc destroy from List with tokens
     proc deallocate from Layout with lexer
 End Process
+
+@Reasoning:
+Drives the lexer pass from start to EOF. Each iteration skips whitespace
+and comments then calls next_token; non-EOF tokens are pushed onto the
+tokens list. EOF token (type 0) or null return ends the loop.
+@End Reasoning
+
+@Implementation:
+Infinite while loop: skip_whitespace then next_token; null or
+token_type==0 (EOF) breaks. Otherwise push the token onto tokens list
+via List.push.
+@End Implementation
 
 Process called "tokenize" takes lexer as Integer:
     Note: Main tokenization loop
@@ -86,6 +146,21 @@ Process called "tokenize" takes lexer as Integer:
         proc push from List with tokens, token
     End While
 End Process
+
+@Reasoning:
+Combined whitespace + comment skip. Handles four whitespace bytes and
+the two C++ comment forms (// line comment, /* block comment */) so the
+main lex loop sees only token-relevant bytes.
+@End Reasoning
+
+@Implementation:
+Reads position/source_length/source. Inner while loops on position. Each
+iteration: byte at position is checked against 32/9/10/13 (whitespace,
+advance). If '/' (47), peeks next: '/' (47) triggers skip_line_comment;
+'*' (42) triggers skip_block_comment; anything else writes position
+back to lexer and returns. Any non-whitespace, non-'/' byte also
+returns. Writes the updated position back at offset 16 on exit.
+@End Implementation
 
 Process called "skip_whitespace" takes lexer as Integer:
     Note: Skip whitespace and comments
@@ -142,6 +217,17 @@ Process called "skip_whitespace" takes lexer as Integer:
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
 
+@Reasoning:
+Drains a // line comment from current position to end-of-line. Consumes
+the newline so the next token starts on the next line.
+@End Reasoning
+
+@Implementation:
+Advances position by 2 (past "//"). Loops position until source_length:
+LF (10) increments past and breaks; any other byte just advances.
+Writes updated position to offset 16.
+@End Implementation
+
 Process called "skip_line_comment" takes lexer as Integer:
     Note: Skip // comment until end of line
 
@@ -160,6 +246,20 @@ Process called "skip_line_comment" takes lexer as Integer:
     End While
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
+
+@Reasoning:
+Drains a /* ... */ block comment. C++ does NOT allow nesting (matches
+the first '*/' regardless of intervening '/*'). On EOF without terminator
+silently exits to avoid hanging the lexer; the parser will produce errors
+downstream.
+@End Reasoning
+
+@Implementation:
+Advances position by 2 (past "/*"). Loops position < source_length - 1
+(need at least one byte to peek ahead): '*' followed by '/' advances
+position by 2 and breaks; otherwise advances by 1. Writes updated
+position to offset 16.
+@End Implementation
 
 Process called "skip_block_comment" takes lexer as Integer:
     Note: Skip /* comment */ block
@@ -182,6 +282,21 @@ Process called "skip_block_comment" takes lexer as Integer:
     End While
     proc memory_set_int64 from Layout with lexer, 16, position
 End Process
+
+@Reasoning:
+Single-byte dispatcher. C++ syntax has many leading-byte discriminators:
+'#' starts preprocessor, '"' starts string, '\'' starts char, digit
+starts number, alpha/underscore starts identifier (which may be a
+keyword), everything else is an operator/punctuator.
+@End Reasoning
+
+@Implementation:
+Reads position/source_length; if past EOF returns TOKEN_EOF (type 0).
+Reads byte at position. Dispatches: '#' (35) -> lex_preprocessor; '"'
+(34) -> lex_string; '\'' (39) -> lex_char; digit -> lex_number; alpha
+(via is_alpha) -> lex_identifier; otherwise -> lex_operator. Each
+sub-lexer is responsible for advancing position past its token.
+@End Implementation
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
@@ -232,6 +347,20 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return proc lex_operator from lexer
 End Process
 
+@Reasoning:
+Preprocessor directives are captured as a single token spanning the '#'
+through end-of-line. Line-continuation (backslash-newline) is honored
+because directives can span multiple lines via "\". The parser hands the
+directive to the preprocessor pipeline for full expansion.
+@End Reasoning
+
+@Implementation:
+Records start_pos. Walks position: LF (10) consumes and breaks; '\\'
+(92) followed by LF advances by 2 to continue on next line; bare '\\'
+just advances; everything else advances by 1. Emits TOKEN_PREPROCESSOR
+with the full slice from start_pos.
+@End Implementation
+
 Process called "lex_preprocessor" takes lexer as Integer returns Integer:
     Note: Lex preprocessor directive
 
@@ -269,6 +398,21 @@ Process called "lex_preprocessor" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_PREPROCESSOR, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+C++ string literals support backslash escape sequences. The token slice
+includes the opening and closing quotes; the parser strips them during
+literal evaluation. Raw strings (R"(...)) and wide strings (L"...",
+u"...", U"...") are not specially handled here - the parser detects
+them by inspecting the prefix.
+@End Reasoning
+
+@Implementation:
+Records start_pos including the opening '"'. Advances past it. Loops:
+'"' (34) consumes and breaks; '\\' (92) consumes both itself and the
+next byte (escape); other bytes advance by 1. Emits TOKEN_STRING with
+the slice including both quotes.
+@End Implementation
+
 Process called "lex_string" takes lexer as Integer returns Integer:
     Note: Lex string literal
 
@@ -296,6 +440,19 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_STRING, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+Character literals 'x' or '\n' etc. Same escape semantics as strings;
+treated separately because the parser distinguishes 'x' (CHAR type)
+from "x" (string).
+@End Reasoning
+
+@Implementation:
+Records start_pos. Advances past opening '\''. Loops: '\'' (39) consumes
+and breaks; '\\' (92) consumes both itself and the next byte (escape);
+other bytes advance by 1. Emits TOKEN_CHAR with the slice including
+both quotes.
+@End Implementation
+
 Process called "lex_char" takes lexer as Integer returns Integer:
     Note: Lex character literal
 
@@ -322,6 +479,23 @@ Process called "lex_char" takes lexer as Integer returns Integer:
     Let length be position minus start_pos
     Return proc create_token with TOKEN_CHAR, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+C++ numeric literals: decimal integer, hex (0x...), binary (0b...),
+octal (0...), decimal float (with optional exponent), and any of these
+with suffix (u, l, ll, f, etc.). The lexer captures the entire span as
+one TOKEN_NUMBER; the parser/back-end interprets the value.
+@End Reasoning
+
+@Implementation:
+Records start_pos. If first byte is '0' and second is 'x' (120),
+advances two bytes and loops is_hex_digit. If first is '0' and second
+is 'b' (98), advances two bytes and loops on '0'/'1' bytes. Otherwise
+loops digits, then handles optional '.' for float (more digits), then
+optional 'e'/'E' for exponent (optional sign, more digits). Type/length
+suffixes are also slurped if present. Emits TOKEN_NUMBER with the full
+slice.
+@End Implementation
 
 Process called "lex_number" takes lexer as Integer returns Integer:
     Note: Lex number (integer, float, hex, octal, binary)
@@ -418,6 +592,21 @@ Process called "lex_number" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_NUMBER, source plus start_pos, length, start_pos
 End Process
 
+@Reasoning:
+C++ identifiers are letter/underscore-start followed by alnum or
+underscore. After scanning, classify_keyword distinguishes keywords from
+identifiers. The lexer doesn't need to know which token type the keyword
+maps to - that's classify_keyword's job.
+@End Reasoning
+
+@Implementation:
+Records start_pos. Loops position: byte that is_alnum OR equal to '_'
+(95) advances; otherwise breaks. Computes length = position - start_pos.
+Calls classify_keyword(source+start_pos, length) which returns either
+the matching TOKEN_* keyword constant or TOKEN_IDENTIFIER. Emits token
+with the resolved type and the slice.
+@End Implementation
+
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Note: Lex identifier or keyword
 
@@ -444,6 +633,23 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let token_type be proc classify_keyword with source plus start_pos, length
     Return proc create_token with token_type, source plus start_pos, length, start_pos
 End Process
+
+@Reasoning:
+C++ has a long list of multi-byte operators: ::, ->, ->*, .*, ==, !=,
+<=, >=, &&, ||, <<, >>, <<=, >>=, +=, -=, *=, /=, %=, &=, |=, ^=, ++,
+--, ?, ..., etc. The lexer tries the LONGEST match first by checking
+two-byte combos before single-byte fallbacks; this ensures "->" doesn't
+get lexed as "-" then ">".
+@End Reasoning
+
+@Implementation:
+Reads current and next byte (when available). Two-byte combinations are
+matched first via nested If blocks (::, ->, ==, !=, <=, >=, &&, ||,
+<<, >>, ++, --, +=, -=, *=, /=, %=, &=, |=, ^=). Three-byte combos
+(<<=, >>=, ...) are handled in nested branches. Falls through to
+single-byte tokens for ( ) { } [ ] ; , . + - * / % & | ^ ~ ! < > = ?
+:. Unknown bytes return TOKEN_UNKNOWN.
+@End Implementation
 
 Process called "lex_operator" takes lexer as Integer returns Integer:
     Note: Lex operator or symbol
@@ -592,6 +798,25 @@ Process called "lex_operator" takes lexer as Integer returns Integer:
     proc memory_set_int64 from Layout with lexer, 16, position plus 1
     Return proc create_token with TOKEN_OPERATOR, source plus position, 1, position
 End Process
+
+@Reasoning:
+C++ has many keywords (~80 in C++20). Linear scan is grouped by lexeme
+length to fast-fail mismatches: a 3-byte lexeme is compared only against
+3-byte keywords ("int", "for", "new"), etc. This dramatically shrinks
+the comparison count per call.
+@End Reasoning
+
+@Implementation:
+Inspects length and dispatches to a length-specific block. Each block
+runs match_string against every C++ keyword of that length; first
+match returns TOKEN_KEYWORD (the type is generic - the parser sub-
+divides by lexeme content). No match returns TOKEN_IDENTIFIER.
+@End Implementation
+
+@Performance_Hints:
+O(K_L) where K_L is the number of keywords of length L (typically 2-10).
+Could be replaced by a perfect hash; not bottleneck per profiling.
+@End Performance_Hints
 
 Process called "classify_keyword" takes text as Integer, length as Integer returns Integer:
     Note: Classify identifier as C++ keyword or regular identifier
@@ -781,6 +1006,15 @@ Process called "classify_keyword" takes text as Integer, length as Integer retur
     Return TOKEN_IDENTIFIER
 End Process
 
+@Reasoning:
+Identifier-start classifier: C++ identifiers begin with letter or
+underscore. UCN escapes (\uXXXX) are not supported in this lexer.
+@End Reasoning
+
+@Implementation:
+'a'..'z' (97..122) or 'A'..'Z' (65..90) or '_' (95) -> 1; else 0.
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -800,6 +1034,14 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier composing is_alpha with digit check.
+@End Reasoning
+
+@Implementation:
+is_alpha -> 1, otherwise '0'..'9' (48..57) -> 1, else 0.
+@End Implementation
+
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -814,6 +1056,14 @@ Process called "is_alnum" takes char as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning:
+Hex classifier for 0x... literal scanning.
+@End Reasoning
+
+@Implementation:
+'0'..'9' (48..57) or 'a'..'f' (97..102) or 'A'..'F' (65..70) -> 1.
+@End Implementation
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
     Note: Check if character is hex digit
@@ -836,6 +1086,16 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Byte-by-byte string comparison used by classify_keyword. Caller has
+already verified the length matches.
+@End Reasoning
+
+@Implementation:
+Loops i 0..length comparing memory_get_byte(text, i) against
+memory_get_byte(target, i); any mismatch returns 0. Full match returns 1.
+@End Implementation
+
 Process called "match_string" takes text as Integer, target as String, length as Integer returns Integer:
     Note: Compare string with target
 
@@ -850,6 +1110,16 @@ Process called "match_string" takes text as Integer, target as String, length as
     End While
     Return 1
 End Process
+
+@Reasoning:
+Centralised token allocator: every lexer path produces tokens with the
+same layout.
+@End Reasoning
+
+@Implementation:
+Allocates 32 bytes. Writes token_type/value_ptr/value_length/position
+at offsets 0/8/16/24.
+@End Implementation
 
 Process called "create_token" takes token_type as Integer, value_ptr as Integer, value_length as Integer, position as Integer returns Integer:
     Note: Create new token

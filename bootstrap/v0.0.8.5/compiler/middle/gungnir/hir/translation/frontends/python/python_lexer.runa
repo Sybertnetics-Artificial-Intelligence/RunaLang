@@ -140,6 +140,15 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Python lexer state with two distinguishing features beyond a generic
+lexer: (1) an indent_stack tracking the current column-position of every
+open block plus a pending_dedents counter so handle_indentation can emit
+multiple DEDENT tokens before consuming the next character; and (2) an
+at_line_start flag and token_* slots holding the most recently emitted
+token's source position for use by the parser. The 13 int64 fields total
+104 bytes (LEXER_SIZE).
+@End Reasoning
 Type called "PythonLexer":
     source as Integer          Note: Source code string
     position as Integer        Note: Current position
@@ -163,6 +172,14 @@ Note: ==========================================================================
 Note: Lexer Creation and Destruction
 Note: ============================================================================
 
+@Reasoning:
+Allocates the 104-byte lexer struct plus a fixed-size indent_stack array
+(MAX_INDENT_LEVELS=100 entries of 8 bytes each). The base indentation
+level (0) is pushed onto the stack so the first real indent always
+produces an INDENT token rather than triggering an underflow.
+at_line_start starts true because position 0 of any source file is by
+definition at the start of a line.
+@End Reasoning
 Process called "create_python_lexer" takes source as Integer returns Integer:
     Note: Create Python lexer for given source code
 
@@ -209,6 +226,12 @@ Process called "create_python_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Frees the lexer struct AND the indent_stack array allocated during
+construction. Null-safe (returns 1 on null lexer) so error paths can
+call it unconditionally. The source buffer is caller-owned and not
+freed here.
+@End Reasoning
 Process called "destroy_python_lexer" takes lexer as Integer returns Integer:
     Note: Destroy Python lexer and free resources
 
@@ -231,6 +254,13 @@ Note: ==========================================================================
 Note: Character Navigation
 Note: ============================================================================
 
+@Reasoning:
+Mutating cursor advance. Increments position, refreshes current_char to
+the new byte (or 0 at EOF), and bumps the column counter. Notably does
+NOT update line tracking — line increments are handled at the
+TOKEN_NEWLINE emission site in next_token because Python treats LF as
+a syntactically significant token rather than ordinary whitespace.
+@End Reasoning
 Process called "advance" takes lexer as Integer returns Integer:
     Note: Advance to next character
 
@@ -256,6 +286,12 @@ Process called "advance" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Non-mutating lookahead. Used for multi-character operator detection
+(==, !=, <=, >=, **, //, +=, etc.) and triple-quoted-string detection
+("'''" vs single "'") where the lexer needs to peek two bytes ahead
+before committing to a tokenization path.
+@End Reasoning
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek at character offset positions ahead
 
@@ -273,6 +309,13 @@ Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+Skips spaces and tabs (mid-line whitespace), but NOT newlines. Python
+treats newlines as statement terminators and indentation as block
+structure, so both LF and leading whitespace at line-start are
+syntactically significant. This routine is only called mid-line, never
+after a newline.
+@End Reasoning
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace (but not newlines - they're significant in Python)
 
@@ -289,6 +332,12 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Consumes "#"-prefixed line comments up to (but not including) the next
+LF. The LF stays so next_token will emit TOKEN_NEWLINE — comments are
+otherwise transparent to Python's grammar but the line terminator that
+follows them must still be observed.
+@End Reasoning
 Process called "skip_comment" takes lexer as Integer returns Integer:
     Note: Skip comment until end of line
 
@@ -309,6 +358,12 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+ASCII digit predicate (0..9). Used by scan_integer and scan_float. Note
+Python supports more digit-character categories (Unicode Nd) in
+identifiers but not in numeric literals; this lexer is ASCII-only by
+design for consistency with the rest of the translator.
+@End Reasoning
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is a digit
 
@@ -321,6 +376,11 @@ Process called "is_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-start predicate: letter (A..Z, a..z) or underscore. Python
+identifiers cannot begin with a digit but may contain digits after the
+first character — the digit handling lives in is_alnum.
+@End Reasoning
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic or underscore
 
@@ -343,6 +403,11 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Letter-or-digit-or-underscore predicate. Used to determine identifier
+continuation in scan_identifier after the first character has been
+classified by is_alpha.
+@End Reasoning
 Process called "is_alnum" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric or underscore
 
@@ -359,6 +424,12 @@ Note: ==========================================================================
 Note: Keyword Recognition
 Note: ============================================================================
 
+@Reasoning:
+Byte-for-byte substring comparison: returns 1 when lexeme[0..length]
+equals keyword[0..keyword_len], 0 otherwise. Length is compared first
+as a fast-reject — keyword candidates with the wrong length skip the
+byte loop entirely.
+@End Reasoning
 Process called "check_keyword" takes lexeme as Integer, length as Integer, keyword as Integer, keyword_len as Integer returns Integer:
     Note: Check if lexeme matches keyword
 
@@ -382,6 +453,14 @@ Process called "check_keyword" takes lexeme as Integer, length as Integer, keywo
     Return 1
 End Process
 
+@Reasoning:
+Tests an identifier lexeme against the full Python keyword set
+(False, None, True, and/as/assert/async/await/break/class/continue/def/
+del/elif/else/except/finally/for/from/global/if/import/in/is/lambda/
+nonlocal/not/or/pass/raise/return/try/while/with/yield/match/case).
+Returns the matching TOKEN_* constant or TOKEN_IDENTIFIER (0) for
+user-defined names.
+@End Reasoning
 Process called "is_python_keyword" takes lexeme as Integer, length as Integer returns Integer:
     Note: Determine if identifier is a Python keyword
 
@@ -591,6 +670,12 @@ Note: ==========================================================================
 Note: Token Scanning - Numbers
 Note: ============================================================================
 
+@Reasoning:
+Scans Python integer literals including the prefixed forms: hex (0x..),
+octal (0o..), binary (0b..), plus optional digit-separating underscores
+("1_000_000"). Returns the captured digit-run including any prefix; the
+parser later interprets the prefix to determine the radix.
+@End Reasoning
 Process called "scan_integer" takes lexer as Integer returns Integer:
     Note: Scan integer literal (decimal, hex, octal, binary)
 
@@ -746,6 +831,12 @@ Process called "scan_integer" takes lexer as Integer returns Integer:
     Return TOKEN_INTEGER
 End Process
 
+@Reasoning:
+Python floating-point literal scanner. Handles digit-run + optional
+fractional ".digits" + optional "[eE][+-]?digits" exponent, plus the
+optional trailing 'j' for complex literals. Underscore digit separators
+are accepted (per PEP 515).
+@End Reasoning
 Process called "scan_float" takes lexer as Integer returns Integer:
     Note: Scan floating-point literal
 
@@ -831,6 +922,14 @@ Note: ==========================================================================
 Note: Token Scanning - Strings
 Note: ============================================================================
 
+@Reasoning:
+Python string literal scanner supporting both single ('...') and double
+("...") quotes, plus triple-quoted ('''...''' and """...""") multi-line
+strings. The quote parameter selects which quoting style is being
+scanned. Recognizes the standard Python escape sequences (\n \t \r \\
+\' \" \0 \x.. \u.... \U........ \N{name}) as well as raw-string and
+byte-string prefixes (r"..", b"..", f"..", and combinations).
+@End Reasoning
 Process called "scan_string" takes lexer as Integer, quote as Integer returns Integer:
     Note: Scan string literal (handles single, double, triple-quoted, raw, f-strings)
 
@@ -903,6 +1002,13 @@ Note: ==========================================================================
 Note: Token Scanning - Identifiers
 Note: ============================================================================
 
+@Reasoning:
+Captures a letter/underscore-starting identifier, then routes the
+substring through is_python_keyword to disambiguate keyword vs
+identifier. The token's lexeme always carries the source text; the
+token type tag indicates whether it is a generic identifier or a
+specific keyword.
+@End Reasoning
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Note: Scan identifier or keyword
 
@@ -1035,6 +1141,17 @@ Note: ==========================================================================
 Note: Main Token Scanner
 Note: ============================================================================
 
+@Reasoning:
+The main token-emit dispatch. Handles Python's three off-side rule
+concerns first: pending DEDENT tokens are drained before consuming any
+character; at line start, handle_indentation computes INDENT/DEDENT
+emissions based on the current leading-whitespace column vs the indent
+stack; only then is the next byte classified to dispatch into the
+appropriate scanner (digit -> scan_integer/scan_float; letter/
+underscore -> scan_identifier; quote -> scan_string; '#' ->
+skip_comment; newline -> TOKEN_NEWLINE; operator characters ->
+appropriate single-/multi-byte operator tokens).
+@End Reasoning
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from source
 
@@ -1381,6 +1498,12 @@ Process called "next_token" takes lexer as Integer returns Integer:
     Return TOKEN_ERROR
 End Process
 
+@Reasoning:
+Returns the type of the most recently emitted token without consuming
+a new one. Used by parser-driven lookahead when next_token has already
+been called once and the parser needs to inspect the result before
+committing to a grammar path.
+@End Reasoning
 Process called "peek_token_type" takes lexer as Integer returns Integer:
     Note: Peek at current token type without consuming it
 
@@ -1401,18 +1524,33 @@ Process called "peek_token_type" takes lexer as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Accessor for the most recent token's lexeme string. Returns the raw
+captured source text; the parser is responsible for any literal-value
+interpretation (e.g. string-escape decoding, numeric conversion).
+@End Reasoning
 Process called "get_token_lexeme" takes lexer as Integer returns Integer:
     Note: Get current token lexeme
 
     Return proc memory_get_int64 from Layout with lexer, 80
 End Process
 
+@Reasoning:
+Accessor for the most recent token's source line. Captured at the
+START of the token, not the position after it, so error diagnostics
+pin the user-visible token location accurately.
+@End Reasoning
 Process called "get_token_line" takes lexer as Integer returns Integer:
     Note: Get current token line number
 
     Return proc memory_get_int64 from Layout with lexer, 88
 End Process
 
+@Reasoning:
+Accessor for the most recent token's source column. Paired with
+get_token_line to form a complete source-coordinate. Like the line
+accessor, returns the column at the START of the token.
+@End Reasoning
 Process called "get_token_column" takes lexer as Integer returns Integer:
     Note: Get current token column number
 

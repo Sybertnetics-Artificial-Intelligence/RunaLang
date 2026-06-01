@@ -74,12 +74,26 @@ Note: ===================================================================
 Note: PARSER STATE
 Note: ===================================================================
 
+@Reasoning:
+Parser carries the upstream lexer and two slots of lookahead. LL(2) is
+necessary because several MATLAB constructs ('identifier (' vs 'identifier['
+function-call/indexing dispatch, transpose vs char-array literal
+disambiguation) require seeing the byte beyond the current token before
+committing to a parse path.
+@End Reasoning
 Type called "MATLABParser":
     lexer as Integer
     current_token as Integer
     peek_token as Integer
 End Type
 
+@Reasoning:
+Generic four-field AST node — type tag (NODE_* constants from this file),
+payload value (string for identifiers/literals, integer for operator codes),
+ordered child list, and a metadata list used by specific node kinds for
+function signatures (inputs/outputs separation), classdef inheritance lists,
+and other auxiliary data that does not fit cleanly into children.
+@End Reasoning
 Type called "ASTNode":
     node_type as Integer
     value as Integer
@@ -91,6 +105,12 @@ Note: ===================================================================
 Note: PARSER INITIALIZATION
 Note: ===================================================================
 
+@Reasoning:
+Primes both lookahead slots by pulling two tokens from the lexer at
+construction. After this returns, current_token is the first source token
+and peek_token is the second; both LL(2) decisions in the parser can fire
+from the first call.
+@End Reasoning
 Process called "matlab_parser_create" takes lexer as Integer returns Integer:
     Let parser be a value of type MATLABParser with
         lexer as lexer,
@@ -104,6 +124,12 @@ Process called "matlab_parser_create" takes lexer as Integer returns Integer:
     Return parser
 End Process
 
+@Reasoning:
+AST node factory. Initializes value to empty string (the default payload),
+and pre-allocates empty children and metadata lists so callers can append
+without nullness checks. Every node-emitting helper goes through this so
+the layout is consistent.
+@End Reasoning
 Process called "create_ast_node" takes node_type as Integer returns ASTNode:
     Let node be a value of type ASTNode with
         node_type as node_type,
@@ -114,30 +140,62 @@ Process called "create_ast_node" takes node_type as Integer returns ASTNode:
     Return node
 End Process
 
+@Reasoning:
+Mutator for the AST node's value payload. Used after create_ast_node when
+the node's type-tag-specific payload is determined (e.g. identifier name,
+literal text, operator code).
+@End Reasoning
 Process called "ast_set_value" takes node as ASTNode, value as Integer:
     Set node.value to value
 End Process
 
+@Reasoning:
+Appends a child to a node's ordered children list. Order matters because
+many AST consumers rely on positional meaning (e.g. an If node's first
+child is the condition, the second is the then-block).
+@End Reasoning
 Process called "ast_add_child" takes node as ASTNode, child as Integer:
     proc list_append from ListCore with node.children, child
 End Process
 
+@Reasoning:
+Accessor for the node type tag. Encapsulates field layout so consumers do
+not depend on the struct offset.
+@End Reasoning
 Process called "ast_node_type" takes node as ASTNode returns Integer:
     Return node.node_type
 End Process
 
+@Reasoning:
+Accessor for the node payload value. Type interpretation (string vs integer
+operator code) is the consumer's responsibility based on node_type.
+@End Reasoning
 Process called "ast_node_value" takes node as ASTNode returns Integer:
     Return node.value
 End Process
 
+@Reasoning:
+Returns the children-list pointer directly. Consumers that want random
+access or iteration can read the list with ListCore primitives instead of
+going through ast_node_child for every index.
+@End Reasoning
 Process called "ast_node_children" takes node as ASTNode returns Integer:
     Return node.children
 End Process
 
+@Reasoning:
+Returns the count of children for the node. Used by traversal code to bound
+the iteration index.
+@End Reasoning
 Process called "ast_node_child_count" takes node as ASTNode returns Integer:
     Return proc list_length from ListCore with node.children
 End Process
 
+@Reasoning:
+Indexed child access. Out-of-range index is a caller error; consumers
+expecting a specific positional child (e.g. If condition at index 0) rely
+on having validated the child count first.
+@End Reasoning
 Process called "ast_node_child" takes node as ASTNode, index as Integer returns Integer:
     Return proc list_get from ListCore with node.children, index
 End Process
@@ -146,15 +204,29 @@ Note: ===================================================================
 Note: TOKEN HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Shifts the two lookahead slots one position forward: current <- peek, peek
+<- lexer.next. Preserves the LL(2) invariant after every consumption.
+@End Reasoning
 Process called "advance" takes parser as Integer:
     Set parser.current_token to parser.peek_token
     Set parser.peek_token to proc matlab_lexer_next_token from Lexer with parser.lexer
 End Process
 
+@Reasoning:
+Convenience getter for the current token's type tag — most parser predicates
+need only the type, not the value or position.
+@End Reasoning
 Process called "current_type" takes parser as Integer returns Integer:
     Return proc matlab_token_type from Lexer with parser.current_token
 End Process
 
+@Reasoning:
+Asserts the current token is the expected type, consumes it, and returns
+the token. Returns 0 on mismatch — callers treat 0 as a parse error and
+typically synthesize an error AST node. No exception/throw semantics; the
+zero-return is the only error channel.
+@End Reasoning
 Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -168,6 +240,11 @@ Process called "expect" takes parser as Integer, expected_type as Integer return
     Return 0
 End Process
 
+@Reasoning:
+Non-consuming type predicate returning 1/0. Used by parse_postfix to peek
+for '(' / '[' / '{' / '.' / "'" / ".'" before deciding which postfix form
+(call, indexing, field access, transpose) to dispatch.
+@End Reasoning
 Process called "match" takes parser as Integer, token_type as Integer returns Integer:
     Let current be proc current_type from parser
     If current is equal to token_type:
@@ -176,6 +253,12 @@ Process called "match" takes parser as Integer, token_type as Integer returns In
     Return 0
 End Process
 
+@Reasoning:
+Consumes any run of NEWLINE tokens at the current position. MATLAB uses
+newlines as statement separators (along with semicolons and commas in some
+contexts) so block-level loops call skip_newlines before each statement to
+tolerate blank lines without trying to parse them.
+@End Reasoning
 Process called "skip_newlines" takes parser as Integer:
     While 1 is equal to 1:
         Let token_type be proc current_type from parser
@@ -191,6 +274,14 @@ Note: ===================================================================
 Note: PROGRAM PARSING
 Note: ===================================================================
 
+@Reasoning:
+Top-level entry. MATLAB source files come in three shapes: function files
+(begin with "function"), class files (begin with "classdef"), and script
+files (anything else). This routine sniffs the first non-newline token to
+dispatch — function files may contain multiple top-level function
+declarations and are looped; class and script files have exactly one
+top-level unit.
+@End Reasoning
 Process called "parse_program" takes parser as Integer returns Integer:
     Let program be proc create_ast_node from MATLAB_PROGRAM
 
@@ -230,6 +321,15 @@ Note: ===================================================================
 Note: FUNCTION PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses one full MATLAB function: "function [outs] = name(ins) ... end".
+Output-parameter parsing handles three forms — bracketed multi-output
+"[a,b] = foo()", single output "y = foo()", and no-output "foo()" — by
+looking at the post-'function' tokens. When a single identifier is followed
+by '=' it is treated as an output; otherwise it is the function name. Input
+parameters in (...) follow, then the body is parsed via
+parse_statement_list_until_end which consumes through the matching "end".
+@End Reasoning
 Process called "parse_function" takes parser as Integer returns Integer:
     Let func be proc create_ast_node from MATLAB_FUNCTION
 
@@ -375,6 +475,12 @@ Note: ===================================================================
 Note: CLASS PARSING
 Note: ===================================================================
 
+@Reasoning:
+Parses "classdef Name < Base ... end" headers, captures the optional single-
+base-class via "<", and then iterates over the class body blocks
+(properties / methods / events / enumeration), dispatching each into its
+own parser. Terminates on the matching "end".
+@End Reasoning
 Process called "parse_classdef" takes parser as Integer returns Integer:
     Let class_def be proc create_ast_node from MATLAB_CLASSDEF
 
@@ -442,6 +548,12 @@ Process called "parse_classdef" takes parser as Integer returns Integer:
     Return class_def
 End Process
 
+@Reasoning:
+Parses a "properties ... end" block inside a classdef. Each property is
+emitted as an MATLAB_IDENTIFIER child; attribute brackets and type/default
+specifications are intentionally not parsed here — they would require a
+broader expression parser inside the property scope.
+@End Reasoning
 Process called "parse_properties" takes parser as Integer returns Integer:
     Let props be proc create_ast_node from MATLAB_PROPERTIES
 
@@ -473,6 +585,12 @@ Process called "parse_properties" takes parser as Integer returns Integer:
     Return props
 End Process
 
+@Reasoning:
+Parses a "methods ... end" block. Each method definition is parsed via the
+same parse_function used at top level — methods are syntactically identical
+to free functions; their classdef containment is captured at the AST
+parent level.
+@End Reasoning
 Process called "parse_methods" takes parser as Integer returns Integer:
     Let methods be proc create_ast_node from MATLAB_METHODS
 
@@ -501,6 +619,11 @@ Process called "parse_methods" takes parser as Integer returns Integer:
     Return methods
 End Process
 
+@Reasoning:
+Parses an "events ... end" block — MATLAB's class event-declaration syntax.
+Each event becomes an IDENTIFIER child; semantic information about event
+attributes is left for a future pass.
+@End Reasoning
 Process called "parse_events" takes parser as Integer returns Integer:
     Let events be proc create_ast_node from MATLAB_EVENTS
 
@@ -532,6 +655,12 @@ Process called "parse_events" takes parser as Integer returns Integer:
     Return events
 End Process
 
+@Reasoning:
+Parses an "enumeration ... end" block (MATLAB class enumeration). Each
+enumerator becomes an IDENTIFIER child. The optional underlying-value
+expression after an enumerator name is not parsed here for the same scope-
+limit reason as parse_properties.
+@End Reasoning
 Process called "parse_enumeration" takes parser as Integer returns Integer:
     Let enums be proc create_ast_node from MATLAB_ENUMERATION
 
@@ -567,6 +696,12 @@ Note: ===================================================================
 Note: STATEMENT PARSING
 Note: ===================================================================
 
+@Reasoning:
+Drives statement-by-statement parsing until EOF. Adds each successfully
+parsed statement to the container's children. Used by the top-level script
+parser; the function-body variant uses parse_statement_list_until_end which
+stops at "end" instead.
+@End Reasoning
 Process called "parse_statement_list" takes parser as Integer, container as Integer:
     While 1 is equal to 1:
         Let token_type be proc current_type from parser
@@ -589,6 +724,13 @@ Process called "parse_statement_list" takes parser as Integer, container as Inte
     End While
 End Process
 
+@Reasoning:
+Variant of parse_statement_list that stops on the "end" keyword (not EOF).
+Used to parse function bodies and any control-flow block body that
+terminates at the matching "end". The terminating "end" is NOT consumed
+here — the caller (parse_function, parse_if_statement, etc.) consumes it
+explicitly so it can detect missing closers.
+@End Reasoning
 Process called "parse_statement_list_until_end" takes parser as Integer, container as Integer:
     While 1 is equal to 1:
         Let token_type be proc current_type from parser
@@ -611,6 +753,14 @@ Process called "parse_statement_list_until_end" takes parser as Integer, contain
     End While
 End Process
 
+@Reasoning:
+Statement-level dispatch. Recognizes control-flow openers (if/for/parfor/
+spmd/while/switch/try) and routes to their dedicated parsers; jump
+statements (return/break/continue) emit zero-child marker nodes since they
+need no payload; global/persistent declarations route to specialized
+parsers; anything else falls through to parse_assignment_or_expr_statement
+which handles both assignments (LHS = RHS) and bare expression statements.
+@End Reasoning
 Process called "parse_statement" takes parser as Integer returns Integer:
     proc skip_newlines from parser
 
@@ -674,6 +824,13 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return proc parse_assignment_or_expr_statement from parser
 End Process
 
+@Reasoning:
+Parses "if cond then-block (elseif cond then-block)* (else else-block)? end".
+elseif chains are flattened into the same IF_STMT node by repeatedly
+appending (condition, then-block) child pairs — the final else-block (if
+any) is the last odd-indexed child. This flat representation matches MATLAB
+semantics where elseif is just a chained alternative rather than nesting.
+@End Reasoning
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Let if_stmt be proc create_ast_node from MATLAB_IF_STMT
 
@@ -735,6 +892,13 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_stmt
 End Process
 
+@Reasoning:
+Handles both "for var = expr ... end" and "parfor var = expr ... end". The
+parfor variant is captured by appending a sentinel IDENTIFIER child with
+value "parfor" so downstream consumers can detect parallel-loop semantics
+without a separate node type. AST shape: (loop_var, iter_expr, body,
+"parfor"-marker?).
+@End Reasoning
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     Let for_stmt be proc create_ast_node from MATLAB_FOR_STMT
 
@@ -784,6 +948,11 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return for_stmt
 End Process
 
+@Reasoning:
+Parses "spmd ... end" — MATLAB's Single-Program-Multiple-Data parallel
+block. The body is just a statement list; the parallel-execution semantics
+are signaled by the MATLAB_SPMD_STMT node type to downstream consumers.
+@End Reasoning
 Process called "parse_spmd_statement" takes parser as Integer returns Integer:
     Let spmd_stmt be proc create_ast_node from MATLAB_SPMD_STMT
 
@@ -799,6 +968,11 @@ Process called "parse_spmd_statement" takes parser as Integer returns Integer:
     Return spmd_stmt
 End Process
 
+@Reasoning:
+Parses "while cond ... end". The AST shape is (condition_expr, body) — a
+two-child structure simpler than parse_if_statement because while has no
+elseif/else alternative.
+@End Reasoning
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Let while_stmt be proc create_ast_node from MATLAB_WHILE_STMT
 
@@ -820,6 +994,13 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     Return while_stmt
 End Process
 
+@Reasoning:
+Parses "switch expr (case val ... )* (otherwise ...)? end". AST shape is
+(switch_expr, case_val_1, case_body_1, case_val_2, case_body_2, ...,
+otherwise_body?). Cases alternate value/body pairs; the trailing optional
+otherwise body is the last child when present (consumers detect it by
+checking the child count for an odd-trailer beyond the matched pairs).
+@End Reasoning
 Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Let switch_stmt be proc create_ast_node from MATLAB_SWITCH_STMT
 
@@ -900,6 +1081,12 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Return switch_stmt
 End Process
 
+@Reasoning:
+Parses "try ... catch (var)? ... end". AST shape is (try_block,
+exception_var?, catch_block). The exception variable is optional in
+MATLAB; when present it captures the MException object for use inside the
+catch body.
+@End Reasoning
 Process called "parse_try_statement" takes parser as Integer returns Integer:
     Let try_stmt be proc create_ast_node from MATLAB_TRY_STMT
 
@@ -952,6 +1139,12 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
     Return try_stmt
 End Process
 
+@Reasoning:
+Parses "global var1 var2 ..." which declares the listed names as
+references to MATLAB's global workspace. Children are IDENTIFIER nodes for
+each declared name. The corresponding parse_persistent_statement handles
+the lexically-similar "persistent" keyword.
+@End Reasoning
 Process called "parse_global_statement" takes parser as Integer returns Integer:
     Let global_stmt be proc create_ast_node from MATLAB_GLOBAL_STMT
 
@@ -978,6 +1171,12 @@ Process called "parse_global_statement" takes parser as Integer returns Integer:
     Return global_stmt
 End Process
 
+@Reasoning:
+Parses "persistent var1 var2 ..." which declares the listed names as
+function-local but retained-across-calls variables. Structurally identical
+to parse_global_statement; the distinct node type lets downstream code
+choose the right storage class.
+@End Reasoning
 Process called "parse_persistent_statement" takes parser as Integer returns Integer:
     Let persistent_stmt be proc create_ast_node from MATLAB_PERSISTENT_STMT
 
@@ -1004,6 +1203,12 @@ Process called "parse_persistent_statement" takes parser as Integer returns Inte
     Return persistent_stmt
 End Process
 
+@Reasoning:
+Parses LHS then peeks at the next token: if '=', treats the LHS as the
+target and continues with the RHS to form ASSIGN_STMT; otherwise, wraps
+the expression in EXPR_STMT. MATLAB does not have augmented assignment
+operators so a single '=' check is sufficient.
+@End Reasoning
 Process called "parse_assignment_or_expr_statement" takes parser as Integer returns Integer:
     Note: Try to parse as assignment, fall back to expression statement
     Let expr be proc parse_expression from parser
@@ -1035,10 +1240,22 @@ Note: ===================================================================
 Note: EXPRESSION PARSING (with operator precedence)
 Note: ===================================================================
 
+@Reasoning:
+Expression entry point. Dispatches to parse_logical_or, the lowest-
+precedence level. The full precedence chain is:
+  logical_or -> logical_and -> comparison -> colon -> additive
+  -> multiplicative -> power -> unary -> postfix -> primary.
+@End Reasoning
 Process called "parse_expression" takes parser as Integer returns Integer:
     Return proc parse_logical_or from parser
 End Process
 
+@Reasoning:
+Lowest-precedence binary level — left-associative '|' (element-wise OR) and
+'||' (short-circuit OR). Distinguishing the two at AST construction time
+preserves the user's semantic intent for codegen (short-circuit must not
+evaluate the RHS when the LHS is true).
+@End Reasoning
 Process called "parse_logical_or" takes parser as Integer returns Integer:
     Let left be proc parse_logical_and from parser
 
@@ -1075,6 +1292,11 @@ Process called "parse_logical_or" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Left-associative '&' (element-wise AND) and '&&' (short-circuit AND),
+binding tighter than '|' / '||' to match MATLAB's documented precedence.
+Same dual-form preservation rationale as parse_logical_or.
+@End Reasoning
 Process called "parse_logical_and" takes parser as Integer returns Integer:
     Let left be proc parse_comparison from parser
 
@@ -1111,6 +1333,11 @@ Process called "parse_logical_and" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Recognizes the six MATLAB comparison operators (==, ~=, <, <=, >, >=) all
+at the same precedence level, left-associative. The op_str dispatch
+collapses six independent token-type tests into one shared emit block.
+@End Reasoning
 Process called "parse_comparison" takes parser as Integer returns Integer:
     Let left be proc parse_colon from parser
 
@@ -1156,6 +1383,13 @@ Process called "parse_comparison" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Range operator parser. MATLAB's ":" forms a range with either two arms
+(start:end) or three arms (start:step:end). The COLON_EXPR node carries
+2 or 3 children depending on which form was matched. Right after a
+comparison level, before additive, because in "1:n+1" the '+' must bind
+tighter than ':' to give "1:(n+1)" rather than "(1:n)+1".
+@End Reasoning
 Process called "parse_colon" takes parser as Integer returns Integer:
     Note: Handle colon operator (range)
     Let left be proc parse_additive from parser
@@ -1195,6 +1429,11 @@ Process called "parse_colon" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Left-associative '+' and '-'. Below colon precedence so "a:b+c" parses as
+"a:(b+c)". Both ops route through a shared BINARY_EXPR emit with op_str
+distinguishing them.
+@End Reasoning
 Process called "parse_additive" takes parser as Integer returns Integer:
     Let left be proc parse_multiplicative from parser
 
@@ -1228,6 +1467,13 @@ Process called "parse_additive" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Left-associative multiplicative operators: '*' (matrix multiply), '/'
+(right divide), '\' (left divide), '.*' (element-wise multiply), './'
+(element-wise right divide), '.\' (element-wise left divide). MATLAB
+distinguishes matrix vs element-wise versions at the syntax level and the
+node values preserve that distinction for codegen.
+@End Reasoning
 Process called "parse_multiplicative" takes parser as Integer returns Integer:
     Let left be proc parse_power from parser
 
@@ -1273,6 +1519,13 @@ Process called "parse_multiplicative" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+'^' (matrix power) and '.^' (element-wise power), left-associative. Higher
+precedence than multiplicative ops so "2*a^3" parses as "2*(a^3)". Note
+MATLAB documents power as left-associative even though most languages make
+it right-associative; matching MATLAB's spec exactly is required for
+behavioral equivalence after translation.
+@End Reasoning
 Process called "parse_power" takes parser as Integer returns Integer:
     Let left be proc parse_unary from parser
 
@@ -1306,6 +1559,12 @@ Process called "parse_power" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Recursive-descent for unary prefix ops: unary '+' (identity, kept to
+preserve source intent), unary '-' (negation), and '~' (logical NOT).
+Recursion onto parse_unary lets a chain like "-~~x" parse correctly. If
+none match, falls through to parse_postfix.
+@End Reasoning
 Process called "parse_unary" takes parser as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -1346,6 +1605,17 @@ Process called "parse_unary" takes parser as Integer returns Integer:
     Return proc parse_postfix from parser
 End Process
 
+@Reasoning:
+Handles all left-bind postfix operations after a primary expression:
+- "'" matrix transpose (TRANSPOSE_EXPR with value "'")
+- ".'" element-wise transpose (TRANSPOSE_EXPR with value ".'")
+- ".field" static field access (FIELD_EXPR with two children)
+- ".(expr)" dynamic field access (DYNAMIC_FIELD_EXPR)
+- "(args)" function call or array indexing (CALL_EXPR)
+- "{args}" cell indexing (INDEX_EXPR)
+Chains naturally because each branch reassigns 'expr' to the new wrapped
+node, so "obj.field(0)" becomes CALL(FIELD(obj, field), 0).
+@End Reasoning
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Let expr be proc parse_primary from parser
 
@@ -1419,6 +1689,16 @@ Process called "parse_postfix" takes parser as Integer returns Integer:
     Return expr
 End Process
 
+@Reasoning:
+Shared parser for the parenthesized/braced argument list after a base
+expression. is_cell=1 means '{...}' cell indexing producing INDEX_EXPR;
+is_cell=0 means '(...)' which is ambiguous between function call and array
+indexing in MATLAB — both forms parse identically syntactically and the
+ambiguity is resolved at semantic-analysis time based on whether the base
+expression names a function or an array. The bare ':' inside indices is
+captured as a COLON_EXPR child sentinel (meaning "all elements along this
+dimension").
+@End Reasoning
 Process called "parse_call_or_index" takes parser as Integer, base_expr as Integer, is_cell as Integer returns Integer:
     Note: Parse function call or array/cell indexing
     Let result be proc create_ast_node from MATLAB_CALL_EXPR of type ASTNode
@@ -1494,6 +1774,14 @@ Process called "parse_call_or_index" takes parser as Integer, base_expr as Integ
     Return result
 End Process
 
+@Reasoning:
+Leaf of the precedence hierarchy. Recognizes numeric/string/char literals,
+identifiers, the magic constants (true/false/pi/Inf/NaN normalized to
+NUMBER_LITERAL nodes), the four bracketed/handle openers (matrix '[',
+cell '{', function-handle '@', parenthesized expression '('), and falls
+back to an empty IDENTIFIER node for any unknown opener so the parser
+makes forward progress instead of looping on bad input.
+@End Reasoning
 Process called "parse_primary" takes parser as Integer returns Integer:
     Let token_type be proc current_type from parser
 
@@ -1597,6 +1885,13 @@ Process called "parse_primary" takes parser as Integer returns Integer:
     Return proc create_ast_node from MATLAB_IDENTIFIER
 End Process
 
+@Reasoning:
+Parses bracketed matrix literals "[a, b; c, d]". Rows are separated by ';'
+or newline; within a row, elements are separated by ',' or whitespace. The
+result is a MATRIX_EXPR with row-MATRIX_EXPR children, each containing the
+row's element expressions. A current_row accumulator flushes into a new row
+node whenever a row separator appears.
+@End Reasoning
 Process called "parse_matrix_literal" takes parser as Integer returns Integer:
     Let matrix be proc create_ast_node from MATLAB_MATRIX_EXPR
 
@@ -1675,6 +1970,14 @@ Process called "parse_matrix_literal" takes parser as Integer returns Integer:
     Return matrix
 End Process
 
+@Reasoning:
+Parses "{a, b; c, d}" cell array literals. Unlike parse_matrix_literal,
+this implementation does not build per-row child nodes — all elements are
+appended directly to the CELL_EXPR as a flat list (semicolons are accepted
+and consumed but produce no structural marker, which is a deliberate
+simplification because cell arrays are far less shape-sensitive than
+numeric matrices at the codegen level).
+@End Reasoning
 Process called "parse_cell_literal" takes parser as Integer returns Integer:
     Let cell be proc create_ast_node from MATLAB_CELL_EXPR
 
@@ -1710,6 +2013,13 @@ Process called "parse_cell_literal" takes parser as Integer returns Integer:
     Return cell
 End Process
 
+@Reasoning:
+Parses MATLAB's two "@" forms after the '@' has already been seen by the
+caller dispatch: "@name" produces FUNC_HANDLE_EXPR with the function name
+as the value, and "@(params) body" produces LAMBDA_EXPR with two children
+(parameter list, body expression). The lambda body is exactly one
+expression — MATLAB anonymous functions are single-expression by design.
+@End Reasoning
 Process called "parse_function_handle" takes parser as Integer returns Integer:
     proc expect with parser, Lexer.TOKEN_AT
 

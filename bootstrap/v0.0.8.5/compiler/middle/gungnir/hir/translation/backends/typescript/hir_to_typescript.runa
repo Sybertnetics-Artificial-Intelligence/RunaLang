@@ -52,10 +52,33 @@ Note: ==========================================================================
 Note: Generation Context Structure
 Note: ============================================================================
 
+@Reasoning:
+TypeScript code generation needs only an emitter handle and a depth
+cursor to emit pretty-printed output. The minimal context keeps the
+allocation cheap.
+@End Reasoning
+
+@Implementation:
+Two int64 fields, 16 bytes total. emitter owns the heap-allocated
+TypeScript byte buffer; indent_level tracks nesting depth used by the
+brace-and-newline statement emitters.
+@End Implementation
+
 Type called "TypeScriptGenerationContext":
     emitter as Integer          Note: TypeScript emitter instance
     indent_level as Integer     Note: Current indentation level
 End Type
+
+@Reasoning:
+Wires the emitter and starting indent so the caller does not have to.
+Failing emitter construction rolls back the context allocation so the
+caller sees a clean zero-handle.
+@End Reasoning
+
+@Implementation:
+Allocates 16 bytes for the context, constructs a typescript emitter,
+writes the emitter handle at offset 0 and indent_level=0 at offset 8.
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create TypeScript generation context
@@ -80,6 +103,16 @@ Process called "create_generation_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+Releases the owned TypeScript emitter before freeing the context block.
+Null-tolerant so callers can invoke unconditionally on cleanup paths.
+@End Reasoning
+
+@Implementation:
+Reads the emitter pointer at offset 0, calls destroy_typescript_emitter
+when non-zero, then deallocates the context block.
+@End Implementation
+
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy TypeScript generation context
 
@@ -101,6 +134,18 @@ End Process
 Note: ============================================================================
 Note: Helper Functions
 Note: ============================================================================
+
+@Reasoning:
+The TypeScript backend reads HIR attributes through a simple two-slot
+dictionary representation (single entry held at offset 8). Inlining the
+lookup avoids pulling in a heavier Dict module.
+@End Reasoning
+
+@Implementation:
+Returns 0 for null dict. Otherwise reads the entry slot at offset 8;
+compares the entry's key (offset 0) against the supplied key via
+strings_equal; on match returns the value at offset 8 of the entry.
+@End Implementation
 
 Process called "get_dict_string_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary structure
@@ -126,6 +171,18 @@ Process called "get_dict_string_value" takes dict as Integer, key as Integer ret
     Return 0
 End Process
 
+@Reasoning:
+Companion accessor when the caller wants to interpret the slot as an HIR
+node pointer rather than a string. The backend's flat layout makes the
+two indistinguishable at the byte level.
+@End Reasoning
+
+@Implementation:
+Delegates to get_dict_string_value because the underlying memory access
+pattern is identical; the distinction is only at the call-site type
+intent.
+@End Implementation
+
 Process called "get_dict_hir_value" takes dict as Integer, key as Integer returns Integer:
     Note: Get HIR value from dictionary structure
 
@@ -135,6 +192,21 @@ End Process
 Note: ============================================================================
 Note: Type Generation
 Note: ============================================================================
+
+@Reasoning:
+TypeScript has a rich type system - primitives, generics, unions,
+intersections, arrays, tuples, function types - each with its own
+syntax. Concentrating dispatch here keeps the broader generators free
+of type-shape conditionals.
+@End Reasoning
+
+@Implementation:
+Reads the "kind" key off the HIR type node. Missing kind means a simple
+"type_name" reference. Otherwise dispatches on kind via strings_equal:
+generic_type emits "Name<args>", union emits "A | B | ...", intersection
+emits "A & B", array emits "T[]", tuple emits "[T1, T2]", function emits
+"(params) => return", and so on.
+@End Implementation
 
 Process called "generate_type_annotation" takes context as Integer, type_hir as Integer returns Integer:
     Note: Generate TypeScript type annotation
@@ -241,6 +313,18 @@ Process called "generate_type_annotation" takes context as Integer, type_hir as 
     Return 1
 End Process
 
+@Reasoning:
+Generic type parameters appear on declarations as "<T, U extends Base, V
+= Default>"; the per-parameter optional clauses (extends, default)
+require a dedicated walker.
+@End Reasoning
+
+@Implementation:
+Emits "<", iterates the parameter list, for each entry emits the
+parameter name, optional " extends <constraint>", optional " = <default>",
+and ", " separators between entries. Closes with ">".
+@End Implementation
+
 Process called "generate_type_parameters" takes context as Integer, params_hir as Integer returns Integer:
     Note: Generate generic type parameters <T, U extends Base>
 
@@ -288,6 +372,19 @@ End Process
 Note: ============================================================================
 Note: Declaration Generation
 Note: ============================================================================
+
+@Reasoning:
+TypeScript interfaces declare a structural type with named members.
+Each interface can extend other interfaces and may declare generic type
+parameters, so this emitter handles the full canonical form.
+@End Reasoning
+
+@Implementation:
+Reads name, type_parameters, extends_list, and members. Emits
+"interface Name", optional generic params via generate_type_parameters,
+optional " extends X, Y", " {\n", each member through
+generate_interface_property or generate_interface_method, then "}\n".
+@End Implementation
 
 Process called "generate_interface_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate TypeScript interface declaration
@@ -344,6 +441,18 @@ Process called "generate_interface_declaration" takes context as Integer, hir as
     Return 1
 End Process
 
+@Reasoning:
+Interface properties are written as "name: Type" or "name?: Type" for
+optional members and "readonly name: Type" for read-only members.
+Trailing ";" terminates each declaration.
+@End Reasoning
+
+@Implementation:
+Reads name, type, optional and readonly flags. Emits indent, optional
+"readonly ", the name, optional "?", ": ", then dispatches the type
+through generate_type_annotation, and closes with ";\n".
+@End Implementation
+
 Process called "generate_interface_property" takes context as Integer, hir as Integer returns Integer:
     Note: Generate interface property signature
 
@@ -374,6 +483,17 @@ Process called "generate_interface_property" takes context as Integer, hir as In
 
     Return 1
 End Process
+
+@Reasoning:
+Interface methods declare a callable member: "name(params): ReturnType".
+Type parameters may also appear between the name and parameter list.
+@End Reasoning
+
+@Implementation:
+Reads name, parameters, type_parameters, and return_type. Emits indent,
+name, optional generic params, "(", parameter list via
+generate_parameter_list, "): ", the return type, then ";\n".
+@End Implementation
 
 Process called "generate_interface_method" takes context as Integer, hir as Integer returns Integer:
     Note: Generate interface method signature
@@ -408,6 +528,17 @@ Process called "generate_interface_method" takes context as Integer, hir as Inte
     Return 1
 End Process
 
+@Reasoning:
+"type Name<T> = Aliased" is the canonical TypeScript type alias form.
+Aliases let users name complex unions and intersections for reuse.
+@End Reasoning
+
+@Implementation:
+Reads name, type_parameters and aliased_type. Emits "type Name", optional
+generic params, " = ", then dispatches the aliased type through
+generate_type_annotation, closing with ";\n".
+@End Implementation
+
 Process called "generate_type_alias_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate TypeScript type alias declaration
 
@@ -435,6 +566,18 @@ Process called "generate_type_alias_declaration" takes context as Integer, hir a
 
     Return 1
 End Process
+
+@Reasoning:
+TypeScript enums declare a named set of value members; explicit values
+can be strings or numbers, otherwise the compiler assigns sequential
+integers. The enum block layout matches TS-style indented members.
+@End Reasoning
+
+@Implementation:
+Reads name and members. Emits "enum Name {\n", iterates members emitting
+each as indent + name + optional " = value" + ",\n", and closes with
+"}\n".
+@End Implementation
 
 Process called "generate_enum_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate TypeScript enum declaration
@@ -489,6 +632,20 @@ Process called "generate_enum_declaration" takes context as Integer, hir as Inte
 
     Return 1
 End Process
+
+@Reasoning:
+TypeScript classes combine ES6 class semantics with type annotations,
+generics, and access modifiers. The header must thread name, optional
+type params, optional extends, optional implements before the body.
+@End Reasoning
+
+@Implementation:
+Reads name, type_parameters, extends_clause, implements_list and
+members. Emits "class Name", optional generic params, optional
+" extends X", optional " implements A, B", " {\n", iterates members
+dispatching properties via generate_class_property and methods via
+generate_class_method, then "}\n".
+@End Implementation
 
 Process called "generate_class_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate TypeScript class declaration with access modifiers
@@ -552,6 +709,19 @@ Process called "generate_class_declaration" takes context as Integer, hir as Int
     Return 1
 End Process
 
+@Reasoning:
+Class properties carry access modifiers (public/private/protected),
+optional static / readonly flags, type annotation, and optional
+initializer.
+@End Reasoning
+
+@Implementation:
+Reads access, static, readonly, name, type, and initializer. Emits
+indent, the access keyword, optional "static ", optional "readonly ",
+the name, ": ", the type annotation, optional " = <initializer>" via
+generate_expression, then ";\n".
+@End Implementation
+
 Process called "generate_class_property" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class property with access modifier and type annotation
 
@@ -597,6 +767,19 @@ Process called "generate_class_property" takes context as Integer, hir as Intege
     Return 1
 End Process
 
+@Reasoning:
+Class methods carry the same modifiers as properties plus async / abstract
+markers and a full statement body. Constructor is a special-case method
+name that the dispatcher recognises.
+@End Reasoning
+
+@Implementation:
+Reads access, static, async, abstract, name, type_parameters, parameters,
+return_type, and body. Emits indent, modifiers, name, optional generic
+params, "(", parameter list, "): ", return type, then either ";\n" for
+abstract methods or " {\n", the body via generate_statement, "}\n".
+@End Implementation
+
 Process called "generate_class_method" takes context as Integer, hir as Integer returns Integer:
     Note: Generate class method with access modifier and type annotations
 
@@ -640,6 +823,19 @@ Process called "generate_class_method" takes context as Integer, hir as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+Top-level function declarations support export, async, generic params,
+parameters, return type, and body. Routing them through one emitter
+keeps the modifier ordering consistent.
+@End Reasoning
+
+@Implementation:
+Reads export, async, name, type_parameters, parameters, return_type and
+body. Emits optional "export ", optional "async ", "function ", name,
+optional generic params, "(", parameter list, "): ", return type, then
+" {\n", the body via generate_statement, "}\n".
+@End Implementation
 
 Process called "generate_function_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate TypeScript function declaration
@@ -688,6 +884,20 @@ Process called "generate_function_declaration" takes context as Integer, hir as 
 
     Return 1
 End Process
+
+@Reasoning:
+TypeScript parameters carry optional rest "..." marker, optional "?" for
+optional parameters, type annotation, and optional default value.
+Threading them through a dedicated walker keeps the function/method
+emitters compact.
+@End Reasoning
+
+@Implementation:
+Iterates the parameters list; for each parameter emits optional "...",
+the name, optional "?", ": ", the type via generate_type_annotation,
+optional " = <default>" via generate_expression. ", " separators between
+parameters.
+@End Implementation
 
 Process called "generate_parameter_list" takes context as Integer, params_hir as Integer returns Integer:
     Note: Generate function parameter list with type annotations
@@ -743,6 +953,18 @@ Process called "generate_parameter_list" takes context as Integer, params_hir as
 
     Return 1
 End Process
+
+@Reasoning:
+TypeScript variable declarations come in three storage classes (var, let,
+const) and may carry type annotation and initializer. The kind keyword
+choice affects scoping, so it must be threaded through faithfully.
+@End Reasoning
+
+@Implementation:
+Reads kind, name, type, and initializer. Emits indent, the kind keyword
+(var/let/const), the name, optional ": " plus type annotation, optional
+" = <initializer>" via generate_expression, and ";\n".
+@End Implementation
 
 Process called "generate_variable_declaration" takes context as Integer, hir as Integer returns Integer:
     Note: Generate variable declaration with optional type annotation
@@ -808,6 +1030,22 @@ End Process
 Note: ============================================================================
 Note: Statement Generation
 Note: ============================================================================
+
+@Reasoning:
+Statement dispatcher for the TypeScript backend. Covers control flow
+(if/else, while, for, switch), assignments, expression statements,
+returns, throws and block scopes. A single dispatcher keeps the file
+structure flat.
+@End Reasoning
+
+@Implementation:
+Reads the HIR statement kind and dispatches to the matching emitter:
+if/else emits "if (cond) { ... } else { ... }"; while emits "while
+(cond) { ... }"; for emits "for (init; cond; update) { ... }"; switch
+emits "switch (e) { case ...; default: ... }"; return emits "return
+expr;"; expression statements emit "<expr>;"; block emits a nested
+"{ ... }".
+@End Implementation
 
 Process called "generate_statement" takes context as Integer, hir as Integer returns Integer:
     Note: Generate any statement from HIR
@@ -1111,6 +1349,22 @@ Note: ==========================================================================
 Note: Expression Generation
 Note: ============================================================================
 
+@Reasoning:
+Expression dispatcher covers literals, identifiers, binary and unary
+operators, function calls, member access, indexing, lambda expressions,
+new expressions, type assertions, and template strings. A single
+dispatch surface keeps the recursion uniform.
+@End Reasoning
+
+@Implementation:
+Reads the HIR expression kind and dispatches: literal kinds emit their
+canonical TypeScript form; identifiers emit the name; binary ops emit
+"left op right" with precedence-aware parenthesisation; calls emit
+"callee(args)"; member access emits "obj.prop"; index emits "obj[idx]";
+lambdas emit "(params) => body"; new emits "new T(args)"; type
+assertions emit "expr as Type"; template strings emit backtick form.
+@End Implementation
+
 Process called "generate_expression" takes context as Integer, hir as Integer returns Integer:
     Note: Generate any expression from HIR
 
@@ -1372,6 +1626,20 @@ End Process
 Note: ============================================================================
 Note: Main Generation Function
 Note: ============================================================================
+
+@Reasoning:
+Public entry. Walks the module-level declarations in the HIR root and
+dispatches each to its matching generator (interface, class, type
+alias, enum, function, variable).
+@End Reasoning
+
+@Implementation:
+Iterates the declarations list off the HIR root, reads each entry's
+"kind" key, and dispatches via strings_equal to
+generate_interface_declaration, generate_class_declaration,
+generate_type_alias_declaration, generate_enum_declaration,
+generate_function_declaration, or generate_variable_declaration.
+@End Implementation
 
 Process called "generate_typescript" takes context as Integer, hir_root as Integer returns Integer:
     Note: Generate TypeScript code from HIR

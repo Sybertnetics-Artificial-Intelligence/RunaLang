@@ -90,6 +90,14 @@ Note: ===================================================================
 Note: LEXER STATE
 Note: ===================================================================
 
+@Reasoning:
+HCL lexer state includes a cached current_char so every classification predicate avoids a function-call hop to peek_char. The in_template flag tracks whether we are inside ${...} interpolation, where lexical rules differ slightly (different terminators, no heredoc allowed).
+@End Reasoning
+
+@Implementation:
+Eight integer slots: source pointer, current position, current line, current column, total length, cached current character, accumulating tokens list, in_template flag.
+@End Implementation
+
 Type called "HCLLexer":
     source as Integer
     position as Integer
@@ -105,6 +113,14 @@ Note: ===================================================================
 Note: TOKEN STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+HCL tokens carry a textual value (rather than a pointer into the source) because the lexer materialises string literals with interpolation markers and escape decoding. Position is kept for diagnostics.
+@End Reasoning
+
+@Implementation:
+Four integer slots: token_type (one of the TOKEN_* constants), value (string handle), line, column.
+@End Implementation
+
 Type called "HCLToken":
     token_type as Integer
     value as Integer
@@ -115,6 +131,14 @@ End Type
 Note: ===================================================================
 Note: LEXER CREATION AND INITIALIZATION
 Note: ===================================================================
+
+@Reasoning:
+Constructor primes the current_char cache so subsequent classification predicates can dereference current_char directly without re-checking position. Initialising in_template to 0 means the lexer starts in standard mode, not interpolation mode.
+@End Reasoning
+
+@Implementation:
+Builds an HCLLexer record, computes source length, creates an empty tokens list. If source length > 0, reads the first character into current_char; otherwise leaves it at 0 (EOF).
+@End Implementation
 
 Process called "create_hcl_lexer" takes source_code as Integer returns Integer:
     Let lexer be a value of type HCLLexer with
@@ -139,6 +163,14 @@ Note: ===================================================================
 Note: CHARACTER NAVIGATION
 Note: ===================================================================
 
+@Reasoning:
+Advance always updates both position and column; it does not handle line increments because lex routines that consume newlines explicitly bump line and reset column (the lexer reaches newlines through specific paths like comment scanning or heredoc body parsing).
+@End Reasoning
+
+@Implementation:
+Increments position and column, then re-reads current_char from source[position] or sets current_char to 0 if past end-of-source.
+@End Implementation
+
 Process called "advance" takes lexer as Integer:
     Set lexer.position to lexer.position plus 1
     Set lexer.column to lexer.column plus 1
@@ -150,6 +182,14 @@ Process called "advance" takes lexer as Integer:
     End If
 End Process
 
+@Reasoning:
+Multi-byte lookahead is required for two-byte operators ("==", "!="), three-byte sequences ("...", "..." with splat), and heredoc opener "<<-". A parametric peek avoids hand-rolling each case.
+@End Reasoning
+
+@Implementation:
+Computes pos = lexer.position + offset; returns 0 if pos is past length; otherwise returns the byte at source[pos]. Does not affect lexer state.
+@End Implementation
+
 Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     Let pos be lexer.position plus offset
     If pos is greater than or equal to lexer.length:
@@ -157,6 +197,14 @@ Process called "peek" takes lexer as Integer, offset as Integer returns Integer:
     End If
     Return proc string_char_at from StringCore with lexer.source, pos
 End Process
+
+@Reasoning:
+HCL distinguishes newline from other whitespace because newlines are sometimes semantically meaningful (statement terminators). This skipper consumes only space (32), tab (9), and CR (13); LF is preserved for the main tokenizer to emit TOKEN_NEWLINE.
+@End Reasoning
+
+@Implementation:
+Three sequential While loops, each consuming one of space/tab/CR while current_char matches. The loops are sequential rather than combined so the inner condition stays simple.
+@End Implementation
 
 Process called "skip_whitespace" takes lexer as Integer:
     While lexer.current_char is equal to 32:
@@ -179,6 +227,14 @@ Note: ===================================================================
 Note: TOKEN CREATION
 Note: ===================================================================
 
+@Reasoning:
+A uniform constructor for every emitted token so callers do not need to remember the field order or layout. Centralising this keeps the HCLToken shape an implementation detail that can evolve without touching every scanner.
+@End Reasoning
+
+@Implementation:
+Builds an HCLToken value with the supplied four fields and returns it. No allocation logic beyond the value-of-type expression.
+@End Implementation
+
 Process called "create_token" takes token_type as Integer, value as Integer, line as Integer, column as Integer returns Integer:
     Let token be a value of type HCLToken with
         token_type as token_type,
@@ -188,6 +244,14 @@ Process called "create_token" takes token_type as Integer, value as Integer, lin
     Return token
 End Process
 
+@Reasoning:
+The lexer batches tokens into a list rather than returning them one at a time so the parser can do a single buffered pass. Centralising the append lets future optimisations (e.g., bulk allocation, lookahead caching) live in one place.
+@End Reasoning
+
+@Implementation:
+One-line delegation to list_append on the lexer's tokens list.
+@End Implementation
+
 Process called "add_token" takes lexer as Integer, token as Integer:
     proc list_append from ListCore with lexer.tokens, token
 End Process
@@ -195,6 +259,14 @@ End Process
 Note: ===================================================================
 Note: IDENTIFIER AND KEYWORD LEXING
 Note: ===================================================================
+
+@Reasoning:
+HCL identifiers allow letters, digits, underscore, and hyphen — hyphen is unusual but Terraform commonly uses it in resource-type names like "aws-instance". After scanning, the lexeme is matched against the keyword table; on miss it falls back to TOKEN_IDENTIFIER.
+@End Reasoning
+
+@Implementation:
+Records start_pos and start_col. Loops scanning alpha/digit/underscore/hyphen using break-via-sentinel pattern (sets local i to 999999 to break the outer While). Extracts the substring, calls get_keyword_type for classification, falls back to TOKEN_IDENTIFIER on zero, and emits a token.
+@End Implementation
 
 Process called "lex_identifier" takes lexer as Integer returns Integer:
     Let start_pos be lexer.position
@@ -254,6 +326,14 @@ Process called "lex_identifier" takes lexer as Integer returns Integer:
 
     Return proc create_token with token_type, text, lexer.line, start_col
 End Process
+
+@Reasoning:
+A flat If-chain rather than length-bucketed dispatch is acceptable here because HCL has only 16 keywords. The keyword list combines Terraform block keywords (resource, variable, etc.) with HCL expression keywords (for, if, in, null, true, false).
+@End Reasoning
+
+@Implementation:
+Sequence of string_equals checks against each keyword literal, returning the matching TOKEN_* constant on first hit. Returns 0 if nothing matches, signalling "use TOKEN_IDENTIFIER" to the caller.
+@End Implementation
 
 Process called "get_keyword_type" takes text as Integer returns Integer:
     Let is_resource be proc string_equals from StringCore with text, "resource"
@@ -339,6 +419,14 @@ Process called "get_keyword_type" takes text as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+HCL identifiers start with [A-Za-z_]. Folding underscore into is_alphabetic matches the semantic boundary used by lex_identifier's start-character test.
+@End Reasoning
+
+@Implementation:
+Returns 1 if 65 <= char <= 90 (A-Z), 97 <= char <= 122 (a-z), or char == 95 (_); otherwise 0.
+@End Implementation
+
 Process called "is_alphabetic" takes char as Integer returns Integer:
     Note: A-Z: 65-90, a-z: 97-122
     If char is greater than or equal to 65:
@@ -361,6 +449,14 @@ Process called "is_alphabetic" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit check, used for both number-start dispatch and identifier-continuation classification.
+@End Reasoning
+
+@Implementation:
+Returns 1 if 48 <= char <= 57, otherwise 0.
+@End Implementation
+
 Process called "is_digit_char" takes char as Integer returns Integer:
     Note: 0-9: 48-57
     If char is greater than or equal to 48:
@@ -374,6 +470,14 @@ End Process
 Note: ===================================================================
 Note: STRING LEXING
 Note: ===================================================================
+
+@Reasoning:
+HCL strings can contain ${...} interpolations that may nest braces. The scanner tracks interpolation_depth so an embedded "}" inside an interpolation does not falsely terminate the interpolation. The opening quote character is captured so the same scanner handles both single- and double-quoted strings.
+@End Reasoning
+
+@Implementation:
+Captures quote_char, consumes the opener, then loops building the value string. Terminates only when current_char equals quote_char AND interpolation_depth is 0. Backslash starts an escape (next char is appended verbatim, no decoding). "$" with "{" lookahead starts an interpolation, bumping depth and emitting the literal "${" into the value. "}" inside an interpolation decrements depth. Sets has_interpolation when any interpolation was seen, then flags the token. On EOF returns a TOKEN_ERROR.
+@End Implementation
 
 Process called "lex_string" takes lexer as Integer returns Integer:
     Let start_col be lexer.column
@@ -444,14 +548,16 @@ Process called "lex_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_ERROR, "Unterminated string", lexer.line, start_col
 End Process
 
+@Reasoning:
+HCL supports full Unicode characters in strings and identifiers. This converter handles ASCII directly and emits UTF-8 multi-byte sequences for higher codepoints so the resulting string remains a valid UTF-8 byte sequence regardless of the input character.
+@End Reasoning
+
+@Implementation:
+ASCII (0-127): delegates to string_from_char. Range 128-2047: 2-byte UTF-8 sequence (byte1=192+char/64, byte2=128+char%64). Range 2048-65535: 3-byte sequence (byte1=224+char/4096, byte2=128+(char/64)%64, byte3=128+char%64). Beyond 65535 returns U+FFFD (replacement character).
+@End Implementation
+
 Process called "char_to_string" takes char as Integer returns Integer:
     Note: Convert character code to string with proper character encoding
-
-    @Reasoning:
-    HCL supports full Unicode characters in strings and identifiers.
-    This function converts character codes to proper string representation
-    with full Unicode support.
-    @End Reasoning
 
     Note: Handle ASCII characters (0-127)
     If char is greater than or equal to 0 and char is less than or equal to 127:
@@ -487,6 +593,14 @@ End Process
 Note: ===================================================================
 Note: NUMBER LEXING
 Note: ===================================================================
+
+@Reasoning:
+HCL numbers may have a single decimal point but no exponent in this minimal lexer; the value is preserved as the original textual run so consumers can parse it according to their precision needs. Tracking has_decimal prevents a second "." from being consumed.
+@End Reasoning
+
+@Implementation:
+Records start_pos and start_col, then loops: on digit advance; on "." advance only if has_decimal is 0 then set has_decimal=1; on anything else break (via sentinel). Extracts the substring as the value and emits TOKEN_NUMBER.
+@End Implementation
 
 Process called "lex_number" takes lexer as Integer returns Integer:
     Let start_pos be lexer.position
@@ -529,6 +643,14 @@ End Process
 Note: ===================================================================
 Note: COMMENT LEXING
 Note: ===================================================================
+
+@Reasoning:
+HCL supports three comment styles: # (Bash-like), // (C++-like), and /* ... */ (block). Folding them into one scanner avoids three near-identical loops; the dispatch on first byte selects the right inner loop.
+@End Reasoning
+
+@Implementation:
+First branch: # advances and consumes bytes until LF. Second branch: "/" with peek 1; "//" runs the same line-comment loop; "/*" runs a block-comment loop scanning for "*/" via peek 1. All loops use the sentinel pattern (set i=999999 to break).
+@End Implementation
 
 Process called "lex_comment" takes lexer as Integer returns Integer:
     Let start_col be lexer.column
@@ -610,6 +732,14 @@ Note: ===================================================================
 Note: HEREDOC LEXING
 Note: ===================================================================
 
+@Reasoning:
+HCL heredocs let users embed multi-line strings without quote escaping. The "<<-" variant additionally strips common leading indentation (indent_mode flag). The delimiter is read until newline, then body bytes accumulate per-line; each line is trimmed and compared against the delimiter to detect termination.
+@End Reasoning
+
+@Implementation:
+Consumes "<<", checks for optional "-" for indent_mode, reads delimiter bytes until LF. Then runs a body loop accumulating into current_line; on LF, trims current_line and compares to delimiter via string_equals — match ends the heredoc, otherwise appends current_line plus "\n" to content and resets current_line. Tracks line and column updates on each LF. Returns TOKEN_ERROR on EOF before delimiter match.
+@End Implementation
+
 Process called "lex_heredoc" takes lexer as Integer returns Integer:
     Let start_col be lexer.column
 
@@ -680,6 +810,14 @@ End Process
 Note: ===================================================================
 Note: MAIN TOKENIZATION
 Note: ===================================================================
+
+@Reasoning:
+Single top-level driver dispatching on the current byte. Newlines are emitted as TOKEN_NEWLINE so the parser can use them for HCL's loose statement-termination rules. Order of dispatch puts comments and heredocs early because their leading characters ("#", "/", "<") overlap with operators.
+@End Reasoning
+
+@Implementation:
+Loops until EOF. Each iteration: skip whitespace, then check for newline (10) -> emit TOKEN_NEWLINE and bump line; "#" -> lex_comment; "/" with "/" or "*" lookahead -> lex_comment, else TOKEN_SLASH; "<" with "<" lookahead -> lex_heredoc, else TOKEN_LESS_THAN; '"' or "'" -> lex_string; digit -> lex_number; alpha -> lex_identifier; otherwise lex_operator handles single/double-char punctuation. Emits TOKEN_EOF before returning the tokens list.
+@End Implementation
 
 Process called "tokenize" takes lexer as Integer returns Integer:
     While lexer.current_char is not equal to 0:
@@ -775,6 +913,14 @@ Process called "tokenize" takes lexer as Integer returns Integer:
 
     Return lexer.tokens
 End Process
+
+@Reasoning:
+Operator dispatch must check two-character operators first (==, !=, <=, >=, =>, &&, ||, ..., .*) before falling back to single-character punctuation, otherwise "==" would be tokenised as two separate "=" tokens. Each two-char path consumes both characters atomically.
+@End Reasoning
+
+@Implementation:
+Starts by reading the current char. Two-character branches use peek 1 to decide: "=" -> EQUAL/ARROW/ASSIGN; "!" -> NOT_EQUAL/NOT; "<" -> LESS_EQUAL/LESS_THAN; ">" -> GREATER_EQUAL/GREATER_THAN; "&" -> AND only on second "&"; "|" -> OR only on second "|"; "." -> ELLIPSIS via three peeks, SPLAT (".*"), or DOT. After two-char checks, a long sequence of If blocks emits single-character tokens for braces, brackets, parens, ":", "?", ",", "+", "-", "*", "%". Any remaining byte emits a TOKEN_ERROR and advances.
+@End Implementation
 
 Process called "lex_operator" takes lexer as Integer:
     Let start_col be lexer.column
@@ -1016,17 +1162,49 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Public accessor isolates the HCLToken layout from consumers that only need the type tag. Keeping accessors in this file lets the type's internal layout evolve (e.g., adding fields) without touching the parser.
+@End Reasoning
+
+@Implementation:
+Returns the token_type field of the token value.
+@End Implementation
+
 Process called "hcl_token_type" takes token as Integer returns Integer:
     Return token.token_type
 End Process
+
+@Reasoning:
+Public accessor for the token's payload string. Separating accessors per field keeps the API stable and self-documenting.
+@End Reasoning
+
+@Implementation:
+Returns the value field of the token.
+@End Implementation
 
 Process called "hcl_token_value" takes token as Integer returns Integer:
     Return token.value
 End Process
 
+@Reasoning:
+Public accessor for the token's source line. Used by the parser to attach line numbers to diagnostics.
+@End Reasoning
+
+@Implementation:
+Returns the line field of the token.
+@End Implementation
+
 Process called "hcl_token_line" takes token as Integer returns Integer:
     Return token.line
 End Process
+
+@Reasoning:
+Public accessor for the token's source column. Together with line gives the parser enough to render carets in error messages.
+@End Reasoning
+
+@Implementation:
+Returns the column field of the token.
+@End Implementation
 
 Process called "hcl_token_column" takes token as Integer returns Integer:
     Return token.column

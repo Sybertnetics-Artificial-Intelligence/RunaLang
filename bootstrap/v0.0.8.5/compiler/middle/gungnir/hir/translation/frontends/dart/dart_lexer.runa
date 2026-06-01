@@ -162,6 +162,22 @@ Note: ==========================================================================
 Note: Lexer Structure
 Note: ============================================================================
 
+@Reasoning:
+Dart source is byte-addressable UTF-8 (Dart's specification mandates UTF-8
+encoding for source files). The lexer's cursor is a byte position rather
+than a code-point index because Dart identifiers and keywords are ASCII
+only - non-ASCII sequences appear only in string literals where the lexer
+treats them opaquely. line/column track 1-based positions for error
+reporting; length caches the source size to avoid recomputation.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64) at offsets 0..32: source (StringCore handle),
+position (byte index, 0-based), line (1-based), column (1-based), length
+(cached string length). Allocated from the arena rather than the heap
+because lexer lifetime is bounded by the parse driver call.
+@End Implementation
+
 Type called "DartLexer":
     source as Integer
     position as Integer
@@ -213,6 +229,18 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+Digit classification is needed for numeric-literal scanning and for the
+alnum predicate used in identifier tail-character matching. Tests the
+ASCII byte range 48..57 ('0'..'9') exclusively because Dart numeric
+literals are ASCII per spec.
+@End Reasoning
+
+@Implementation:
+Single range comparison: 48 <= ch <= 57 returns 1, otherwise 0. Two nested
+If's avoid a compound boolean expression. Constant-time.
+@End Implementation
+
 Process called "is_digit" takes ch as Integer returns Integer:
     Note: Check if character is digit (0-9)
 
@@ -224,6 +252,18 @@ Process called "is_digit" takes ch as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Identifier-start classifier: Dart identifiers begin with letter or
+underscore (U+005F). Non-ASCII identifier letters (per Unicode) are not
+supported in this lexer because Dart's idiomatic style uses ASCII names;
+ASCII coverage is sufficient for the C-family-style identifier grammar.
+@End Reasoning
+
+@Implementation:
+Returns 1 for '_' (95), 'A'..'Z' (65..90), and 'a'..'z' (97..122). Three
+nested-If range checks; constant time.
+@End Implementation
 
 Process called "is_alpha" takes ch as Integer returns Integer:
     Note: Check if character is alphabetic (a-z, A-Z, _)
@@ -247,6 +287,17 @@ Process called "is_alpha" takes ch as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Identifier-tail classifier: Dart identifier characters after the first
+include digits in addition to letters/underscore. Reuses is_digit and
+is_alpha for clarity.
+@End Reasoning
+
+@Implementation:
+Returns 1 if is_digit returns 1, otherwise returns the is_alpha result
+directly. Constant time.
+@End Implementation
+
 Process called "is_alnum" takes ch as Integer returns Integer:
     Note: Check if character is alphanumeric
 
@@ -258,6 +309,17 @@ Process called "is_alnum" takes ch as Integer returns Integer:
     Let alpha_check be proc is_alpha from ch
     Return alpha_check
 End Process
+
+@Reasoning:
+Hexadecimal classifier supports 0x... literal scanning. Accepts 0..9,
+A..F, and a..f. Distinct from is_alnum because hex digits don't include
+G..Z.
+@End Reasoning
+
+@Implementation:
+Returns 1 if is_digit returns 1; otherwise tests 'A'..'F' (65..70) and
+'a'..'f' (97..102) via nested If range checks.
+@End Implementation
 
 Process called "is_hex_digit" takes ch as Integer returns Integer:
     Note: Check if character is hexadecimal digit
@@ -281,6 +343,16 @@ Process called "is_hex_digit" takes ch as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+Whitespace classifier covers the four whitespace bytes used by Dart in
+practice: space (0x20), tab (0x09), LF (0x0A), CR (0x0D). Vertical-tab
+and form-feed are not used in Dart source.
+@End Reasoning
+
+@Implementation:
+Four equality checks; returns 1 on match, 0 otherwise. Constant time.
+@End Implementation
 
 Process called "is_whitespace" takes ch as Integer returns Integer:
     Note: Check if character is whitespace
@@ -308,6 +380,18 @@ Note: ==========================================================================
 Note: Lexer Utility Functions
 Note: ============================================================================
 
+@Reasoning:
+Read-only cursor accessor. Returns 0 (EOF sentinel) when at or past
+length; this matches how character scanners check for end-of-input
+without a separate eof flag.
+@End Reasoning
+
+@Implementation:
+Reads source/position/length from offsets 0/8/32. If position >= length
+returns 0. Otherwise calls StringCore.string_char_at(source, position) and
+returns the byte.
+@End Implementation
+
 Process called "current_char" takes lexer as Integer returns Integer:
     Note: Get current character without advancing
 
@@ -322,6 +406,19 @@ Process called "current_char" takes lexer as Integer returns Integer:
     Let ch be proc string_char_at from StringCore with source, position
     Return ch
 End Process
+
+@Reasoning:
+Multi-byte lookahead for disambiguating multi-character operators ("==",
+"!=", "<<", ">>=", etc.) and for distinguishing identifiers from
+contextual keywords without committing the cursor.
+@End Reasoning
+
+@Implementation:
+Reads source/position/length. Computes peek_pos = position + offset. If
+peek_pos >= length returns 0 (EOF). Otherwise returns the byte at
+peek_pos. Negative offsets are not validated; callers must pass
+non-negative values.
+@End Implementation
 
 Process called "peek_char" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek ahead offset characters
@@ -338,6 +435,19 @@ Process called "peek_char" takes lexer as Integer, offset as Integer returns Int
     Let ch be proc string_char_at from StringCore with source, peek_pos
     Return ch
 End Process
+
+@Reasoning:
+Cursor-advancing read. Updates line/column counters so error messages
+quote correct source locations. Newline (0x0A) resets column to 1 and
+bumps line; any other byte bumps column by 1. CR is handled implicitly
+(its column bump still happens; the LF that follows in CRLF then resets).
+@End Reasoning
+
+@Implementation:
+Calls current_char to load the byte at the cursor. Bumps position by 1.
+If the byte is 10 (LF), increments line and resets column to 1; otherwise
+increments column. Returns the byte that was at the original cursor.
+@End Implementation
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance position and return current character
@@ -363,6 +473,18 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return ch
 End Process
 
+@Reasoning:
+Conditional advance combinator: consumes the next byte only if it matches
+the expected value. Common in multi-char operator parsing (e.g. after
+seeing '!' the scanner calls match_char('=') to decide between '!' and
+'!=').
+@End Reasoning
+
+@Implementation:
+Reads current_char without consuming. On mismatch returns 0 immediately,
+leaving the cursor untouched. On match calls advance_char and returns 1.
+@End Implementation
+
 Process called "match_char" takes lexer as Integer, expected as Integer returns Integer:
     Note: Match and consume expected character
 
@@ -378,6 +500,18 @@ End Process
 Note: ============================================================================
 Note: Skip Whitespace and Comments
 Note: ============================================================================
+
+@Reasoning:
+Inter-token whitespace skipper. Loops until the cursor sits on a non-
+whitespace byte or EOF (advance_char returns 0 / current_char returns 0
+at end-of-source so the loop exits via the is_whitespace=0 path).
+@End Reasoning
+
+@Implementation:
+While loop reading current_char and checking is_whitespace. Calls
+advance_char inside the loop to consume the whitespace. Returns 1 on
+exit (signalling the predicate-loop convention).
+@End Implementation
 
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     Note: Skip whitespace characters
@@ -395,6 +529,19 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Skips Dart // line comments. Caller has already peeked the two '/'
+characters so this routine consumes both and then drains the rest of the
+line.
+@End Reasoning
+
+@Implementation:
+Consumes the two '/' bytes via two advance_char calls. Then loops:
+encountering 0 (EOF) or 10 (LF) ends the comment (newline is consumed so
+the next token scan starts on the line below). Anything else is
+advanced past.
+@End Implementation
 
 Process called "skip_line_comment" takes lexer as Integer returns Integer:
     Note: Skip // comment
@@ -419,6 +566,20 @@ Process called "skip_line_comment" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Skips /* ... */ block comments. Dart's spec allows nesting of /**/
+comments but this implementation handles only the flat (non-nested)
+form because nested comments are rare in practice; if nesting is
+needed it should be added explicitly with a depth counter.
+@End Reasoning
+
+@Implementation:
+Consumes the leading "/*" via two advance_char calls. Loops: 0 (EOF)
+exits; '*' (42) peeked-followed-by-'/' (47) consumes both and exits;
+anything else is advanced past. EOF without terminator silently exits
+to avoid hanging the lexer.
+@End Implementation
 
 Process called "skip_block_comment" takes lexer as Integer returns Integer:
     Note: Skip /* */ comment

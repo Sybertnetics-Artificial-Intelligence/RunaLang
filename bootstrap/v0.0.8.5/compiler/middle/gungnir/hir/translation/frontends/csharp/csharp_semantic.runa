@@ -14,6 +14,24 @@ Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/collections/list.runa" as List
 Import "compiler/frontend/primitives/collections/dictionary.runa" as Dict
 
+@Reasoning:
+C# semantic analysis must reconcile namespace-qualified names, generic type
+parameter constraints, and a multi-level inheritance graph (single class
+inheritance + multiple interface implementation). Type, class hierarchy,
+namespace, and generic-constraint registries live as separate Dicts to
+keep lookups O(1) and to let later passes (HIR emission) reuse them as
+read-only artifacts.
+@End Reasoning
+
+@Implementation:
+72-byte record (9 x i64) at offsets 0..64: global_scope (Dict, root symbol
+table), current_scope (Dict, top of stack), scope_stack (List of Dict),
+type_registry (Dict type_name->TypeDecl AST node), class_hierarchy (Dict
+class_name->base_chain), namespace_registry (Dict namespace_path->member
+list), generic_constraints (Dict param_name->List of constraint nodes),
+error_message (owned StringCore), has_error (sticky 0/1).
+@End Implementation
+
 Type called "CSharpSemanticAnalyzer":
     global_scope as Integer
     current_scope as Integer
@@ -158,6 +176,19 @@ Process called "collect_namespace_declaration" takes analyzer as Integer, namesp
     End If
 End Process
 
+@Reasoning:
+Pass-1 collection of class declarations into the type registry so cross-
+references in later passes (base-class resolution, method overload search)
+can resolve forward declarations without re-walking the source tree.
+@End Reasoning
+
+@Implementation:
+Reads type_registry from offset 24 and the class name (StringCore) from
+class_node offset 8. Stores class_node under its name. Then triggers
+collect_generic_parameters to extract any &lt;T,U,...&gt; type parameters into
+the analyzer's generic_constraints map.
+@End Implementation
+
 Process called "collect_class_declaration" takes analyzer as Integer, class_node as Integer:
     Note: Collect class declaration for inheritance analysis
 
@@ -171,6 +202,17 @@ Process called "collect_class_declaration" takes analyzer as Integer, class_node
         proc collect_generic_parameters with analyzer, class_node
     End If
 End Process
+
+@Reasoning:
+Interfaces share the same registry with classes because C# disallows
+shadowing between them and the implementation-check pass needs both
+populated before walking class.base_list entries.
+@End Reasoning
+
+@Implementation:
+Mirror of collect_class_declaration: stores interface_node under its name
+in type_registry at offset 24 and collects generic parameters.
+@End Implementation
 
 Process called "collect_interface_declaration" takes analyzer as Integer, interface_node as Integer:
     Note: Collect interface declaration for implementation checking
@@ -186,6 +228,21 @@ Process called "collect_interface_declaration" takes analyzer as Integer, interf
     End If
 End Process
 
+@Reasoning:
+Structs in C# are value types but they still occupy a slot in the type
+registry so generic constraints (where T : struct), nameof(), and overload
+resolution can find them. Unlike classes, structs cannot have a user-
+specified base class so generic parameter collection is skipped here -
+struct generics are still collected when the parser emits them via the
+type_node's generics child slot.
+@End Reasoning
+
+@Implementation:
+Registers struct_node by name in type_registry at offset 24. Note: this
+implementation does NOT call collect_generic_parameters because struct
+generic parameters are handled later when walking members.
+@End Implementation
+
 Process called "collect_struct_declaration" takes analyzer as Integer, struct_node as Integer:
     Note: Collect struct declaration for type analysis
 
@@ -196,6 +253,16 @@ Process called "collect_struct_declaration" takes analyzer as Integer, struct_no
         proc set from Dict with type_registry, struct_name, struct_node
     End If
 End Process
+
+@Reasoning:
+Enums occupy the type registry so they can be referenced in member
+declarations and constraint clauses. Enums have a fixed underlying type
+(default int) and no generics, so this routine is minimal.
+@End Reasoning
+
+@Implementation:
+Registers enum_node by name in type_registry at offset 24.
+@End Implementation
 
 Process called "collect_enum_declaration" takes analyzer as Integer, enum_node as Integer:
     Note: Collect enum declaration for type analysis
@@ -208,6 +275,17 @@ Process called "collect_enum_declaration" takes analyzer as Integer, enum_node a
     End If
 End Process
 
+@Reasoning:
+Delegates are named function-pointer types. They go in type_registry so
+event-handler binding and Func/Action references can resolve them. Like
+structs/enums, delegates also have generic forms but parameter collection
+happens during signature analysis, not here.
+@End Reasoning
+
+@Implementation:
+Registers delegate_node by name in type_registry at offset 24.
+@End Implementation
+
 Process called "collect_delegate_declaration" takes analyzer as Integer, delegate_node as Integer:
     Note: Collect delegate declaration for function pointer analysis
 
@@ -218,6 +296,20 @@ Process called "collect_delegate_declaration" takes analyzer as Integer, delegat
         proc set from Dict with type_registry, delegate_name, delegate_node
     End If
 End Process
+
+@Reasoning:
+Generic parameters &lt;T,U,...&gt; of a class/interface declaration must be
+indexed by param name so the where-clause validator and instantiation
+checker can look up constraints from anywhere in the analyzer without
+walking back to the declaring node.
+@End Reasoning
+
+@Implementation:
+Reads generic_constraints from offset 48 and the generics slot from
+type_node offset 24. The generics slot is a parent node with children at
+offset 32 holding each parameter; for each parameter the param_name at
+offset 8 is keyed into generic_constraints with the param node as value.
+@End Implementation
 
 Process called "collect_generic_parameters" takes analyzer as Integer, type_node as Integer:
     Note: Collect generic type parameters and constraints
@@ -292,6 +384,22 @@ Process called "build_type_hierarchy" takes analyzer as Integer, type_name as In
     proc set from Dict with class_hierarchy, type_name, type_info
 End Process
 
+@Reasoning:
+C# single inheritance: a class can have at most one base CLASS, but the
+base list also contains interfaces. By convention the C# grammar places
+the base class FIRST in the base list (before any interfaces), so the
+extractor takes the first base-list entry as the candidate. Returning 0
+when no base list is present means "implicit System.Object".
+@End Reasoning
+
+@Implementation:
+Reads base_list from type_node offset 32. If present, reads its children
+list at offset 32 of base_list and takes the first child (index 0).
+Returns the first child's name (offset 8). Returns 0 in any null case.
+This routine does NOT verify the first entry is a class - that check
+happens during hierarchy validation.
+@End Implementation
+
 Process called "get_base_class" takes analyzer as Integer, type_node as Integer returns Integer:
     Note: Extract base class from type declaration
 
@@ -310,6 +418,20 @@ Process called "get_base_class" takes analyzer as Integer, type_node as Integer 
 
     Return 0
 End Process
+
+@Reasoning:
+Walks every entry in the base list and filters those that resolve to
+interface declarations, returning their names. Used by HIR emission to
+emit vtable layouts. Always returns a List (possibly empty) so callers
+don't need to null-check the result.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh List for interface names. Reads base_list at type_node
+offset 32 and iterates its children. For each child, calls
+is_interface_type; if 1, appends the child's name (offset 8). Returns the
+List. The List is OWNED by the caller; caller must destroy it.
+@End Implementation
 
 Process called "get_implemented_interfaces" takes analyzer as Integer, type_node as Integer returns Integer:
     Note: Extract implemented interfaces from type declaration
@@ -379,6 +501,21 @@ Process called "validate_type_parameter_constraints" takes analyzer as Integer, 
     End If
 End Process
 
+@Reasoning:
+C# generic constraints come in three shapes: where T : SomeType (type
+constraint), where T : new() (constructor constraint), and the full where
+clause spanning struct/class/interface bounds. Each form needs distinct
+validation; this dispatcher routes by constraint AST node type.
+@End Reasoning
+
+@Implementation:
+Reads constraint_type from constraint offset 0 and compares against the
+three parser-defined constants. Dispatches to validate_where_clause,
+validate_type_constraint, or validate_constructor_constraint with the
+parameter name and the constraint node. Unknown constraint types are
+silently ignored so unrecognised AST shapes do not break the whole pass.
+@End Implementation
+
 Process called "validate_constraint" takes analyzer as Integer, param_name as Integer, constraint as Integer:
     Note: Validate individual generic constraint
 
@@ -441,6 +578,20 @@ Process called "analyze_class_members" takes analyzer as Integer, class_node as 
 
     proc exit_type_scope from analyzer
 End Process
+
+@Reasoning:
+C# class members span method, property, field, event, indexer, constructor,
+destructor, and operator-overload. Each has distinct semantic rules
+(accessibility, override semantics, signature constraints). This dispatcher
+routes by member node type so each analyzer can stay focused on one shape.
+@End Reasoning
+
+@Implementation:
+Reads member_type from member_node offset 0 and chains If/Otherwise If
+against the parser-defined member-type constants, dispatching to the
+relevant analyze_* routine. Unknown member kinds fall through silently;
+the parser is expected to emit only the eight types listed.
+@End Implementation
 
 Process called "analyze_member" takes analyzer as Integer, member_node as Integer:
     Note: Analyze individual class member
@@ -551,6 +702,20 @@ Process called "enter_type_scope" takes analyzer as Integer, type_node as Intege
     proc memory_set_int64 from Layout with analyzer, 8, new_scope
 End Process
 
+@Reasoning:
+Symmetric counterpart to enter_type_scope; pops the type's scope when the
+class/interface/struct walk completes. When the pop empties the stack the
+analyzer falls back to global_scope so subsequent global declarations
+still have a valid current_scope.
+@End Reasoning
+
+@Implementation:
+Reads scope_stack and stack_size. If non-empty, pops the top scope (the
+popped Dict is owned by the analyzer's destructor) and updates
+current_scope at offset 8 to the new top, or to global_scope if the stack
+went empty.
+@End Implementation
+
 Process called "exit_type_scope" takes analyzer as Integer:
     Note: Exit current type scope
 
@@ -571,6 +736,18 @@ Process called "exit_type_scope" takes analyzer as Integer:
     End If
 End Process
 
+@Reasoning:
+Methods have their own local-variable scope nested inside the enclosing
+type scope. A fresh Dict pushed when entering a method ensures parameters
+and locals do not leak out, and ensures shadowing of class fields works
+correctly (a local "x" hides a field "x" until exit).
+@End Reasoning
+
+@Implementation:
+Allocates a fresh Dict, pushes it onto scope_stack at offset 16, and
+points current_scope at offset 8 to the new Dict.
+@End Implementation
+
 Process called "enter_method_scope" takes analyzer as Integer:
     Note: Enter new scope for method analysis
 
@@ -580,6 +757,17 @@ Process called "enter_method_scope" takes analyzer as Integer:
 
     proc memory_set_int64 from Layout with analyzer, 8, new_scope
 End Process
+
+@Reasoning:
+Symmetric counterpart to enter_method_scope; pops the method's local-scope
+when the method walk finishes. Restores the enclosing type scope as
+current_scope so subsequent members see only class-level symbols.
+@End Reasoning
+
+@Implementation:
+Identical algorithm to exit_type_scope: pop top of scope_stack, update
+current_scope to new top or to global_scope when empty.
+@End Implementation
 
 Process called "exit_method_scope" takes analyzer as Integer:
     Note: Exit current method scope
@@ -600,6 +788,27 @@ Process called "exit_method_scope" takes analyzer as Integer:
         End If
     End If
 End Process
+
+@Reasoning:
+Built-in type predicate is needed for "where T : struct" constraint checks,
+implicit-conversion analysis, and to skip user-defined-type lookups for
+predefined types. C# defines the canonical 16 primitive types listed in
+the C# language specification (clr_alias).
+@End Reasoning
+
+@Implementation:
+Builds a List of 16 builtin type name strings (int, long, short, byte,
+sbyte, uint, ulong, ushort, float, double, decimal, bool, char, string,
+object, void) and linearly compares against type_name via StringCore.equals.
+Returns 1 on match, 0 otherwise. The list is rebuilt per call which is
+wasteful but is called rarely (only during constraint checking).
+@End Implementation
+
+@Performance_Hints:
+O(16) per call; constant in the type count but the rebuild has 16
+allocations. If this becomes a hot path, hoist the builtin list to a
+static cached value on the analyzer.
+@End Performance_Hints
 
 Process called "is_builtin_type" takes analyzer as Integer, type_name as Integer returns Integer:
     Note: Check if type is a C# built-in type
@@ -695,6 +904,18 @@ Process called "check_inheritance_cycle" takes analyzer as Integer, type_name as
 
     Return 0
 End Process
+
+@Reasoning:
+Sticky-first-error pattern used across the analyzer. Records the message
+text via a defensive copy so the caller can free the original string.
+Sets has_error=1 so downstream passes can short-circuit.
+@End Reasoning
+
+@Implementation:
+Writes has_error=1 at offset 64 first (so racers see error state even if
+the copy fails). Copies the message via StringCore.copy_string and stores
+the new handle at offset 56. The analyzer destructor frees the copy.
+@End Implementation
 
 Process called "set_csharp_semantic_error" takes analyzer as Integer, message as Integer:
     Note: Set semantic analyzer error state

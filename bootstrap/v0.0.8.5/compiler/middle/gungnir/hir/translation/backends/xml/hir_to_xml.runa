@@ -58,6 +58,19 @@ Note: ==========================================================================
 Note: XML Generation Context
 Note: ============================================================================
 
+@Reasoning:
+Carries every piece of state needed for XML emission: the emitter, the
+indentation cursor and configurable indent string, plus pretty-print and
+XML-declaration flags so callers can swap between compact and human-
+readable output without recompiling. Errors are stored in-band.
+@End Reasoning
+
+@Implementation:
+Seven int64 fields totalling 56 bytes. indent_string is a heap-owned
+buffer (created in create_generation_context, freed in destroy). Boolean
+flags use {0,1}.
+@End Implementation
+
 Type called "XMLGenContext":
     emitter as Integer          Note: XMLEmitter instance
     indent_level as Integer     Note: Current indentation level
@@ -71,6 +84,20 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+A single allocation step that wires the emitter, indent buffer and default
+flag values means callers cannot accidentally use a half-initialised
+context.
+@End Reasoning
+
+@Implementation:
+Allocates 56 bytes for the context, creates the XML emitter, allocates a
+3-byte "  \0" indent buffer, then writes all seven fields through
+memory_set_int64. Defaults: indent_level=0, pretty_print=1,
+include_declaration=1, error fields zero. Rolls back partial allocation
+on failure.
+@End Implementation
 
 Process called "create_generation_context" returns Integer:
     Note: Create XML generation context with default settings
@@ -108,6 +135,17 @@ Process called "create_generation_context" returns Integer:
     Return context
 End Process
 
+@Reasoning:
+Counterpart of create_generation_context; releases the emitter, indent
+buffer and error message heap copy before freeing the context.
+@End Reasoning
+
+@Implementation:
+Reads each owned slot (emitter, indent_str, error_message) and calls the
+appropriate destructor / deallocate only when non-zero, then frees the
+context block.
+@End Implementation
+
 Process called "destroy_generation_context" takes context as Integer returns Integer:
     Note: Destroy generation context and free resources
 
@@ -143,6 +181,18 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Records the first generation error so the caller can surface it after the
+walk completes; storing a heap copy decouples the message lifetime from
+the (transient) source buffer.
+@End Reasoning
+
+@Implementation:
+Frees any prior error string, allocates msg_length+1 bytes, copies the
+message bytes, null-terminates, then writes the pointer at offset 40 and
+sets has_error to 1.
+@End Implementation
+
 Process called "set_generation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set generation error message
 
@@ -172,6 +222,18 @@ Note: ==========================================================================
 Note: Indentation
 Note: ============================================================================
 
+@Reasoning:
+Pretty-printed XML needs leading whitespace that matches the current
+nesting depth. Skipping the loop when pretty_print is 0 keeps single-line
+output free of stray spaces.
+@End Reasoning
+
+@Implementation:
+Reads pretty_print; returns early when 0. Otherwise iterates indent_level
+times, each time emitting the indent_string buffer through the XML
+emitter.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation for current level
 
@@ -194,6 +256,16 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Pretty mode separates sibling elements with newlines; compact mode
+suppresses them so the XML fits on one line for wire transport.
+@End Reasoning
+
+@Implementation:
+Returns early when pretty_print is 0. Otherwise emits a single LF (10)
+byte through the XML emitter.
+@End Implementation
+
 Process called "emit_newline" takes context as Integer returns Integer:
     Note: Emit newline if pretty printing is enabled
 
@@ -213,6 +285,18 @@ Note: ==========================================================================
 Note: HIR Node Type Detection
 Note: ============================================================================
 
+@Reasoning:
+The XML element emitter needs to know whether a HIR node carries attribute
+metadata (dictionary), so a tag-based predicate avoids walking the node.
+Returns 0 for null nodes to keep call sites short.
+@End Reasoning
+
+@Implementation:
+Reads the node type tag at offset 0 and compares it against the HIR's
+canonical "DictionaryLiteral" type code returned by get_hir_node_type.
+Returns 1 on match, 0 otherwise.
+@End Implementation
+
 Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a dictionary literal
 
@@ -230,6 +314,16 @@ Process called "is_dictionary_hir" takes hir_node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+String predicate for the dictionary-lookup helpers; lets the caller branch
+between get_string_literal_value and returning the raw node pointer.
+@End Reasoning
+
+@Implementation:
+Reads the node tag at offset 0 and compares with the StringLiteral code.
+Returns 1 on match, 0 otherwise (including null inputs).
+@End Implementation
+
 Process called "is_string_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a string literal
 
@@ -246,6 +340,16 @@ Process called "is_string_hir" takes hir_node as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+List predicate; lets the element emitter recognise child arrays and emit
+each element as a sibling under the parent tag.
+@End Reasoning
+
+@Implementation:
+Reads the node tag at offset 0 and compares with the ListLiteral code.
+Returns 1 on match, 0 otherwise (including null inputs).
+@End Implementation
 
 Process called "is_list_hir" takes hir_node as Integer returns Integer:
     Note: Check if HIR node is a list literal
@@ -267,6 +371,20 @@ End Process
 Note: ============================================================================
 Note: HIR Dictionary Key Access
 Note: ============================================================================
+
+@Reasoning:
+The XML backend reads element name, text content and attribute values out
+of HIR dictionaries by string key. A dedicated lookup avoids importing the
+full Dict module just for this hot path.
+@End Reasoning
+
+@Implementation:
+Walks the HIR dictionary entries; for each, compares the entry key with
+the requested key byte-by-byte after a fast length check. When matched,
+returns the string literal value via get_string_literal_value, or the
+raw value pointer if the value is not a string. Returns 0 when no key
+matches.
+@End Implementation
 
 Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get string value from HIR dictionary by key
@@ -328,6 +446,17 @@ Process called "get_dict_string_value" takes hir_dict as Integer, key as Integer
     Return 0  Note: Key not found
 End Process
 
+@Reasoning:
+Companion to get_dict_string_value when the caller wants the raw HIR
+value (e.g. a nested dictionary or list) rather than a string projection.
+@End Reasoning
+
+@Implementation:
+Walks the HIR dictionary entries; for each, compares the entry key with
+the requested key byte-by-byte after a fast length check. Returns the
+raw value pointer on match, 0 otherwise.
+@End Implementation
+
 Process called "get_dict_hir_value" takes hir_dict as Integer, key as Integer returns Integer:
     Note: Get HIR node value from HIR dictionary by key
 
@@ -379,6 +508,20 @@ End Process
 Note: ============================================================================
 Note: XML Element Generation
 Note: ============================================================================
+
+@Reasoning:
+XML elements are the central syntactic unit: open tag with optional
+attributes, optional content, optional close tag. A single emitter
+handles self-closing, text-only, and child-nested forms.
+@End Reasoning
+
+@Implementation:
+Reads the "tag" name from the HIR dictionary, opens "<tag", emits any
+attributes by delegating to generate_attributes, then chooses between
+"/>" (no children), ">text</tag>" (string text content), or
+">\n<children>\n</tag>" (nested children dispatched through
+generate_node). Uses emit_indent/emit_newline to handle pretty printing.
+@End Implementation
 
 Process called "generate_element" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate XML element from HIR dictionary
@@ -517,6 +660,17 @@ Process called "generate_element" takes context as Integer, hir_node as Integer 
     Return 1
 End Process
 
+@Reasoning:
+XML attributes attach to the opening tag as name="value" pairs separated
+by spaces. Values must be escaped just like text content.
+@End Reasoning
+
+@Implementation:
+Walks the attributes dictionary entries; for each key/value pair emits
+" name=\"escaped_value\"" through the XML emitter using its
+emit_string and emit_attribute_value helpers.
+@End Implementation
+
 Process called "generate_attributes" takes context as Integer, attributes_hir as Integer returns Integer:
     Note: Generate XML attributes from HIR dictionary
 
@@ -567,6 +721,16 @@ Note: ==========================================================================
 Note: Text Content Generation
 Note: ============================================================================
 
+@Reasoning:
+Text content embedded between XML tags must be escaped for &, <, > and
+optionally quotes to prevent breaking the document structure.
+@End Reasoning
+
+@Implementation:
+Reads the string value from the HIR text node and forwards it to the XML
+emitter's emit_escaped_text helper which handles the entity replacements.
+@End Implementation
+
 Process called "generate_text" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate XML text content from HIR string literal
 
@@ -590,6 +754,17 @@ End Process
 Note: ============================================================================
 Note: Comment and Processing Instruction Generation
 Note: ============================================================================
+
+@Reasoning:
+XML comments are "<!-- text -->" sequences. The text must not contain
+"--" or end with "-" to be well-formed; the emitter assumes the HIR
+layer has already validated the payload.
+@End Reasoning
+
+@Implementation:
+Reads the comment text from the HIR node, then emits "<!-- ", the text,
+" -->" through the XML emitter. Pretty mode wraps with newlines.
+@End Implementation
 
 Process called "generate_comment" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate XML comment from HIR dictionary with "_comment" key
@@ -617,6 +792,17 @@ Process called "generate_comment" takes context as Integer, hir_node as Integer 
 
     Return 1
 End Process
+
+@Reasoning:
+Processing instructions ("<?target data?>") let documents carry tooling
+hints (stylesheet links, etc.) that survive parsing intact. The emitter
+preserves them verbatim.
+@End Reasoning
+
+@Implementation:
+Reads target and data attributes from the HIR node, emits "<?", target,
+" ", data, "?>" through the XML emitter. Pretty mode wraps with newlines.
+@End Implementation
 
 Process called "generate_processing_instruction" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate XML processing instruction from HIR dictionary with "_pi" key
@@ -648,6 +834,18 @@ End Process
 Note: ============================================================================
 Note: Node Type Dispatch
 Note: ============================================================================
+
+@Reasoning:
+Central dispatcher that routes any HIR node to the right XML emitter.
+Encapsulating the dispatch here keeps the recursive walk free of node-
+shape conditionals.
+@End Reasoning
+
+@Implementation:
+Reads the node "_type" string and dispatches to generate_element,
+generate_text, generate_comment, or generate_processing_instruction.
+Falls back to setting a generation error when the kind is unsupported.
+@End Implementation
 
 Process called "generate_node" takes context as Integer, hir_node as Integer returns Integer:
     Note: Generate XML from HIR node (dispatch based on node type)
@@ -699,6 +897,20 @@ End Process
 Note: ============================================================================
 Note: Top-Level Generation Function
 Note: ============================================================================
+
+@Reasoning:
+Public entry. Owns the lifecycle of an XMLGenContext, prepends the XML
+declaration when the include_declaration flag is set, and forwards
+internal errors to the higher-level translation_context.
+@End Reasoning
+
+@Implementation:
+Validates hir_root, constructs a generation context, optionally emits
+"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", dispatches the root
+through generate_node, then either pushes the internal error string to
+add_translation_error or extracts the output buffer via the emitter's
+get_output. Always destroys the context before returning.
+@End Implementation
 
 Process called "generate_xml_from_hir" takes hir_root as Integer, translation_context as Integer returns Integer:
     Note: Generate XML from HIR root node

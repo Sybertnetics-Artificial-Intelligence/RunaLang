@@ -48,6 +48,25 @@ Note: ==========================================================================
 Note: Semantic Analyzer State
 Note: ============================================================================
 
+@Reasoning:
+C++ semantic analysis is scope-, class-, and template-instantiation-sensitive.
+Name lookup walks an explicit scope stack (function/block/class/namespace);
+member lookup additionally consults class_hierarchy for base-class chains;
+template instantiation needs a separate cache to avoid re-instantiating the
+same template/args pair. Carrying these as fields on the analyzer keeps the
+recursive walks state-free and allows save/restore on errors via a sticky
+has_error flag.
+@End Reasoning
+
+@Implementation:
+80-byte record (10 x i64 slots) at offsets 0..72: global_scope (Dict
+name->CppSymbol), current_scope (Dict, top of stack), scope_stack (List of
+Dict), class_hierarchy (Dict class_name->base_list), template_cache (Dict
+template_id->instantiation), current_class (CppSymbol*), current_function
+(CppSymbol*), template_context (TemplateContext*), error_message (owned
+StringCore), has_error (sticky 0/1).
+@End Implementation
+
 Type called "CppSemanticAnalyzer":
     global_scope as Integer       Note: Global symbol table
     current_scope as Integer      Note: Current scope symbol table
@@ -64,6 +83,24 @@ End Type
 Note: ============================================================================
 Note: Symbol Table Entry for C++
 Note: ============================================================================
+
+@Reasoning:
+C++ symbols carry more than just a name and type: function overloads require
+a list of overloads at the same name, classes need template parameter lists,
+and every symbol is positioned relative to its class and namespace for
+qualified lookup (e.g., A::B::foo). The attributes slot packs access level,
+storage class, virtual/static/const flags as a bitfield so all attribute
+checks are O(1).
+@End Reasoning
+
+@Implementation:
+64-byte record (8 x i64) at offsets 0..56: name (StringCore), symbol_type
+(one of CPP_SYMBOL_* constants), type_info (type AST node pointer),
+attributes (packed bitfield), template_params (List of param nodes or 0
+for non-templates), overloads (List of CppSymbol or 0 for non-functions),
+class_context (CppSymbol* of enclosing class or 0), namespace_context
+(StringCore qualified namespace path or 0 for global).
+@End Implementation
 
 Type called "CppSymbol":
     name as Integer               Note: Symbol name
@@ -96,6 +133,22 @@ Constant ACCESS_PUBLIC as Integer is 2
 Note: ============================================================================
 Note: Template Instantiation Context
 Note: ============================================================================
+
+@Reasoning:
+Template instantiation in C++ is recursive: a template can instantiate
+another template, and template parameters from outer scopes must remain
+visible inside inner instantiations. The context is therefore a linked list
+via parent_context, with template_args holding the leaf binding map. The
+depth counter is checked against a hard limit to fail fast on accidentally
+divergent recursive templates (C++ standard mandates a limit of 17+).
+@End Reasoning
+
+@Implementation:
+24-byte record (3 x i64) at offsets 0/8/16: template_args (Dict param_name
+-> argument AST node), parent_context (TemplateContext* of enclosing
+instantiation or 0 for outermost), instantiation_depth (integer count
+incremented on each nested push, used to enforce the instantiation limit).
+@End Implementation
 
 Type called "TemplateContext":
     template_args as Integer      Note: Template argument mappings
@@ -643,6 +696,21 @@ Process called "push_cpp_scope" takes analyzer as Integer:
     proc memory_set_int64 from Layout with analyzer, 8, new_scope  Note: current_scope
 End Process
 
+@Reasoning:
+Symmetric counterpart to push_cpp_scope; closes the innermost block or class
+scope when a closing brace is encountered. Global scope must NEVER be popped
+because that would leave the analyzer with an empty stack and break all
+subsequent lookups, so the routine guards on stack_size > 1.
+@End Reasoning
+
+@Implementation:
+Reads scope_stack from offset 16, measures its size, and if it has at least
+two entries pops the top, then updates current_scope (offset 8) to point at
+the new top (index stack_size-2 after the pop). The popped Dict is not
+destroyed here because lambda/local-class scopes may reference its symbols
+in already-emitted HIR; ownership transfers to the analyzer destructor.
+@End Implementation
+
 Process called "pop_cpp_scope" takes analyzer as Integer:
     Note: Pop scope from scope stack
 
@@ -699,11 +767,36 @@ Process called "set_cpp_semantic_error" takes analyzer as Integer, message as In
     proc memory_set_int64 from Layout with analyzer, 64, error_copy
 End Process
 
+@Reasoning:
+Callers (and the driver pipeline) need to know whether analysis succeeded
+before consuming the analyzer's symbol tables for HIR emission. The flag is
+sticky on first error so the rest of the walk continues for diagnostic
+breadth without overwriting the original cause.
+@End Reasoning
+
+@Implementation:
+Direct read of the has_error slot at offset 72; returns 0/1 verbatim. No
+copying, no allocation, safe to call after destroy_cpp_semantic_analyzer
+has run (subject to caller checking the analyzer pointer is still valid).
+@End Implementation
+
 Process called "has_cpp_semantic_error" takes analyzer as Integer returns Integer:
     Note: Check if analyzer has error
 
     Return proc memory_get_int64 from Layout with analyzer, 72
 End Process
+
+@Reasoning:
+Diagnostic emitter pulls the first error message that tripped the analyzer.
+Returns a borrowed pointer to the analyzer-owned StringCore; the caller must
+NOT free it - destroy_cpp_semantic_analyzer owns the lifetime.
+@End Reasoning
+
+@Implementation:
+Direct read of the error_message slot at offset 64. Returns 0 if no error
+was recorded; otherwise returns the StringCore handle that was installed by
+set_cpp_semantic_error.
+@End Implementation
 
 Process called "get_cpp_semantic_error" takes analyzer as Integer returns Integer:
     Note: Get error message

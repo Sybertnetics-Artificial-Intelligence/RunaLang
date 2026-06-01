@@ -19,6 +19,18 @@ Note: ===================================================================
 Note: SEMANTIC ANALYZER STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+Eighteen-slot analyzer state covering all Makefile semantic registries:
+- targets/variables/dependencies are Dict-typed for O(1) name lookup during
+  reference resolution and cycle detection;
+- pattern_rules / implicit_rules / phony_targets / include_files /
+  conditional_blocks / function_calls / variable_references are List-typed
+  since they are iterated linearly during validation passes;
+- circular_dependencies / undefined_targets / unused_variables /
+  validation_errors / validation_warnings collect diagnostic output;
+- default_target / error_message / has_error provide single-value scalar
+  state for the first explicit target and any fatal error.
+@End Reasoning
 Type called "MakefileSemanticAnalyzer":
     targets as Integer
     variables as Integer
@@ -289,6 +301,21 @@ Process called "collect_makefile_include" takes analyzer as Integer, include_dir
     End While
 End Process
 
+@Reasoning:
+Validates an "include" / "sinclude" / "-include" filename by probing the
+filesystem with access(F_OK=0) for existence and access(R_OK=4) for read
+permission. Missing files emit an error (because plain "include" is fatal in
+Make); existing-but-unreadable files emit a warning so the user is notified
+without aborting the analysis pipeline. Silent-include forms (sinclude /
+-include) are not distinguished here — the parser layer is expected to handle
+suppression by passing through the silent flag.
+@End Reasoning
+
+@Security_Scope:
+Performs a filesystem access() syscall on the user-supplied include_file
+path. The string is taken at face value with no normalization; symlink and
+TOCTOU concerns are deferred to the build executor downstream.
+@End Security_Scope
 Process called "validate_include_file_existence" takes analyzer as Integer, include_file as Integer returns Integer:
     Note: Check if include file exists on filesystem using stat syscall
 
@@ -491,6 +518,13 @@ Process called "resolve_variable_references" takes analyzer as Integer:
     End While
 End Process
 
+@Reasoning:
+Per-list driver for variable-reference extraction. Used by
+resolve_variable_references to walk target names, prerequisites, and recipe
+command lines, dispatching each string into extract_variable_references which
+does the actual "$..." parsing. Null list is a no-op so callers do not need
+to guard.
+@End Reasoning
 Process called "check_variable_references_in_list" takes analyzer as Integer, string_list as Integer, references as Integer:
     Note: Check for variable references in list of strings
 
@@ -557,6 +591,13 @@ Process called "validate_makefile_targets" takes analyzer as Integer:
     proc check_missing_recipes from analyzer
 End Process
 
+@Reasoning:
+Iterates every target rule registered in the targets Dict and dispatches the
+target-name list and prerequisite list through their respective name
+validators (validate_target_names checks for empty, invalid-character, or
+duplicate target names; validate_prerequisite_names performs similar checks
+on dependency strings).
+@End Reasoning
 Process called "validate_target_syntax" takes analyzer as Integer:
     Note: Validate target rule syntax
 
@@ -784,6 +825,11 @@ Process called "validate_makefile_patterns" takes analyzer as Integer:
     proc validate_suffix_rules from analyzer
 End Process
 
+@Reasoning:
+Top-level driver for pattern-rule validation. Walks the analyzer's
+pattern_rules List and delegates each rule to validate_individual_pattern_rule
+for the per-rule "%" wildcard checks.
+@End Reasoning
 Process called "validate_pattern_rule_syntax_all" takes analyzer as Integer:
     Note: Validate syntax of all pattern rules
 
@@ -863,6 +909,21 @@ Process called "detect_makefile_circular_dependencies" takes analyzer as Integer
     End While
 End Process
 
+@Reasoning:
+DFS visit with three-color tracking: 'visiting' marks the recursion stack
+(WHITE/GRAY in classic terms) and 'visited' marks completed subtrees (BLACK).
+A back-edge (dependency name already in 'visiting') is exactly a cycle and is
+recorded as "target -> dep" in circular_deps plus a validation error.
+On exit, the node is removed from 'visiting' and added to 'visited' so
+ancestors can complete their own DFS without re-flagging this subtree.
+@End Reasoning
+
+@Performance_Hints:
+O(V + E) total across all targets when amortized through the visited set:
+each node is processed at most once because the 'visited' check at the
+caller prevents re-entry. Memory: O(V) for the two tracking dicts plus the
+recursion stack.
+@End Performance_Hints
 Process called "detect_cycle_from_target" takes analyzer as Integer, target_name as Integer, visited as Integer, visiting as Integer, circular_deps as Integer:
     Note: Detect cycles starting from specific target
 
@@ -998,6 +1059,11 @@ Process called "parse_variable_reference" takes text as Integer, start_pos as In
     Return 0
 End Process
 
+@Reasoning:
+Single-pass count of how many times a given byte appears in a string. Used
+by pattern-rule validation to enforce "exactly one %" in pattern targets.
+Returns 0 for empty strings without error.
+@End Reasoning
 Process called "count_character_occurrences" takes text as Integer, target_char as Integer returns Integer:
     Note: Count occurrences of character in text
 
@@ -1020,6 +1086,12 @@ Note: ===================================================================
 Note: ERROR HANDLING
 Note: ===================================================================
 
+@Reasoning:
+Records a fatal semantic error in the analyzer's error_message slot and
+sets has_error to 1. Distinct from add_makefile_validation_error: this is
+for analyzer-internal failures (e.g. memory allocation errors), while
+validation errors collect user-visible Makefile defects.
+@End Reasoning
 Process called "set_makefile_semantic_error" takes analyzer as Integer, error_message as Integer:
     Note: Set semantic analysis error
 
@@ -1027,6 +1099,12 @@ Process called "set_makefile_semantic_error" takes analyzer as Integer, error_me
     proc memory_set_int64 from Layout with analyzer, 136, 1
 End Process
 
+@Reasoning:
+Appends a user-visible validation error (e.g. undefined target, circular
+dependency, bad pattern rule) to the analyzer's validation_errors list.
+Multiple errors accumulate; the caller queries them via
+makefile_semantic_get_errors after analysis completes.
+@End Reasoning
 Process called "add_makefile_validation_error" takes analyzer as Integer, error_message as Integer:
     Note: Add validation error to error list
 
@@ -1034,6 +1112,11 @@ Process called "add_makefile_validation_error" takes analyzer as Integer, error_
     proc add from List with errors, error_message
 End Process
 
+@Reasoning:
+Appends a non-fatal warning (e.g. unused variable, undefined-but-builtin
+variable reference, unreadable include file) to validation_warnings. Warnings
+do not affect has_error or analysis success; they are advisory only.
+@End Reasoning
 Process called "add_makefile_validation_warning" takes analyzer as Integer, warning_message as Integer:
     Note: Add validation warning to warning list
 
@@ -1045,6 +1128,12 @@ Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
 
+@Reasoning:
+Public one-shot entry point: constructs an analyzer, runs the full analysis
+pipeline (collection -> resolution -> validation -> cycle detection) against
+the provided AST, and returns the populated analyzer for the caller to query
+via the accessor procs below. Analyzer allocation failure returns 0.
+@End Reasoning
 Process called "makefile_semantic_analyze" takes makefile_ast as Integer returns Integer:
     Note: Perform semantic analysis on Makefile AST
 
@@ -1057,6 +1146,11 @@ Process called "makefile_semantic_analyze" takes makefile_ast as Integer returns
     Return analyzer
 End Process
 
+@Reasoning:
+Accessor for the validation_errors list at offset 112. Null analyzer returns
+0 so callers can chain after a potentially-failed analyze call without an
+explicit null check.
+@End Reasoning
 Process called "makefile_semantic_get_errors" takes analyzer as Integer returns Integer:
     Note: Get validation errors from semantic analysis
 
@@ -1067,6 +1161,10 @@ Process called "makefile_semantic_get_errors" takes analyzer as Integer returns 
     Return proc memory_get_int64 from Layout with analyzer, 112
 End Process
 
+@Reasoning:
+Accessor for the validation_warnings list at offset 120. Null-safe like the
+errors accessor.
+@End Reasoning
 Process called "makefile_semantic_get_warnings" takes analyzer as Integer returns Integer:
     Note: Get validation warnings from semantic analysis
 
@@ -1077,6 +1175,10 @@ Process called "makefile_semantic_get_warnings" takes analyzer as Integer return
     Return proc memory_get_int64 from Layout with analyzer, 120
 End Process
 
+@Reasoning:
+Accessor for the circular_dependencies list at offset 88 — each entry is a
+"target -> dependency" string produced by the DFS cycle detector. Null-safe.
+@End Reasoning
 Process called "makefile_semantic_get_circular_dependencies" takes analyzer as Integer returns Integer:
     Note: Get circular dependencies found during analysis
 
@@ -1087,6 +1189,11 @@ Process called "makefile_semantic_get_circular_dependencies" takes analyzer as I
     Return proc memory_get_int64 from Layout with analyzer, 88
 End Process
 
+@Reasoning:
+Accessor for the undefined_targets list at offset 96 — names referenced as
+prerequisites that have no matching target rule and no implicit-rule match.
+Null-safe.
+@End Reasoning
 Process called "makefile_semantic_get_undefined_targets" takes analyzer as Integer returns Integer:
     Note: Get undefined targets found during analysis
 
@@ -1097,6 +1204,11 @@ Process called "makefile_semantic_get_undefined_targets" takes analyzer as Integ
     Return proc memory_get_int64 from Layout with analyzer, 96
 End Process
 
+@Reasoning:
+Returns the count of validation errors (or 1 for a null analyzer, which is
+itself a failure state). Callers typically treat any non-zero value as a
+build-blocking failure.
+@End Reasoning
 Process called "makefile_semantic_has_errors" takes analyzer as Integer returns Integer:
     Note: Check if semantic analysis found any errors
 

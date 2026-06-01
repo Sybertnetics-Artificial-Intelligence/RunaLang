@@ -54,6 +54,18 @@ Note: ==========================================================================
 Note: Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Carries the writer-side state required for HIR-to-JSON translation: the raw byte
+emitter, indentation cursor, formatting preferences, and a single-slot error channel
+so callers do not need to thread an Either-result through every traversal step.
+@End Reasoning
+
+@Implementation:
+Six int64 fields kept as a flat owned-heap block; bool-valued fields use {0,1}
+since the bootstrap object model lacks a native Boolean. error_message owns its
+heap copy and is freed in destroy_hir_to_json_context.
+@End Implementation
+
 Type called "HIRToJSONContext":
     emitter as Integer          Note: JSON emitter instance
     error_message as Integer    Note: Error message (if any)
@@ -66,6 +78,25 @@ End Type
 Note: ============================================================================
 Note: Context Creation and Destruction
 Note: ============================================================================
+
+@Reasoning:
+Construction must produce a fully-initialized context: a context whose emitter
+slot is null would let any downstream emit_* call dereference 0. Two-stage
+allocation (context, then emitter) keeps the error path symmetric.
+@End Reasoning
+
+@Implementation:
+Allocates the 48-byte HIRToJSONContext, then a raw byte emitter. If either
+allocation fails the partial state is rolled back. All six fields are written
+through memory_set_int64; indent_size defaults to 2 spaces per RFC 8259 pretty
+printers.
+@End Implementation
+
+@Performance_Hints:
+Two heap allocations per top-level translation. The emitter buffer grows as
+output accumulates; preallocating would require a size estimate the caller
+does not have.
+@End Performance_Hints
 
 Process called "create_hir_to_json_context" takes pretty_print as Integer returns Integer:
     Note: Create HIR to JSON translation context
@@ -101,6 +132,19 @@ Process called "create_hir_to_json_context" takes pretty_print as Integer return
     Return context
 End Process
 
+@Reasoning:
+Symmetric counterpart to create_hir_to_json_context. Frees the emitter and the
+error-message buffer the context may have taken ownership of, before releasing
+the context block itself. Null-tolerant so callers may invoke it
+unconditionally in cleanup paths.
+@End Reasoning
+
+@Implementation:
+Reads the emitter and error_message slots via memory_get_int64, frees each only
+if non-zero, then deallocates the context block. Order matters: the emitter
+must be torn down before the context whose memory holds the pointer.
+@End Implementation
+
 Process called "destroy_hir_to_json_context" takes context as Integer returns Integer:
     Note: Destroy translation context
 
@@ -131,6 +175,24 @@ Note: ==========================================================================
 Note: Error Handling
 Note: ============================================================================
 
+@Reasoning:
+Stores the first or replacement error message so the caller can report it back.
+Owning a heap copy decouples the lifetime of the message from the source HIR or
+caller buffer, which may be transient.
+@End Reasoning
+
+@Implementation:
+Frees any prior error_message buffer, copies the C-style null-terminated input
+into a freshly allocated string (length + 1 for the terminator), and sets
+has_error to 1. Uses string_length to size the copy, memory_copy for the bytes,
+and memory_set_byte for the terminator.
+@End Implementation
+
+@Security_Scope:
+Trusts that message is a valid null-terminated string the caller still owns.
+Returned heap is owned by the context.
+@End Security_Scope
+
 Process called "set_translation_error" takes context as Integer, message as Integer returns Integer:
     Note: Set translation error message
 
@@ -160,6 +222,18 @@ Note: ==========================================================================
 Note: Indentation Management
 Note: ============================================================================
 
+@Reasoning:
+Pretty-printing requires indentation that matches the current nesting depth.
+Bypassing the loop when pretty_print is 0 keeps compact-mode output free of
+stray whitespace.
+@End Reasoning
+
+@Implementation:
+Reads indent_level and indent_size from the context, multiplies them to obtain
+the byte count, then emits that many ASCII space (32) bytes through the raw
+emitter.
+@End Implementation
+
 Process called "emit_indent" takes context as Integer returns Integer:
     Note: Emit indentation if pretty printing enabled
 
@@ -184,6 +258,17 @@ Process called "emit_indent" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+JSON pretty-printing inserts a newline between every object/array member.
+Skipping the newline in compact mode produces single-line output suitable for
+wire transmission.
+@End Reasoning
+
+@Implementation:
+Conditionally emits a single LF (10) byte through the raw emitter when
+pretty_print is non-zero.
+@End Implementation
+
 Process called "emit_newline" takes context as Integer returns Integer:
     Note: Emit newline if pretty printing enabled
 
@@ -199,6 +284,18 @@ Process called "emit_newline" takes context as Integer returns Integer:
     Return 1
 End Process
 
+@Reasoning:
+Called by translate_hir_dictionary and translate_hir_list when entering a
+nested structure so subsequent emit_indent calls produce one extra indent
+level of leading whitespace.
+@End Reasoning
+
+@Implementation:
+Reads the current indent_level slot, increments it, writes it back. Trivial
+counter mutation; no overflow guard needed because real HIR nesting is bounded
+by the parser's recursion limits.
+@End Implementation
+
 Process called "increase_indent" takes context as Integer returns Integer:
     Note: Increase indentation level
 
@@ -208,6 +305,17 @@ Process called "increase_indent" takes context as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Symmetric counterpart to increase_indent, called when exiting a nested
+structure. Clamps at zero so a mismatched call cannot drive the counter
+negative and break later indent arithmetic.
+@End Reasoning
+
+@Implementation:
+Reads indent_level; if greater than zero, decrements and writes back. The
+clamp is a defensive invariant rather than an error case.
+@End Implementation
 
 Process called "decrease_indent" takes context as Integer returns Integer:
     Note: Decrease indentation level
@@ -225,6 +333,32 @@ End Process
 Note: ============================================================================
 Note: String Escaping
 Note: ============================================================================
+
+@Reasoning:
+RFC 8259 requires every double quote, backslash, and control character inside
+a JSON string to be escaped, or else the resulting document is not valid JSON.
+This routine produces the exact escape sequence the spec mandates for each
+forbidden code point.
+@End Reasoning
+
+@Implementation:
+Emits an opening quote, walks the input byte-by-byte using string_length to
+bound the loop, and rewrites the seven RFC short escapes (\", \\, \b, \f, \n,
+\r, \t) plus a six-byte \u00XX escape for any other control char below 0x20.
+Bytes at or above 0x20 are passed through unchanged so UTF-8 sequences survive
+intact. Closes with a quote byte.
+@End Implementation
+
+@Performance_Hints:
+One pass per string; hot loop on character translation. The byte-level emitter
+is the common bottleneck; batching contiguous safe runs would help but is left
+to a future emitter API.
+@End Performance_Hints
+
+@Security_Scope:
+Trusts str to be a null-terminated UTF-8 buffer. Control bytes are neutralized
+by escaping; arbitrary binary input cannot break out of the quoted region.
+@End Security_Scope
 
 Process called "emit_escaped_string" takes context as Integer, str as Integer returns Integer:
     Note: Emit JSON string with proper escaping
@@ -308,6 +442,24 @@ Note: ==========================================================================
 Note: HIR Node Translation
 Note: ============================================================================
 
+@Reasoning:
+Central dispatcher for the HIR-to-JSON tree walk. Keeping a single dispatcher
+means each translator handles exactly one node kind, which keeps recursion
+explicit and the call graph predictable.
+@End Reasoning
+
+@Implementation:
+Reads the node tag via get_hir_node_type and forwards to the specialised
+translate_hir_* helper for dictionaries, lists, strings, integers, floats,
+booleans and nulls. Unknown tags become a translation error so the caller
+sees the unsupported variant by name in the failure message.
+@End Implementation
+
+@Performance_Hints:
+Linear chain of if-checks per node; cheap because the constant comparisons
+fold into branch chains. Recursion depth equals HIR nesting depth.
+@End Performance_Hints
+
 Process called "translate_hir_node_to_json" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR node to JSON
 
@@ -355,6 +507,25 @@ Process called "translate_hir_node_to_json" takes context as Integer, hir_node a
     proc set_translation_error with context, "Unsupported HIR node type for JSON"
     Return 0
 End Process
+
+@Reasoning:
+HIR dictionaries are the source of JSON objects. The translator must preserve
+insertion order, escape every key as a JSON string regardless of its Runa
+representation, and emit valid syntactic punctuation (braces, colons, commas).
+@End Reasoning
+
+@Implementation:
+Emits '{' then iterates HIR dictionary entries via get_dictionary_entry_count
+and get_dictionary_entry_at. For each entry: indent, emit key via
+emit_escaped_string, emit ':' (plus optional space when pretty), recurse via
+translate_hir_node_to_json on the value, append ',' on all but the last
+entry, then newline. Recursion failure short-circuits to 0.
+@End Implementation
+
+@Performance_Hints:
+One pass over entries; recursion cost dominates because each value triggers
+another dispatcher entry.
+@End Performance_Hints
 
 Process called "translate_hir_dictionary" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR dictionary to JSON object
@@ -426,6 +597,22 @@ Process called "translate_hir_dictionary" takes context as Integer, hir_node as 
     Return 1
 End Process
 
+@Reasoning:
+HIR lists become JSON arrays. Mirrors the dictionary translator but without
+keys and using square brackets instead of braces.
+@End Reasoning
+
+@Implementation:
+Emits '['; if the list has any elements, enters a nested indent block and
+walks element by element through get_list_element_at, recursing into
+translate_hir_node_to_json for each. Adds a comma between elements and a
+newline after each. Emits ']' once the loop is complete.
+@End Implementation
+
+@Performance_Hints:
+Linear in element count plus the cost of every recursive translation.
+@End Performance_Hints
+
 Process called "translate_hir_list" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR list to JSON array
 
@@ -481,6 +668,17 @@ Process called "translate_hir_list" takes context as Integer, hir_node as Intege
     Return 1
 End Process
 
+@Reasoning:
+Delegates to emit_escaped_string so every Runa string literal becomes a
+spec-conformant JSON string with proper escapes.
+@End Reasoning
+
+@Implementation:
+Pulls the literal value out of the HIR node via get_string_literal_value;
+a null payload is a parser invariant violation and is reported as a
+translation error. Otherwise hands the buffer to emit_escaped_string.
+@End Implementation
+
 Process called "translate_hir_string" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR string literal to JSON string
 
@@ -498,6 +696,17 @@ Process called "translate_hir_string" takes context as Integer, hir_node as Inte
     Return 1
 End Process
 
+@Reasoning:
+JSON has only a single Number type; integer literals are emitted in their
+canonical base-10 representation with an optional leading minus sign.
+@End Reasoning
+
+@Implementation:
+Reads the i64 value through get_integer_literal_value, formats it with the
+local integer_to_string helper, emits the result through the raw emitter,
+then frees the temporary buffer.
+@End Implementation
+
 Process called "translate_hir_integer" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR integer literal to JSON number
 
@@ -513,6 +722,26 @@ Process called "translate_hir_integer" takes context as Integer, hir_node as Int
 
     Return 1
 End Process
+
+@Reasoning:
+The bootstrap stdlib int-to-string is not available in this module's import
+graph, so this backend ships its own minimal converter. Producing the digits
+right-to-left and writing into a pre-sized buffer avoids any string-concat
+overhead.
+@End Reasoning
+
+@Implementation:
+Special-cases zero with a two-byte "0\0" allocation. For non-zero values,
+records the sign, takes the absolute value, counts decimal digits with a
+divide loop, allocates length+1 bytes, then writes digits from least- to
+most-significant by repeatedly taking modulo 10. Inserts '-' at index 0 if
+the input was negative, then null-terminates.
+@End Implementation
+
+@Performance_Hints:
+Two passes (count, then write); allocates exactly the bytes needed. Caller
+owns and must free the returned buffer.
+@End Performance_Hints
 
 Process called "integer_to_string" takes value as Integer returns Integer:
     Note: Convert integer to string representation
@@ -582,6 +811,18 @@ Process called "integer_to_string" takes value as Integer returns Integer:
     Return result
 End Process
 
+@Reasoning:
+The HIR keeps the original lexical form of float literals precisely so
+backends can reproduce the user's chosen precision without rounding through
+a double. Emitting the source string is the only round-trip-safe choice.
+@End Reasoning
+
+@Implementation:
+Retrieves the lexeme via get_float_literal_string. A null payload indicates a
+malformed HIR node and is reported as a translation error. Otherwise the
+string is forwarded verbatim through the raw emitter.
+@End Implementation
+
 Process called "translate_hir_float" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR float literal to JSON number
 
@@ -606,6 +847,16 @@ Process called "translate_hir_float" takes context as Integer, hir_node as Integ
     Return 1
 End Process
 
+@Reasoning:
+JSON booleans are the literal tokens true / false. Non-zero HIR boolean
+payloads collapse to true so the writer is robust to any truthy encoding.
+@End Reasoning
+
+@Implementation:
+Calls get_boolean_literal_value; if it returns 1 the literal "true" is
+written, otherwise "false". The string is emitted with the raw emitter.
+@End Implementation
+
 Process called "translate_hir_boolean" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR boolean literal to JSON true/false
 
@@ -623,6 +874,15 @@ Process called "translate_hir_boolean" takes context as Integer, hir_node as Int
     Return 1
 End Process
 
+@Reasoning:
+The JSON null token is the canonical projection of HIR's Optional/None.
+@End Reasoning
+
+@Implementation:
+Emits the four-byte string "null" through the raw emitter. The hir_node
+parameter is unused but kept for dispatcher symmetry.
+@End Implementation
+
 Process called "translate_hir_null" takes context as Integer, hir_node as Integer returns Integer:
     Note: Translate HIR null literal to JSON null
 
@@ -635,6 +895,29 @@ End Process
 Note: ============================================================================
 Note: Top-Level Translation Function
 Note: ============================================================================
+
+@Reasoning:
+Public entry point for HIR-to-JSON translation. Wraps the private dispatch in
+a lifecycle that owns the per-translation context and surfaces any internal
+error through the caller's higher-level translation_context.
+@End Reasoning
+
+@Implementation:
+Validates hir_root, creates a pretty-printing HIRToJSONContext, recurses
+through translate_hir_node_to_json, then inspects has_error: on failure the
+internal message is forwarded to add_translation_error and the context is
+destroyed. On success the emitter's output buffer is detached (caller-owned)
+and the context is destroyed.
+@End Implementation
+
+@Performance_Hints:
+One create / one destroy per translation. Output buffer ownership transfers
+to the caller; the caller must free or pass it to a writer that does.
+@End Performance_Hints
+
+@Security_Scope:
+Trusts hir_root to be a valid HIR node graph produced by the parser.
+@End Security_Scope
 
 Process called "translate_hir_to_json" takes hir_root as Integer, translation_context as Integer returns Integer:
     Note: Translate Runa HIR to JSON string

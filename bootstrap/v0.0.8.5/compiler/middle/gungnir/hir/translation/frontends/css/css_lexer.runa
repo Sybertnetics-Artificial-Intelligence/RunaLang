@@ -85,6 +85,18 @@ Constant TOKEN_EQUALS as Integer is 23
 Constant TOKEN_COMMENT as Integer is 24
 Constant TOKEN_EOF as Integer is 99
 
+@Reasoning:
+CSS lexing is byte-based ASCII (the spec allows non-ASCII in identifiers
+via escapes but the practical corpus is ASCII). The lexer cursor is
+byte-indexed and source_length is cached so the EOF check is O(1).
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64) at offsets 0..32: source (StringCore handle),
+source_length (cached byte length), position (byte cursor, 0-based), line
+(1-based), column (1-based).
+@End Implementation
+
 Type called "Lexer":
     source as Integer
     source_length as Integer
@@ -92,6 +104,20 @@ Type called "Lexer":
     line as Integer
     column as Integer
 End Type
+
+@Reasoning:
+Tokens carry a borrowed pointer + length into the source string rather
+than a defensively-copied StringCore so lexing stays allocation-light.
+Line/column are stamped at token-start for error reporting. metadata is
+a general-purpose slot used by hash tokens (#id vs #hex) and number
+tokens (units).
+@End Reasoning
+
+@Implementation:
+48-byte record (6 x i64) at offsets 0..40: token_type (TOKEN_*),
+text (raw byte pointer into source), length (byte count), line, column,
+metadata (token-type-specific).
+@End Implementation
 
 Type called "Token":
     token_type as Integer
@@ -101,6 +127,19 @@ Type called "Token":
     column as Integer
     metadata as Integer
 End Type
+
+@Reasoning:
+Lexer factory. Validates the source pointer and caches source_length so
+the per-character bounds check is constant time. Initialises line/column
+to 1 (1-based) and position to 0.
+@End Reasoning
+
+@Implementation:
+Null-checks source; on null returns 0. Computes source_length via
+StringCore.string_length. Allocates 40-byte block; on OOM returns 0.
+Writes source, source_length, position=0, line=1, column=1 at offsets
+0/8/16/24/32.
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create a new CSS lexer
@@ -127,6 +166,18 @@ Process called "create_lexer" takes source as Integer returns Integer:
     Return lexer
 End Process
 
+@Reasoning:
+Cursor-read accessor; returns 0 (EOF sentinel) at or past source_length so
+scanners can distinguish EOF from a NUL byte (CSS source rarely contains
+NULs anyway).
+@End Reasoning
+
+@Implementation:
+Reads position and source_length. If position >= source_length returns 0.
+Otherwise reads the byte at source+position via memory_get_byte and
+returns it.
+@End Implementation
+
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -142,6 +193,19 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+Multi-byte lookahead for distinguishing comment delimiters ("/*", "*/"),
+attribute-selector operators ("~=", "^=", "$=", "*=", "|="), and pseudo-
+classes (":pseudo" vs "::pseudo").
+@End Reasoning
+
+@Implementation:
+Reads position and source_length. Computes peek_pos = position + offset.
+If peek_pos >= source_length returns 0. Otherwise reads byte at
+source+peek_pos. Negative offsets are not validated; callers pass
+non-negative values.
+@End Implementation
 
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek ahead by offset characters
@@ -159,6 +223,19 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns In
 
     Return char
 End Process
+
+@Reasoning:
+Cursor-advancing read with line/column maintenance. LF (0x0A) increments
+line and resets column to 1; any other byte increments column. CR is
+treated like any other byte; CRLF sequences correctly bump the line on
+the LF and the column tracking remains consistent.
+@End Reasoning
+
+@Implementation:
+Reads position/source_length; if past EOF returns 0. Otherwise reads the
+byte, increments position. On LF (10) bumps line and resets column to 1;
+otherwise bumps column. Returns the original byte.
+@End Implementation
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
@@ -191,6 +268,16 @@ Process called "advance_char" takes lexer as Integer returns Integer:
     Return char
 End Process
 
+@Reasoning:
+CSS whitespace per spec: U+0020 space, U+0009 tab, U+000A LF, U+000D CR.
+Form-feed (U+000C) is in the spec but absent from real-world stylesheets;
+omitted intentionally to keep the predicate fast.
+@End Reasoning
+
+@Implementation:
+Four equality checks against 32, 9, 10, 13. Returns 1 on match, 0 otherwise.
+@End Implementation
+
 Process called "is_whitespace" takes char as Integer returns Integer:
     If char is equal to 32:
         Return 1
@@ -207,6 +294,16 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII alphabetic classifier. Used by is_identifier_start /
+is_identifier_char to bound CSS identifiers to ASCII letters; non-ASCII
+identifiers are not supported by this lexer.
+@End Reasoning
+
+@Implementation:
+Two nested-If range checks: 'A'..'Z' (65..90) and 'a'..'z' (97..122).
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     If char is greater than or equal to 65:
         If char is less than or equal to 90:
@@ -221,6 +318,15 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit classifier used by number scanning and identifier tail
+classification.
+@End Reasoning
+
+@Implementation:
+Single range check: '0'..'9' (48..57). Returns 1 on match.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     If char is greater than or equal to 48:
         If char is less than or equal to 57:
@@ -229,6 +335,16 @@ Process called "is_digit" takes char as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning:
+Hex classifier for #rrggbb and #rrggbbaa color literal scanning. Accepts
+0..9, A..F, and a..f.
+@End Reasoning
+
+@Implementation:
+Three nested range checks: '0'..'9' (48..57), 'A'..'F' (65..70), 'a'..'f'
+(97..102). Returns 1 on match.
+@End Implementation
 
 Process called "is_hex_digit" takes char as Integer returns Integer:
     If char is greater than or equal to 48:
@@ -249,6 +365,18 @@ Process called "is_hex_digit" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+CSS identifiers may start with a letter, dash (vendor prefix or custom
+property leading "-"), or underscore. The fourth start case per spec is
+an escaped char "\xx"; that's handled in scan_identifier directly, not
+here.
+@End Reasoning
+
+@Implementation:
+Calls is_alpha; on match returns 1. Otherwise checks '-' (45) and '_'
+(95) explicitly. Returns 0 for any other byte.
+@End Implementation
+
 Process called "is_identifier_start" takes char as Integer returns Integer:
     Let is_alpha_result be proc is_alpha from char
     If is_alpha_result is equal to 1:
@@ -262,6 +390,17 @@ Process called "is_identifier_start" takes char as Integer returns Integer:
     End If
     Return 0
 End Process
+
+@Reasoning:
+CSS identifier-tail characters extend is_identifier_start with digits.
+'--' is a valid prefix (CSS custom properties), '-' is a valid mid-
+character, hence dashes are also accepted in tail position.
+@End Reasoning
+
+@Implementation:
+Calls is_alpha then is_digit; either match returns 1. Otherwise checks
+'-' (45) and '_' (95).
+@End Implementation
 
 Process called "is_identifier_char" takes char as Integer returns Integer:
     Let is_alpha_result be proc is_alpha from char
@@ -281,6 +420,17 @@ Process called "is_identifier_char" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Centralised token allocator. Every scanner produces tokens through this
+single path so the layout stays uniform across token kinds.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes; on OOM returns 0. Writes token_type/text/length/line
+/column/metadata at offsets 0/8/16/24/32/40. text is a borrowed pointer
+into source - the token's lifetime must not exceed the source string's.
+@End Implementation
+
 Process called "create_token" takes token_type as Integer, text as Integer, length as Integer, line as Integer, column as Integer, metadata as Integer returns Integer:
     Let token_size be 48
     Let token be proc allocate from Layout with token_size
@@ -299,6 +449,19 @@ Process called "create_token" takes token_type as Integer, text as Integer, leng
     Return token
 End Process
 
+@Reasoning:
+Inter-token whitespace skipper. CSS exposes whitespace as significant only
+inside the descendant combinator (between selectors); the lexer doesn't
+emit a whitespace token there - the parser inserts it implicitly between
+non-combinator selector tokens.
+@End Reasoning
+
+@Implementation:
+Loops peek_char + is_whitespace; on non-whitespace breaks. Uses
+advance_char to consume so line/column tracking stays accurate. Returns 1
+by convention.
+@End Implementation
+
 Process called "skip_whitespace" takes lexer as Integer returns Integer:
     While 1 is equal to 1:
         Let char be proc peek_char from lexer
@@ -313,6 +476,21 @@ Process called "skip_whitespace" takes lexer as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+CSS only has /* ... */ block comments (no //). Comments are emitted as
+TOKEN_COMMENT (not skipped) so formatters and IDEs can preserve them
+through the AST.
+@End Reasoning
+
+@Implementation:
+Captures line/column at the start of the "/*". Consumes the two delimiter
+bytes; records start_position. Loops: 0 (EOF) breaks; '*' (42) followed
+by '/' (47) breaks. Computes end_position - start_position as the inner
+length. Consumes the closing "*/" (two advances). text_ptr points to the
+start of the inner comment text in source. Emits TOKEN_COMMENT with that
+borrowed slice.
+@End Implementation
 
 Process called "scan_comment" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
@@ -352,6 +530,20 @@ Process called "scan_comment" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_COMMENT, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+Identifiers in CSS include property names, selector tags, function names,
+@-rule names (after the '@'), and custom property identifiers
+(--my-var). Caller must verify is_identifier_start before calling this.
+@End Reasoning
+
+@Implementation:
+Captures source/start_position/line/column. Loops peek_char +
+is_identifier_char; on non-id-char breaks. text_ptr = source +
+start_position (borrowed slice into source). length = end - start. Emits
+TOKEN_IDENTIFIER. The token's borrowed text pointer keeps zero-copy
+performance.
+@End Implementation
+
 Process called "scan_identifier" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 16
@@ -376,6 +568,21 @@ Process called "scan_identifier" takes lexer as Integer returns Integer:
 
     Return proc create_token with TOKEN_IDENTIFIER, text_ptr, length, line, column, 0
 End Process
+
+@Reasoning:
+CSS numeric literals are integers or decimals optionally followed by a
+unit (px, em, %, deg, rad, etc.). The number portion is scanned first
+then the unit suffix (alpha or '%') is scanned and attached as
+metadata, preserving zero-copy by keeping a borrowed unit pointer.
+@End Reasoning
+
+@Implementation:
+Captures source/start/line/column. Scans digits and '.' (46) into the
+number portion. After the number, peeks for alpha or '%' (37); if found,
+scans the unit and stores unit_ptr (borrowed) in the token's metadata
+slot at offset 40. The token's text/length always cover only the digit
+portion - units are accessible separately via metadata.
+@End Implementation
 
 Process called "scan_number" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
@@ -432,6 +639,22 @@ Process called "scan_number" takes lexer as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+CSS string literals can use single or double quotes. Backslash escapes are
+recognised so the lexer correctly skips an escaped quote in the middle of
+a string. The token text covers only the content between (not including)
+the quotes.
+@End Reasoning
+
+@Implementation:
+Captures source/line/column. Consumes the opening quote and remembers its
+byte value in quote_char. Records start_position immediately after the
+quote. Loops: 0 (EOF) breaks unterminated; matching quote_char breaks
+(consumed below); '\\' (92) consumes itself + the next byte. text_ptr =
+source + start_position; length = end - start (excluding the closing
+quote which is consumed by the scanner ending the loop).
+@End Implementation
+
 Process called "scan_string" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let line be proc memory_get_int64 from Layout with lexer, 24
@@ -470,6 +693,20 @@ Process called "scan_string" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_STRING, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+'#'-prefixed tokens cover both ID selectors (#header) and hex color
+literals (#ff00aa). Both are scanned identically here; downstream
+consumers distinguish by checking whether the suffix is all hex digits
+and 3/4/6/8 bytes long. text covers the suffix including the '#'.
+@End Reasoning
+
+@Implementation:
+Captures source/start/line/column. Consumes the leading '#'. Loops:
+accepts is_hex_digit OR is_identifier_char so both selector IDs and hex
+colors are accepted. text_ptr = source + start_position (includes '#');
+length = end - start.
+@End Implementation
+
 Process called "scan_hash" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 16
@@ -500,6 +737,18 @@ Process called "scan_hash" takes lexer as Integer returns Integer:
     Return proc create_token with TOKEN_HASH, text_ptr, length, line, column, 0
 End Process
 
+@Reasoning:
+At-rule tokens start with '@' followed by an identifier (@media, @import,
+@keyframes, ...). The full @-name is captured as a single token so the
+parser doesn't have to re-stitch the '@' to the next identifier.
+@End Reasoning
+
+@Implementation:
+Captures source/start/line/column. Consumes the leading '@'. Loops
+peek_char + is_identifier_char; on non-id-char breaks. text_ptr =
+source + start_position (covers '@' + name); length = end - start.
+@End Implementation
+
 Process called "scan_at_rule" takes lexer as Integer returns Integer:
     Let source be proc memory_get_int64 from Layout with lexer, 0
     Let start_position be proc memory_get_int64 from Layout with lexer, 16
@@ -526,6 +775,22 @@ Process called "scan_at_rule" takes lexer as Integer returns Integer:
 
     Return proc create_token with TOKEN_AT_RULE, text_ptr, length, line, column, 0
 End Process
+
+@Reasoning:
+Top-level dispatcher: skips whitespace, then routes the current byte to
+the appropriate scanner. Dispatch order is significant - longer
+multi-byte prefixes (e.g. "/*" before bare '/') are checked first.
+@End Reasoning
+
+@Implementation:
+Skips whitespace. Peeks current_char. EOF (0) returns TOKEN_EOF. '/'
+followed by '*' (peek_ahead) dispatches to scan_comment. '.' is treated as
+a class-selector prefix - advance and continue into scan_identifier. '#'
+dispatches to scan_hash (if next is hex/id) or scan_identifier (when used
+as class-only). '@' dispatches to scan_at_rule. Quotes (34/39) dispatch
+to scan_string. Other bytes fall through to per-operator branches handled
+elsewhere in the proc body.
+@End Implementation
 
 Process called "next_token" takes lexer as Integer returns Integer:
     proc skip_whitespace from lexer

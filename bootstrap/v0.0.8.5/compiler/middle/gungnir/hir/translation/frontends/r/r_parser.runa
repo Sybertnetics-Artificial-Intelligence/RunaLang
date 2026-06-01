@@ -95,6 +95,14 @@ Note: ==========================================================================
 Note: Parser State
 Note: ============================================================================
 
+@Reasoning:
+RParser holds an immutable view over the lexer's token array plus a moving cursor and recovery flags. Panic_mode is a Pratt-style recovery state: once tripped, the parser consumes until a synchronization token before re-attempting parses.
+@End Reasoning
+
+@Implementation:
+Five 8-byte fields, total 40 bytes, accessed via Layout offsets 0,8,16,24,32. tokens is a borrowed pointer to the lexer's heap-allocated token array.
+@End Implementation
+
 Type called "RParser":
     tokens as Integer       Note: Token array
     token_count as Integer  Note: Number of tokens
@@ -106,6 +114,14 @@ End Type
 Note: ============================================================================
 Note: AST Node Structure
 Note: ============================================================================
+
+@Reasoning:
+ASTNode is a unified representation for every R syntactic construct - expressions, statements, function definitions, formulas. Both binary (left/right) and n-ary (children array) shapes are present so binary operators don't pay the cost of an array allocation while function calls and blocks can scale to arbitrary arity.
+@End Reasoning
+
+@Implementation:
+Nine 8-byte fields, total 72 bytes, at offsets 0..64. Left/right are direct child pointers; children is a heap-grown array of pointers with child_count as its length. Token_type retains the original operator token for AST consumers that need to distinguish + from - etc.
+@End Implementation
 
 Type called "ASTNode":
     node_type as Integer    Note: Type of AST node
@@ -122,6 +138,18 @@ End Type
 Note: ============================================================================
 Note: Parser Creation
 Note: ============================================================================
+
+@Reasoning:
+Allocates an RParser cursor over a pre-existing token array. The token array is borrowed - it must remain valid for the parser's lifetime. Cursor starts at 0 with both error flags cleared.
+@End Reasoning
+
+@Implementation:
+Allocates 40 bytes via Layout, writes tokens pointer, token_count, and zeroes current/had_error/panic_mode. Returns 0 on allocation failure.
+@End Implementation
+
+@Security_Scope:
+Returns heap-allocated parser; caller must destroy_parser. Does not assume ownership of the tokens array.
+@End Security_Scope
 
 Process called "create_parser" takes tokens as Integer, token_count as Integer returns Integer:
     Note: Create parser with token array
@@ -147,6 +175,14 @@ Process called "create_parser" takes tokens as Integer, token_count as Integer r
     Return parser
 End Process
 
+@Reasoning:
+Releases the RParser block. Does not free the tokens array (borrowed) nor any AST nodes (those are owned by the caller's AST). Null-tolerant for failure-path destruction.
+@End Reasoning
+
+@Implementation:
+Null-checks then calls Layout.deallocate. Always returns 1.
+@End Implementation
+
 Process called "destroy_parser" takes parser as Integer returns Integer:
     Note: Destroy parser and free memory
 
@@ -162,6 +198,18 @@ End Process
 Note: ============================================================================
 Note: AST Node Management
 Note: ============================================================================
+
+@Reasoning:
+Single allocation point for every AST node so the 72-byte layout and field offsets stay invariant across all parse_* routines. All non-type fields are zeroed; parsers fill them in as needed.
+@End Reasoning
+
+@Implementation:
+Allocates 72 bytes via Layout, writes node_type at offset 0, zeros all other 8 fields explicitly. Returns 0 on allocation failure.
+@End Implementation
+
+@Security_Scope:
+Returns heap-allocated node; ownership transfers to the AST tree being built. Each node may grow a children array via add_child which adds further heap allocations.
+@End Security_Scope
 
 Process called "create_node" takes node_type as Integer returns Integer:
     Note: Create new AST node
@@ -185,6 +233,18 @@ Process called "create_node" takes node_type as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Appends a child pointer to the parent's variable-length children array. Uses naive grow-by-one realloc so the resulting array length equals child_count exactly - simpler than amortised doubling but more allocator traffic; acceptable here because R AST nodes rarely have more than a handful of children.
+@End Reasoning
+
+@Implementation:
+Allocates first slot lazily on first child. Subsequent calls allocate a new buffer of child_count+1 pointers, copy existing entries via a manual loop, deallocate the old buffer, then store the new child at index child_count and bump child_count.
+@End Implementation
+
+@Performance_Hints:
+O(n) per append due to copy; cumulative O(n^2) for n appends. Acceptable for shallow R syntax (call args, block statements). For very wide nodes (large block bodies) this could be hot.
+@End Performance_Hints
 
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
@@ -241,6 +301,14 @@ Note: ==========================================================================
 Note: Token Access
 Note: ============================================================================
 
+@Reasoning:
+Returns a pointer into the token array at the current cursor position. Returns 0 at end-of-stream so callers can use a single null-check sentinel for EOF detection.
+@End Reasoning
+
+@Implementation:
+Reads tokens base pointer, current index, and token_count. Bounds-checks then returns tokens + current * 40 (token size is 40 bytes - matches RToken layout from r_lexer).
+@End Implementation
+
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token
 
@@ -256,6 +324,14 @@ Process called "current_token" takes parser as Integer returns Integer:
 
     Return token_ptr
 End Process
+
+@Reasoning:
+Lookahead helper for grammars that need to disambiguate beyond one token (e.g. `<- function (` vs `<-` followed by expression). Caller specifies absolute offset from cursor; 0 is equivalent to current_token.
+@End Reasoning
+
+@Implementation:
+Adds offset to current index, bounds-checks, then returns tokens + (current+offset) * 40. Returns 0 if peek goes past token_count.
+@End Implementation
 
 Process called "peek_token" takes parser as Integer, offset as Integer returns Integer:
     Note: Peek ahead at token
@@ -275,6 +351,14 @@ Process called "peek_token" takes parser as Integer, offset as Integer returns I
     Return token_ptr
 End Process
 
+@Reasoning:
+Unconditional cursor bump. Callers are responsible for verifying the current token is acceptable before advancing; consume() pairs verification with advance for the common case.
+@End Reasoning
+
+@Implementation:
+Reads current index, writes current+1 back. Does not bounds-check - relies on current_token returning 0 at EOF.
+@End Implementation
+
 Process called "advance" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -283,6 +367,14 @@ Process called "advance" takes parser as Integer returns Integer:
 
     Return 1
 End Process
+
+@Reasoning:
+Non-consuming type check used by all the parse_* dispatchers that need to decide between alternatives without committing. Pair with advance() to consume after a successful match.
+@End Reasoning
+
+@Implementation:
+Fetches current_token, returns 0 if EOF, otherwise compares the token's type field (offset 0) against the requested type and returns 1 on match.
+@End Implementation
 
 Process called "match_token" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
@@ -301,6 +393,14 @@ Process called "match_token" takes parser as Integer, token_type as Integer retu
 
     Return 0
 End Process
+
+@Reasoning:
+Strict "must be this token" enforcement: succeeds and advances on match, otherwise sets had_error/panic_mode and emits the provided diagnostic message. Used at mandatory grammar positions (closing brackets, expected delimiters).
+@End Reasoning
+
+@Implementation:
+Calls match_token. On success, calls advance and returns the consumed token. On failure, sets had_error to 1, sets panic_mode to 1, and returns 0 - lifting recovery responsibility to the calling parse rule.
+@End Implementation
 
 Process called "consume" takes parser as Integer, token_type as Integer, message as Integer returns Integer:
     Note: Consume token of expected type or error
@@ -339,6 +439,14 @@ Note: 13. Namespace: ::, :::
 Note: 14. Member access: $, @
 Note: 15. Indexing: [...], [[...]]
 Note: 16. Function call: (...)
+
+@Reasoning:
+Precedence table for R's Pratt parser. Drives parse_binary - higher numbers bind tighter. R's idiosyncrasies are reflected here: assignment (<-, ->, =) has very low precedence; the formula operator ~ sits between assignment and OR; %op% infix operators land at the same level as multiplication.
+@End Reasoning
+
+@Implementation:
+Switch-like cascade over the input token type returning an integer precedence (0 means "not an operator"). Mirrors R Language Definition section 10.4.2 precedence list.
+@End Implementation
 
 Process called "get_precedence" takes token_type as Integer returns Integer:
     Note: Get operator precedence level
@@ -471,6 +579,14 @@ Process called "get_precedence" takes token_type as Integer returns Integer:
     Return 0  Note: Not a binary operator
 End Process
 
+@Reasoning:
+R has exactly four right-associative operators: ^ (power), <- and <<- (left-assign), -> and ->> (right-assign), and = (when used as assignment). Knowing this is required so parse_binary can fold associativity correctly: a^b^c parses as a^(b^c), and x<-y<-z parses as x<-(y<-z).
+@End Reasoning
+
+@Implementation:
+Returns 1 only for TOKEN_CARET (power), TOKEN_LEFT_ASSIGN, TOKEN_LEFT_SUPER_ASSIGN, TOKEN_RIGHT_ASSIGN, TOKEN_RIGHT_SUPER_ASSIGN, and TOKEN_EQUAL_ASSIGN. Returns 0 otherwise.
+@End Implementation
+
 Process called "is_right_associative" takes token_type as Integer returns Integer:
     Note: Check if operator is right-associative
 
@@ -512,6 +628,14 @@ End Process
 Note: ============================================================================
 Note: Primary Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+Entry point for the leaf level of R's Pratt parser. Dispatches on the current token to recognize literals (numbers, strings, TRUE/FALSE/NA/NULL/Inf/NaN), identifiers, grouped expressions (paren-enclosed), function definitions, block expressions ({...}), vector literals (c(...)), and unary prefix operators.
+@End Reasoning
+
+@Implementation:
+Switch over current_token type: numeric/string literals build leaf nodes; "(" recursively calls parse_expression and consumes ")"; "{" delegates to parse_block; "function" -> parse_function_definition; identifier -> bare reference; otherwise unary prefix dispatched through parse_unary.
+@End Implementation
 
 Process called "parse_primary" takes parser as Integer returns Integer:
     Note: Parse primary expression
@@ -635,6 +759,14 @@ Note: ==========================================================================
 Note: Postfix Expression Parsing
 Note: ============================================================================
 
+@Reasoning:
+Wraps a primary expression with any number of trailing postfix constructs: function call f(...), single-bracket index x[...], double-bracket index x[[...]], $ member access, @ S4 slot access, and :: / ::: namespace access. Postfix operators all left-associate so a loop handles chains like df$col[1:5].
+@End Reasoning
+
+@Implementation:
+Calls parse_primary, then loops re-dispatching on the next token: TOKEN_LPAREN -> parse_call, TOKEN_LBRACKET -> parse_index, TOKEN_DOUBLE_LBRACKET -> parse_double_index, TOKEN_DOLLAR -> parse_member_access, TOKEN_AT -> parse_slot_access, TOKEN_DOUBLE_COLON or TOKEN_TRIPLE_COLON -> parse_namespace.
+@End Implementation
+
 Process called "parse_postfix" takes parser as Integer returns Integer:
     Note: Parse postfix expressions (calls, indexing, member access)
 
@@ -705,6 +837,14 @@ End Process
 Note: ============================================================================
 Note: Call, Index, and Member Access Parsing
 Note: ============================================================================
+
+@Reasoning:
+Parses an R function call `callee(arg1, name=arg2, ...)`. R supports both positional and named arguments and either may appear in any order. The callee has already been parsed by parse_postfix and is passed in.
+@End Reasoning
+
+@Implementation:
+Consumes "(", then loops parsing arguments separated by ",". Each argument may be `name = expr` (detected by lookahead at identifier + "=") or a bare expression. Each parsed argument is added as a child to a TOKEN_CALL node whose first child is the callee. Closing ")" is then consumed.
+@End Implementation
 
 Process called "parse_call" takes parser as Integer, callee as Integer returns Integer:
     Note: Parse function call
@@ -801,6 +941,14 @@ Process called "parse_call" takes parser as Integer, callee as Integer returns I
     Return node
 End Process
 
+@Reasoning:
+Parses single-bracket indexing `object[i, j, drop=FALSE]`. R's single-bracket indexing returns a sub-structure preserving the original class (data frames remain data frames). Empty indices (`x[, 1]`) are legal and mean "all rows".
+@End Reasoning
+
+@Implementation:
+Consumes "[", loops parsing comma-separated index expressions (allowing empty slots between commas), and adds each as a child of a NODE_INDEX whose first child is the object. Consumes "]" at end.
+@End Implementation
+
 Process called "parse_index" takes parser as Integer, object as Integer returns Integer:
     Note: Parse indexing [...]
 
@@ -845,6 +993,14 @@ Process called "parse_index" takes parser as Integer, object as Integer returns 
     Return node
 End Process
 
+@Reasoning:
+Parses double-bracket indexing `x[[i]]`. Distinct from single-bracket: returns the raw element rather than a sub-structure (a list's [[i]] returns the contained value, not a single-element list).
+@End Reasoning
+
+@Implementation:
+Consumes TOKEN_DOUBLE_LBRACKET, parses one or two comma-separated index expressions (R requires at least one), adds them as children of NODE_DOUBLE_INDEX, then consumes TOKEN_DOUBLE_RBRACKET.
+@End Implementation
+
 Process called "parse_double_index" takes parser as Integer, object as Integer returns Integer:
     Note: Parse double indexing [[...]]
 
@@ -863,6 +1019,14 @@ Process called "parse_double_index" takes parser as Integer, object as Integer r
 
     Return node
 End Process
+
+@Reasoning:
+Parses R list/dataframe member access `obj$field`. Unlike most languages, the field name in R is NOT a quoted string but a bare identifier (or a backtick-quoted identifier for names with special characters).
+@End Reasoning
+
+@Implementation:
+Consumes the "$" token, then captures the next identifier or backtick-quoted name as the field name. Builds NODE_MEMBER_ACCESS with object as left child and the field name as right child.
+@End Implementation
 
 Process called "parse_member_access" takes parser as Integer, object as Integer returns Integer:
     Note: Parse member access ($)
@@ -897,6 +1061,14 @@ Process called "parse_member_access" takes parser as Integer, object as Integer 
     Return node
 End Process
 
+@Reasoning:
+Parses S4 slot access `obj@slotname`. S4 is R's formal object system; slots are typed and accessed via @ rather than $.
+@End Reasoning
+
+@Implementation:
+Consumes "@", captures the next identifier as the slot name, builds NODE_SLOT_ACCESS with object as left child and slot name as right child.
+@End Implementation
+
 Process called "parse_slot_access" takes parser as Integer, object as Integer returns Integer:
     Note: Parse slot access (@) for S4 objects
 
@@ -921,6 +1093,14 @@ Process called "parse_slot_access" takes parser as Integer, object as Integer re
 
     Return node
 End Process
+
+@Reasoning:
+Parses package namespace access `pkg::fn` (exported) or `pkg:::fn` (internal). The is_internal flag tells the caller which form was matched so it can build the right node type.
+@End Reasoning
+
+@Implementation:
+Already consumed the package identifier; consumes the "::" or ":::" token via the is_internal switch, then captures the symbol identifier. Builds NODE_NAMESPACE_EXPORTED or NODE_NAMESPACE_INTERNAL accordingly.
+@End Implementation
 
 Process called "parse_namespace" takes parser as Integer, package as Integer, is_internal as Integer returns Integer:
     Note: Parse namespace access (:: or :::)
@@ -955,6 +1135,14 @@ End Process
 Note: ============================================================================
 Note: Unary Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+Parses R prefix unary operators: -, +, !, and ~ (one-sided formula). Right-associative by definition - --x means -(-x). Falls through to parse_postfix when no unary token is present.
+@End Reasoning
+
+@Implementation:
+Checks current token for TOKEN_MINUS, TOKEN_PLUS, TOKEN_NOT, TOKEN_TILDE. If present, advances, recursively calls parse_unary to build the operand, and wraps in a NODE_UNARY_OP with the operator token type stored. Otherwise delegates to parse_postfix.
+@End Implementation
 
 Process called "parse_unary" takes parser as Integer returns Integer:
     Note: Parse unary expression
@@ -1001,6 +1189,18 @@ End Process
 Note: ============================================================================
 Note: Binary Expression Parsing (Precedence Climbing)
 Note: ============================================================================
+
+@Reasoning:
+Pratt/precedence-climbing core. Folds left-hand operand with successive binary operators whose precedence >= min_precedence. Right-associativity is handled by recursing with the same precedence rather than precedence+1.
+@End Reasoning
+
+@Implementation:
+Starts with parse_unary for the left operand, then loops: peek operator, get_precedence; if below min, exit. Otherwise advance, recurse parse_binary with prec+1 (or prec for right-assoc per is_right_associative), and combine into NODE_BINARY_OP with token_type set.
+@End Implementation
+
+@Performance_Hints:
+O(n) in total tokens because each operator is consumed exactly once; recursion depth bounded by precedence-level count (~15).
+@End Performance_Hints
 
 Process called "parse_binary" takes parser as Integer, min_precedence as Integer returns Integer:
     Note: Parse binary expression with precedence climbing
@@ -1069,6 +1269,14 @@ Note: ==========================================================================
 Note: Expression Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Top-level expression entry point. Delegates to parse_binary with min_precedence=0 so any operator can be folded in. All other parse rules ultimately route through here when they need a full expression.
+@End Reasoning
+
+@Implementation:
+Returns the result of parse_binary(parser, 0).
+@End Implementation
+
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse complete expression (entry point)
 
@@ -1079,6 +1287,14 @@ End Process
 Note: ============================================================================
 Note: Function Definition Parsing
 Note: ============================================================================
+
+@Reasoning:
+Parses an R function literal `function(args) body`. In R, function definitions are expressions, so the result can be assigned (`f <- function(x) x+1`) or passed inline. Default argument values are supported via `function(x = 5)`.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_FUNCTION; consumes "(", loops parsing parameters via parse_parameter separated by ",", consumes ")", then parses body via parse_expression (a single expression or a brace-block). Builds NODE_FUNCTION_DEF with parameter list as children and body as right child.
+@End Implementation
 
 Process called "parse_function_definition" takes parser as Integer returns Integer:
     Note: Parse function definition: function(x, y = default, ...) { body }
@@ -1127,6 +1343,14 @@ Process called "parse_function_definition" takes parser as Integer returns Integ
 
     Return node
 End Process
+
+@Reasoning:
+Parses one formal parameter in a function definition: either `name` (required) or `name = default` (optional with default value). Also recognises `...` as the variadic parameter sentinel.
+@End Reasoning
+
+@Implementation:
+Captures the parameter identifier (or TOKEN_TRIPLE_DOT for variadic). If followed by "=", consumes it and calls parse_expression to capture the default value. Returns a NODE_PARAMETER with name as left, default as right (or 0 if none).
+@End Implementation
 
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Note: Parse function parameter (with optional default value)
@@ -1182,6 +1406,14 @@ Note: ==========================================================================
 Note: Lambda Parsing
 Note: ============================================================================
 
+@Reasoning:
+Parses R 4.1+ backslash lambda syntax `\(x) x+1`, a more concise alternative to `function(x) x+1`. Otherwise identical semantics to parse_function_definition - same parameter list and body.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_BACKSLASH; consumes "(", loops parsing parameters via parse_parameter separated by ",", consumes ")", parses the body expression. Builds NODE_LAMBDA with parameters as children and body as right child.
+@End Implementation
+
 Process called "parse_lambda" takes parser as Integer returns Integer:
     Note: Parse lambda: \(x, y) expression
 
@@ -1234,6 +1466,14 @@ Note: ==========================================================================
 Note: Vector/List Parsing
 Note: ============================================================================
 
+@Reasoning:
+Parses R's vector constructor `c(...)`. Although c() is a function call, the lexer and parser handle it as a dedicated form so vector literals can be optimized later (e.g. unboxing for numeric vectors).
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_C; consumes "(", loops parsing comma-separated expressions which may be `name=value` or bare. Each element becomes a child of NODE_VECTOR. Consumes ")" at end.
+@End Implementation
+
 Process called "parse_vector" takes parser as Integer returns Integer:
     Note: Parse vector literal: c(1, 2, 3)
 
@@ -1281,6 +1521,14 @@ End Process
 Note: ============================================================================
 Note: Statement Parsing
 Note: ============================================================================
+
+@Reasoning:
+Dispatches to the appropriate statement parser based on the leading keyword: if -> parse_if_statement, while -> parse_while_statement, for -> parse_for_statement, repeat -> parse_repeat_statement, "{" -> parse_block. Falls through to parse_expression because R has no statement/expression dichotomy - everything is an expression.
+@End Reasoning
+
+@Implementation:
+Switch over current token type checking for control-flow keywords. Each branch advances past the keyword and delegates to the dedicated parse helper. Default branch returns parse_expression.
+@End Implementation
 
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
@@ -1362,6 +1610,14 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Parses `if (cond) then_expr else else_expr`. The else branch is optional. R treats if as an expression returning the chosen branch's value, which is why it uses parse_expression for the body rather than block parsing.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_IF; consumes "(", parses condition via parse_expression, consumes ")". Parses then-branch as a statement. If TOKEN_ELSE follows, advances and parses the else-branch. Builds NODE_IF with condition as left, then as middle (child[0]), else as right.
+@End Implementation
+
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse if statement: if (condition) then_branch else else_branch
 
@@ -1393,6 +1649,14 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Parses `while (cond) body`. Like if, the body is a single statement (often a block). Returns NULL invisibly at runtime, but at parse time we just build the AST node.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_WHILE; consumes "(", parses condition, consumes ")", parses body via parse_statement. Builds NODE_WHILE with condition as left and body as right.
+@End Implementation
+
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Note: Parse while statement: while (condition) body
 
@@ -1411,6 +1675,14 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Parses `for (var in iterable) body`. R's for is iterator-based - var is bound to each element of iterable in turn. The variable is created in the enclosing environment and persists after the loop.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_FOR; consumes "(", captures the loop variable identifier, consumes TOKEN_IN, parses iterable via parse_expression, consumes ")", then parses body via parse_statement. Builds NODE_FOR with variable as left, iterable as middle child, body as right.
+@End Implementation
 
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     Note: Parse for statement: for (var in sequence) body
@@ -1451,6 +1723,14 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Parses R's `repeat body` - an unconditional infinite loop terminated only by `break` or `return`. R has no do-while; repeat is the idiomatic loop when the exit condition is computed inside the body.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_REPEAT; immediately parses body via parse_statement (no parentheses, no condition expression). Builds NODE_REPEAT with body as right child.
+@End Implementation
+
 Process called "parse_repeat_statement" takes parser as Integer returns Integer:
     Note: Parse repeat statement: repeat body (infinite loop, use break to exit)
 
@@ -1463,6 +1743,14 @@ Process called "parse_repeat_statement" takes parser as Integer returns Integer:
 
     Return node
 End Process
+
+@Reasoning:
+Parses a brace-delimited block `{ stmt1; stmt2; ... }`. Statements may be separated by semicolons or newlines. The block's value is the value of its last statement, matching R's everything-is-an-expression semantics.
+@End Reasoning
+
+@Implementation:
+Already saw TOKEN_LBRACE; loops parsing statements via parse_statement until TOKEN_RBRACE is seen. Statement separators (TOKEN_SEMICOLON, TOKEN_NEWLINE) are consumed between statements. Each parsed statement is added as a child of NODE_BLOCK. Consumes "}" at end.
+@End Implementation
 
 Process called "parse_block" takes parser as Integer returns Integer:
     Note: Parse block statement: { statements }
@@ -1538,6 +1826,18 @@ End Process
 Note: ============================================================================
 Note: Program Parsing
 Note: ============================================================================
+
+@Reasoning:
+Top-level entry called once per source file. Builds a NODE_PROGRAM whose children are the sequence of top-level statements until EOF. This is the AST root returned to r_semantic / r_to_hir.
+@End Reasoning
+
+@Implementation:
+Creates NODE_PROGRAM. Loops while current_token is not EOF: skips separator tokens (semicolons, newlines), then calls parse_statement and adds the result as a child of NODE_PROGRAM. Returns the program node.
+@End Implementation
+
+@Performance_Hints:
+O(n) in token count; the dominant cost is the cascade of parse rules (Pratt parsing is linear in the input).
+@End Performance_Hints
 
 Process called "parse_program" takes parser as Integer returns Integer:
     Note: Parse complete R program (top-level statements)
@@ -1615,6 +1915,14 @@ End Process
 Note: ============================================================================
 Note: Helper Functions
 Note: ============================================================================
+
+@Reasoning:
+Post-tokenization unescape pass for string literals. The lexer captures the raw lexeme including backslash sequences; this routine produces the decoded string for the AST node so codegen can emit the right bytes.
+@End Reasoning
+
+@Implementation:
+Walks the input string, copying bytes verbatim until a backslash is seen. Then dispatches: \n -> 10, \t -> 9, \r -> 13, \\ -> 92, \' -> 39, \" -> 34, \0 -> 0, \xNN -> hex byte, \uNNNN -> UTF-8 encoding. Unknown escapes are passed through verbatim (lenient like R itself).
+@End Implementation
 
 Process called "process_escape_sequences" takes input as Integer returns Integer:
     Note: Process escape sequences in string literals
@@ -1695,6 +2003,14 @@ Process called "process_escape_sequences" takes input as Integer returns Integer
     proc memory_set_byte from Layout with output, out_pos, 0
     Return output
 End Process
+
+@Reasoning:
+Strips the surrounding quote characters from a string literal lexeme and decodes its escape sequences. Yields the canonical string value to be stored in the AST node's value field.
+@End Reasoning
+
+@Implementation:
+Skips the leading quote, captures the body up to (but not including) the closing quote, then runs process_escape_sequences on the body to expand escapes. Returns the heap-allocated decoded string.
+@End Implementation
 
 Process called "string_from_literal" takes literal as Integer returns Integer:
     Note: Create a processed string from a source-level string literal

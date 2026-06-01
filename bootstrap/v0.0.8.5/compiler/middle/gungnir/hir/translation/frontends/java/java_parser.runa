@@ -110,6 +110,12 @@ Note: ==========================================================================
 Note: Parser State Structure
 Note: ============================================================================
 
+@Reasoning:
+Parser state holds a borrowed lexer and a single-token lookahead in
+current_token. previous_token preserves position for error pointing after
+advance. in_panic_mode is set during synchronization recovery so cascaded
+errors are suppressed until a safe sync point is reached.
+@End Reasoning
 Type called "JavaParser":
     lexer as Integer            Note: Java lexer instance
     current_token as Integer    Note: Current token
@@ -118,6 +124,13 @@ Type called "JavaParser":
     in_panic_mode as Integer    Note: Error recovery flag
 End Type
 
+@Reasoning:
+Generic AST node carrying a tag (node_type), an originating token for
+source location, a name slot (identifiers/qualified names), a value slot
+(literal payload or flags such as is-static), a dynamically-grown children
+pointer array, count, and an attributes side-channel for modifier sets and
+other extensions.
+@End Reasoning
 Type called "ASTNode":
     node_type as Integer        Note: AST node type constant
     token as Integer            Note: Associated token
@@ -132,6 +145,11 @@ Note: ==========================================================================
 Note: Parser Creation
 Note: ============================================================================
 
+@Reasoning:
+Allocates and initializes a JavaParser, then primes the one-token lookahead
+by calling next_java_token once. Returns 0 on OOM. Lexer ownership remains
+with the caller — parser only borrows it.
+@End Reasoning
 Process called "create_parser" takes lexer as Integer returns Integer:
     Note: Create Java parser with lexer
 
@@ -159,6 +177,11 @@ Note: ==========================================================================
 Note: AST Node Management
 Note: ============================================================================
 
+@Reasoning:
+Allocates a 56-byte ASTNode and zero-initializes all fields except
+node_type. Children array is lazily allocated only when add_child is called,
+so leaf nodes pay no per-children memory cost.
+@End Reasoning
 Process called "create_ast_node" takes node_type as Integer returns Integer:
     Note: Create AST node with given type
 
@@ -180,6 +203,13 @@ Process called "create_ast_node" takes node_type as Integer returns Integer:
     Return node
 End Process
 
+@Reasoning:
+Appends a child pointer to the parent's children array. On first append the
+array is allocated with capacity 8 — no growth strategy is needed in this
+parser because each grammar production caps children by structure (function
+bodies use nested blocks, not flat parent arrays). Returns 0 on null parent
+or null child without aborting.
+@End Reasoning
 Process called "add_child" takes parent as Integer, child as Integer returns Integer:
     Note: Add child node to parent
 
@@ -210,6 +240,11 @@ Process called "add_child" takes parent as Integer, child as Integer returns Int
     Return 1
 End Process
 
+@Reasoning:
+Setter for the name field at offset 16. Guards against a null node so
+diagnostic-only or recovered nodes can be safely mutated. Stores the name
+pointer by value — non-owning slice into source.
+@End Reasoning
 Process called "set_node_name" takes node as Integer, name as Integer returns Integer:
     Note: Set node name
 
@@ -222,6 +257,11 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
     Return 1
 End Process
 
+@Reasoning:
+Setter for value at offset 24. Doubles as a flag slot (is_static on imports,
+is_final on modifiers, etc.) so node_type need not multiply for every
+attribute combination.
+@End Reasoning
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value
 
@@ -234,6 +274,11 @@ Process called "set_node_value" takes node as Integer, value as Integer returns 
     Return 1
 End Process
 
+@Reasoning:
+Setter for the originating token at offset 8. Used to attach source-location
+information to AST nodes so later diagnostics can point at the original
+tokens that produced each subtree.
+@End Reasoning
 Process called "set_node_token" takes node as Integer, token as Integer returns Integer:
     Note: Set node token
 
@@ -250,6 +295,10 @@ Note: ==========================================================================
 Note: Token Management
 Note: ============================================================================
 
+@Reasoning:
+Returns the parser's one-token lookahead. Direct field load — production
+code paths must use this rather than re-reading the lexer.
+@End Reasoning
 Process called "current_token" takes parser as Integer returns Integer:
     Note: Get current token
 
@@ -257,6 +306,11 @@ Process called "current_token" takes parser as Integer returns Integer:
     Return token
 End Process
 
+@Reasoning:
+Returns the token_type tag of the current lookahead, or TOKEN_EOF when the
+lookahead is null. Callers can treat exhausted input the same as a real EOF
+token without a separate null check.
+@End Reasoning
 Process called "current_token_type" takes parser as Integer returns Integer:
     Note: Get current token type
 
@@ -270,6 +324,11 @@ Process called "current_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Promotes current_token into previous_token and pulls the next token from
+the lexer into current_token. Returns the new lookahead so callers may
+inspect it without a second field read.
+@End Reasoning
 Process called "advance" takes parser as Integer returns Integer:
     Note: Advance to next token
 
@@ -284,6 +343,12 @@ Process called "advance" takes parser as Integer returns Integer:
     Return next_token
 End Process
 
+@Reasoning:
+Asserts the lookahead equals expected_type, advances past it on success,
+returns 0 on mismatch. Used by deterministic grammar productions to consume
+required separators (semicolons, braces, parens) without re-checking after
+the call.
+@End Reasoning
 Process called "expect" takes parser as Integer, expected_type as Integer returns Integer:
     Note: Expect specific token type and advance
 
@@ -297,6 +362,11 @@ Process called "expect" takes parser as Integer, expected_type as Integer return
     Return 1
 End Process
 
+@Reasoning:
+Non-consuming predicate: returns 1 if the lookahead is the given token type,
+0 otherwise. Used by alternation choices (FIRST sets) without committing
+to a branch.
+@End Reasoning
 Process called "match" takes parser as Integer, token_type as Integer returns Integer:
     Note: Check if current token matches type
 
@@ -309,6 +379,11 @@ Process called "match" takes parser as Integer, token_type as Integer returns In
     Return 0
 End Process
 
+@Reasoning:
+Consuming predicate: if the lookahead matches, advance past it and return 1;
+otherwise leave the parser positioned and return 0. Common for optional
+syntactic markers (final, static, ?, ...).
+@End Reasoning
 Process called "match_and_advance" takes parser as Integer, token_type as Integer returns Integer:
     Note: Match token type and advance if matches
 
@@ -326,6 +401,11 @@ Note: ==========================================================================
 Note: Compilation Unit Parsing
 Note: ============================================================================
 
+@Reasoning:
+Top of the Java grammar: optional package declaration, zero-or-more imports,
+zero-or-more type declarations. Stops on EOF or on a type_decl that fails
+to parse (indicating recovery couldn't resync, so we avoid infinite loops).
+@End Reasoning
 Process called "parse_compilation_unit" takes parser as Integer returns Integer:
     Note: Parse Java compilation unit (package + imports + types)
 
@@ -369,6 +449,11 @@ Process called "parse_compilation_unit" takes parser as Integer returns Integer:
     Return cu_node
 End Process
 
+@Reasoning:
+Grammar: 'package' QualifiedName ';'. Consumes the 'package' keyword,
+captures the dotted name, attaches it as the package node's name, and
+requires the closing semicolon.
+@End Reasoning
 Process called "parse_package_declaration" takes parser as Integer returns Integer:
     Note: Parse package declaration
 
@@ -384,6 +469,11 @@ Process called "parse_package_declaration" takes parser as Integer returns Integ
     Return package_node
 End Process
 
+@Reasoning:
+Grammar: 'import' ['static'] QualifiedName ['.' '*'] ';'. The static flag is
+stored in the node's value slot (1 = static). Wildcard imports append ".*"
+to the name string to preserve canonical form.
+@End Reasoning
 Process called "parse_import_declaration" takes parser as Integer returns Integer:
     Note: Parse import declaration
 
@@ -414,6 +504,12 @@ Process called "parse_import_declaration" takes parser as Integer returns Intege
     Return import_node
 End Process
 
+@Reasoning:
+Parses identifier ('.' identifier)*, concatenating with '.' separators into
+a single dotted-name string. Used for package, import target, and qualified
+type references. Stops at any non-identifier following a dot (caller
+handles the residual token, e.g. '*' in wildcard imports).
+@End Reasoning
 Process called "parse_qualified_name" takes parser as Integer returns Integer:
     Note: Parse qualified name (e.g., java.util.List)
 
@@ -453,6 +549,12 @@ Note: ==========================================================================
 Note: Type Declaration Parsing
 Note: ============================================================================
 
+@Reasoning:
+Dispatches to one of class/interface/enum/annotation declaration based on
+the keyword following any modifiers. Handles the '@interface' (annotation
+type) form by peeking past '@' for the INTERFACE keyword. Modifiers are
+parsed once up front and threaded to the chosen production.
+@End Reasoning
 Process called "parse_type_declaration" takes parser as Integer returns Integer:
     Note: Parse type declaration (class, interface, enum, annotation)
 
@@ -479,6 +581,12 @@ Process called "parse_type_declaration" takes parser as Integer returns Integer:
     Return type_node
 End Process
 
+@Reasoning:
+Grammar: Modifiers 'class' Identifier [TypeParameters] ['extends' Type]
+['implements' TypeList] ClassBody. Child order is fixed (modifiers, type
+params, super, interfaces, members) so downstream translation can index by
+position.
+@End Reasoning
 Process called "parse_class_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse class declaration
 
@@ -539,6 +647,12 @@ Process called "parse_class_declaration" takes parser as Integer, modifiers as I
     Return class_node
 End Process
 
+@Reasoning:
+Grammar: Modifiers 'interface' Identifier [TypeParameters]
+['extends' TypeList] InterfaceBody. Differs from class declaration in that
+'extends' here yields a TypeList (multi-inheritance of interfaces) rather
+than a single super-type, and there is no implements clause.
+@End Reasoning
 Process called "parse_interface_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse interface declaration
 
@@ -592,6 +706,12 @@ Process called "parse_interface_declaration" takes parser as Integer, modifiers 
     Return interface_node
 End Process
 
+@Reasoning:
+Grammar: Modifiers 'enum' Identifier ['implements' TypeList] '{'
+EnumConstants [';' ClassBodyDeclarations] '}'. Constants are
+comma-separated; the optional ';' transitions into a regular class-body for
+methods/fields defined on the enum.
+@End Reasoning
 Process called "parse_enum_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse enum declaration
 
@@ -663,6 +783,12 @@ Process called "parse_enum_declaration" takes parser as Integer, modifiers as In
     Return enum_node
 End Process
 
+@Reasoning:
+Grammar: Annotations* Identifier ['(' ArgumentList ')'] [ClassBody]. The
+optional argument list is for constants that invoke an enum constructor;
+the optional class body provides per-constant method overrides (anonymous
+subclass semantics).
+@End Reasoning
 Process called "parse_enum_constant" takes parser as Integer returns Integer:
     Note: Parse enum constant
 
@@ -703,6 +829,11 @@ Process called "parse_enum_constant" takes parser as Integer returns Integer:
     Return constant_node
 End Process
 
+@Reasoning:
+Grammar: Modifiers '@' 'interface' Identifier '{' AnnotationMember* '}'.
+The '@' must be followed directly by 'interface' — this caller has already
+confirmed that via the dispatcher in parse_type_declaration.
+@End Reasoning
 Process called "parse_annotation_declaration" takes parser as Integer, modifiers as Integer returns Integer:
     Note: Parse annotation type declaration
 
@@ -747,6 +878,13 @@ Note: ==========================================================================
 Note: Modifiers and Annotations
 Note: ============================================================================
 
+@Reasoning:
+Consumes a sequence of access modifiers (public/private/protected),
+non-access modifiers (static/final/abstract/synchronized/volatile/transient/
+native/strictfp), and annotations into a single MODIFIER_LIST node.
+Annotation handling is interleaved so '@Override public static' works the
+same as 'public @Override static'. Stops at the first non-modifier token.
+@End Reasoning
 Process called "parse_modifiers" takes parser as Integer returns Integer:
     Note: Parse modifiers and annotations
 
@@ -798,6 +936,11 @@ Process called "parse_modifiers" takes parser as Integer returns Integer:
     Return modifiers_node
 End Process
 
+@Reasoning:
+Parses a single annotation use site: '@' QualifiedName ['(' Args ')']. Args
+may be either a single value expression or comma-separated name=value pairs;
+parse_annotation_arguments treats both uniformly as expressions.
+@End Reasoning
 Process called "parse_annotation" takes parser as Integer returns Integer:
     Note: Parse annotation usage
 
@@ -820,6 +963,12 @@ Process called "parse_annotation" takes parser as Integer returns Integer:
     Return annotation_node
 End Process
 
+@Reasoning:
+Comma-separated expression list bounded by the closing right paren. Each
+argument is parsed as a full expression — name-value pairs (e.g.,
+key = "value") parse as assignment expressions and are decomposed by later
+semantic passes.
+@End Reasoning
 Process called "parse_annotation_arguments" takes parser as Integer returns Integer:
     Note: Parse annotation arguments
 
@@ -847,6 +996,14 @@ Note: ==========================================================================
 Note: Class Member Parsing
 Note: ============================================================================
 
+@Reasoning:
+Dispatches on modifiers + first significant token to one of nested type,
+constructor, method, or field. Constructor-vs-method ambiguity is resolved
+by checking whether an identifier is immediately followed by '(' (the
+identifier is the class name and we have no return type). Otherwise a type
+reference is parsed first and the following identifier picks between method
+and field by the LPAREN/SEMICOLON discriminator.
+@End Reasoning
 Process called "parse_class_member" takes parser as Integer returns Integer:
     Note: Parse class member (field, method, constructor, nested type)
 
@@ -907,6 +1064,12 @@ Process called "parse_class_member" takes parser as Integer returns Integer:
     End If
 End Process
 
+@Reasoning:
+Interface members are abstract methods, default methods (Java 8+), constant
+fields, or nested types — interfaces have no constructors. After modifiers
+and a type reference, the LPAREN/SEMICOLON discriminator picks
+method-vs-field.
+@End Reasoning
 Process called "parse_interface_member" takes parser as Integer returns Integer:
     Note: Parse interface member (method, field, nested type)
 
@@ -946,6 +1109,11 @@ Process called "parse_interface_member" takes parser as Integer returns Integer:
     End If
 End Process
 
+@Reasoning:
+Annotation element grammar: Type Identifier '(' ')' ['default' Expression]
+';'. The mandatory empty parameter list distinguishes annotation elements
+from regular interface members. Default values are AST children if present.
+@End Reasoning
 Process called "parse_annotation_member" takes parser as Integer returns Integer:
     Note: Parse annotation member (annotation element)
 
@@ -982,6 +1150,11 @@ Process called "parse_annotation_member" takes parser as Integer returns Integer
     Return member_node
 End Process
 
+@Reasoning:
+Constructors have no return type. Caller has already consumed the
+constructor identifier (the class name). Grammar: Modifiers Name '('
+ParameterList ')' ['throws' TypeList] Block.
+@End Reasoning
 Process called "parse_constructor_declaration" takes parser as Integer, modifiers as Integer, name as Integer returns Integer:
     Note: Parse constructor declaration
 
@@ -1013,6 +1186,11 @@ Process called "parse_constructor_declaration" takes parser as Integer, modifier
     Return constructor_node
 End Process
 
+@Reasoning:
+Continuation entry point — caller has already parsed the return type and
+identifier. Grammar: '(' ParameterList ')' ['throws' TypeList] (Block | ';').
+A semicolon (no body) marks an abstract or interface method.
+@End Reasoning
 Process called "parse_method_declaration_with_type" takes parser as Integer, modifiers as Integer, return_type as Integer, name as Integer returns Integer:
     Note: Parse method declaration with known type
 
@@ -1049,6 +1227,11 @@ Process called "parse_method_declaration_with_type" takes parser as Integer, mod
     Return method_node
 End Process
 
+@Reasoning:
+Continuation entry point — caller has already parsed the type and the field
+name. Handles trailing C-style array dimensions on the field name (int x[];
+form), an optional '= initializer', and the terminating semicolon.
+@End Reasoning
 Process called "parse_field_declaration_with_type" takes parser as Integer, modifiers as Integer, field_type as Integer, name as Integer returns Integer:
     Note: Parse field declaration with known type
 
@@ -1082,6 +1265,12 @@ Process called "parse_field_declaration_with_type" takes parser as Integer, modi
     Return field_node
 End Process
 
+@Reasoning:
+Reached when an identifier could be either a return-type reference or a
+constructor name. Now that we know the next identifier is the member name,
+we wrap type_name into a TYPE_REFERENCE node and forward to the appropriate
+method/field continuation based on LPAREN vs other.
+@End Reasoning
 Process called "parse_method_or_field" takes parser as Integer, modifiers as Integer, type_name as Integer returns Integer:
     Note: Parse method or field when type is identifier (could be constructor)
 
@@ -1103,6 +1292,11 @@ Process called "parse_method_or_field" takes parser as Integer, modifiers as Int
     End If
 End Process
 
+@Reasoning:
+Parses zero or more comma-separated parameters between the parens. Empty
+list short-circuits on immediate RPAREN. The closing paren itself is not
+consumed here — caller validates the matching ')'.
+@End Reasoning
 Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Note: Parse method parameter list
 
@@ -1126,6 +1320,11 @@ Process called "parse_parameter_list" takes parser as Integer returns Integer:
     Return params_node
 End Process
 
+@Reasoning:
+Grammar: Modifiers Type ['...'] Identifier. The '...' varargs marker is
+stored in the node's value slot (1 = varargs). Modifiers here may include
+'final' and annotations (e.g., @Nullable).
+@End Reasoning
 Process called "parse_parameter" takes parser as Integer returns Integer:
     Note: Parse method parameter
 
@@ -1159,6 +1358,13 @@ Note: ==========================================================================
 Note: Type Parsing
 Note: ============================================================================
 
+@Reasoning:
+Universal type-reference parser. Recognizes all eight Java primitives plus
+void (no array on void), or falls through to a qualified-name reference
+type with optional generic arguments. Primitive parses always continue into
+parse_array_dimensions to attach trailing []s. The token attached to
+primitive nodes preserves the spelling for downstream selectors.
+@End Reasoning
 Process called "parse_type_reference" takes parser as Integer returns Integer:
     Note: Parse type reference (primitive, reference, array, generic)
 
@@ -1253,6 +1459,11 @@ Process called "parse_type_reference" takes parser as Integer returns Integer:
     Return proc parse_array_dimensions with parser, type_node
 End Process
 
+@Reasoning:
+Consumes a run of '[]' suffixes after a type or variable name. If at least
+one pair is seen, wraps base_type in an ARRAY_TYPE node; otherwise returns
+base_type unchanged so non-array references don't acquire an extra wrapper.
+@End Reasoning
 Process called "parse_array_dimensions" takes parser as Integer, base_type as Integer returns Integer:
     Note: Parse array dimensions []
 
@@ -1277,6 +1488,11 @@ Process called "parse_array_dimensions" takes parser as Integer, base_type as In
     Return base_type
 End Process
 
+@Reasoning:
+Grammar: '<' TypeParameter (',' TypeParameter)* '>'. Used for generic
+class/interface/method declarations. Each parameter is itself parsed with
+parse_type_parameter and may carry extends bounds.
+@End Reasoning
 Process called "parse_type_parameters" takes parser as Integer returns Integer:
     Note: Parse generic type parameters <T, U extends Base>
 
@@ -1299,6 +1515,11 @@ Process called "parse_type_parameters" takes parser as Integer returns Integer:
     Return type_params_node
 End Process
 
+@Reasoning:
+Grammar: Identifier ['extends' TypeBound]. Identifier becomes the parameter
+name; the optional bounds list (one type or intersection like
+'T extends A & B') becomes a child.
+@End Reasoning
 Process called "parse_type_parameter" takes parser as Integer returns Integer:
     Note: Parse single type parameter (T extends Base bitwise and Interface)
 
@@ -1320,6 +1541,12 @@ Process called "parse_type_parameter" takes parser as Integer returns Integer:
     Return param_node
 End Process
 
+@Reasoning:
+Parses one or more bound types separated by '&' (BITAND). The '&' here is
+syntactically the bitwise-AND token reused as the intersection-type
+separator per JLS. The first bound may be a class; subsequent bounds must
+be interfaces, but that constraint is enforced semantically, not here.
+@End Reasoning
 Process called "parse_type_bound_list" takes parser as Integer returns Integer:
     Note: Parse type bound list (Base bitwise and Interface1 bitwise and Interface2)
 
@@ -1338,6 +1565,11 @@ Process called "parse_type_bound_list" takes parser as Integer returns Integer:
     Return bounds_node
 End Process
 
+@Reasoning:
+Grammar: '<' TypeArgument (',' TypeArgument)* '>'. Used at type-reference
+use sites (e.g., List<String>). Each argument may be a wildcard or a regular
+type reference.
+@End Reasoning
 Process called "parse_type_arguments" takes parser as Integer returns Integer:
     Note: Parse generic type arguments <String, Integer>
 
@@ -1360,6 +1592,10 @@ Process called "parse_type_arguments" takes parser as Integer returns Integer:
     Return type_args_node
 End Process
 
+@Reasoning:
+A type argument is either a wildcard ('?' with optional extends/super
+bound) or a regular type reference. The leading '?' is the discriminator.
+@End Reasoning
 Process called "parse_type_argument" takes parser as Integer returns Integer:
     Note: Parse single type argument (Type or ? extends Type or ? super Type)
 
@@ -1371,6 +1607,11 @@ Process called "parse_type_argument" takes parser as Integer returns Integer:
     Return proc parse_type_reference from parser
 End Process
 
+@Reasoning:
+Grammar: '?' [('extends' | 'super') Type]. The variance is encoded in the
+value slot: 0 = unbounded '?', 1 = extends, 2 = super. The bound type, if
+any, is the single child.
+@End Reasoning
 Process called "parse_wildcard_type" takes parser as Integer returns Integer:
     Note: Parse wildcard type (? extends Type or ? super Type)
 
@@ -1397,6 +1638,11 @@ Process called "parse_wildcard_type" takes parser as Integer returns Integer:
     Return wildcard_node
 End Process
 
+@Reasoning:
+Comma-separated type references with no surrounding delimiters. Used for
+implements clauses, multi-extends on interfaces, throws clauses, and so on.
+The caller is responsible for any trailing token (semicolon, brace, etc.).
+@End Reasoning
 Process called "parse_type_list" takes parser as Integer returns Integer:
     Note: Parse comma-separated type list
 
@@ -1419,6 +1665,11 @@ Note: ==========================================================================
 Note: Statement Parsing
 Note: ============================================================================
 
+@Reasoning:
+Grammar: '{' Statement* '}'. Iterates parse_statement until RBRACE or until
+a statement parse fails to make progress (then we exit and let the closing
+expect catch a missing brace).
+@End Reasoning
 Process called "parse_block" takes parser as Integer returns Integer:
     Note: Parse block statement
 
@@ -1445,6 +1696,12 @@ Process called "parse_block" takes parser as Integer returns Integer:
     Return block_node
 End Process
 
+@Reasoning:
+Statement dispatcher: a leading keyword (if/while/for/return/throw/try/
+switch/break/continue) picks a specialized production; LBRACE recurses into
+a nested block; lone SEMICOLON is an empty statement (returns a placeholder
+node); anything else falls through to expression-or-declaration.
+@End Reasoning
 Process called "parse_statement" takes parser as Integer returns Integer:
     Note: Parse statement
 
@@ -1499,6 +1756,11 @@ Process called "parse_statement" takes parser as Integer returns Integer:
     Return proc parse_expression_or_declaration from parser
 End Process
 
+@Reasoning:
+Grammar: 'if' '(' Expression ')' Statement ['else' Statement]. Dangling-else
+is resolved by the natural recursive descent: the else binds to the
+innermost still-open if because we parse it eagerly after the then-branch.
+@End Reasoning
 Process called "parse_if_statement" takes parser as Integer returns Integer:
     Note: Parse if statement
 
@@ -1525,6 +1787,10 @@ Process called "parse_if_statement" takes parser as Integer returns Integer:
     Return if_node
 End Process
 
+@Reasoning:
+Grammar: 'while' '(' Expression ')' Statement. The condition is the first
+child, the body is the second; downstream code can rely on that ordering.
+@End Reasoning
 Process called "parse_while_statement" takes parser as Integer returns Integer:
     Note: Parse while statement
 
@@ -1544,6 +1810,12 @@ Process called "parse_while_statement" takes parser as Integer returns Integer:
     Return while_node
 End Process
 
+@Reasoning:
+Top of the for-statement parse. Distinguishes traditional C-style for from
+the enhanced for-each by peeking with check_enhanced_for and routing to the
+appropriate body. The leading 'for' '(' is consumed here so both branches
+share that prefix.
+@End Reasoning
 Process called "parse_for_statement" takes parser as Integer returns Integer:
     Note: Parse for statement (traditional or enhanced for-each)
 
@@ -1561,6 +1833,13 @@ Process called "parse_for_statement" takes parser as Integer returns Integer:
     Return proc parse_traditional_for from parser
 End Process
 
+@Reasoning:
+Lookahead-only predicate: speculatively scans Type Identifier ':' without
+committing, restoring current_token and previous_token before returning.
+Returns 1 if the colon was found (enhanced for-each), 0 otherwise.
+Restoration is direct field-write because Layout.memory_set_int64 makes
+that cheaper than driving the lexer backward.
+@End Reasoning
 Process called "check_enhanced_for" takes parser as Integer returns Integer:
     Note: Check if this is an enhanced for loop (for-each)
     Note: Enhanced for has pattern: Type identifier : expression
@@ -1609,6 +1888,12 @@ Process called "check_enhanced_for" takes parser as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+Grammar: for '(' [init] ';' [cond] ';' [update] ')' Statement. Each of the
+three sections is optional and may be empty (omission detected by an
+immediate semicolon or RPAREN). The expression-or-declaration parser is
+used for the init so 'int i = 0' and 'i = 0' both work.
+@End Reasoning
 Process called "parse_traditional_for" takes parser as Integer returns Integer:
     Note: Parse traditional for statement
 
@@ -1647,6 +1932,12 @@ Process called "parse_traditional_for" takes parser as Integer returns Integer:
     Return for_node
 End Process
 
+@Reasoning:
+Grammar: for '(' Type Identifier ':' Expression ')' Statement. The element
+type and name describe the per-iteration variable; the expression is the
+Iterable / array. Element name is stored on the node, collection and body
+are children.
+@End Reasoning
 Process called "parse_enhanced_for" takes parser as Integer returns Integer:
     Note: Parse enhanced for statement (for-each)
 
@@ -1672,6 +1963,10 @@ Process called "parse_enhanced_for" takes parser as Integer returns Integer:
     Return for_node
 End Process
 
+@Reasoning:
+Grammar: 'return' [Expression] ';'. Empty return (no expression) is detected
+by an immediate semicolon; in that case the return node has no children.
+@End Reasoning
 Process called "parse_return_statement" takes parser as Integer returns Integer:
     Note: Parse return statement
 
@@ -1690,6 +1985,10 @@ Process called "parse_return_statement" takes parser as Integer returns Integer:
     Return return_node
 End Process
 
+@Reasoning:
+Grammar: 'throw' Expression ';'. Java requires the operand (no bare throw),
+so we always parse an expression with no optionality check.
+@End Reasoning
 Process called "parse_throw_statement" takes parser as Integer returns Integer:
     Note: Parse throw statement
 
@@ -1705,6 +2004,12 @@ Process called "parse_throw_statement" takes parser as Integer returns Integer:
     Return throw_node
 End Process
 
+@Reasoning:
+Grammar: 'try' ['(' Resources ')'] Block Catch* ['finally' Block]. Handles
+try, try-with-resources (Java 7+), multi-catch chains, and the optional
+finally. Java requires at least one catch or finally; this parser does not
+enforce that — semantic analysis catches missing handlers.
+@End Reasoning
 Process called "parse_try_statement" takes parser as Integer returns Integer:
     Note: Parse try statement (with optional resources, catch, finally)
 
@@ -1745,6 +2050,11 @@ Process called "parse_try_statement" takes parser as Integer returns Integer:
     Return try_node
 End Process
 
+@Reasoning:
+Grammar: 'catch' '(' Type Identifier ')' Block. Multi-catch (Type1 | Type2)
+is not split into separate clauses here; that lives in parse_type_reference
+or upstream of it depending on grammar revision.
+@End Reasoning
 Process called "parse_catch_clause" takes parser as Integer returns Integer:
     Note: Parse catch clause
 
@@ -1769,6 +2079,11 @@ Process called "parse_catch_clause" takes parser as Integer returns Integer:
     Return catch_node
 End Process
 
+@Reasoning:
+Try-with-resources resource list: one or more resource specifications
+separated by ';'. Trailing semicolons are tolerated by terminating on
+'no semicolon' detection.
+@End Reasoning
 Process called "parse_resource_list" takes parser as Integer returns Integer:
     Note: Parse resource list for try-with-resources
 
@@ -1792,6 +2107,11 @@ Process called "parse_resource_list" takes parser as Integer returns Integer:
     Return resources_node
 End Process
 
+@Reasoning:
+Grammar: Type Identifier '=' Expression. Reuses the variable-declaration
+node shape so the catch-finally machinery can dispose() each resource the
+same way ordinary locals are scoped.
+@End Reasoning
 Process called "parse_resource_specification" takes parser as Integer returns Integer:
     Note: Parse single resource specification
 
@@ -1813,6 +2133,12 @@ Process called "parse_resource_specification" takes parser as Integer returns In
     Return resource_node
 End Process
 
+@Reasoning:
+Grammar: 'switch' '(' Expression ')' '{' (CaseClause | DefaultClause)* '}'.
+Selector is the first child; case/default clauses follow. Fall-through is
+preserved structurally — case bodies extend until the next case/default or
+the closing brace.
+@End Reasoning
 Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Note: Parse switch statement
 
@@ -1853,6 +2179,11 @@ Process called "parse_switch_statement" takes parser as Integer returns Integer:
     Return switch_node
 End Process
 
+@Reasoning:
+Grammar: 'case' Expression ':' Statement*. Case bodies extend until the
+next case/default or the enclosing '}' — fall-through is intentional and
+preserved by terminating only on those three lookaheads.
+@End Reasoning
 Process called "parse_case_statement" takes parser as Integer returns Integer:
     Note: Parse case statement
 
@@ -1894,6 +2225,12 @@ Process called "parse_case_statement" takes parser as Integer returns Integer:
     Return case_node
 End Process
 
+@Reasoning:
+Default clause shares the AST_CASE_STATEMENT node type but the value slot
+is set to 1 to distinguish it from a regular case (which has 0). No
+expression precedes ':' for default. Body extension rule matches the case
+clause.
+@End Reasoning
 Process called "parse_default_statement" takes parser as Integer returns Integer:
     Note: Parse default statement
 
@@ -1932,6 +2269,10 @@ Process called "parse_default_statement" takes parser as Integer returns Integer
     Return default_node
 End Process
 
+@Reasoning:
+Grammar: 'break' [Identifier] ';'. The optional label is stored on the
+node's name slot when present; an unlabeled break has no name.
+@End Reasoning
 Process called "parse_break_statement" takes parser as Integer returns Integer:
     Note: Parse break statement
 
@@ -1953,6 +2294,10 @@ Process called "parse_break_statement" takes parser as Integer returns Integer:
     Return break_node
 End Process
 
+@Reasoning:
+Grammar: 'continue' [Identifier] ';'. Mirrors break with the same label
+handling — label refers to an enclosing labeled-loop in semantic resolution.
+@End Reasoning
 Process called "parse_continue_statement" takes parser as Integer returns Integer:
     Note: Parse continue statement
 
@@ -1974,6 +2319,13 @@ Process called "parse_continue_statement" takes parser as Integer returns Intege
     Return continue_node
 End Process
 
+@Reasoning:
+Disambiguates an expression statement from a local variable declaration.
+Primitive type keywords or the 'final' modifier unambiguously indicate a
+declaration. Identifier-starting sequences are ambiguous (could be type
+name or expression); a save/restore of the parser state lets the
+declaration scan attempt to succeed and rollback on failure.
+@End Reasoning
 Process called "parse_expression_or_declaration" takes parser as Integer returns Integer:
     Note: Parse expression statement or variable declaration
 
@@ -2049,6 +2401,12 @@ Process called "parse_expression_or_declaration" takes parser as Integer returns
     Return expr_stmt
 End Process
 
+@Reasoning:
+Grammar: Type Identifier ['=' Expression] ';'. Single-declarator form;
+multiple comma-separated declarators (int a, b, c;) are not produced as a
+single node here — additional declarators would have to fan out by upstream
+splitting if they were observed.
+@End Reasoning
 Process called "parse_variable_declaration" takes parser as Integer returns Integer:
     Note: Parse local variable declaration
 
@@ -2079,12 +2437,22 @@ Note: ==========================================================================
 Note: Expression Parsing
 Note: ============================================================================
 
+@Reasoning:
+Single-line entry point that delegates to the precedence ladder. Lowest
+precedence (ternary) is the top of the ladder; each tier increases in
+binding strength down to primary expressions.
+@End Reasoning
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse expression (entry point for expression parsing)
 
     Return proc parse_ternary_expression from parser
 End Process
 
+@Reasoning:
+Grammar: LogicalOr ['?' Expression ':' Expression]. Right-associative: the
+two branch expressions are themselves parsed with parse_expression so
+nested ternaries chain correctly (a ? b : c ? d : e parses as a ? b : (c ? d : e)).
+@End Reasoning
 Process called "parse_ternary_expression" takes parser as Integer returns Integer:
     Note: Parse ternary conditional expression (? :)
 
@@ -2109,6 +2477,11 @@ Process called "parse_ternary_expression" takes parser as Integer returns Intege
     Return expr
 End Process
 
+@Reasoning:
+Left-associative chain over '||'. Builds a left-leaning tree: a || b || c
+becomes (a || b) || c. The operator token type is stored in the binary
+node's value slot for later codegen / type-check dispatch.
+@End Reasoning
 Process called "parse_logical_or_expression" takes parser as Integer returns Integer:
     Note: Parse logical OR expression (||)
 
@@ -2133,6 +2506,11 @@ Process called "parse_logical_or_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over '&&'. Higher precedence than '||' per Java
+precedence rules: a || b && c parses as a || (b && c) because the && tier
+is invoked from inside the || tier's operand parse.
+@End Reasoning
 Process called "parse_logical_and_expression" takes parser as Integer returns Integer:
     Note: Parse logical AND expression (&&)
 
@@ -2157,6 +2535,11 @@ Process called "parse_logical_and_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over bitwise '|'. Sits between logical AND and
+bitwise XOR per Java precedence. Note '|' here means the bitwise operator;
+the short-circuit '||' is a distinct token handled at the logical OR tier.
+@End Reasoning
 Process called "parse_bitwise_or_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise OR expression (|)
 
@@ -2181,6 +2564,10 @@ Process called "parse_bitwise_or_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over bitwise '^'. Sits between bitwise OR and
+bitwise AND per Java precedence.
+@End Reasoning
 Process called "parse_bitwise_xor_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise XOR expression (^)
 
@@ -2205,6 +2592,11 @@ Process called "parse_bitwise_xor_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over bitwise '&'. Sits between bitwise XOR and
+equality per Java precedence. Distinct from '&&' which is a separate
+short-circuit token.
+@End Reasoning
 Process called "parse_bitwise_and_expression" takes parser as Integer returns Integer:
     Note: Parse bitwise AND expression (&)
 
@@ -2229,6 +2621,10 @@ Process called "parse_bitwise_and_expression" takes parser as Integer returns In
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over '==' and '!='. Equality operators bind tighter
+than bitwise but looser than relational operators per Java precedence.
+@End Reasoning
 Process called "parse_equality_expression" takes parser as Integer returns Integer:
     Note: Parse equality expression (== !=)
 
@@ -2264,6 +2660,11 @@ Process called "parse_equality_expression" takes parser as Integer returns Integ
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over <, <=, >, >=, and instanceof. instanceof is
+folded into the relational tier (its right operand is a Type rather than an
+expression, but typed-uniformly here — semantic analysis disambiguates).
+@End Reasoning
 Process called "parse_relational_expression" takes parser as Integer returns Integer:
     Note: Parse relational expression (< <= > >= instanceof)
 
@@ -2305,6 +2706,10 @@ Process called "parse_relational_expression" takes parser as Integer returns Int
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over <<, >>, >>>. The >>> (unsigned right shift) is
+a separate Java token and is treated as a peer operator here.
+@End Reasoning
 Process called "parse_shift_expression" takes parser as Integer returns Integer:
     Note: Parse shift expression (<< shifted right by >>>)
 
@@ -2342,6 +2747,11 @@ Process called "parse_shift_expression" takes parser as Integer returns Integer:
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over '+' and '-'. Java's '+' is overloaded for
+string concatenation; that distinction is made by the type checker, not
+here.
+@End Reasoning
 Process called "parse_additive_expression" takes parser as Integer returns Integer:
     Note: Parse additive expression (+ -)
 
@@ -2377,6 +2787,10 @@ Process called "parse_additive_expression" takes parser as Integer returns Integ
     Return left
 End Process
 
+@Reasoning:
+Left-associative chain over '*', '/', '%'. Highest-binding binary tier
+before unary operators take over.
+@End Reasoning
 Process called "parse_multiplicative_expression" takes parser as Integer returns Integer:
     Note: Parse multiplicative expression (* / %)
 
@@ -2414,6 +2828,12 @@ Process called "parse_multiplicative_expression" takes parser as Integer returns
     Return left
 End Process
 
+@Reasoning:
+Handles prefix unary operators (++, --, +, -, !, ~) by recursing on
+itself for right associativity. Parens are routed to cast-or-grouped
+disambiguation; everything else falls through to the postfix tier. The
+operator token is stored in the unary node's value slot for codegen.
+@End Reasoning
 Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Note: Parse unary expression (++ -- + - ! ~)
 
@@ -2483,6 +2903,14 @@ Process called "parse_unary_expression" takes parser as Integer returns Integer:
     Return proc parse_postfix_expression from parser
 End Process
 
+@Reasoning:
+Disambiguates between '(Type) expr' (cast) and '( expr )' (grouped). Uses a
+single-token lookahead: an identifier immediately followed by ')' is treated
+as a cast target; anything else parses as a grouped expression. The
+heuristic is intentionally conservative — more elaborate cast targets
+(generic, array) fall under the grouped path and are routed through cast
+semantics by later passes if the operand is unary.
+@End Reasoning
 Process called "parse_cast_or_grouped" takes parser as Integer returns Integer:
     Note: Parse cast expression or grouped expression
 
@@ -2538,6 +2966,12 @@ Process called "parse_cast_or_grouped" takes parser as Integer returns Integer:
     End If
 End Process
 
+@Reasoning:
+After a primary expression, iteratively consumes postfix operators: '.'
+member access, '[]' array index, '()' invocation, '++'/'--' post-increment,
+and '::' method reference. Each rewrites the current expr into an enclosing
+node so a chain like obj.field.method()[0] builds left-to-right.
+@End Reasoning
 Process called "parse_postfix_expression" takes parser as Integer returns Integer:
     Note: Parse postfix expression (primary followed by postfix operators)
 
@@ -2620,6 +3054,12 @@ Process called "parse_postfix_expression" takes parser as Integer returns Intege
     Return expr
 End Process
 
+@Reasoning:
+Atoms: numeric/string/char/boolean/null literals via parse_literal; 'this'
+and 'super' keywords; 'new' constructor invocations; identifiers (with
+possible lambda start). Parens fall through to parse_lambda_or_grouped to
+distinguish (params) -> body from a regular parenthesized expression.
+@End Reasoning
 Process called "parse_primary_expression" takes parser as Integer returns Integer:
     Note: Parse primary expression (literals, identifiers, this, super, new, lambda)
 
@@ -2702,6 +3142,12 @@ Process called "parse_primary_expression" takes parser as Integer returns Intege
     Return 0
 End Process
 
+@Reasoning:
+Wraps the current literal token into an AST_LITERAL node, copying the
+token pointer and its value slot for later type-directed interpretation
+(int vs long, float vs double, raw string text, etc.). Then advances past
+the literal.
+@End Reasoning
 Process called "parse_literal" takes parser as Integer returns Integer:
     Note: Parse literal value
 
@@ -2718,6 +3164,12 @@ Process called "parse_literal" takes parser as Integer returns Integer:
     Return literal_node
 End Process
 
+@Reasoning:
+Grammar: 'new' Type '(' ArgumentList ')' [ClassBody]. The optional class
+body is the anonymous-subclass form (new Runnable() { public void run() {}}).
+Array allocations (new int[5]) follow a distinct grammar and are handled
+elsewhere.
+@End Reasoning
 Process called "parse_new_expression" takes parser as Integer returns Integer:
     Note: Parse new expression (object creation)
 
@@ -2745,6 +3197,12 @@ Process called "parse_new_expression" takes parser as Integer returns Integer:
     Return new_node
 End Process
 
+@Reasoning:
+Inline class body used by anonymous classes following 'new'. Reuses the
+AST_BLOCK shape and runs parse_class_member until the closing brace. This
+keeps anonymous-class members and regular class members structurally
+identical for downstream translation.
+@End Reasoning
 Process called "parse_class_body" takes parser as Integer returns Integer:
     Note: Parse class body (for anonymous classes)
 
@@ -2771,6 +3229,18 @@ Process called "parse_class_body" takes parser as Integer returns Integer:
     Return body_node
 End Process
 
+@Reasoning:
+Disambiguates between '(params) -> body' and '(expression)' using a bounded
+scan: save state, walk forward through simple-looking tokens (identifiers,
+commas, primitive type keywords, 'final') until ')', then peek for '->'.
+Bails to grouped if a complex token appears or if the scan exceeds 50
+tokens (defensive cap against pathological inputs). Restores state before
+the chosen parse to ensure no double-consumption.
+@End Reasoning
+@Performance_Hints:
+Bounded by min(50, distance to matching paren). Used per primary expression
+beginning with '(' — typically a small fraction of total tokens.
+@End Performance_Hints
 Process called "parse_lambda_or_grouped" takes parser as Integer returns Integer:
     Note: Parse lambda expression or grouped expression
     Note: Lambda patterns: (params) -> body, () -> body, param -> body
@@ -2890,6 +3360,11 @@ Process called "parse_lambda_or_grouped" takes parser as Integer returns Integer
     End If
 End Process
 
+@Reasoning:
+A lambda body is either a single expression (x -> x + 1) or a block
+({ return x + 1; }). LBRACE signals the block form; everything else is an
+expression body.
+@End Reasoning
 Process called "parse_lambda_body" takes parser as Integer returns Integer:
     Note: Parse lambda body (expression or block)
 
@@ -2901,6 +3376,11 @@ Process called "parse_lambda_body" takes parser as Integer returns Integer:
     Return proc parse_expression from parser
 End Process
 
+@Reasoning:
+Comma-separated expressions for method/constructor calls. Empty list
+short-circuits on immediate RPAREN. The closing paren is not consumed
+here — the caller (e.g., postfix invocation handler) expects ')'.
+@End Reasoning
 Process called "parse_argument_list" takes parser as Integer returns Integer:
     Note: Parse argument list for method calls
 
@@ -2928,6 +3408,11 @@ Note: ==========================================================================
 Note: Main Parse Entry Point
 Note: ============================================================================
 
+@Reasoning:
+Public entry point. Delegates to parse_compilation_unit and returns the
+root AST node. Single-call API hides the internal naming of the start
+symbol.
+@End Reasoning
 Process called "parse" takes parser as Integer returns Integer:
     Note: Parse complete Java source file
 

@@ -49,6 +49,13 @@ Note: ==========================================================================
 Note: Python to HIR Translation Context
 Note: ============================================================================
 
+@Reasoning:
+Three-slot translator state. arena is an upstream arena allocator so all
+HIR nodes produced during one translate_python_to_hir invocation share
+a single bulk lifetime. current_function tracks the enclosing
+function-name string so async/await/yield validation can match against
+the right context. errors collects diagnostics emitted during the walk.
+@End Reasoning
 Type called "PythonToHIRContext":
     arena as Integer           Note: Arena for allocations
     current_function as Integer  Note: Current function name
@@ -57,6 +64,11 @@ End Type
 
 Constant CONTEXT_SIZE as Integer is 24
 
+@Reasoning:
+Allocates a 24-byte (3-int64) context, stores the upstream arena
+pointer, primes current_function to 0, and initializes the errors list.
+Returns 0 on OOM to let callers propagate the failure.
+@End Reasoning
 Process called "create_python_to_hir_context" takes arena as Integer returns Integer:
     Note: Create Python to HIR translation context
 
@@ -75,6 +87,11 @@ Process called "create_python_to_hir_context" takes arena as Integer returns Int
     Return context
 End Process
 
+@Reasoning:
+Frees the errors list and the context struct. Null-safe so error paths
+can call it unconditionally. The arena is not freed here — its lifetime
+is managed by the caller of translate_python_to_hir.
+@End Reasoning
 Process called "destroy_python_to_hir_context" takes context as Integer returns Integer:
     Note: Destroy Python to HIR translation context
 
@@ -127,6 +144,14 @@ Note: ==========================================================================
 Note: Node Translation Dispatcher
 Note: ============================================================================
 
+@Reasoning:
+The master dispatch for Python AST -> HIR. Routes every PYTHON_* node
+type to its specialized translator covering module structure
+(MODULE/FUNCTION_DEF/CLASS_DEF/IMPORT/FROM_IMPORT), all statement
+forms, all expression forms, and literal kinds. Null nodes return 0
+(empty HIR), preserving the caller's ability to use this routine on
+optional sub-nodes.
+@End Reasoning
 Process called "translate_node" takes context as Integer, node as Integer returns Integer:
     Note: Dispatch node translation based on node type
 
@@ -325,6 +350,12 @@ Note: ==========================================================================
 Note: Module Translation
 Note: ============================================================================
 
+@Reasoning:
+Module-level: creates the HIR module node and recursively translates
+every top-level child (function/class/import/statement). Source order
+is preserved so program semantics that depend on declaration order
+(decorator evaluation, side-effecting statements) carry through.
+@End Reasoning
 Process called "translate_module" takes context as Integer, node as Integer returns Integer:
     Note: Translate Python module to HIR
 
@@ -356,6 +387,13 @@ Note: ==========================================================================
 Note: Declaration Translation
 Note: ============================================================================
 
+@Reasoning:
+"def name(params): body" -> HIR function node. Saves and restores
+current_function on the context so nested defs work correctly. Captures
+decorators, parameters (including *args/**kwargs/keyword-only), return
+annotation, and body. The async variant routes through the same proc
+but tags the result with async metadata.
+@End Reasoning
 Process called "translate_function_def" takes context as Integer, node as Integer returns Integer:
     Note: Translate function definition to HIR
 
@@ -390,6 +428,13 @@ Process called "translate_function_def" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+"class Name(bases, metaclass=M): body" -> HIR class node. Captures base
+classes (multiple inheritance allowed in Python), optional metaclass
+keyword argument, decorators, and class body. The body is translated
+under the same dispatcher recursively so nested methods, properties,
+and class-level statements all become children.
+@End Reasoning
 Process called "translate_class_def" takes context as Integer, node as Integer returns Integer:
     Note: Translate class definition to HIR
 
@@ -428,6 +473,12 @@ Process called "translate_class_def" takes context as Integer, node as Integer r
     Return hir
 End Process
 
+@Reasoning:
+"import module [as alias]" -> HIR import statement. Multiple
+comma-separated imports become multiple HIR import nodes — Python
+syntax allows "import a, b, c" but downstream HIR keeps each import
+as a separate node for simpler dependency tracking.
+@End Reasoning
 Process called "translate_import" takes context as Integer, node as Integer returns Integer:
     Note: Translate import statement to HIR
 
@@ -454,6 +505,13 @@ Process called "translate_import" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+"from module import name1, name2, ..." -> HIR from-import statement.
+The optional star-import ("from module import *") is represented by a
+single child with the "*" sentinel name. Relative imports ("from .
+import x", "from ..pkg import y") are tagged with the dot-count in
+metadata.
+@End Reasoning
 Process called "translate_from_import" takes context as Integer, node as Integer returns Integer:
     Note: Translate from...import statement to HIR
 
@@ -489,6 +547,11 @@ Note: ==========================================================================
 Note: Statement Translation
 Note: ============================================================================
 
+@Reasoning:
+A bare expression used as a statement (function call for side effects,
+expression at REPL, etc.). Wraps the translated expression in an HIR
+expression-statement so block-level traversal can iterate uniformly.
+@End Reasoning
 Process called "translate_expression_stmt" takes context as Integer, node as Integer returns Integer:
     Note: Translate expression statement to HIR
 
@@ -506,6 +569,12 @@ Process called "translate_expression_stmt" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"target = value" -> HIR assignment. Python allows tuple/list unpacking
+on the LHS ("a, b = (1, 2)") which becomes a single HIR assignment with
+a tuple-pattern target; chained assignment ("a = b = c") becomes
+multiple HIR set statements with the same RHS.
+@End Reasoning
 Process called "translate_assignment" takes context as Integer, node as Integer returns Integer:
     Note: Translate assignment to HIR
 
@@ -529,6 +598,12 @@ Process called "translate_assignment" takes context as Integer, node as Integer 
     Return hir
 End Process
 
+@Reasoning:
+"a += b", "a -= b", etc. -> HIR augmented-assignment. Kept as a single
+HIR node rather than desugaring to "a = a + b" because Python may call
+__iadd__ for in-place mutation (e.g. on lists) which has different
+semantics than a fresh "a = a + b".
+@End Reasoning
 Process called "translate_augmented_assignment" takes context as Integer, node as Integer returns Integer:
     Note: Translate augmented assignment to HIR
 
@@ -557,6 +632,12 @@ Process called "translate_augmented_assignment" takes context as Integer, node a
     Return hir
 End Process
 
+@Reasoning:
+"if cond: then-block (elif: alt-block)* (else: else-block)?" -> HIR if.
+elif chains are flattened into the same HIR if as alternating
+(condition, then-block) pairs followed by an optional final else-block,
+matching the AST shape produced by python_parser.
+@End Reasoning
 Process called "translate_if_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate if statement to HIR
 
@@ -584,6 +665,12 @@ Process called "translate_if_statement" takes context as Integer, node as Intege
     Return hir
 End Process
 
+@Reasoning:
+"for target in iterable: body (else: else-block)?" -> HIR for. Python's
+"for-else" clause (else runs when the loop completes without break) is
+preserved via an optional fourth child; HIR consumers detect it by the
+presence of the extra child.
+@End Reasoning
 Process called "translate_for_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate for statement to HIR
 
@@ -620,6 +707,11 @@ Process called "translate_for_statement" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+"while cond: body (else: else-block)?" -> HIR while. Same for-else
+pattern as translate_for_statement — the else-clause runs only when
+the loop exits via condition becoming false (not via break).
+@End Reasoning
 Process called "translate_while_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate while statement to HIR
 
@@ -650,6 +742,13 @@ Process called "translate_while_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"with expr as name: body" -> HIR resource-block. Captures the
+context-manager expression (returns __enter__/__exit__ object), the
+optional name binding, and the body. Multi-context "with a, b: body"
+expands to nested HIR with-blocks because each context manager has its
+own __exit__ to call in reverse order.
+@End Reasoning
 Process called "translate_with_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate with statement to HIR
 
@@ -676,6 +775,13 @@ Process called "translate_with_statement" takes context as Integer, node as Inte
     Return hir
 End Process
 
+@Reasoning:
+"try: ... except T as name: ... else: ... finally: ..." -> HIR try. All
+four clause kinds (try, multiple except, optional else, optional
+finally) are captured. except clauses translate into HIR catch-arms
+with optional exception type filter and optional name binding. else
+runs only on normal completion of try; finally always runs.
+@End Reasoning
 Process called "translate_try_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate try statement to HIR
 
@@ -713,6 +819,13 @@ Process called "translate_try_statement" takes context as Integer, node as Integ
     Return hir
 End Process
 
+@Reasoning:
+"match expr: case pattern: body" (Python 3.10+ structural pattern
+matching) -> HIR match. Each case clause becomes a match arm with its
+pattern (literal/identifier/sequence/mapping/class/star/or-pattern),
+optional guard, and body. The wildcard "_" pattern matches anything
+and is preserved as a wildcard arm.
+@End Reasoning
 Process called "translate_match_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate match statement to HIR
 
@@ -746,6 +859,12 @@ Process called "translate_match_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"return [expr]" -> HIR return. The expression is optional (bare
+"return" returns None). Inside a generator function, return values
+become the StopIteration argument; this distinction is left for the
+analyzer to enforce via current_function context.
+@End Reasoning
 Process called "translate_return_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate return statement to HIR
 
@@ -763,6 +882,11 @@ Process called "translate_return_statement" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"break" -> HIR break — a payload-free jump to the end of the innermost
+enclosing loop. Validation that break appears only inside a loop is
+the analyzer's responsibility.
+@End Reasoning
 Process called "translate_break_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate break statement to HIR
 
@@ -772,6 +896,11 @@ Process called "translate_break_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"continue" -> HIR continue — jumps back to the loop's condition check.
+Like break, valid only inside a loop and lowering depends on whether
+the surrounding loop is for or while.
+@End Reasoning
 Process called "translate_continue_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate continue statement to HIR
 
@@ -781,6 +910,12 @@ Process called "translate_continue_statement" takes context as Integer, node as 
     Return hir
 End Process
 
+@Reasoning:
+"pass" -> HIR no-op. Preserved (rather than dropped) because some
+syntactic contexts require a non-empty body and dropping the pass
+would make those blocks empty in HIR. The codegen layer optimizes out
+no-ops in non-required positions.
+@End Reasoning
 Process called "translate_pass_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate pass statement to HIR
 
@@ -790,6 +925,12 @@ Process called "translate_pass_statement" takes context as Integer, node as Inte
     Return hir
 End Process
 
+@Reasoning:
+"raise [expr [from cause]]" -> HIR raise. Three forms: bare "raise"
+(re-raises the current exception, only valid inside except), "raise
+expr" (raises a new exception), "raise expr from cause" (sets the
+__cause__ chain for chained-exception display).
+@End Reasoning
 Process called "translate_raise_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate raise statement to HIR
 
@@ -807,6 +948,12 @@ Process called "translate_raise_statement" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"assert cond [, msg]" -> HIR assert. Captures the predicate and the
+optional message. Codegen may emit a no-op when compiling with
+optimization enabled (Python -O), but this translator preserves the
+assertion unconditionally so the choice is downstream.
+@End Reasoning
 Process called "translate_assert_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate assert statement to HIR
 
@@ -830,6 +977,13 @@ Process called "translate_assert_statement" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"del target1, target2, ..." -> HIR delete. Targets can be names (unbind
+from scope), subscripts ("del a[i]" calls __delitem__), or attributes
+("del obj.x" calls __delattr__); each target form lowers to a
+different HIR primitive but they all live under one delete-statement
+parent for source-order preservation.
+@End Reasoning
 Process called "translate_delete_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate del statement to HIR
 
@@ -847,6 +1001,12 @@ Process called "translate_delete_statement" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"global var1, var2" -> HIR global declarations. Each name becomes a
+binding annotation so subsequent assignments in the function bind to
+the module scope instead of creating a local. The HIR layer represents
+this as a binding-class annotation rather than a runtime operation.
+@End Reasoning
 Process called "translate_global_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate global statement to HIR
 
@@ -873,6 +1033,12 @@ Process called "translate_global_statement" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"nonlocal var1, var2" -> HIR nonlocal declarations. Similar to global
+but binds to the nearest enclosing function scope (not the module
+scope). Each name is annotated accordingly so closure capture
+generates the right reference.
+@End Reasoning
 Process called "translate_nonlocal_statement" takes context as Integer, node as Integer returns Integer:
     Note: Translate nonlocal statement to HIR
 
@@ -903,6 +1069,13 @@ Note: ==========================================================================
 Note: Expression Translation
 Note: ============================================================================
 
+@Reasoning:
+Binary operator expression "a op b" -> HIR binary. Covers arithmetic
+(+ - * / // % **), comparison (== != < <= > >= is is-not in not-in),
+bitwise (& | ^ << >>), and logical (and or — though these often
+appear as separate boolean-op nodes). The operator-string slot
+preserves the source form for codegen dispatch.
+@End Reasoning
 Process called "translate_binary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate binary expression to HIR
 
@@ -931,6 +1104,12 @@ Process called "translate_binary_expression" takes context as Integer, node as I
     Return hir
 End Process
 
+@Reasoning:
+Unary prefix operator "op x" -> HIR unary. Covers "+x" (identity, kept
+for source fidelity), "-x" (negation), "not x" (boolean inversion),
+and "~x" (bitwise NOT). The operator-string slot preserves which form
+was used.
+@End Reasoning
 Process called "translate_unary_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate unary expression to HIR
 
@@ -953,6 +1132,12 @@ Process called "translate_unary_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"lambda params: body" -> HIR lambda. The body is exactly one expression
+(Python lambdas cannot contain statements). Free variables in the
+lambda are captured from the enclosing scope at lambda construction
+time, just like def-functions.
+@End Reasoning
 Process called "translate_lambda_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate lambda expression to HIR
 
@@ -976,6 +1161,12 @@ Process called "translate_lambda_expression" takes context as Integer, node as I
     Return hir
 End Process
 
+@Reasoning:
+"func(arg1, kwarg=v, *args, **kwargs)" -> HIR call. The four argument
+forms (positional, keyword, *-unpack, **-unpack) are translated into
+distinct child slots so codegen can construct the call frame
+correctly. Argument source order is preserved within each kind.
+@End Reasoning
 Process called "translate_call_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate call expression to HIR
 
@@ -1009,6 +1200,13 @@ Process called "translate_call_expression" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"obj[index]" -> HIR subscript. Index can be a scalar, a slice
+(start:stop:step), or a tuple of these. Each form lowers to a
+different runtime call (__getitem__ for assignment context;
+__delitem__ for "del a[i]"). Multi-dimensional indexing "a[i, j]"
+becomes a tuple-typed index node.
+@End Reasoning
 Process called "translate_subscript_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate subscript expression to HIR
 
@@ -1032,6 +1230,12 @@ Process called "translate_subscript_expression" takes context as Integer, node a
     Return hir
 End Process
 
+@Reasoning:
+"obj.attr" -> HIR member access. The attribute name is captured as a
+string field (not as a child node) because it is a compile-time
+constant. Chained access "a.b.c" produces nested member-access HIR
+nodes through the recursive descent.
+@End Reasoning
 Process called "translate_attribute_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate attribute expression to HIR
 
@@ -1054,6 +1258,12 @@ Process called "translate_attribute_expression" takes context as Integer, node a
     Return hir
 End Process
 
+@Reasoning:
+"[elem1, elem2, ...]" -> HIR list literal. Star-unpack elements
+("[*x]") are preserved as marked children so codegen can call
+__iter__-spread instead of plain copy. Empty lists are valid and
+emit a zero-element HIR list.
+@End Reasoning
 Process called "translate_list_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate list expression to HIR
 
@@ -1080,6 +1290,12 @@ Process called "translate_list_expression" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"{key: value, ...}" -> HIR dict literal. Each key/value pair becomes
+two adjacent children. "**other" spread elements are tagged with
+metadata so codegen can call dict.update() instead of inserting them
+as ordinary keys.
+@End Reasoning
 Process called "translate_dict_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate dict expression to HIR
 
@@ -1113,6 +1329,12 @@ Process called "translate_dict_expression" takes context as Integer, node as Int
     Return hir
 End Process
 
+@Reasoning:
+"{elem1, elem2, ...}" -> HIR set literal. Disambiguated from dict
+literals at parse time by the absence of ":" separators. Empty
+"{}" is always a dict, never a set — set() must be used for empty
+sets.
+@End Reasoning
 Process called "translate_set_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate set expression to HIR
 
@@ -1139,6 +1361,12 @@ Process called "translate_set_expression" takes context as Integer, node as Inte
     Return hir
 End Process
 
+@Reasoning:
+"(elem1, elem2, ...)" -> HIR tuple literal. Single-element form requires
+a trailing comma: "(x,)" — without it the parens are grouping not
+tuple-constructing. Empty tuple "()" is valid. Star-unpack handling
+is the same as for list literals.
+@End Reasoning
 Process called "translate_tuple_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate tuple expression to HIR
 
@@ -1165,6 +1393,11 @@ Process called "translate_tuple_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"await expr" -> HIR await. The current_function context lets the
+analyzer enforce that await appears only inside async functions; this
+translator just produces the HIR node without performing that check.
+@End Reasoning
 Process called "translate_await_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate await expression to HIR
 
@@ -1182,6 +1415,13 @@ Process called "translate_await_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"yield [expr]" or "yield from iterable" -> HIR yield. Bare yield
+returns None. "yield from" expands an iterable's values into the
+caller as a delegated generator. The presence of a yield turns the
+enclosing function into a generator, which is detected and tagged
+separately by the analyzer.
+@End Reasoning
 Process called "translate_yield_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate yield expression to HIR
 
@@ -1199,6 +1439,13 @@ Process called "translate_yield_expression" takes context as Integer, node as In
     Return hir
 End Process
 
+@Reasoning:
+"value_if_true if cond else value_if_false" -> HIR ternary expression.
+Note Python's word-order is different from C's "cond ? a : b" — the
+condition is in the middle. This routine reads the three children in
+the parser's order and reassembles them in the HIR-canonical
+(cond, then-value, else-value) order.
+@End Reasoning
 Process called "translate_conditional_expression" takes context as Integer, node as Integer returns Integer:
     Note: Translate conditional expression to HIR
 
@@ -1232,6 +1479,12 @@ Note: ==========================================================================
 Note: Literal Translation
 Note: ============================================================================
 
+@Reasoning:
+Bare identifier reference -> HIR identifier node. The name resolution
+(local vs nonlocal vs global vs builtin) is left to a later pass — this
+translator just produces the structural node with the captured name
+string.
+@End Reasoning
 Process called "translate_identifier" takes context as Integer, node as Integer returns Integer:
     Note: Translate identifier to HIR
 
@@ -1246,6 +1499,12 @@ Process called "translate_identifier" takes context as Integer, node as Integer 
     Return hir
 End Process
 
+@Reasoning:
+Integer literal -> HIR integer literal. The lexeme is captured as a
+string (including any 0x/0o/0b prefix) so the parser-provided source
+form is preserved for accurate downstream literal-value recovery and
+diagnostic reporting.
+@End Reasoning
 Process called "translate_integer" takes context as Integer, node as Integer returns Integer:
     Note: Translate integer literal to HIR
 
@@ -1260,6 +1519,13 @@ Process called "translate_integer" takes context as Integer, node as Integer ret
     Return hir
 End Process
 
+@Reasoning:
+Float literal -> HIR float literal. Source text is preserved as-is so
+"1.0", "1e2", and "1." round-trip exactly. The trailing "j" imaginary
+suffix (e.g. "3.14j") is recognized at the lexer and routes here with
+the suffix included; downstream codegen reads the suffix to decide
+between real and complex emission.
+@End Reasoning
 Process called "translate_float" takes context as Integer, node as Integer returns Integer:
     Note: Translate float literal to HIR
 
@@ -1274,6 +1540,12 @@ Process called "translate_float" takes context as Integer, node as Integer retur
     Return hir
 End Process
 
+@Reasoning:
+String literal -> HIR string literal. Source text captured includes
+escape sequences (\n, \t, etc.) in their unprocessed form — escape
+decoding is the responsibility of a later pass. f-strings, b-strings,
+and raw-strings are distinguished by prefix metadata on the HIR node.
+@End Reasoning
 Process called "translate_string" takes context as Integer, node as Integer returns Integer:
     Note: Translate string literal to HIR
 
@@ -1288,6 +1560,11 @@ Process called "translate_string" takes context as Integer, node as Integer retu
     Return hir
 End Process
 
+@Reasoning:
+"None" -> HIR null literal. Python's None has no other forms (e.g.
+"NULL" or "nil") so a single fixed-value node suffices. The HIR null
+literal is the canonical representation across all source languages.
+@End Reasoning
 Process called "translate_none" takes context as Integer, node as Integer returns Integer:
     Note: Translate None literal to HIR
 
@@ -1297,6 +1574,12 @@ Process called "translate_none" takes context as Integer, node as Integer return
     Return hir
 End Process
 
+@Reasoning:
+"True" -> HIR boolean literal with value 1. Python's True is a
+singleton; the HIR boolean literal preserves the boolean type so
+downstream code can distinguish it from the integer 1 when needed for
+type-narrow contexts.
+@End Reasoning
 Process called "translate_true" takes context as Integer, node as Integer returns Integer:
     Note: Translate True literal to HIR
 
@@ -1306,6 +1589,10 @@ Process called "translate_true" takes context as Integer, node as Integer return
     Return hir
 End Process
 
+@Reasoning:
+"False" -> HIR boolean literal with value 0. Symmetric to translate_true;
+preserved as a boolean type for the same reason.
+@End Reasoning
 Process called "translate_false" takes context as Integer, node as Integer returns Integer:
     Note: Translate False literal to HIR
 
@@ -1319,6 +1606,14 @@ Note: ==========================================================================
 Note: Parameter Translation
 Note: ============================================================================
 
+@Reasoning:
+One formal parameter -> HIR parameter. Captures the name, optional
+type annotation, optional default value, and the parameter kind
+(positional-or-keyword / positional-only / keyword-only / *args /
+**kwargs). The kind flag matters because Python's calling convention
+treats them differently — positional-only cannot be passed by name,
+keyword-only cannot be passed positionally, etc.
+@End Reasoning
 Process called "translate_parameter" takes context as Integer, node as Integer returns Integer:
     Note: Translate parameter to HIR
 

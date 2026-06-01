@@ -12,23 +12,76 @@ Import "../emitter_common.runa" as EmitterCommon
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 
+@Reasoning:
+Layout-compatible alias of the underlying raw byte emitter. Carried in a
+distinct type so the SQL-specific wrappers can present a domain-typed
+interface while delegating the actual buffer math to EmitterCommon.
+@End Reasoning
+
+@Implementation:
+Three int64 fields - data pointer, allocated capacity, current write index
+- matching the shared emitter header exactly so the raw API can operate on
+the same memory.
+@End Implementation
+
 Type called "SQLEmitter":
     buffer as Integer
     capacity as Integer
     length as Integer
 End Type
 
+@Reasoning:
+SQL backends use the same buffer-growth logic as every other emitter, so
+construction is delegated to the shared raw factory instead of duplicating
+allocation code.
+@End Reasoning
+
+@Implementation:
+Returns the result of emitter_raw_create which allocates an SQLEmitter-
+compatible header plus a default-size byte buffer.
+@End Implementation
+
 Process called "create_sql_emitter" returns Integer:
     Return proc emitter_raw_create from EmitterCommon
 End Process
+
+@Reasoning:
+Pairs with create_sql_emitter; delegates teardown to the shared raw
+destructor that frees both the header and the byte buffer.
+@End Reasoning
+
+@Implementation:
+Calls emitter_raw_destroy on the supplied emitter handle.
+@End Implementation
 
 Process called "destroy_sql_emitter" takes emitter as Integer:
     proc emitter_raw_destroy from EmitterCommon with emitter
 End Process
 
+@Reasoning:
+Exposed as a domain-typed wrapper so SQL-specific emitters can request
+buffer growth without importing EmitterCommon directly.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_ensure_capacity which doubles the underlying
+buffer until additional_bytes fit.
+@End Implementation
+
 Process called "ensure_capacity" takes emitter as Integer, additional_bytes as Integer:
     proc emitter_raw_ensure_capacity from EmitterCommon with emitter, additional_bytes
 End Process
+
+@Reasoning:
+Preserved here for callers that still depend on the original SQL-emitter
+API surface. New code should use the layout primitives directly.
+@End Reasoning
+
+@Implementation:
+Byte-wise loop from index 0 to size, reading via memory_get_byte and
+writing via memory_set_byte. No overlap detection - callers must ensure
+source and dest do not overlap.
+@End Implementation
 
 Process called "copy_memory" takes source as Integer, dest as Integer, size as Integer:
     Note: Byte-wise memory copy preserved for source compatibility.
@@ -40,9 +93,29 @@ Process called "copy_memory" takes source as Integer, dest as Integer, size as I
     End While
 End Process
 
+@Reasoning:
+SQL emitters frequently write single delimiter bytes (commas, parens,
+semicolons); the wrapper lets call sites stay in the SQL namespace.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_emit_byte which appends the byte and grows the
+buffer when needed.
+@End Implementation
+
 Process called "emit_char" takes emitter as Integer, char as Integer:
     proc emitter_raw_emit_byte from EmitterCommon with emitter, char
 End Process
+
+@Reasoning:
+Workhorse for token emission - SQL is mostly keywords, identifiers and
+literals strung together; emit_string writes raw byte sequences.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_emit_string which copies a null-terminated string
+into the emitter buffer and grows it if necessary.
+@End Implementation
 
 Process called "emit_string" takes emitter as Integer, string as Integer:
     proc emitter_raw_emit_string from EmitterCommon with emitter, string
@@ -51,6 +124,18 @@ End Process
 Note: ========================================
 Note: SQL Keyword Emission
 Note: ========================================
+
+@Reasoning:
+Standard SQL convention is uppercase keywords for readability and grep-
+ability. Doing the upper-casing at emission time means the rest of the
+backend can store keywords in any case.
+@End Reasoning
+
+@Implementation:
+Allocates an upper-cased copy of the input via StringCore.to_uppercase,
+writes it through the raw emitter, then deallocates the temporary so the
+keyword string is not leaked.
+@End Implementation
 
 Process called "emit_keyword" takes emitter as Integer, keyword as Integer:
     Note: Emit SQL keyword in uppercase. Frees the temporary uppercased copy.
@@ -62,6 +147,17 @@ End Process
 Note: ========================================
 Note: SQL Identifier Emission
 Note: ========================================
+
+@Reasoning:
+SQL identifiers must be double-quoted when they collide with reserved
+words or contain non-identifier characters; bare identifiers stay
+unquoted for readability.
+@End Reasoning
+
+@Implementation:
+Calls identifier_needs_quoting; if true, brackets the identifier with
+ASCII " (34); otherwise writes the identifier as-is.
+@End Implementation
 
 Process called "emit_identifier" takes emitter as Integer, identifier as Integer:
     Note: Emit SQL identifier, double-quoted only when reserved or non-alpha.
@@ -75,6 +171,20 @@ Process called "emit_identifier" takes emitter as Integer, identifier as Integer
         proc emitter_raw_emit_string from EmitterCommon with emitter, identifier
     End If
 End Process
+
+@Reasoning:
+Determining whether an identifier collides with SQL reserved words or
+contains unsafe characters has to be conservative because false negatives
+generate parse errors at the database server while false positives only
+produce ugly but valid output.
+@End Reasoning
+
+@Implementation:
+Empty identifiers are quoted. Otherwise iterates each char and treats it
+as a bare identifier byte if it is A-Z, a-z, 0-9 or underscore. The
+function also walks a reserved-keyword list (further down the file) and
+returns 1 on any match.
+@End Implementation
 
 Process called "identifier_needs_quoting" takes identifier as Integer returns Integer:
     Note: Check if identifier needs quoting (contains special chars or is reserved).
@@ -319,6 +429,20 @@ Note: ========================================
 Note: SQL Operator Emission
 Note: ========================================
 
+@Reasoning:
+SQL has two operator flavours: word-based (AND, OR, NOT, LIKE) which need
+upper-casing for style, and symbol-based (=, <>, +, /) which must be passed
+through verbatim. Distinguishing them at emit-time keeps the convention out
+of every caller.
+@End Reasoning
+
+@Implementation:
+Inspects the operator's first byte: if it falls in [A-Z] or [a-z], the
+operator is forwarded to emit_keyword for uppercase emission. Anything
+else (symbols, digits) is written through emitter_raw_emit_string
+unchanged.
+@End Implementation
+
 Process called "emit_operator" takes emitter as Integer, operator as Integer:
     Note: Emit SQL operator. Word-based operators (AND, OR, ...) are
     Note: uppercased; symbol operators are emitted as-is.
@@ -353,6 +477,16 @@ Note: ========================================
 Note: Literal Emission
 Note: ========================================
 
+@Reasoning:
+SQL integer literals are emitted in base-10 with no quotes; this helper
+hides the temporary string allocation needed to format the integer.
+@End Reasoning
+
+@Implementation:
+Calls StringCore.integer_to_string, writes the resulting buffer through the
+raw emitter, then frees the temporary heap allocation.
+@End Implementation
+
 Process called "emit_integer" takes emitter as Integer, value as Integer:
     Note: Emit integer literal.
     Let int_str be proc integer_to_string from StringCore with value
@@ -360,12 +494,40 @@ Process called "emit_integer" takes emitter as Integer, value as Integer:
     proc deallocate from Layout with int_str
 End Process
 
+@Reasoning:
+SQL float literals are bare numeric tokens (no quotes); centralising the
+format choice means changes to precision rules only affect this helper.
+@End Reasoning
+
+@Implementation:
+Formats value via StringCore.float_to_string, writes the produced buffer,
+then frees the temporary heap allocation.
+@End Implementation
+
 Process called "emit_float" takes emitter as Integer, value as Float:
     Note: Emit float literal.
     Let float_str be proc float_to_string from StringCore with value
     proc emitter_raw_emit_string from EmitterCommon with emitter, float_str
     proc deallocate from Layout with float_str
 End Process
+
+@Reasoning:
+SQL string literals are single-quoted with embedded apostrophes doubled
+('') per ISO-9075. Failing to escape would either truncate the literal
+mid-string or open an injection vector.
+@End Reasoning
+
+@Implementation:
+Emits ASCII single-quote (39), walks the input byte by byte writing each
+character through; when a 39 byte is encountered it is written twice to
+produce the doubled-quote escape. Closes with a final 39 byte.
+@End Implementation
+
+@Security_Scope:
+Trusts string_value to be a null-terminated buffer. Escaping prevents
+quote characters from breaking out of the literal, but the caller is still
+responsible for sanitising semantic content (e.g. shell injection upstream).
+@End Security_Scope
 
 Process called "emit_string_literal" takes emitter as Integer, string_value as Integer:
     Note: Emit SQL string literal with single quotes; single quotes inside
@@ -392,6 +554,17 @@ End Process
 Note: ========================================
 Note: Output Retrieval
 Note: ========================================
+
+@Reasoning:
+Final step of the emitter lifecycle - hands the accumulated bytes back to
+the caller as a freshly-allocated null-terminated string.
+@End Reasoning
+
+@Implementation:
+Forwards to emitter_raw_get_output which copies the buffer contents into a
+new heap allocation sized length+1 and null-terminates it. Caller owns the
+returned buffer.
+@End Implementation
 
 Process called "get_output" takes emitter as Integer returns Integer:
     Return proc emitter_raw_get_output from EmitterCommon with emitter

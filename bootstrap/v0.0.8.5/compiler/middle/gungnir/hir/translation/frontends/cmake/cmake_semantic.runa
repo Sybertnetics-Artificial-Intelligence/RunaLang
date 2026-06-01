@@ -19,6 +19,28 @@ Note: ===================================================================
 Note: SEMANTIC ANALYZER STRUCTURE
 Note: ===================================================================
 
+@Reasoning:
+CMake's "language" is really a build-system declarative engine layered on a
+macro-style command interpreter. Semantic analysis therefore tracks many
+parallel namespaces: targets (executables/libraries), free variables,
+function/macro definitions, include lists, subdirectories, cached
+properties, policies (CMP00xx behavior selectors), generators, dependency
+edges, target-link sets, compile definitions, and include directories. Each
+gets its own Dict so lookups remain O(1) regardless of project size.
+Separate validation_errors/validation_warnings streams keep severity ordering
+intact for the diagnostic reporter, and circular_dependencies/undefined_*
+caches collect graph-analysis output without re-walking the build graph.
+@End Reasoning
+
+@Implementation:
+176-byte record (22 x i64 slots, offsets 0..168): every "registry" slot is
+either a Dict (for keyed lookups like targets/variables) or a List (for
+ordered streams like validation_errors). The cmake_minimum_version slot at
+offset 168 is parsed from the first cmake_minimum_required() command and
+gates policy enforcement. has_error is sticky; error_message holds the
+first failure's owned StringCore.
+@End Implementation
+
 Type called "CMakeSemanticAnalyzer":
     targets as Integer
     variables as Integer
@@ -809,12 +831,39 @@ Process called "set_cmake_semantic_error" takes analyzer as Integer, error_messa
     proc memory_set_int64 from Layout with analyzer, 160, 1
 End Process
 
+@Reasoning:
+Validation errors are independent from the sticky has_error flag set by
+set_cmake_semantic_error: a CMake project can have many recoverable validation
+failures (undefined target referenced, mismatched argument count, etc.) that
+should be collected so the user sees the full report, not just the first
+issue. This append-only stream preserves source order.
+@End Reasoning
+
+@Implementation:
+Reads the validation_errors List from offset 136 and appends the borrowed
+error_message StringCore pointer. Ownership policy: the analyzer's destructor
+walks this list and frees each entry, so callers must pass a heap-owned
+string (typically allocated immediately before the call).
+@End Implementation
+
 Process called "add_cmake_validation_error" takes analyzer as Integer, error_message as Integer:
     Note: Add validation error to error list
 
     Let errors be proc memory_get_int64 from Layout with analyzer, 136
     proc add from List with errors, error_message
 End Process
+
+@Reasoning:
+Warnings vs errors are tracked in separate streams so the diagnostic reporter
+can apply different severity formatting (color, exit code) without rescanning.
+A warning never sets has_error, allowing builds to continue.
+@End Reasoning
+
+@Implementation:
+Mirror of add_cmake_validation_error against the validation_warnings list at
+offset 144. Same ownership policy: list destructor will free each warning
+string, so callers pass heap-owned StringCore handles.
+@End Implementation
 
 Process called "add_cmake_validation_warning" takes analyzer as Integer, warning_message as Integer:
     Note: Add validation warning to warning list
@@ -826,6 +875,27 @@ End Process
 Note: ===================================================================
 Note: PUBLIC API
 Note: ===================================================================
+
+@Reasoning:
+Top-level entry point that bundles create_cmake_semantic_analyzer +
+analyze_cmake_project for callers that want a one-shot analysis without
+managing analyzer lifetime themselves (driver pipeline, language server).
+The returned analyzer carries every diagnostic stream and graph result.
+@End Reasoning
+
+@Implementation:
+Allocates a fresh analyzer; on OOM returns 0 (caller treats as fatal). Calls
+analyze_cmake_project which walks the AST and populates targets, variables,
+dependencies and diagnostic lists. The intermediate result is discarded
+because the analyzer itself is the public artifact.
+@End Implementation
+
+@Security_Scope:
+cmake_ast originates from user CMakeLists.txt files; routine never reads
+past the AST node graph so it is safe against malformed but well-formed
+trees. Memory-exhaustion safety relies on create_cmake_semantic_analyzer's
+allocation checks.
+@End Security_Scope
 
 Process called "cmake_semantic_analyze" takes cmake_ast as Integer returns Integer:
     Note: Perform semantic analysis on CMake AST
@@ -839,6 +909,18 @@ Process called "cmake_semantic_analyze" takes cmake_ast as Integer returns Integ
     Return analyzer
 End Process
 
+@Reasoning:
+Public accessor for the validation_errors List the diagnostic emitter walks
+when formatting build report output. Returning 0 when analyzer is null lets
+callers chain accessors without null-checking the analyzer each time.
+@End Reasoning
+
+@Implementation:
+Reads offset 136 (validation_errors List handle). Returns a BORROWED
+pointer - the analyzer's destructor owns the list; consumers must not
+free or destroy it.
+@End Implementation
+
 Process called "cmake_semantic_get_errors" takes analyzer as Integer returns Integer:
     Note: Get validation errors from semantic analysis
 
@@ -848,6 +930,17 @@ Process called "cmake_semantic_get_errors" takes analyzer as Integer returns Int
 
     Return proc memory_get_int64 from Layout with analyzer, 136
 End Process
+
+@Reasoning:
+Symmetric public accessor for the validation_warnings List. Kept separate
+from errors so warning-only builds (CMake's default for many issues) can be
+reported without flagging the build as failed.
+@End Reasoning
+
+@Implementation:
+Reads offset 144 (validation_warnings List handle); borrowed pointer
+returned exactly as for the errors accessor.
+@End Implementation
 
 Process called "cmake_semantic_get_warnings" takes analyzer as Integer returns Integer:
     Note: Get validation warnings from semantic analysis
@@ -859,6 +952,18 @@ Process called "cmake_semantic_get_warnings" takes analyzer as Integer returns I
     Return proc memory_get_int64 from Layout with analyzer, 144
 End Process
 
+@Reasoning:
+Cycle detection on the dependency graph runs once during analyze; this
+accessor exposes the cached cycle list so build scripts and IDEs can flag
+them without re-running Tarjan/Kosaraju. Each entry is a list of target
+names forming one SCC.
+@End Reasoning
+
+@Implementation:
+Reads offset 104 (circular_dependencies List handle). Borrowed pointer;
+ownership stays with the analyzer.
+@End Implementation
+
 Process called "cmake_semantic_get_circular_dependencies" takes analyzer as Integer returns Integer:
     Note: Get circular dependencies found during analysis
 
@@ -868,6 +973,17 @@ Process called "cmake_semantic_get_circular_dependencies" takes analyzer as Inte
 
     Return proc memory_get_int64 from Layout with analyzer, 104
 End Process
+
+@Reasoning:
+After dependency analysis the undefined_targets list contains every name
+referenced by target_link_libraries/add_dependencies that was never created
+via add_executable/add_library. Exposed so IDEs can underline the offending
+references in CMakeLists.txt source.
+@End Reasoning
+
+@Implementation:
+Reads offset 112 (undefined_targets List handle). Borrowed pointer.
+@End Implementation
 
 Process called "cmake_semantic_get_undefined_targets" takes analyzer as Integer returns Integer:
     Note: Get undefined targets found during analysis
@@ -879,6 +995,17 @@ Process called "cmake_semantic_get_undefined_targets" takes analyzer as Integer 
     Return proc memory_get_int64 from Layout with analyzer, 112
 End Process
 
+@Reasoning:
+Each CMake policy CMP00xx has three states (OLD, NEW, unset) and trigger
+warnings when called while unset on the active policy version. The analyzer
+collects those warnings into a dedicated stream so callers can suppress
+policy noise independently from real validation warnings.
+@End Reasoning
+
+@Implementation:
+Reads offset 128 (policy_warnings List handle). Borrowed pointer.
+@End Implementation
+
 Process called "cmake_semantic_get_policy_warnings" takes analyzer as Integer returns Integer:
     Note: Get CMake policy warnings from analysis
 
@@ -888,6 +1015,19 @@ Process called "cmake_semantic_get_policy_warnings" takes analyzer as Integer re
 
     Return proc memory_get_int64 from Layout with analyzer, 128
 End Process
+
+@Reasoning:
+Drivers need a single integer "did analysis succeed" check rather than a
+list pointer. Returning the actual error count (not just 0/1) lets callers
+pretty-print "N errors" without re-measuring the list. Null analyzer is
+treated as having 1 error so failures upstream propagate.
+@End Reasoning
+
+@Implementation:
+Reads validation_errors at offset 136 and returns List.size. When the
+analyzer pointer is null returns 1 to indicate failure (the allocation
+failed). Non-null analyzer with empty list returns 0 (success).
+@End Implementation
 
 Process called "cmake_semantic_has_errors" takes analyzer as Integer returns Integer:
     Note: Check if semantic analysis found any errors

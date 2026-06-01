@@ -67,6 +67,14 @@ Note: ==========================================================================
 Note: Lexer State Structure
 Note: ============================================================================
 
+@Reasoning:
+A flat byte-array cursor plus line/column tracking is sufficient because HTML is parsed by character, not by Unicode codepoint, in this translator. Tracking line and column lets emitted tokens carry source positions for downstream diagnostics.
+@End Reasoning
+
+@Implementation:
+Five 8-byte slots: source bytes pointer, source byte length, current byte position, current line (1-based), current column (1-based). Total record size is 40 bytes.
+@End Implementation
+
 Type called "Lexer":
     source as Integer
     source_length as Integer
@@ -78,6 +86,14 @@ End Type
 Note: ============================================================================
 Note: Token Structure
 Note: ============================================================================
+
+@Reasoning:
+A single 48-byte token shape supports every TOKEN_* variant; punctuation tokens leave text/length as 0 while text-bearing tokens (identifier, string, text, comment, doctype, entity) point back into the source buffer rather than copying. Inlining position lets parsers attach diagnostics without re-querying the lexer.
+@End Reasoning
+
+@Implementation:
+Six 8-byte slots: token_type (TOKEN_* constant), text pointer into source, byte length, line, column, metadata reserved for future flags.
+@End Implementation
 
 Type called "Token":
     token_type as Integer
@@ -91,6 +107,14 @@ End Type
 Note: ============================================================================
 Note: Lexer Creation
 Note: ============================================================================
+
+@Reasoning:
+Initialising the lexer separately from tokenisation lets callers reuse a single source pointer across multiple parse passes (e.g., for incremental reparsing). Line and column start at 1 to match human-facing tooling conventions.
+@End Reasoning
+
+@Implementation:
+Rejects null source. Computes source_length via string_length (treating source as NUL-terminated bytes). Allocates 40 bytes and initialises slot 0=source, 8=length, 16=0 (position), 24=1 (line), 32=1 (column).
+@End Implementation
 
 Process called "create_lexer" takes source as Integer returns Integer:
     Note: Create a new HTML lexer
@@ -121,6 +145,14 @@ Note: ==========================================================================
 Note: Character Examination
 Note: ============================================================================
 
+@Reasoning:
+Returning 0 at end-of-source lets every callsite use the same end-of-stream sentinel as a literal NUL byte. This avoids needing a separate "is at end" check before every peek.
+@End Reasoning
+
+@Implementation:
+Reads position from offset 16 and source_length from offset 8; if position >= length returns 0; otherwise reads the byte at source+position.
+@End Implementation
+
 Process called "peek_char" takes lexer as Integer returns Integer:
     Note: Peek at current character without advancing
 
@@ -136,6 +168,14 @@ Process called "peek_char" takes lexer as Integer returns Integer:
 
     Return char
 End Process
+
+@Reasoning:
+Several constructs need multi-byte lookahead (e.g., "<!--" needs four characters of certainty before committing to comment mode, "</" needs two for closing-tag detection). A parametric peek avoids hand-rolling each lookahead.
+@End Reasoning
+
+@Implementation:
+Computes peek_pos = position + offset; returns 0 if peek_pos exceeds source_length; otherwise reads the byte at source+peek_pos. Does not modify lexer state.
+@End Implementation
 
 Process called "peek_ahead" takes lexer as Integer, offset as Integer returns Integer:
     Note: Peek ahead by offset characters
@@ -153,6 +193,14 @@ Process called "peek_ahead" takes lexer as Integer, offset as Integer returns In
 
     Return char
 End Process
+
+@Reasoning:
+Advancing must update position AND maintain the line/column counters so error messages can point at the right place. Newline (10) resets column to 1 and bumps line; all other bytes (including CR=13 alone) just bump column, matching the behaviour expected by Unix-style sources.
+@End Reasoning
+
+@Implementation:
+Reads current position and source_length; refuses to advance past end. Reads the byte at position, increments position, then updates line/column: newline -> line+=1, column=1; other -> column+=1. Returns the consumed byte so callers can branch on it.
+@End Implementation
 
 Process called "advance_char" takes lexer as Integer returns Integer:
     Note: Advance to next character
@@ -189,6 +237,14 @@ Note: ==========================================================================
 Note: Character Classification
 Note: ============================================================================
 
+@Reasoning:
+HTML treats space, tab, LF, and CR as whitespace inside tags. Inline classification with explicit byte values keeps the lexer free of dependencies on a general character-classification library and is faster than table lookup for this 4-element set.
+@End Reasoning
+
+@Implementation:
+Returns 1 if char is 32 (space), 9 (tab), 10 (LF), or 13 (CR), otherwise 0.
+@End Implementation
+
 Process called "is_whitespace" takes char as Integer returns Integer:
     Note: Check if character is whitespace
 
@@ -211,6 +267,14 @@ Process called "is_whitespace" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+HTML tag and attribute names start with an ASCII letter. Checking both A-Z (65-90) and a-z (97-122) ranges directly avoids any locale dependence.
+@End Reasoning
+
+@Implementation:
+Returns 1 if 65 <= char <= 90 or 97 <= char <= 122, otherwise 0.
+@End Implementation
+
 Process called "is_alpha" takes char as Integer returns Integer:
     Note: Check if character is alphabetic
 
@@ -229,6 +293,14 @@ Process called "is_alpha" takes char as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+ASCII digit detection is needed because HTML attribute names and tag names allow digits after the first character. A single range check covers 0-9.
+@End Reasoning
+
+@Implementation:
+Returns 1 if 48 <= char <= 57, otherwise 0.
+@End Implementation
+
 Process called "is_digit" takes char as Integer returns Integer:
     Note: Check if character is a digit
 
@@ -240,6 +312,14 @@ Process called "is_digit" takes char as Integer returns Integer:
 
     Return 0
 End Process
+
+@Reasoning:
+HTML identifier continuation accepts letters, digits, hyphens ("data-id"), and underscores ("data_id" in some flavours). Bundling these into one predicate keeps the scan_tag_name loop simple.
+@End Reasoning
+
+@Implementation:
+Composes is_alpha and is_digit, plus explicit 45 (hyphen) and 95 (underscore). Returns 1 on any match.
+@End Implementation
 
 Process called "is_alphanumeric" takes char as Integer returns Integer:
     Note: Check if character is alphanumeric
@@ -269,6 +349,14 @@ Note: ==========================================================================
 Note: Token Creation
 Note: ============================================================================
 
+@Reasoning:
+A single allocator for every token variant guarantees consistent 48-byte layout regardless of which scan function produced it. Storing line/column at construction time captures the position before subsequent advances move the lexer past the token.
+@End Reasoning
+
+@Implementation:
+Allocates 48 bytes and writes token_type/text/length/line/column/metadata at offsets 0/8/16/24/32/40. Returns 0 on allocation failure.
+@End Implementation
+
 Process called "create_token" takes token_type as Integer, text as Integer, length as Integer, line as Integer, column as Integer, metadata as Integer returns Integer:
     Note: Create a new token
 
@@ -293,6 +381,14 @@ Note: ==========================================================================
 Note: Whitespace Skipping
 Note: ============================================================================
 
+@Reasoning:
+Whitespace between attributes inside a tag is non-significant and must be skipped so the next token starts at a meaningful byte. Outside tags whitespace is significant (it is text content), so this helper is intentionally scoped to in-tag use.
+@End Reasoning
+
+@Implementation:
+Loops calling peek_char and breaks on the first non-whitespace byte; otherwise advances. Uses is_whitespace for classification.
+@End Implementation
+
 Process called "skip_whitespace_in_tag" takes lexer as Integer returns Integer:
     Note: Skip whitespace inside tags only
 
@@ -313,6 +409,14 @@ End Process
 Note: ============================================================================
 Note: Tag Scanning
 Note: ============================================================================
+
+@Reasoning:
+Tag and attribute names share the same lexical shape (identifier characters until a non-identifier byte). Scanning them with one routine keeps the lexer state-machine simple. Returning 0 on zero length protects callers from emitting empty identifiers.
+@End Reasoning
+
+@Implementation:
+Records start_position, line, and column before consuming. Loops advancing while is_alphanumeric holds. Computes length = end_position - start_position and constructs a TOKEN_IDENTIFIER whose text pointer is source+start_position (no copy).
+@End Implementation
 
 Process called "scan_tag_name" takes lexer as Integer returns Integer:
     Note: Scan tag name or attribute name
@@ -344,6 +448,14 @@ Process called "scan_tag_name" takes lexer as Integer returns Integer:
 
     Return proc create_token with TOKEN_IDENTIFIER, text_ptr, length, line, column, 0
 End Process
+
+@Reasoning:
+Attribute values may use either single or double quotes; capturing the opening quote and using it as the terminator handles both uniformly without two separate scanners.
+@End Reasoning
+
+@Implementation:
+Records line/column, consumes the opening quote (and remembers its byte as quote_char), records the post-quote start_position, then loops advancing until peek_char matches quote_char or reaches end-of-source (0). Computes length, consumes the closing quote, and emits TOKEN_STRING with text pointing into the source buffer between the quotes.
+@End Implementation
 
 Process called "scan_attribute_value" takes lexer as Integer returns Integer:
     Note: Scan quoted attribute value
@@ -383,6 +495,14 @@ End Process
 Note: ============================================================================
 Note: Text Content Scanning
 Note: ============================================================================
+
+@Reasoning:
+Text content runs from the current position until either a tag-start ("<", byte 60) or an entity-start ("&", byte 38) is encountered. Stopping on entity makes it the parser's job to emit a separate entity token rather than burying the entity inside text bytes.
+@End Reasoning
+
+@Implementation:
+Records start_position, line, column. Loops advancing while peek_char is not 0, 60, or 38. Returns 0 if the run is empty to avoid zero-length text tokens cluttering the stream. Emits TOKEN_TEXT with text pointing into source+start_position.
+@End Implementation
 
 Process called "scan_text" takes lexer as Integer returns Integer:
     Note: Scan text content between tags
@@ -425,6 +545,14 @@ End Process
 Note: ============================================================================
 Note: Comment Scanning
 Note: ============================================================================
+
+@Reasoning:
+The comment delimiter "<!--" has already been confirmed by next_token's lookahead, so this routine consumes exactly four bytes to step past it, then scans the body until the terminator "-->" using multi-byte lookahead at every step.
+@End Reasoning
+
+@Implementation:
+Advances four bytes to skip "<!--". Captures start_position after the delimiter. Loops: at each iteration peeks for hyphen (45) and uses peek_ahead 1 and 2 to look for "->"; on match breaks before consuming. After the loop, computes length, then advances three bytes to consume "-->". Emits TOKEN_COMMENT pointing into the source between delimiters.
+@End Implementation
 
 Process called "scan_comment" takes lexer as Integer returns Integer:
     Note: Scan HTML comment <!-- ... -->
@@ -477,6 +605,14 @@ Note: ==========================================================================
 Note: DOCTYPE Scanning
 Note: ============================================================================
 
+@Reasoning:
+DOCTYPE declarations end at the first ">" and do not allow ">" inside. Capturing the entire body including "<!DOCTYPE" prefix simplifies downstream rendering — the parser stores the declaration verbatim and reproduces it on output.
+@End Reasoning
+
+@Implementation:
+Records start_position with the cursor still at "<" (the prefix has not been consumed by callers for DOCTYPE), then loops advancing until peek_char hits ">" (62) or 0. On finding ">" advances one more to consume it. Emits TOKEN_DOCTYPE containing the full delcaration text including delimiters.
+@End Implementation
+
 Process called "scan_doctype" takes lexer as Integer returns Integer:
     Note: Scan DOCTYPE declaration
 
@@ -511,6 +647,14 @@ End Process
 Note: ============================================================================
 Note: Entity Scanning
 Note: ============================================================================
+
+@Reasoning:
+Entities terminate either at semicolon (well-formed) or at a whitespace (forgiving recovery for malformed input). Capturing the leading ampersand in the token text simplifies later entity-resolution because the resolver can dispatch on prefix style ("&#" vs "&name").
+@End Reasoning
+
+@Implementation:
+Records start_position at "&", advances past it, then loops: on EOF (0) break, on semicolon (59) advance and break, on space (32) break without consuming. Emits TOKEN_ENTITY with text pointing at source+start_position covering the full entity.
+@End Implementation
 
 Process called "scan_entity" takes lexer as Integer returns Integer:
     Note: Scan HTML entity &name; or &#123;
@@ -552,6 +696,14 @@ End Process
 Note: ============================================================================
 Note: Main Tokenization
 Note: ============================================================================
+
+@Reasoning:
+This dispatcher distinguishes the seven major HTML lexical categories using one to four bytes of lookahead. The "<" branch needs the deepest lookahead because "<!--" (comment) and "<!D" (DOCTYPE) share the "<!" prefix; otherwise the dispatch is a flat character-class switch.
+@End Reasoning
+
+@Implementation:
+1) End-of-source -> TOKEN_EOF. 2) "<" with "!--" lookahead -> scan_comment; with "!D" or "!d" -> scan_doctype; with "/" -> emit TOKEN_TAG_CLOSE; otherwise TOKEN_TAG_OPEN. 3) ">" -> TOKEN_TAG_END. 4) "/" with ">" lookahead -> TOKEN_SELF_CLOSE. 5) "=" -> TOKEN_EQUALS. 6) Quote (34 or 39) -> scan_attribute_value. 7) "&" -> scan_entity. 8) Whitespace inside tag context -> skip and recurse. 9) Alpha -> scan_tag_name. 10) Otherwise -> scan_text.
+@End Implementation
 
 Process called "next_token" takes lexer as Integer returns Integer:
     Note: Get next token from HTML source

@@ -108,6 +108,22 @@ Note: ==========================================================================
 Note: Parser Structure
 Note: ============================================================================
 
+@Reasoning:
+COBOL parsing is division-based (IDENTIFICATION/ENVIRONMENT/DATA/PROCEDURE)
+with strict ordering and column-sensitive recovery, so the parser keeps
+both current and previous tokens. previous_token lets the recovery layer
+unwind to the start of a failed statement without re-lexing. arena is
+threaded so AST nodes share allocation lifetimes with the lexer's lexeme
+storage.
+@End Reasoning
+
+@Implementation:
+40-byte record (5 x i64) at offsets 0..32: lexer (COBOLLexer handle),
+current_token (Token* of one-symbol lookahead), previous_token (Token* of
+prior consumed token), error_count (accumulating count for "stop after N
+errors" policies), arena (caller-owned arena, not owned by the parser).
+@End Implementation
+
 Type called "COBOLParser":
     lexer as Integer            Note: Lexer instance
     current_token as Integer    Note: Current token
@@ -212,6 +228,18 @@ Process called "peek_token_type" takes parser as Integer returns Integer:
     Return token_type
 End Process
 
+@Reasoning:
+Identifier and literal AST construction needs the raw lexeme text. The
+COBOLToken layout stores the lexeme at offset 8 of the token record;
+reading via the parser keeps callers token-shape-agnostic.
+@End Reasoning
+
+@Implementation:
+Reads the current_token pointer from parser offset 8; returns 0 if no
+current token (EOF state). Otherwise loads the lexeme StringCore handle
+from the token's offset 8. Borrowed pointer; the lexer's arena owns it.
+@End Implementation
+
 Process called "peek_token_lexeme" takes parser as Integer returns Integer:
     Note: Get current token lexeme
 
@@ -225,6 +253,18 @@ Process called "peek_token_lexeme" takes parser as Integer returns Integer:
 
     Return lexeme
 End Process
+
+@Reasoning:
+Predicate form of peek_token_type. Returning a clean 0/1 boolean lets
+recursive-descent predicates compose without comparing to a token constant
+inline; common in COBOL because many statements have keyword choices
+(WRITE..., WRITE FROM..., WRITE AFTER ADVANCING...).
+@End Reasoning
+
+@Implementation:
+Reads current token type via peek_token_type, returns 1 on match and 0
+otherwise. Constant time, no allocation.
+@End Implementation
 
 Process called "check_token_type" takes parser as Integer, expected as Integer returns Integer:
     Note: Check if current token matches expected type
@@ -336,6 +376,18 @@ Process called "set_node_name" takes node as Integer, name as Integer returns In
 
     Return 1
 End Process
+
+@Reasoning:
+Distinct from set_node_name because literals (numeric, alphanumeric,
+figurative) carry their content under the "value" slot while named nodes
+(paragraphs, data items) carry the identifier under "name". Keeping the
+slots separate avoids ambiguity downstream.
+@End Reasoning
+
+@Implementation:
+Null-checks node; writes value (a StringCore handle for textual literals,
+or an integer for numeric kinds) into offset 16. Borrowed handle.
+@End Implementation
 
 Process called "set_node_value" takes node as Integer, value as Integer returns Integer:
     Note: Set node value (for literals, constants)
@@ -1419,6 +1471,22 @@ Process called "parse_move_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+ADD has three syntactic shapes: "ADD a TO b", "ADD a b c TO d", and
+"ADD a b GIVING c". The TO operand is destination; GIVING is a separate
+result target that leaves operands unchanged. Common COBOL gotcha is that
+TO and GIVING can co-occur but with different semantics.
+@End Reasoning
+
+@Implementation:
+Consumes the ADD keyword via advance_token. Builds a COBOL_ADD_STMT node.
+Loops reading expressions until the period terminator, distinguishing
+operands (initial sequence), the destination (after TO), and the result
+(after GIVING). Each parsed expression is attached as a child node. Period
+or unrecognised token terminates the loop and skip_to_period is the
+recovery fallback.
+@End Implementation
+
 Process called "parse_add_statement" takes parser as Integer returns Integer:
     Note: Parse ADD statement (ADD operands TO destination GIVING result)
 
@@ -2191,6 +2259,20 @@ Process called "parse_display_statement" takes parser as Integer returns Integer
     Return stmt
 End Process
 
+@Reasoning:
+ACCEPT reads from a designated source (console, DATE, TIME, DAY, ENVIRONMENT)
+into a data item. The destination expression is the only required child; the
+FROM clause (selecting source) is consumed by skip_to_period because the
+back-end re-parses it from the AST node's tail metadata.
+@End Reasoning
+
+@Implementation:
+Consumes ACCEPT keyword; allocates COBOL_ACCEPT_STMT; parses the
+destination via parse_expression and attaches it as a child if non-null;
+calls skip_to_period to consume any FROM clause and trailing tokens up to
+the period terminator.
+@End Implementation
+
 Process called "parse_accept_statement" takes parser as Integer returns Integer:
     Note: Parse ACCEPT statement
 
@@ -2209,6 +2291,19 @@ Process called "parse_accept_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+OPEN binds a logical file (declared via FD/SELECT) for I-O, INPUT, OUTPUT,
+EXTEND, or I-O modes. The mode keyword and file name list are recorded on
+the AST node via the lexer's lexeme history (skip_to_period preserves the
+tokens for the back-end via lexer state).
+@End Reasoning
+
+@Implementation:
+Consumes OPEN keyword; allocates COBOL_OPEN_STMT; calls skip_to_period to
+consume the mode keyword and file list. Mode/file-name detail is left to
+the back-end which re-walks the lexer's token sequence per statement.
+@End Implementation
+
 Process called "parse_open_statement" takes parser as Integer returns Integer:
     Note: Parse OPEN statement
 
@@ -2220,6 +2315,17 @@ Process called "parse_open_statement" takes parser as Integer returns Integer:
 
     Return stmt
 End Process
+
+@Reasoning:
+CLOSE releases the logical file connection established by OPEN. May list
+multiple files. AST node carries no payload at the parser stage because
+the back-end consumes the file list from token metadata stored alongside.
+@End Reasoning
+
+@Implementation:
+Consumes CLOSE; allocates COBOL_CLOSE_STMT; skip_to_period absorbs the
+file list and any WITH NO REWIND / WITH LOCK clauses up to the period.
+@End Implementation
 
 Process called "parse_close_statement" takes parser as Integer returns Integer:
     Note: Parse CLOSE statement
@@ -2233,6 +2339,18 @@ Process called "parse_close_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+READ pulls the next record from a file. Optional NEXT / PREVIOUS modifiers
+and AT END / INVALID KEY / NOT INVALID KEY conditional handlers all live
+after the file name. Parser captures the statement shell; back-end pulls
+the modifiers off the token stream.
+@End Reasoning
+
+@Implementation:
+Consumes READ; allocates COBOL_READ_STMT; skip_to_period reads through any
+INTO target and conditional clauses.
+@End Implementation
+
 Process called "parse_read_statement" takes parser as Integer returns Integer:
     Note: Parse READ statement
 
@@ -2245,6 +2363,17 @@ Process called "parse_read_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+WRITE emits the current record. FROM source-area, AFTER ADVANCING n LINES,
+and AT END-OF-PAGE conditional all attach to the same statement; parser
+captures the bare statement node and lets the back-end re-walk the tokens.
+@End Reasoning
+
+@Implementation:
+Consumes WRITE; allocates COBOL_WRITE_STMT; skip_to_period absorbs FROM,
+ADVANCING, AT END-OF-PAGE clauses through the period.
+@End Implementation
+
 Process called "parse_write_statement" takes parser as Integer returns Integer:
     Note: Parse WRITE statement
 
@@ -2256,6 +2385,20 @@ Process called "parse_write_statement" takes parser as Integer returns Integer:
 
     Return stmt
 End Process
+
+@Reasoning:
+GO TO transfers control to a paragraph or section. The TO keyword is
+syntactically optional in COBOL-85 GO TO so the parser tolerates both
+shapes. Target identifier is captured on the node's name slot so the
+back-end can emit the correct branch.
+@End Reasoning
+
+@Implementation:
+Consumes GO; allocates COBOL_GO_STMT; consumes optional TO; if next token
+is an identifier, captures the lexeme via peek_token_lexeme and stores it
+on the node via set_node_name, then advances; skip_to_period consumes any
+trailing DEPENDING ON expression and the period.
+@End Implementation
 
 Process called "parse_go_statement" takes parser as Integer returns Integer:
     Note: Parse GO TO statement
@@ -2283,6 +2426,18 @@ Process called "parse_go_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+STOP terminates the program. STOP RUN ends the entire process; STOP literal
+displays the literal and waits for operator response (legacy form). Parser
+captures the bare statement; back-end distinguishes RUN vs literal via the
+token stream.
+@End Reasoning
+
+@Implementation:
+Consumes STOP; allocates COBOL_STOP_STMT; skip_to_period consumes any RUN
+keyword or literal operand through the period.
+@End Implementation
+
 Process called "parse_stop_statement" takes parser as Integer returns Integer:
     Note: Parse STOP statement
 
@@ -2294,6 +2449,18 @@ Process called "parse_stop_statement" takes parser as Integer returns Integer:
 
     Return stmt
 End Process
+
+@Reasoning:
+EXIT is a structured-exit marker. In COBOL-85 it has several forms (EXIT,
+EXIT PARAGRAPH, EXIT SECTION, EXIT PERFORM, EXIT PROGRAM). Parser captures
+the bare node; back-end inspects the trailing keyword to pick the right
+control-flow primitive.
+@End Reasoning
+
+@Implementation:
+Consumes EXIT; allocates COBOL_EXIT_STMT; skip_to_period absorbs the
+optional qualifier keyword and period.
+@End Implementation
 
 Process called "parse_exit_statement" takes parser as Integer returns Integer:
     Note: Parse EXIT statement
@@ -2307,6 +2474,18 @@ Process called "parse_exit_statement" takes parser as Integer returns Integer:
     Return stmt
 End Process
 
+@Reasoning:
+GOBACK returns from the current program to the caller. Unlike STOP RUN it
+unwinds only the current PROGRAM-ID, not the whole process. Captured as a
+distinct statement so back-end can lower it to a function return rather
+than process exit.
+@End Reasoning
+
+@Implementation:
+Consumes GOBACK; allocates COBOL_GOBACK_STMT; skip_to_period reaches the
+period terminator.
+@End Implementation
+
 Process called "parse_goback_statement" takes parser as Integer returns Integer:
     Note: Parse GOBACK statement
 
@@ -2318,6 +2497,18 @@ Process called "parse_goback_statement" takes parser as Integer returns Integer:
 
     Return stmt
 End Process
+
+@Reasoning:
+CALL invokes a sub-program with USING (pass-by-reference/-content/-value)
+and optional ON EXCEPTION / NOT ON EXCEPTION handlers. Parser captures the
+statement shell; back-end re-walks the token stream for the argument list
+and handler clauses.
+@End Reasoning
+
+@Implementation:
+Consumes CALL; allocates COBOL_CALL_STMT; skip_to_period absorbs the
+program name, USING list, and any exception clauses through the period.
+@End Implementation
 
 Process called "parse_call_statement" takes parser as Integer returns Integer:
     Note: Parse CALL statement
@@ -2334,6 +2525,22 @@ End Process
 Note: ============================================================================
 Note: Expression Parsing
 Note: ============================================================================
+
+@Reasoning:
+COBOL expressions at this level are limited to atoms: identifiers, numeric
+literals, alphanumeric literals, and figurative constants (ZERO/SPACES/
+HIGH-VALUES/LOW-VALUES/QUOTES/NULLS). Complex arithmetic appears only
+inside COMPUTE/ADD/SUBTRACT statements which build their own expression
+trees from these atoms.
+@End Reasoning
+
+@Implementation:
+Inspects current token type and dispatches: IDENTIFIER -> COBOL_IDENTIFIER
+node with lexeme as name; NUMBER or STRING -> COBOL_LITERAL with lexeme as
+value; figurative constants -> COBOL_FIGURATIVE_CONST. Every branch
+consumes one token via advance_token. Returns 0 on unexpected token so the
+caller can react (typically by recovering via skip_to_period).
+@End Implementation
 
 Process called "parse_expression" takes parser as Integer returns Integer:
     Note: Parse expression (identifier, literal, or figurative constant)

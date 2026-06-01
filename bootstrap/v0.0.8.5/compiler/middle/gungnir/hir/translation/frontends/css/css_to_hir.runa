@@ -23,6 +23,25 @@ Import "compiler/middle/gungnir/hir/translation/frontends/css/css_parser.runa" a
 Import "compiler/frontend/primitives/memory/layout.runa" as Layout
 Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
 
+@Reasoning:
+Top-level entry: parses CSS source via the CSS parser, then translates the
+resulting AST to the HIR Dict shape. Two-stage so callers can swap in a
+different AST source (e.g. an editor's incremental parse) by calling
+translate_node directly.
+@End Reasoning
+
+@Implementation:
+Calls Parser.parse_css on the source string; on parse failure (0 return)
+propagates 0. Otherwise walks the AST root via translate_node. The options
+argument is reserved for future use (target profile, vendor-prefix policy)
+and is currently passed unused.
+@End Implementation
+
+@Security_Scope:
+source is untrusted CSS text. Parser handles malformed input by returning 0;
+this routine therefore never dereferences a malformed AST.
+@End Security_Scope
+
 Process called "translate_css_to_hir" takes source as Integer, options as Integer returns Integer:
     Let ast be proc parse_css from Parser with source
 
@@ -34,6 +53,20 @@ Process called "translate_css_to_hir" takes source as Integer, options as Intege
 
     Return hir
 End Process
+
+@Reasoning:
+Single-table dispatcher keyed on node_type (200..207 are the CSS AST node
+type constants emitted by css_parser). Each type has a dedicated
+translator; null node and unknown type both return 0 so the caller can
+treat 0 as "no HIR was produced".
+@End Reasoning
+
+@Implementation:
+Reads node_type at offset 0. Branches: 200 stylesheet, 201 rule, 202 at-rule,
+203 selector, 204 declaration, 205 value, 206 function, 207 comment.
+Anything outside the range falls through to Return 0 (silent skip - the
+walk continues).
+@End Implementation
 
 Process called "translate_node" takes node as Integer returns Integer:
     If node is equal to 0:
@@ -77,6 +110,19 @@ Process called "translate_node" takes node as Integer returns Integer:
     Return 0
 End Process
 
+@Reasoning:
+A CSS stylesheet is the top-level container of rules and at-rules. HIR
+captures it as {type:"stylesheet", rules:[...]} so consumers can iterate
+rules uniformly regardless of nesting depth.
+@End Reasoning
+
+@Implementation:
+Allocates an output Dict with type="stylesheet". Reads child_count at
+offset 32 and children pointer-array at offset 24, then translates each
+child through translate_node. Non-null translations are pushed onto a
+"rules" List which is attached to the Dict before return.
+@End Implementation
+
 Process called "translate_stylesheet" takes node as Integer returns Integer:
     Let dict be proc create_dictionary
 
@@ -106,6 +152,20 @@ Process called "translate_stylesheet" takes node as Integer returns Integer:
 
     Return dict
 End Process
+
+@Reasoning:
+A CSS rule is "selectors { declarations }". HIR splits the rule's children
+into two parallel lists - selectors (203) and declarations (204) - so
+downstream consumers don't have to scan a heterogeneous child list to
+distinguish a selector from a property:value pair.
+@End Reasoning
+
+@Implementation:
+Allocates Dict with type="rule" and two empty Lists (selectors,
+declarations). Walks children: child_type 203 -> translate_selector ->
+selectors list; child_type 204 -> translate_declaration -> declarations
+list; other child types are ignored to keep the rule shape clean.
+@End Implementation
 
 Process called "translate_rule" takes node as Integer returns Integer:
     Let dict be proc create_dictionary
@@ -151,6 +211,21 @@ Process called "translate_rule" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+At-rules (@media, @import, @keyframes, @font-face, @supports, ...) have a
+name and an optional nested block. HIR captures them as
+{type:"at-rule", name, rules:[...]} preserving the nested rule list for
+block-form at-rules while a name-only form (@import) yields an empty rules
+list.
+@End Reasoning
+
+@Implementation:
+Allocates Dict with type="at-rule"; reads the at-rule name from offset 8
+of the AST node and stores it under "name". Walks children identically to
+translate_stylesheet (every child dispatched through translate_node) and
+attaches them under "rules".
+@End Implementation
+
 Process called "translate_at_rule" takes node as Integer returns Integer:
     Let dict be proc create_dictionary
 
@@ -185,10 +260,40 @@ Process called "translate_at_rule" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+Selectors are emitted by the parser already as a single flattened value
+string ("h1.title, .nav > li.active::hover") so the translator simply
+unwraps the value field and returns it directly. No Dict shell is needed
+because the rule's "selectors" array stores each selector as a bare string.
+@End Reasoning
+
+@Implementation:
+Reads the selector text from offset 16 (value slot) and returns it
+verbatim. Borrowed StringCore pointer; the rule Dict assumes ownership when
+the result is appended to its selectors list.
+@End Implementation
+
 Process called "translate_selector" takes node as Integer returns Integer:
     Let value be proc memory_get_int64 from Layout with node, 16
     Return value
 End Process
+
+@Reasoning:
+A declaration is "property: value" inside a rule block. HIR captures it as
+{property, value} so consumers can iterate properties without indexing into
+a heterogeneous child list. Only the FIRST value child is consumed because
+a single declaration in CSS holds exactly one property:value pair (compound
+values like "10px solid red" are already concatenated into the value
+slot by the parser).
+@End Reasoning
+
+@Implementation:
+Allocates Dict with property field copied from node offset 8. If the
+declaration has at least one child (value node), reads its value-string
+from offset 16 of the child and attaches it under "value". A bare-property
+declaration (no value child) yields a Dict with only the property key,
+which the back-end treats as malformed.
+@End Implementation
 
 Process called "translate_declaration" takes node as Integer returns Integer:
     Let dict be proc create_dictionary
@@ -211,10 +316,35 @@ Process called "translate_declaration" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+Value nodes are leaf nodes that carry the literal value text from the
+parser. HIR returns the bare value string just like translate_selector
+because the declaration Dict consumes it directly.
+@End Reasoning
+
+@Implementation:
+Reads the value text at offset 16 and returns it. Borrowed StringCore
+pointer.
+@End Implementation
+
 Process called "translate_value" takes node as Integer returns Integer:
     Let value be proc memory_get_int64 from Layout with node, 16
     Return value
 End Process
+
+@Reasoning:
+CSS functions (rgb(), calc(), url(), var()) appear inside declaration
+values. They're emitted as {type:"function", name} so consumers can
+distinguish them from bare values without re-parsing the value text. The
+argument list is not unpacked at this layer; tools that need the
+arguments parse them on demand from the original value string.
+@End Reasoning
+
+@Implementation:
+Allocates Dict with type="function" and name copied from the AST node's
+name slot at offset 8. The function's argument expression remains in the
+parent declaration's value text.
+@End Implementation
 
 Process called "translate_function" takes node as Integer returns Integer:
     Let dict be proc create_dictionary
@@ -230,6 +360,18 @@ Process called "translate_function" takes node as Integer returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+CSS comments survive into HIR so source-map and round-trip printing remain
+faithful. Captured as {type:"comment", value} with value being the raw
+comment text excluding the /* */ delimiters.
+@End Reasoning
+
+@Implementation:
+Allocates Dict with type="comment"; copies the comment text from offset 16
+of the AST node into the "value" key. Used by formatters and IDEs to
+preserve developer notes.
+@End Implementation
+
 Process called "translate_comment" takes node as Integer returns Integer:
     Let dict be proc create_dictionary
 
@@ -243,6 +385,20 @@ Process called "translate_comment" takes node as Integer returns Integer:
 
     Return dict
 End Process
+
+@Reasoning:
+CSS-local Dict so the translator stays self-contained (the CSS translator
+intentionally avoids the heavy collections module to keep CSS support
+dependency-light). Fixed initial capacity of 10 since typical CSS Dicts
+in HIR hold 2-6 entries (type, name, rules, selectors, declarations, value).
+@End Reasoning
+
+@Implementation:
+Allocates a 32-byte header (size, capacity, keys ptr, values ptr) and two
+80-byte parallel arrays (10 i64 slots each) for keys and values. The keys
+and values pointers are written into the header at offsets 16/24. On OOM
+(allocate returns 0) propagates 0.
+@End Implementation
 
 Process called "create_dictionary" returns Integer:
     Let dict_size be 32
@@ -266,6 +422,20 @@ Process called "create_dictionary" returns Integer:
     Return dict
 End Process
 
+@Reasoning:
+Append-only Dict insert without uniqueness checks because the translator
+controls every key it inserts and never overwrites. Skipping the linear
+search keeps insertion O(1).
+@End Reasoning
+
+@Implementation:
+Reads current size from offset 0 and the keys/values arrays from offsets
+16/24. Writes (key, value) at the size-th slot (offset size*8) in both
+parallel arrays, increments size. Does not handle resize because CSS HIR
+Dicts stay under the 10-entry capacity by construction; callers that need
+more should switch to the general Dict module.
+@End Implementation
+
 Process called "dict_set" takes dict as Integer, key as Integer, value as Integer returns Integer:
     Let size be proc memory_get_int64 from Layout with dict, 0
     Let keys be proc memory_get_int64 from Layout with dict, 16
@@ -279,6 +449,19 @@ Process called "dict_set" takes dict as Integer, key as Integer, value as Intege
 
     Return 1
 End Process
+
+@Reasoning:
+CSS-local List, paired with the local Dict. Same justification: keep the
+CSS translator self-contained and dependency-light. Initial capacity of 10
+covers typical CSS HIR lists (rule selectors, declarations within a rule,
+top-level stylesheet rules of small style files).
+@End Reasoning
+
+@Implementation:
+Allocates a 24-byte header (size, capacity, items ptr) and an 80-byte items
+array (10 i64 slots). The items pointer is written into the header at
+offset 16. On OOM returns 0.
+@End Implementation
 
 Process called "create_list" returns Integer:
     Let list_size be 24
@@ -298,6 +481,17 @@ Process called "create_list" returns Integer:
 
     Return list
 End Process
+
+@Reasoning:
+Append-only insert. Symmetric with dict_set, also unchecked against the
+fixed 10-slot capacity because the translator's insertion patterns stay
+within it.
+@End Reasoning
+
+@Implementation:
+Reads size from offset 0 and items pointer from offset 16. Writes item at
+slot offset size*8, increments size. No resize.
+@End Implementation
 
 Process called "list_append" takes list as Integer, item as Integer returns Integer:
     Let size be proc memory_get_int64 from Layout with list, 0
