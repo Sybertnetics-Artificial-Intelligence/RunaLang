@@ -7458,6 +7458,315 @@ Process called "codegen_current_loop_context" takes codegen as Integer returns I
     Return 0  Note: NULL
 End Process
 
+Note: ========================================================================
+Note: Per-function frame size estimation (replaces hardcoded 16KB subq).
+Note: codegen_estimate_stmt_frame walks a single statement and accumulates
+Note: the byte size of every local variable that would be added by
+Note: codegen_generate_statement: STMT_LET (1), STMT_FOR (11), STMT_FOR_EACH
+Note: (12), and STMT_MATCH (8) variant field bindings. Sub-statements (If
+Note: branches, While body, For body, For Each body, Match arms) are
+Note: recursed so nested let-statements are counted.
+Note: Per-let typed allocations consult the program type table the same way
+Note: codegen_calculate_type_size does, so STMT_LET-with-`as Type` and
+Note: `Let X be a value of type T` paths get their true struct size, not
+Note: the default 8-byte Integer slot. STMT_LET that allocates an array
+Note: type (TYPE_KIND_ARRAY) consumes the full array byte size.
+Note: The returned size is conservative: each variable counts at least 8
+Note: bytes. Expression-spill push/pop pairs are NOT included here - they
+Note: net to zero stack delta but instantaneously dip below %rsp, which is
+Note: covered by the 1024-byte headroom added in
+Note: codegen_compute_function_frame_size.
+Note: ========================================================================
+Process called "codegen_estimate_stmt_frame" takes stmt as Integer, program as Integer returns Integer:
+    Note: Guard against null or low-address bogus pointers (same pattern as
+    Note: codegen_scan_set_targets).
+    If stmt is equal to 0:
+        Return 0
+    End If
+    If stmt is less than 65536:
+        Return 0
+    End If
+
+    Let total be 0
+    Let stmt_type be memory_get_int32(stmt, 0)
+
+    Note: STMT_LET = 1: variable_name(8), expression(16), let_decl_type(24).
+    Note: Match codegen_generate_statement's STMT_LET branch behaviour for
+    Note: sizing: if let_decl_type is set, use it; else if the expression is
+    Note: EXPR_TYPE_NAME (struct allocation), use the named type's full size;
+    Note: else default to 8 bytes (Integer-sized slot).
+    If stmt_type is equal to 1:
+        Let let_decl_type be memory_get_pointer(stmt, 24)
+        Let let_size be 8
+        If let_decl_type is not equal to 0:
+            Set let_size to codegen_calculate_type_size(let_decl_type, program)
+            If let_size is less than 8:
+                Set let_size to 8
+            End If
+        Otherwise:
+            Let let_expr be memory_get_pointer(stmt, 16)
+            If let_expr is not equal to 0:
+                Let expr_type be memory_get_int32(let_expr, 0)
+                If expr_type is equal to 7:  Note: EXPR_TYPE_NAME
+                    Let type_name be memory_get_pointer(let_expr, 8)
+                    If type_name is not equal to 0:
+                        Note: Look up the type to get its true size, including
+                        Note: TYPE_KIND_ARRAY (size = element_count * 8). The
+                        Note: codegen STMT_LET branch bumps stack_offset by
+                        Note: type_size for arrays (line ~5995) so the frame
+                        Note: must match.
+                        Let type_count be memory_get_int32(program, 24)
+                        Let types be memory_get_pointer(program, 16)
+                        Let found_size be 0
+                        Let ti be 0
+                        While ti is less than type_count:
+                            Let type_offset be ti multiplied by 8
+                            Let type_ptr be memory_get_pointer(types, type_offset)
+                            If type_ptr is not equal to 0:
+                                Let tname be memory_get_pointer(type_ptr, 0)
+                                If tname is not equal to 0:
+                                    If string_equals(tname, type_name) is equal to 1:
+                                        Set found_size to memory_get_int32(type_ptr, 16)
+                                        Set ti to type_count
+                                    End If
+                                End If
+                            End If
+                            Set ti to ti plus 1
+                        End While
+                        If found_size is greater than 8:
+                            Set let_size to found_size
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set total to total plus let_size
+        Return total
+    End If
+
+    Note: STMT_IF = 5: condition(8), if_body(16), if_body_count(24),
+    Note: else_body(32), else_body_count(40). Both branches contribute to the
+    Note: stack_offset counter linearly (codegen doesn't reset between
+    Note: branches), so sum both.
+    If stmt_type is equal to 5:
+        Let if_body be memory_get_pointer(stmt, 16)
+        Let if_count be memory_get_int32(stmt, 24)
+        If if_body is not equal to 0:
+            Let i be 0
+            While i is less than if_count:
+                Let child be memory_get_pointer(if_body, i multiplied by 8)
+                Let child_size be codegen_estimate_stmt_frame(child, program)
+                Set total to total plus child_size
+                Set i to i plus 1
+            End While
+        End If
+        Let else_body be memory_get_pointer(stmt, 32)
+        Let else_count be memory_get_int32(stmt, 40)
+        If else_body is not equal to 0:
+            Let j be 0
+            While j is less than else_count:
+                Let echild be memory_get_pointer(else_body, j multiplied by 8)
+                Let echild_size be codegen_estimate_stmt_frame(echild, program)
+                Set total to total plus echild_size
+                Set j to j plus 1
+            End While
+        End If
+        Return total
+    End If
+
+    Note: STMT_WHILE = 6: condition(8), body(16), body_count(24)
+    If stmt_type is equal to 6:
+        Let wbody be memory_get_pointer(stmt, 16)
+        Let wcount be memory_get_int32(stmt, 24)
+        If wbody is not equal to 0:
+            Let wi be 0
+            While wi is less than wcount:
+                Let wchild be memory_get_pointer(wbody, wi multiplied by 8)
+                Let wchild_size be codegen_estimate_stmt_frame(wchild, program)
+                Set total to total plus wchild_size
+                Set wi to wi plus 1
+            End While
+        End If
+        Return total
+    End If
+
+    Note: STMT_FOR = 11: var(8), start(16), end(24), step(32), body(40),
+    Note: body_count(48). Adds the range loop variable (default Integer = 8
+    Note: bytes) plus any locals declared inside the body.
+    If stmt_type is equal to 11:
+        Set total to total plus 8  Note: Loop variable slot
+        Let fbody be memory_get_pointer(stmt, 40)
+        Let fcount be memory_get_int32(stmt, 48)
+        If fbody is not equal to 0:
+            Let fi be 0
+            While fi is less than fcount:
+                Let fchild be memory_get_pointer(fbody, fi multiplied by 8)
+                Let fchild_size be codegen_estimate_stmt_frame(fchild, program)
+                Set total to total plus fchild_size
+                Set fi to fi plus 1
+            End While
+        End If
+        Return total
+    End If
+
+    Note: STMT_FOR_EACH = 12: var_name(8), collection(16), body(24),
+    Note: body_count(32), type_name(40). The loop variable's size depends on
+    Note: the optional `as Type` annotation; default 8 bytes.
+    If stmt_type is equal to 12:
+        Let fe_type_name be memory_get_pointer(stmt, 40)
+        Let fe_size be 8
+        If fe_type_name is not equal to 0:
+            Set fe_size to codegen_calculate_type_size(fe_type_name, program)
+            If fe_size is less than 8:
+                Set fe_size to 8
+            End If
+        End If
+        Set total to total plus fe_size
+        Let febody be memory_get_pointer(stmt, 24)
+        Let fecount be memory_get_int32(stmt, 32)
+        If febody is not equal to 0:
+            Let fei be 0
+            While fei is less than fecount:
+                Let fechild be memory_get_pointer(febody, fei multiplied by 8)
+                Let fechild_size be codegen_estimate_stmt_frame(fechild, program)
+                Set total to total plus fechild_size
+                Set fei to fei plus 1
+            End While
+        End If
+        Return total
+    End If
+
+    Note: STMT_MATCH = 8: expr(8), when_clauses(16), when_count(24). Each
+    Note: WhenClause is 48 bytes: pattern_type(0), pattern_value(8),
+    Note: field_bindings(16), field_count(24), body(32), body_count(40).
+    Note: Variant patterns (PATTERN_VARIANT) add one local per field binding
+    Note: via codegen_add_variable at line ~7010. The body recurses.
+    If stmt_type is equal to 8:
+        Let mclauses be memory_get_pointer(stmt, 16)
+        Let mcount be memory_get_int32(stmt, 24)
+        If mclauses is not equal to 0:
+            Let mi be 0
+            While mi is less than mcount:
+                Let mc_off be mi multiplied by 48
+                Let mc_ptr be mclauses plus mc_off
+                Let mc_field_count be memory_get_int32(mc_ptr, 24)
+                Note: Each field binding consumes 8 bytes (default Integer).
+                If mc_field_count is greater than 0:
+                    Let field_bytes be mc_field_count multiplied by 8
+                    Set total to total plus field_bytes
+                End If
+                Let mc_body be memory_get_pointer(mc_ptr, 32)
+                Let mc_bcount be memory_get_int32(mc_ptr, 40)
+                If mc_body is not equal to 0:
+                    Let mbi be 0
+                    While mbi is less than mc_bcount:
+                        Let mb_child be memory_get_pointer(mc_body, mbi multiplied by 8)
+                        Let mb_size be codegen_estimate_stmt_frame(mb_child, program)
+                        Set total to total plus mb_size
+                        Set mbi to mbi plus 1
+                    End While
+                End If
+                Set mi to mi plus 1
+            End While
+        End If
+        Return total
+    End If
+
+    Note: STMT_SET (2), STMT_RETURN (3), STMT_PRINT (4), STMT_EXPRESSION (7),
+    Note: STMT_BREAK (9), STMT_CONTINUE (10), STMT_IMPORT (13),
+    Note: STMT_INLINE_ASSEMBLY (16), STMT_COMPOUND_ASSIGN (17) introduce no
+    Note: new locals - they only manipulate existing variables or emit raw
+    Note: instructions.
+    Return 0
+End Process
+
+Note: Compute the total bytes a function will subq from %rsp in its
+Note: prologue. Counts parameters (each one stored to a stack slot via
+Note: codegen_add_variable_with_type_and_param_flag) plus the AST-walked
+Note: body via codegen_estimate_stmt_frame, then adds:
+Note:   - 1024 bytes spill headroom (covers nested expression push/pop
+Note:     pairs, deep call argument preparation, builtin-call register
+Note:     saves at lines ~3313-3327, match-value pushq at line ~6768,
+Note:     for-each counter/length/collection three-deep pushq stack at
+Note:     lines ~6336-6345, etc.)
+Note:   - rounds up to 16-byte alignment (System V ABI requirement at call
+Note:     boundaries)
+Note:   - enforces 256-byte minimum (red zone + at least 32 bytes for ABI
+Note:     scratch even in leaf functions)
+Note: Never under-allocates: any frame we report here is the exact byte
+Note: count that will be subq'd from %rsp, and the AST walk catches every
+Note: code path that increments codegen->stack_offset.
+Process called "codegen_compute_function_frame_size" takes func as Integer, program as Integer returns Integer:
+    Let total be 0
+
+    Note: Parameters consume stack slots too. Each parameter is sized by
+    Note: codegen_calculate_type_size using its declared type (default
+    Note: "Integer" -> 8 bytes when type is null). This matches the loop at
+    Note: line ~7568.
+    Let parameter_count be memory_get_int32(func, 16)
+    Let parameters be memory_get_pointer(func, 8)
+    If parameters is not equal to 0:
+        Let pi be 0
+        While pi is less than parameter_count:
+            Let p_offset be pi multiplied by 16  Note: sizeof(Parameter) = 16
+            Let p_type be memory_get_pointer(parameters, p_offset plus 8)
+            Let p_size be 8
+            If p_type is not equal to 0:
+                Set p_size to codegen_calculate_type_size(p_type, program)
+                If p_size is less than 8:
+                    Set p_size to 8
+                End If
+            End If
+            Set total to total plus p_size
+            Set pi to pi plus 1
+        End While
+    End If
+
+    Note: Walk the function body to count all local-introducing statements.
+    Let statement_count be memory_get_int32(func, 40)
+    Let statements be memory_get_pointer(func, 32)
+    If statements is not equal to 0:
+        Let si be 0
+        While si is less than statement_count:
+            Let s_offset be si multiplied by 8
+            Let stmt be memory_get_pointer(statements, s_offset)
+            Let stmt_size be codegen_estimate_stmt_frame(stmt, program)
+            Set total to total plus stmt_size
+            Set si to si plus 1
+        End While
+    End If
+
+    Note: Add 1024 bytes for expression-time push/pop spills, deep argument
+    Note: staging, and builtin-call register saves. Empirically every
+    Note: codegen pushq is paired with a popq within the same statement, so
+    Note: peak temporary depth tops out at ~10-12 slots in the worst nested
+    Note: case (match-with-for-each-with-builtin-call). 1024 = 128 slots,
+    Note: roughly 10x safety factor.
+    Set total to total plus 1024
+
+    Note: Round up to 16-byte boundary. System V ABI requires %rsp to be
+    Note: 16-byte aligned at every call instruction. Our prologue does
+    Note: pushq %rbp (8 bytes) + subq $N -> total stack delta from caller's
+    Note: aligned %rsp is 8 + N. For that sum to be 16-byte aligned, N must
+    Note: be of the form 16k + 8. Round up `total` to the next multiple of
+    Note: 16 first, then add 8.
+    Let aligned be total plus 15
+    Let div16 be aligned divided by 16
+    Let mul16 be div16 multiplied by 16
+    Set aligned to mul16
+    Set aligned to aligned plus 8
+
+    Note: 256-byte minimum floor for ABI scratch + alignment + any
+    Note: forgotten cases (e.g., new STMT types added later that this
+    Note: estimator doesn't yet recognize - they'd be silently skipped,
+    Note: and the floor catches a few of them).
+    If aligned is less than 256:
+        Set aligned to 256
+    End If
+
+    Return aligned
+End Process
+
 Note: Generate code for a function - equivalent to codegen_generate_function
 Process called "codegen_generate_function" takes codegen as Integer, func as Integer returns Integer:
     Note: Reset variable state for each function
@@ -7494,6 +7803,11 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
     file_write_buffered(output_file, func_name, 0)
     file_write_buffered(output_file, ":\n", 0)
 
+    Note: Compute per-function frame size up front so both the probe and
+    Note: the prologue subq see the same value (task #187 fix).
+    Let frame_program be memory_get_pointer(codegen, 48)  Note: codegen->current_program
+    Let frame_size be codegen_compute_function_frame_size(func, frame_program)
+
     Note: Function prologue
     emit_line(output_file, "    pushq %rbp")
     emit_line(output_file, "    movq %rsp, %rbp")
@@ -7506,7 +7820,7 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         Let node be callgraph_find_node(call_graph, func_name)
         If node is not equal to 0:
             Let is_recursive be memory_get_int32(node, 28)
-            codegen_inject_stack_probe(output_file, func_name, is_recursive)
+            codegen_inject_stack_probe(output_file, func_name, is_recursive, frame_size)
         End If
     End If
     Note: ========================================================================
@@ -7536,14 +7850,13 @@ Process called "codegen_generate_function" takes codegen as Integer, func as Int
         End If
     End If
 
-    Note: BF-0011 root-cause fix. Was hardcoded `subq $2048` for every function,
-    Note: which silently corrupted memory whenever a function's locals exceeded
-    Note: 2048 bytes (parser_parse_primary uses 2080 — wrote 32 bytes BELOW %rsp,
-    Note: into territory the next call's pushed return-address would overwrite).
-    Note: Bumped to 16384 (16KB) to cover all currently-known function sizes
-    Note: with 8x headroom. Proper two-pass per-function sizing should replace
-    Note: this once codegen-helper restructuring lands.
-    emit_line(output_file, "    subq $16384, %rsp  # Pre-allocate stack frame (16KB, fits all known function sizes)")
+    Note: Per-function frame size (task #187 fix). Replaces the hardcoded
+    Note: `subq $16384` that wasted ~15.8KB per function. frame_size was
+    Note: computed above (before the prologue) so the probe and the subq
+    Note: use the same value.
+    file_write_buffered(output_file, "    subq $", 0)
+    file_write_buffered(output_file, integer_to_string(frame_size), 0)
+    file_write_buffered(output_file, ", %rsp  # Per-function frame size\n", 0)
 
     Let parameters be memory_get_pointer(func, 8)  Note: func->parameters (Parameter*)
     Let i be 0
@@ -8219,7 +8532,14 @@ Process called "codegen_generate" takes codegen as Integer, program as Integer r
     emit_line(output_file, "__module_init:")
     emit_line(output_file, "    pushq %rbp")
     emit_line(output_file, "    movq %rsp, %rbp")
-    emit_line(output_file, "    subq $16384, %rsp  # Stack space for global initializers")
+    Note: __module_init evaluates global initializer expressions. It adds no
+    Note: variables to codegen->stack_offset (no STMT_LET — just direct
+    Note: expression eval + RIP-relative stores into .data slots), so the
+    Note: only frame need is expression-spill headroom for nested
+    Note: push/pop pairs. 2056 bytes = 2048 spill area + 8 for ABI
+    Note: alignment (matches the +8 rule applied in
+    Note: codegen_compute_function_frame_size).
+    emit_line(output_file, "    subq $2056, %rsp  # Stack space for global initializer expression spills")
     Note: __module_init iterates ALL globals (own + imported). This is the
     Note: weak symbol that the linker keeps a single copy of across all
     Note: .o files. The main program's __module_init - which has the full
@@ -9199,8 +9519,10 @@ Process called "callgraph_print_warnings" takes graph as Integer returns Integer
 End Process
 
 Note: Inject stack probe at function prologue
-Note: This checks if stack pointer is within safe bounds before proceeding
-Process called "codegen_inject_stack_probe" takes output_file as Integer, function_name as Integer, is_recursive as Integer returns Integer:
+Note: This checks if stack pointer is within safe bounds before proceeding.
+Note: Takes the per-function frame_size so the probe checks the exact bytes
+Note: this function is about to consume rather than a hardcoded constant.
+Process called "codegen_inject_stack_probe" takes output_file as Integer, function_name as Integer, is_recursive as Integer, frame_size as Integer returns Integer:
     Note: Only inject probes for recursive functions or in debug mode
     If is_recursive is equal to 0:
         Return 0
@@ -9208,7 +9530,9 @@ Process called "codegen_inject_stack_probe" takes output_file as Integer, functi
 
     emit_line(output_file, "    # Stack overflow protection")
     emit_line(output_file, "    movq %rsp, %rax")
-    emit_line(output_file, "    subq $16384, %rax  # Check if we have 16KB stack space")
+    file_write_buffered(output_file, "    subq $", 0)
+    file_write_buffered(output_file, integer_to_string(frame_size), 0)
+    file_write_buffered(output_file, ", %rax  # Reserve this function's frame for probe check\n", 0)
 
     Note: Compare against a conservative stack limit
     Note: In a full implementation, this would check against __stack_limit
