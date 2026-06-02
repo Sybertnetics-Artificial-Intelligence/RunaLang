@@ -7,7 +7,12 @@ Note: concurrent functional programming, fault tolerance
 Note: ============================================================================
 
 Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_parser.runa" as Parser
+Import "compiler/middle/gungnir/hir/translation/frontends/erlang/erlang_lexer.runa" as ErlangLexer
 Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HIRNodes
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/core/string_primitive.runa" as StringPrim
+Import "compiler/frontend/primitives/collections/list.runa" as ListPrim
 
 Note: ============================================================================
 Note: TRANSLATION CONTEXT
@@ -2050,4 +2055,130 @@ file convention without losing the more-descriptive internal function name.
 @End Reasoning
 Process called "translate_erlang_to_hir" that takes erl_module as ErlangModule returns HIRModule:
     Return translate_erlang_module_to_hir with erl_module
+End Process
+
+Note: ============================================================================
+Note: SOURCE -> HIR PIPELINE BUNDLER
+Note: ============================================================================
+
+@Reasoning:
+The Erlang lexer exposes a token-at-a-time API (create_erlang_lexer +
+next_token) but the parser expects three parallel arrays (token-type
+list, lexeme-string list, line-number list). This helper drives the
+lexer in a loop and populates the three parallel arrays so the parser
+can consume them via its standard create_erlang_parser entry point.
+
+Each iteration calls next_token to obtain a Token record (24 bytes:
+type at offset 0, start_pos at offset 8, end_pos at offset 16). The
+helper reads the lexer's current_line at offset 24 BEFORE calling
+next_token because next_token internally advances past whitespace and
+newlines, which would otherwise associate the token with the line that
+follows it. Lexemes are reconstructed via string_substring(source,
+start, end-start). EOF tokens are appended to the array so the parser's
+TOKEN_EOF dispatch fires cleanly at the end of the stream; the loop
+then terminates.
+@End Reasoning
+@Implementation:
+Allocates three new lists. Reads the lexer's source pointer (offset 0)
+to support lexeme extraction. Loops calling next_token: peeks the
+lexer's current_line, then advances. Reads the token's type and span;
+extracts the lexeme as a substring. Appends type, lexeme, line into
+the three lists. Stops after appending the first TOKEN_EOF (so the
+parser sees a sentinel EOF entry). Returns nothing — the lexer's
+internal tokens/lexemes/lines fields (offsets 40/48/56) are written
+with the three list handles so the wrapper can pass them downstream.
+@End Implementation
+Process called "lex_erlang_to_arrays" takes lexer as Integer returns Integer:
+    Let tokens_list be proc list_create from ListPrim
+    Let lexemes_list be proc list_create from ListPrim
+    Let lines_list be proc list_create from ListPrim
+
+    Let source_ptr be proc memory_get_int64 from Layout with lexer, 0
+
+    Let done be 0
+    While done is equal to 0:
+        Note: Capture the line of the token BEFORE next_token internally
+        Note: skips whitespace / advances. next_token's skip_whitespace pass
+        Note: may bump current_line past blank lines that precede the token;
+        Note: we still want the line of the token itself, which is what
+        Note: lexer.current_line reads as after skip_whitespace.
+        proc skip_whitespace_and_comments from ErlangLexer with lexer
+        Let line_at_token be proc memory_get_int64 from Layout with lexer, 24
+
+        Let token be proc next_token from ErlangLexer with lexer
+        If token is equal to 0:
+            Set done to 1
+        Otherwise:
+            Let ttype be proc memory_get_int64 from Layout with token, 0
+            Let start_pos be proc memory_get_int64 from Layout with token, 8
+            Let end_pos be proc memory_get_int64 from Layout with token, 16
+
+            Let lexeme_len be end_pos minus start_pos
+            Let lexeme be 0
+            If lexeme_len is greater than 0:
+                Set lexeme to proc string_substring from StringPrim with source_ptr, start_pos, lexeme_len
+            Otherwise:
+                Set lexeme to ""
+            End If
+
+            proc list_push from ListPrim with tokens_list, ttype
+            proc list_push from ListPrim with lexemes_list, lexeme
+            proc list_push from ListPrim with lines_list, line_at_token
+
+            If ttype is equal to ErlangLexer.TOKEN_EOF:
+                Set done to 1
+            End If
+        End If
+    End While
+
+    Note: Persist the three list handles into the lexer's reserved slots
+    Note: (tokens @40, lexemes @48, lines @56) so callers reading the lexer
+    Note: state see the populated parallel arrays. Returning 0 lets the
+    Note: caller chain to a parser create call without an explicit out-pointer.
+    proc memory_set_int64 from Layout with lexer, 40, tokens_list
+    proc memory_set_int64 from Layout with lexer, 48, lexemes_list
+    proc memory_set_int64 from Layout with lexer, 56, lines_list
+    Return 0
+End Process
+
+@Reasoning:
+Public single-arg facade invoked by the translation dispatcher's
+LANG_ERLANG arm. Wires the full source -> HIR pipeline: create_erlang_lexer
+builds the lexer state from the source string, lex_erlang_to_arrays
+populates the lexer's three parallel-array slots by repeatedly invoking
+next_token, parse_erlang_module wraps those arrays in an ErlangParser
+and parses out an ErlangModule, and translate_erlang_to_hir lowers the
+module into HIR.
+@End Reasoning
+@Implementation:
+lexer = create_erlang_lexer(source); lex_erlang_to_arrays(lexer); reads
+tokens/lexemes/lines from the lexer's offset 40/48/56 slots; parser =
+create_erlang_parser(tokens, lexemes, lines); module = parse_erlang_module(
+parser); return translate_erlang_module_to_hir(module). On lexer
+allocation failure the wrapper short-circuits to 0 so downstream stages
+don't see a partially-formed module.
+@End Implementation
+Process called "erlang_to_hir_from_source" takes source_code as Integer returns Integer:
+    Let lexer be proc create_erlang_lexer from ErlangLexer with source_code
+    If lexer is equal to 0:
+        Return 0
+    End If
+
+    proc lex_erlang_to_arrays with lexer
+
+    Let tokens_list be proc memory_get_int64 from Layout with lexer, 40
+    Let lexemes_list be proc memory_get_int64 from Layout with lexer, 48
+    Let lines_list be proc memory_get_int64 from Layout with lexer, 56
+
+    Let parser be proc create_erlang_parser from Parser with tokens_list, lexemes_list, lines_list
+    Let erl_module be proc parse_erlang_module from Parser with parser
+    Return translate_erlang_module_to_hir with erl_module
+End Process
+
+@Reasoning:
+Dispatcher-facing single-arg facade. The translation.runa LANG_ERLANG arm
+calls `erlang_to_hir(source)` — this thin wrapper exposes that name.
+@End Reasoning
+Process called "erlang_to_hir" takes source_code as Integer returns Integer:
+    Return proc erlang_to_hir_from_source with source_code
 End Process

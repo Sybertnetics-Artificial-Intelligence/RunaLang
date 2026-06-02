@@ -1,1157 +1,1328 @@
 Note: ============================================================================
-Note: JULIA TO HIR TRANSLATOR
+Note: JULIA -> HIR TRANSLATOR
 Note: ============================================================================
-Note: Translates Julia AST to High-level Intermediate Representation (HIR)
-Note: Handles Julia-specific features:
-Note: - Multiple dispatch and method specialization
-Note: - Parametric types and type constraints
-Note: - Metaprogramming and macro expansion
-Note: - Module system and imports
-Note: - Performance annotations and optimizations
-Note: - Abstract types and composite types
-Note: - Just-in-time compilation hints
+Note: Consumes the native parser output: 64-byte ASTNode records with
+Note: integer NODE_* tags (see julia_parser.runa). The previous version of
+Note: this file targeted a separate JuliaIRNode struct with string-tagged
+Note: .type fields that the parser does not produce, leaving the LANG_JULIA
+Note: arm of the translation dispatcher non-functional. This rewrite walks
+Note: the parser's ASTNode tree directly via memory_get_int64 at the
+Note: documented offsets (node_type @0, value @8, left @16, right @24,
+Note: children @32, child_count @40, line @48, column @56) and emits a
+Note: dictionary-shaped HIR tree compatible with the dispatcher's downstream
+Note: consumers (hir_to_* emitters that inspect "node_type" string tags
+Note: and named child slots).
+Note: ============================================================================
 
-Import "compiler/middle/gungnir/hir/hir_nodes.runa" as HirNodes
-Import "compiler/middle/gungnir/hir/hir_builder.runa" as HirBuilder
+Import "compiler/middle/gungnir/hir/translation/frontends/julia/julia_lexer.runa" as JLexer
+Import "compiler/middle/gungnir/hir/translation/frontends/julia/julia_parser.runa" as JParser
+Import "compiler/frontend/primitives/memory/layout.runa" as Layout
+Import "compiler/frontend/primitives/core/string_core.runa" as StringCore
+Import "compiler/frontend/primitives/collections/hashtable.runa" as Dict
+Import "compiler/frontend/primitives/collections/list.runa" as List
 
-Note: Local Julia AST node schema (fields used by translation logic; distinct from
-Note: the real HIRNode in hir_nodes.runa which has node_type/value/children/etc).
-Note: This represents the parsed Julia source AST input, NOT the HIR output.
+Note: ============================================================================
+Note: HIR STORAGE PRIMITIVES
+Note: ============================================================================
+
 @Reasoning:
-Julia's AST contains many syntactically distinct constructs (modules,
-function/method definitions, parametric type defs, comprehensions, macro
-calls, type-annotated lets). One union record with optional fields lets a
-single Match in translate_julia_node dispatch on .type without per-construct
-node hierarchies, mirroring how Julia itself uses Expr(:head, args...).
+HIR nodes in the dictionary-shaped translation pipeline are untyped
+hashtables keyed by string field names. Wrapping hashtable_create keeps
+the call sites in this file consistent with every other dictionary-shaped
+frontend (bash_to_hir, elixir_to_hir, haskell_to_hir, ...).
 @End Reasoning
+Process called "create_hir_dict" returns Integer:
+    Return proc hashtable_create from Dict
+End Process
 
-@Implementation:
-30+ optional fields. .type and .type_kind are dispatch discriminators;
-.name/.function_name carry identifiers; .body/.expression/.value carry
-nested ASTs; .parameters/.type_parameters/.arguments/.fields are List
-handles; .literal_type tags primitive literals; .supertype/.base_type
-are recursive JuliaIRNode handles for type-level expressions. Fields not
-relevant to a given node kind are simply ignored by the translator.
-@End Implementation
+@Reasoning:
+HIR list storage uses the production dynamic list primitive. Children,
+arguments, comprehension generators, struct fields and any other ordered
+HIR collection allocate through this single helper so a future storage
+swap stays local.
+@End Reasoning
+Process called "create_hir_list" returns Integer:
+    Return proc list_create from List
+End Process
 
-Type called "JuliaIRNode":
-    type as String
-    name as String
-    body as Integer
-    exports as Integer
-    imports as Integer
+@Reasoning:
+Domain alias over hashtable_set so call sites can use the "set_dict_value"
+vocabulary other dictionary-shaped frontends already use.
+@End Reasoning
+Process called "set_dict_value" takes dict as Integer, key as Integer, value as Integer returns Integer:
+    Return proc hashtable_set from Dict with dict, key, value
+End Process
+
+@Reasoning:
+Corresponding alias for list_push. Walker code reading "append child to
+body" is clearer than "push" semantics.
+@End Reasoning
+Process called "list_append" takes lst as Integer, item as Integer returns Integer:
+    Return proc list_push from List with lst, item
+End Process
+
+Note: ============================================================================
+Note: ASTNode FIELD ACCESS HELPERS
+Note: ============================================================================
+Note: Julia parser ASTNode layout (64 bytes):
+Note:   node_type @0, value @8, left @16, right @24,
+Note:   children @32, child_count @40, line @48, column @56
+Note: All access goes through these helpers so an ASTNode schema change
+Note: only requires editing this section.
+
+@Reasoning:
+Direct-offset accessors keep the walker call sites free from memory_get_int64
+boilerplate and make the schema documentation visible in one place. The
+helpers do not range-check the node pointer because callers either have
+already null-guarded or wish to crash early on a bad pointer.
+@End Reasoning
+Process called "ast_node_type" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 0
+End Process
+
+Process called "ast_value" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 8
+End Process
+
+Process called "ast_left" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 16
+End Process
+
+Process called "ast_right" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 24
+End Process
+
+Process called "ast_children" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 32
+End Process
+
+Process called "ast_child_count" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 40
+End Process
+
+Process called "ast_line" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 48
+End Process
+
+Process called "ast_column" takes node as Integer returns Integer:
+    Return proc memory_get_int64 from Layout with node, 56
+End Process
+
+@Reasoning:
+Children array is a flat pointer-array (one int64 per slot). This helper
+fetches the i-th child as an Integer pointer to the child ASTNode.
+@End Reasoning
+Process called "ast_child_at" takes node as Integer, index as Integer returns Integer:
+    Let children be proc ast_children with node
+    If children is equal to 0:
+        Return 0
+    End If
+    Return proc memory_get_int64 from Layout with children, index multiplied by 8
+End Process
+
+Note: ============================================================================
+Note: TRANSLATOR STATE
+Note: ============================================================================
+
+@Reasoning:
+The translator carries Julia-specific state: a dispatch_hints dictionary
+keyed by function name for multiple-dispatch metadata, a type_parameters
+dictionary for `where T` resolution, and a macro_cache for expansion
+results. The fan-out is necessary because Julia's parametric type system
+and metaprogramming features cannot be analysed locally and require
+translator-level bookkeeping that survives across nested module / function
+walks.
+@End Reasoning
+Type called "JuliaToHIRTranslator":
+    dispatch_hints as Integer
     type_parameters as Integer
-    parameters as Integer
-    return_type as Integer
-    where_clause as Integer
-    function_name as String
-    signature as Integer
-    line_info as Integer
-    type_kind as String
-    fields as Integer
-    is_mutable as Integer
-    supertype as Integer
-    arguments as Integer
-    type_arguments as Integer
-    keyword_arguments as Integer
-    macro_name as String
-    elements as Integer
-    element_type as Integer
-    dimensions as Integer
-    expression as Integer
-    iterators as Integer
-    filters as Integer
-    asserted_type as Integer
-    variable as Integer
-    iterable as Integer
-    value as Integer
-    literal_type as Integer
-    base_type as JuliaIRNode
+    macro_cache as Integer
+    current_module as Integer
+    current_function as Integer
 End Type
 
 @Reasoning:
-Minimal type-parameter record. Julia parametric types like Array{T,N} carry
-zero or more such parameters; current translation only needs the parameter
-name. Constraint info (where-clauses) is held on the parent function/struct
-record, not here.
+Constructor pre-builds every tracking dictionary so the walkers never test
+for null subsystem handles on the hot path. current_module / current_function
+start as 0 because walking begins outside any module/function context;
+they are pushed and restored across nested scopes.
 @End Reasoning
-
-Type called "JuliaTypeParam":
-    name as String
-End Type
-
-@Reasoning:
-Function parameters in Julia carry an optional type annotation
-(`x::Int64`). The annotation is itself a JuliaIRNode because Julia
-type-expressions can be arbitrary (parametric, where-quantified, vararg).
-Untyped parameters carry a null type_annotation.
-@End Reasoning
-
-Type called "JuliaFuncParam":
-    name as String
-    type_annotation as JuliaIRNode
-End Type
-
-@Reasoning:
-The translation context bundles every piece of mutable state a Julia
-translation pass needs: the HIR builder it appends to, the lexical
-module/function stack, the type-parameter scope (for `where T` resolution),
-local variable bindings, an instance cache for method specialization, a
-macro-expansion cache, and the optimization knobs (`optimization_level`,
-`world_age`) Julia exposes. Bundling avoids threading 10 separate
-parameters through every translate_* call.
-@End Reasoning
-
-@Implementation:
-Reference-counted record built via "a value of type" constructor in
-create_julia_hir_context. Dictionaries are keyed by qualified Julia name;
-performance_hints is a list of pragma strings collected from @inbounds /
-@simd / @fastmath macros and consumed by the optimizer pass after
-translation.
-@End Implementation
-
-Type called "JuliaToHIRContext":
-    hir_builder as HIRBuilder
-    current_module as String
-    current_function as String
-    type_parameters as List[String]
-    local_variables as Dictionary[String, HIRNode]
-    method_instances as Dictionary[String, HIRNode]
-    macro_expansions as Dictionary[String, HIRNode]
-    performance_hints as List[String]
-    optimization_level as Integer
-    world_age as Integer
-End Type
-
-@Reasoning:
-The public entry point creates a fresh JuliaToHIRContext (which seeds the
-"Main" module, optimisation level 2, world age 1), recursively translates the
-Julia AST into HIR, and then runs optimize_julia_hir on the result. Running
-the optimiser inside the entry rather than asking the caller to do it
-guarantees that Julia-specific transforms (dispatch hint annotation, special
-function recognition, array hot-path hints) are always applied; clients that
-want unoptimised HIR for diagnostic purposes should call translate_julia_node
-directly with their own context.
-@End Reasoning
-Process called "translate_julia_to_hir" that takes julia_ast as JuliaIRNode returns HIRNode:
-    Note: Main entry point for Julia to HIR translation
-
-    Let context be create_julia_hir_context
-    Let hir_module be translate_julia_node with julia_ast and context
-
-    Note: Perform post-translation optimizations
-    Call optimize_julia_hir with hir_module and context
-
-    Return hir_module
-End Process
-
-@Reasoning:
-A fresh context establishes the "Main" module as the default lexical scope
-(matching Julia's REPL behaviour) and seeds an optimization_level of 2
-(-O2 equivalent) and world_age 1, which represents the empty
-method-dispatch world prior to any user method definitions. Both knobs are
-mutated as the translator visits `@optlevel` / method definitions.
-@End Reasoning
-
-@Implementation:
-Allocates a new HIRBuilder, then constructs JuliaToHIRContext via the
-struct-with-fields syntax. All five tracking maps (locals, methods, macros,
-hints, params) start empty so the translator can populate them
-incrementally.
-@End Implementation
-
-Process called "create_julia_hir_context" that takes nothing returns JuliaToHIRContext:
-    Note: Create translation context for Julia to HIR
-
-    Let hir_builder be create_hir_builder
-
-    Return a value of type JuliaToHIRContext with
-        hir_builder as hir_builder,
-        current_module as "Main",
-        current_function as null,
-        type_parameters as a list containing nothing,
-        local_variables as a dictionary containing nothing,
-        method_instances as a dictionary containing nothing,
-        macro_expansions as a dictionary containing nothing,
-        performance_hints as a list containing nothing,
-        optimization_level as 2,
-        world_age as 1
-End Process
-
-@Reasoning:
-Central dispatcher: every other translate_julia_* helper handles a single
-construct, but the recursive structure of Julia ASTs means many helpers
-need to re-translate child nodes whose kind is not statically known. This
-function is the polymorphic entry point those helpers call back into.
-@End Reasoning
-
-@Implementation:
-One large Match on node.type. Each arm forwards to the dedicated helper
-(translate_julia_module, _function_def, _method_def, etc). Falls through
-to an Otherwise branch that builds a generic HIR placeholder node for any
-construct the translator does not yet specialise — keeps the pipeline
-total rather than crashing on unknown shapes.
-@End Implementation
-
-Process called "translate_julia_node" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate any Julia AST node to HIR
-
-    Match node.type:
-        When "Module":
-            Return translate_julia_module with node and ctx
-        When "FunctionDef":
-            Return translate_julia_function_def with node and ctx
-        When "MethodDef":
-            Return translate_julia_method_def with node and ctx
-        When "TypeDef":
-            Return translate_julia_type_def with node and ctx
-        When "AbstractTypeDef":
-            Return translate_julia_abstract_type_def with node and ctx
-        When "PrimitiveTypeDef":
-            Return translate_julia_primitive_type_def with node and ctx
-        When "StructDef":
-            Return translate_julia_struct_def with node and ctx
-        When "MacroDef":
-            Return translate_julia_macro_def with node and ctx
-        When "MacroCall":
-            Return translate_julia_macro_call with node and ctx
-        When "Assignment":
-            Return translate_julia_assignment with node and ctx
-        When "MethodCall":
-            Return translate_julia_method_call with node and ctx
-        When "FieldAccess":
-            Return translate_julia_field_access with node and ctx
-        When "ArrayAccess":
-            Return translate_julia_array_access with node and ctx
-        When "ArrayConstruction":
-            Return translate_julia_array_construction with node and ctx
-        When "TupleConstruction":
-            Return translate_julia_tuple_construction with node and ctx
-        When "TypeAssertion":
-            Return translate_julia_type_assertion with node and ctx
-        When "TypeParameterDecl":
-            Return translate_julia_type_parameter with node and ctx
-        When "WhereClause":
-            Return translate_julia_where_clause with node and ctx
-        When "UsingStatement":
-            Return translate_julia_using_statement with node and ctx
-        When "ImportStatement":
-            Return translate_julia_import_statement with node and ctx
-        When "ExportStatement":
-            Return translate_julia_export_statement with node and ctx
-        When "BinaryOperation":
-            Return translate_julia_binary_operation with node and ctx
-        When "UnaryOperation":
-            Return translate_julia_unary_operation with node and ctx
-        When "ComparisonChain":
-            Return translate_julia_comparison_chain with node and ctx
-        When "IfStatement":
-            Return translate_julia_if_statement with node and ctx
-        When "TryStatement":
-            Return translate_julia_try_statement with node and ctx
-        When "ForLoop":
-            Return translate_julia_for_loop with node and ctx
-        When "WhileLoop":
-            Return translate_julia_while_loop with node and ctx
-        When "BreakStatement":
-            Return translate_julia_break_statement with node and ctx
-        When "ContinueStatement":
-            Return translate_julia_continue_statement with node and ctx
-        When "ReturnStatement":
-            Return translate_julia_return_statement with node and ctx
-        When "ThrowStatement":
-            Return translate_julia_throw_statement with node and ctx
-        When "LambdaExpression":
-            Return translate_julia_lambda_expression with node and ctx
-        When "ComprehensionExpression":
-            Return translate_julia_comprehension with node and ctx
-        When "GeneratorExpression":
-            Return translate_julia_generator with node and ctx
-        When "QuoteExpression":
-            Return translate_julia_quote_expression with node and ctx
-        When "InterpolationExpression":
-            Return translate_julia_interpolation with node and ctx
-        When "SymbolLiteral":
-            Return translate_julia_symbol_literal with node and ctx
-        When "Identifier":
-            Return translate_julia_identifier with node and ctx
-        When "Literal":
-            Return translate_julia_literal with node and ctx
-        Otherwise:
-            Return translate_generic_julia_node with node and ctx
-    End Match
-End Process
-
-@Reasoning:
-Modules are translated by saving and restoring ctx.current_module around the
-recursive body translation. This save-restore pattern is necessary because
-Julia allows nested module declarations and inner constructs (qualified
-references, exports) must be resolved against the innermost enclosing module
-at the point where they appear. Exports and imports are translated in source
-order BEFORE the body so subsequent body references can see the populated
-import map, matching Julia's actual resolution semantics.
-@End Reasoning
-Process called "translate_julia_module" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia module definition
-
-    Let module_name be node.name
-    Let module_body be node.body
-    Let exports be node.exports
-    Let imports be node.imports
-
-    Note: Create HIR module
-    Let hir_module be create_hir_module with ctx.hir_builder and module_name
-
-    Note: Set module context
-    Let old_module be ctx.current_module
-    Set ctx.current_module to module_name
-
-    Note: Translate exports
-    For Each export_item in exports:
-        Let hir_export be translate_julia_export with export_item and ctx
-        Call add_hir_export with hir_module and hir_export
-    End For
-
-    Note: Translate imports
-    For Each import_item in imports:
-        Let hir_import be translate_julia_import with import_item and ctx
-        Call add_hir_import with hir_module and hir_import
-    End For
-
-    Note: Translate module body
-    For Each stmt in module_body:
-        Let hir_stmt be translate_julia_node with stmt and ctx
-        Call add_hir_statement with hir_module and hir_stmt
-    End For
-
-    Note: Restore module context
-    Set ctx.current_module to old_module
-
-    Return hir_module
-End Process
-
-@Reasoning:
-Julia functions translate into HIR functions that carry the type-parameter
-list, where-clause constraints, parameter list with per-parameter type
-annotations, and an optional return-type assertion. Type parameters are added
-to ctx.type_parameters BEFORE translating the parameter list, body, or where
-clause because each of those may reference the type parameters as bound names
-that must resolve to a parameter slot rather than a free identifier. After the
-body is translated we remove the type parameters from scope so they cannot
-leak into sibling function definitions in the same module body.
-@End Reasoning
-@Implementation:
-Dispatch hint generation runs after the body to allow add_julia_dispatch_hints
-to consult the fully-translated HIR body when synthesising specialisation
-hints; the hints depend on which method-call shapes appear inside the function.
-@End Implementation
-Process called "translate_julia_function_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia function definition
-
-    Let func_name be node.name
-    Let type_params be node.type_parameters
-    Let params be node.parameters
-    Let return_type be node.return_type
-    Let body be node.body
-    Let where_clause be node.where_clause
-
-    Note: Create HIR function
-    Let hir_function be create_hir_function with ctx.hir_builder and func_name
-
-    Note: Set function context
-    Let old_function be ctx.current_function
-    Set ctx.current_function to func_name
-
-    Note: Translate type parameters
-    If type_params is not equal to 0:
-        For Each type_param as JuliaTypeParam in type_params:
-            Let hir_type_param be translate_julia_type_parameter with type_param and ctx
-            Call add_hir_type_parameter with hir_function and hir_type_param
-            Add type_param.name to end of ctx.type_parameters
-        End For
-    End If
-
-    Note: Translate where clause constraints
-    If where_clause is not equal to 0:
-        Let hir_constraints be translate_julia_where_clause with where_clause and ctx
-        Call add_hir_constraints with hir_function and hir_constraints
-    End If
-
-    Note: Translate parameters
-    For Each param as JuliaFuncParam in params:
-        Let hir_param be translate_julia_parameter with param and ctx
-        Call add_hir_parameter with hir_function and hir_param
-
-        Note: Add to local variables
-        Set ctx.local_variables at key param.name to hir_param
-    End For
-
-    Note: Translate return type
-    If return_type is not equal to 0:
-        Let hir_return_type be translate_julia_type_expression with return_type and ctx
-        Call set_hir_return_type with hir_function and hir_return_type
-    End If
-
-    Note: Translate function body
-    Let hir_body be translate_julia_node with body and ctx
-    Call set_hir_function_body with hir_function and hir_body
-
-    Note: Add method specialization hints
-    Call add_julia_dispatch_hints with hir_function and params and ctx
-
-    Note: Restore function context
-    Set ctx.current_function to old_function
-
-    Note: Clear type parameters from scope
-    If type_params is not equal to 0:
-        For Each type_param as JuliaTypeParam in type_params:
-            Call remove_from_list with ctx.type_parameters and type_param.name
-        End For
-    End If
-
-    Return hir_function
-End Process
-
-@Reasoning:
-A 'method' in Julia is a single specialisation of a function for one argument
-signature; functions are name-bound collections of methods that the runtime
-dispatches between based on the runtime types of arguments. We translate by
-building an HIR method node and registering it in the dispatch table via
-add_method_to_dispatch_table, which lets downstream optimisation passes ask
-"what are all the methods of this function?" without re-walking the AST. The
-line_info is propagated to the HIR via set_hir_source_location so debugger
-backends can map between Julia source positions and HIR positions.
-@End Reasoning
-Process called "translate_julia_method_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia method definition (specific method for existing function)
-
-    Let func_name be node.function_name
-    Let signature be node.signature
-    Let body be node.body
-    Let line_info be node.line_info
-
-    Note: Create HIR method
-    Let hir_method be create_hir_method with ctx.hir_builder and func_name
-
-    Note: Translate method signature
-    Let hir_signature be translate_julia_method_signature with signature and ctx
-    Call set_hir_method_signature with hir_method and hir_signature
-
-    Note: Translate method body
-    Let hir_body be translate_julia_node with body and ctx
-    Call set_hir_method_body with hir_method and hir_body
-
-    Note: Add method to dispatch table
-    Call add_method_to_dispatch_table with hir_method and signature and ctx
-
-    Note: Set source location for debugging
-    Call set_hir_source_location with hir_method and line_info
-
-    Return hir_method
-End Process
-
-@Reasoning:
-Julia type declarations come in three shapes that share the same outer AST
-form (`type ... end`) but have very different semantics: struct (composite
-with fields), abstract (no fields, used as supertype only), and primitive
-(fixed-bit-width bits-types). The type_kind sub-discriminator selects the
-right specialised translator.
-@End Reasoning
-
-@Implementation:
-Match on node.type_kind. The Otherwise arm defaults to struct because
-unrecognised kinds most often originate from a missing kind tag on a
-field-bearing AST, and struct is the least-lossy fallback. Each specialised
-translator owns its own HIR construction.
-@End Implementation
-
-Process called "translate_julia_type_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia type definition (struct, abstract type, or primitive type)
-
-    Match node.type_kind:
-        When "struct":
-            Return translate_julia_struct_def with node and ctx
-        When "abstract":
-            Return translate_julia_abstract_type_def with node and ctx
-        When "primitive":
-            Return translate_julia_primitive_type_def with node and ctx
-        Otherwise:
-            Return translate_julia_struct_def with node and ctx
-    End Match
-End Process
-
-@Reasoning:
-Julia structs carry a mutability bit that affects whether field stores are
-permitted after construction; we translate this into an HIR property so the
-backend can reject illegal mutations and choose between stack and heap layout
-strategies. Default constructors are generated AFTER field translation
-because the constructor signature depends on the materialised field set; if
-the source defined custom constructors elsewhere, the upstream parser emits
-them as separate method definitions that the dispatcher in translate_julia_node
-processes independently.
-@End Reasoning
-Process called "translate_julia_struct_def" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia struct definition
-
-    Let type_name be node.name
-    Let type_params be node.type_parameters
-    Let fields be node.fields
-    Let is_mutable be node.is_mutable
-    Let supertype be node.supertype
-
-    Note: Create HIR struct type
-    Let hir_struct be create_hir_struct_type with ctx.hir_builder and type_name
-
-    Note: Set mutability
-    Call set_hir_struct_mutable with hir_struct and is_mutable
-
-    Note: Translate type parameters
-    If type_params is not equal to 0:
-        For Each type_param in type_params:
-            Let hir_type_param be translate_julia_type_parameter with type_param and ctx
-            Call add_hir_type_parameter with hir_struct and hir_type_param
-        End For
-    End If
-
-    Note: Translate supertype
-    If supertype is not equal to 0:
-        Let hir_supertype be translate_julia_type_expression with supertype and ctx
-        Call set_hir_supertype with hir_struct and hir_supertype
-    End If
-
-    Note: Translate fields
-    For Each field in fields:
-        Let hir_field be translate_julia_struct_field with field and ctx
-        Call add_hir_struct_field with hir_struct and hir_field
-    End For
-
-    Note: Generate constructors if not explicitly defined
-    Call generate_default_constructors with hir_struct and fields and ctx
-
-    Return hir_struct
-End Process
-
-@Reasoning:
-Method calls are the dispatch sites that drive Julia's multiple-dispatch
-runtime: the actual method selected depends on the runtime types of every
-argument, not just the receiver. We translate by recording the call shape
-verbatim (function name + argument expressions) and then invoke
-optimize_special_function_calls to recognise hot patterns like +(::Int,::Int)
-or getindex(::Array,::Int) where the compiler can devirtualise the call at HIR
-level. Generic calls remain dispatch-flexible and only specialise during
-later monomorphisation.
-@End Reasoning
-Process called "translate_julia_method_call" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia method call with multiple dispatch
-
-    Let function_name be node.function_name
-    Let arguments be node.arguments
-    Let type_args be node.type_arguments
-    Let keyword_args be node.keyword_arguments
-
-    Note: Create HIR method call
-    Let hir_call be create_hir_method_call with ctx.hir_builder and function_name
-
-    Note: Translate arguments
-    For Each arg in arguments:
-        Let hir_arg be translate_julia_node with arg and ctx
-        Call add_hir_call_argument with hir_call and hir_arg
-    End For
-
-    Note: Translate type arguments
-    If type_args is not equal to 0:
-        For Each type_arg in type_args:
-            Let hir_type_arg be translate_julia_type_expression with type_arg and ctx
-            Call add_hir_call_type_argument with hir_call and hir_type_arg
-        End For
-    End If
-
-    Note: Translate keyword arguments
-    If keyword_args is not equal to 0:
-        For Each kw_arg in keyword_args:
-            Let hir_kw_arg be translate_julia_keyword_argument with kw_arg and ctx
-            Call add_hir_call_keyword_argument with hir_call and hir_kw_arg
-        End For
-    End If
-
-    Note: Add dispatch information
-    Call add_dispatch_metadata with hir_call and function_name and arguments and ctx
-
-    Note: Check for special function calls that need optimization
-    Call optimize_special_function_calls with hir_call and function_name and ctx
-
-    Return hir_call
-End Process
-
-@Reasoning:
-Julia macros are syntactic transforms applied before HIR generation, so by the
-time the translator sees them they have either already been expanded by the
-upstream parser or they are a small set of compiler-recognised performance
-macros (@inbounds, @simd, @fastmath, @inline, @noinline, @generated, @time,
-@allocated, @assert, @show) that we treat specially because they MAP to HIR
-attributes rather than HIR code. Each recognised macro routes to a dedicated
-translator that attaches the appropriate hint to the argument expressions;
-unrecognised macros fall through to translate_generic_macro_call which keeps
-the macro shape verbatim for the user to inspect.
-@End Reasoning
-Process called "translate_julia_macro_call" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia macro call and expand
-
-    Let macro_name be node.macro_name
-    Let arguments be node.arguments
-
-    Note: Handle special performance macros
-    Match macro_name:
-        When "@inbounds":
-            Return translate_inbounds_macro with arguments and ctx
-        When "@simd":
-            Return translate_simd_macro with arguments and ctx
-        When "@fastmath":
-            Return translate_fastmath_macro with arguments and ctx
-        When "@inline":
-            Return translate_inline_macro with arguments and ctx
-        When "@noinline":
-            Return translate_noinline_macro with arguments and ctx
-        When "@generated":
-            Return translate_generated_macro with arguments and ctx
-        When "@time":
-            Return translate_time_macro with arguments and ctx
-        When "@allocated":
-            Return translate_allocated_macro with arguments and ctx
-        When "@assert":
-            Return translate_assert_macro with arguments and ctx
-        When "@show":
-            Return translate_show_macro with arguments and ctx
-        Otherwise:
-            Return translate_generic_macro_call with node and ctx
-    End Match
-End Process
-
-@Reasoning:
-Array literals translate into an HIR array construction node that carries the
-element type (if explicitly written, e.g. Int[1,2,3]), the dimensions (for
-multi-dimensional constructors like [1 2 ; 3 4]), and each element subtree.
-The dimensions field is crucial because Julia's row-major bracketed syntax
-encodes 2-D arrays in a way that text reconstruction loses, so we capture
-dimensions up front from the AST. add_array_optimization_hints runs after
-element translation to recognise homogeneous-type literals where SIMD-friendly
-storage layouts can be selected.
-@End Reasoning
-Process called "translate_julia_array_construction" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia array construction
-
-    Let elements be node.elements
-    Let element_type be node.element_type
-    Let dimensions be node.dimensions
-
-    Note: Create HIR array construction
-    Let hir_array be create_hir_array_construction with ctx.hir_builder
-
-    Note: Translate element type
-    If element_type is not equal to 0:
-        Let hir_element_type be translate_julia_type_expression with element_type and ctx
-        Call set_hir_array_element_type with hir_array and hir_element_type
-    End If
-
-    Note: Set dimensions
-    If dimensions is not equal to 0:
-        Call set_hir_array_dimensions with hir_array and dimensions
-    End If
-
-    Note: Translate elements
-    For Each element in elements:
-        Let hir_element be translate_julia_node with element and ctx
-        Call add_hir_array_element with hir_array and hir_element
-    End For
-
-    Note: Add array optimization hints
-    Call add_array_optimization_hints with hir_array and elements and ctx
-
-    Return hir_array
-End Process
-
-@Reasoning:
-Array comprehensions ([expr for var in iter if filter]) are kept in their
-high-level comprehension form rather than desugared to a manual loop at HIR
-level because loop optimisations (pre-allocation sizing, fusion, type
-specialisation) need to see the comprehension as a unit. The HIR record holds
-the body expression, the iterator list (multiple 'for' clauses chain into
-nested loops), and the filter list (one or more 'if' clauses applied to each
-combined iteration tuple). Filters are emitted as a list because Julia allows
-multiple 'if' clauses; they are ANDed together at codegen time.
-@End Reasoning
-Process called "translate_julia_comprehension" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia array comprehension
-
-    Let expression be node.expression
-    Let iterators be node.iterators
-    Let filters be node.filters
-
-    Note: Create HIR comprehension
-    Let hir_comprehension be create_hir_comprehension with ctx.hir_builder
-
-    Note: Translate expression
-    Let hir_expr be translate_julia_node with expression and ctx
-    Call set_hir_comprehension_expression with hir_comprehension and hir_expr
-
-    Note: Translate iterators
-    For Each iterator in iterators:
-        Let hir_iterator be translate_julia_iterator with iterator and ctx
-        Call add_hir_comprehension_iterator with hir_comprehension and hir_iterator
-    End For
-
-    Note: Translate filters
-    If filters is not equal to 0:
-        For Each filter in filters:
-            Let hir_filter be translate_julia_node with filter and ctx
-            Call add_hir_comprehension_filter with hir_comprehension and hir_filter
-        End For
-    End If
-
-    Note: Add comprehension optimization hints
-    Call add_comprehension_optimization_hints with hir_comprehension and ctx
-
-    Return hir_comprehension
-End Process
-
-@Reasoning:
-'expr::Type' assertions in Julia are runtime type checks that simultaneously
-inform the type inferencer of the expression's narrowed type. We preserve both
-the underlying expression and the asserted type as siblings on an HIR
-assertion node, with add_type_assertion_hints attaching a strong type narrowing
-hint that downstream passes use to specialise the surrounding code. The
-assertion is NOT lowered into an if-throw pair at HIR level so that the
-compiler can elide the runtime check when type inference proves it
-unnecessary; lowering happens during code generation.
-@End Reasoning
-Process called "translate_julia_type_assertion" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia type assertion (::Type)
-
-    Let expression be node.expression
-    Let asserted_type be node.asserted_type
-
-    Note: Create HIR type assertion
-    Let hir_assertion be create_hir_type_assertion with ctx.hir_builder
-
-    Note: Translate expression
-    Let hir_expr be translate_julia_node with expression and ctx
-    Call set_hir_assertion_expression with hir_assertion and hir_expr
-
-    Note: Translate asserted type
-    Let hir_type be translate_julia_type_expression with asserted_type and ctx
-    Call set_hir_assertion_type with hir_assertion and hir_type
-
-    Note: Add type assertion optimization hints
-    Call add_type_assertion_hints with hir_assertion and hir_type and ctx
-
-    Return hir_assertion
-End Process
-
-@Reasoning:
-For-loops in Julia bind a single variable to successive elements of any
-iterable; this translator captures the iteration variable, the iterable
-expression, and the loop body without rewriting them into a while-with-index
-form because the HIR keeps the for-loop shape so analyze_simd_opportunities
-can pattern-match against canonical ranges (1:N, eachindex(...)) for
-vectorisation. add_loop_optimization_hints inspects the iterable to attach
-loop-bound information when statically determinable, which feeds bound-check
-elimination later in the pipeline.
-@End Reasoning
-Process called "translate_julia_for_loop" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia for loop
-
-    Let variable be node.variable
-    Let iterable be node.iterable
-    Let body be node.body
-
-    Note: Create HIR for loop
-    Let hir_for be create_hir_for_loop with ctx.hir_builder
-
-    Note: Translate loop variable
-    Let hir_var be translate_julia_identifier with variable and ctx
-    Call set_hir_for_variable with hir_for and hir_var
-
-    Note: Translate iterable
-    Let hir_iterable be translate_julia_node with iterable and ctx
-    Call set_hir_for_iterable with hir_for and hir_iterable
-
-    Note: Translate body
-    Let hir_body be translate_julia_node with body and ctx
-    Call set_hir_for_body with hir_for and hir_body
-
-    Note: Add loop optimization hints
-    Call add_loop_optimization_hints with hir_for and iterable and ctx
-
-    Note: Check for SIMD opportunities
-    Call analyze_simd_opportunities with hir_for and body and ctx
-
-    Return hir_for
-End Process
-
-@Reasoning:
-Julia literals carry semantic type information that matters for downstream
-optimization (e.g. Int64 vs Float64 selects different arithmetic
-instructions). The translator must preserve the literal_type tag rather
-than letting it be inferred, because integer overflow / float precision
-behaviour differ.
-@End Reasoning
-
-@Implementation:
-Creates a HIR literal with the raw value, then matches literal_type and
-sets a concrete HIR type name: Integer -> Int64, Float -> Float64, Char ->
-Char, Boolean -> Bool, Symbol -> Symbol, String -> String. Unrecognised
-literal kinds fall through to "Any" so the translator stays total.
-@End Implementation
-
-Process called "translate_julia_literal" that takes node as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia literal values
-
-    Let value be node.value
-    Let literal_type be node.literal_type
-
-    Note: Create HIR literal
-    Let hir_literal be create_hir_literal with ctx.hir_builder and value
-
-    Note: Set literal type
-    Match literal_type:
-        When "Integer":
-            Call set_hir_literal_type with hir_literal and "Int64"
-        When "Float":
-            Call set_hir_literal_type with hir_literal and "Float64"
-        When "String":
-            Call set_hir_literal_type with hir_literal and "String"
-        When "Character":
-            Call set_hir_literal_type with hir_literal and "Char"
-        When "Boolean":
-            Call set_hir_literal_type with hir_literal and "Bool"
-        When "Symbol":
-            Call set_hir_literal_type with hir_literal and "Symbol"
-        Otherwise:
-            Call set_hir_literal_type with hir_literal and "Any"
-    End Match
-
-    Return hir_literal
+Process called "create_julia_to_hir_translator" returns Integer:
+    Let translator be a value of type JuliaToHIRTranslator
+    Set translator.dispatch_hints to proc hashtable_create from Dict
+    Set translator.type_parameters to proc hashtable_create from Dict
+    Set translator.macro_cache to proc hashtable_create from Dict
+    Set translator.current_module to 0
+    Set translator.current_function to 0
+    Return translator
 End Process
 
 Note: ============================================================================
-Note: PERFORMANCE MACRO TRANSLATIONS
+Note: MAIN DISPATCHER
 Note: ============================================================================
 
 @Reasoning:
-@inbounds wraps an expression in an HIR block that promises every array
-indexing inside the expression is in-bounds, allowing the backend to remove
-bounds checks. We translate the inner expression first (so any nested macros
-or method calls translate normally), then attach the "no_bounds_check" hint
-on the wrapper block; backend passes consult the hint when emitting array
-access code. This contract is unsafe: violating it is undefined behaviour,
-matching Julia's @inbounds semantics exactly.
+The Julia parser emits ASTNodes tagged with integer NODE_* constants
+(see julia_parser.runa lines 53-102). This central dispatcher routes
+each tag to its specialised translator. Unknown tags fall back to a
+sentinel HIR "unknown_node" dict carrying the source tag so downstream
+tooling can report which kind was unrecognised rather than silently
+dropping a subtree.
 @End Reasoning
-@Security_Scope:
-@inbounds disables safety checks; the trustworthiness of the wrapped code is
-the user's responsibility. Translator does not add any extra validation.
-@End Security_Scope
-Process called "translate_inbounds_macro" that takes arguments as List[JuliaIRNode], ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate @inbounds macro for bounds check elimination
-
-    Note: Get the expression to execute without bounds checking
-    Let expression be arguments at index 0
-
-    Note: Create HIR inbounds block
-    Let hir_inbounds be create_hir_inbounds_block with ctx.hir_builder
-
-    Note: Translate expression with bounds checking disabled
-    Let hir_expr be translate_julia_node with expression and ctx
-    Call set_hir_inbounds_expression with hir_inbounds and hir_expr
-
-    Note: Add optimization hint
-    Call add_hir_optimization_hint with hir_inbounds and "no_bounds_check"
-
-    Return hir_inbounds
-End Process
-
-@Reasoning:
-@simd marks a loop as a candidate for SIMD vectorisation. The translator
-wraps the loop in an HIR SIMD block and attaches both "vectorize" and "simd"
-hints; the dual hinting is intentional - "vectorize" is the backend-agnostic
-request and "simd" is the architecture-specific permission to emit SIMD
-instructions specifically. The macro contract permits the compiler to assume
-loop iterations are independent enough to reorder, which the user has
-asserted by writing @simd.
-@End Reasoning
-Process called "translate_simd_macro" that takes arguments as List[JuliaIRNode], ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate @simd macro for vectorization
-
-    Note: Get the loop to vectorize
-    Let loop_expr be arguments at index 0
-
-    Note: Create HIR SIMD block
-    Let hir_simd be create_hir_simd_block with ctx.hir_builder
-
-    Note: Translate loop with SIMD hints
-    Let hir_loop be translate_julia_node with loop_expr and ctx
-    Call set_hir_simd_loop with hir_simd and hir_loop
-
-    Note: Add vectorization hints
-    Call add_hir_optimization_hint with hir_simd and "vectorize"
-    Call add_hir_optimization_hint with hir_simd and "simd"
-
-    Return hir_simd
-End Process
-
-@Reasoning:
-@fastmath enables IEEE-relaxed floating-point transformations: reassociation,
-no-NaN, no-Inf, no-signed-zero, contraction. The translator attaches four
-separate hints rather than a single "fastmath" hint so backend passes can
-opt into individual relaxations selectively - some targets support reassoc
-but not no_nans, for example. The user has accepted that exact IEEE semantics
-no longer hold inside the block; we do NOT silently propagate the hints into
-nested macros, only into the immediate expression.
-@End Reasoning
-Process called "translate_fastmath_macro" that takes arguments as List[JuliaIRNode], ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate @fastmath macro for aggressive math optimizations
-
-    Note: Get the expression for fast math
-    Let expression be arguments at index 0
-
-    Note: Create HIR fastmath block
-    Let hir_fastmath be create_hir_fastmath_block with ctx.hir_builder
-
-    Note: Translate expression with fast math enabled
-    Let hir_expr be translate_julia_node with expression and ctx
-    Call set_hir_fastmath_expression with hir_fastmath and hir_expr
-
-    Note: Add fast math optimization hints
-    Call add_hir_optimization_hint with hir_fastmath and "fast_math"
-    Call add_hir_optimization_hint with hir_fastmath and "reassoc"
-    Call add_hir_optimization_hint with hir_fastmath and "no_nans"
-    Call add_hir_optimization_hint with hir_fastmath and "no_infs"
-
-    Return hir_fastmath
-End Process
-
-Note: ============================================================================
-Note: HELPER FUNCTIONS
-Note: ============================================================================
-
-@Reasoning:
-For each function parameter whose declaration carries an explicit type
-annotation, we emit a "specialized_for_<TypeName>" hint on the HIR function.
-These hints let downstream monomorphisation choose a single concrete method
-instance over the generic one when call-site type analysis matches the
-annotation. A final "multiple_dispatch" hint is added unconditionally so even
-fully-untyped functions are tagged for the dispatch optimiser to consider.
-The hint vocabulary is open-ended; backends ignore hints they do not
-recognise.
-@End Reasoning
-Process called "add_julia_dispatch_hints" that takes hir_function as HIRNode, params as List[JuliaIRNode], ctx as JuliaToHIRContext returns Nothing:
-    Note: Add method dispatch hints for optimization
-
-    Note: Analyze parameter types for dispatch hints
-    For Each param as JuliaFuncParam in params:
-        If param.type_annotation is not equal to 0:
-            Let type_hint be "specialized_for_" joined with param.type_annotation.name
-            Call add_hir_optimization_hint with hir_function and type_hint
-        End If
-    End For
-
-    Note: Add general dispatch hint
-    Call add_hir_optimization_hint with hir_function and "multiple_dispatch"
-End Process
-
-@Reasoning:
-A small fixed set of Julia function names map to well-known semantic
-categories that backend passes optimise specifically: the four arithmetic
-operators get an "arithmetic_op" tag (enabling fold-on-constant and target
-ISA selection), getindex/setindex! get array access tags (enabling bounds
-elision when paired with @inbounds), and length/size get an "array_property"
-tag (enabling load hoisting in loops). Any name not in this list passes
-through untagged because adding noise hints would just dilute the signal.
-@End Reasoning
-Process called "optimize_special_function_calls" that takes hir_call as HIRNode, function_name as String, ctx as JuliaToHIRContext returns Nothing:
-    Note: Add optimization hints for special Julia functions
-
-    Match function_name:
-        When "+":
-            Call add_hir_optimization_hint with hir_call and "arithmetic_op"
-        When "-":
-            Call add_hir_optimization_hint with hir_call and "arithmetic_op"
-        When "*":
-            Call add_hir_optimization_hint with hir_call and "arithmetic_op"
-        When "/":
-            Call add_hir_optimization_hint with hir_call and "arithmetic_op"
-        When "getindex":
-            Call add_hir_optimization_hint with hir_call and "array_access"
-        When "setindex!":
-            Call add_hir_optimization_hint with hir_call and "array_assignment"
-        When "length":
-            Call add_hir_optimization_hint with hir_call and "array_property"
-        When "size":
-            Call add_hir_optimization_hint with hir_call and "array_property"
-        Otherwise:
-            Note: No special optimization hints
-    End Match
-End Process
-
-@Reasoning:
-We attach three hint kinds: "literal_array" + "const_fold" when every element
-is a literal (the entire construction can be folded to a static constant at
-compile time), "small_array" when the literal length is at most 32 (the
-threshold below which stack allocation is generally a win), and
-"array_construction" unconditionally so backend passes can locate every
-construction site uniformly. The threshold of 32 is chosen to match typical
-cache-line/spill thresholds; revisiting it requires profiling, not
-guesswork.
-@End Reasoning
-Process called "add_array_optimization_hints" that takes hir_array as HIRNode, elements as List[JuliaIRNode], ctx as JuliaToHIRContext returns Nothing:
-    Note: Add optimization hints for array construction
-
-    Note: Check if all elements are literals
-    Let all_literals be true
-    For Each element as JuliaIRNode in elements:
-        If element.type is not equal to "Literal":
-            Set all_literals to false
-            Break
-        End If
-    End For
-
-    If all_literals:
-        Call add_hir_optimization_hint with hir_array and "literal_array"
-        Call add_hir_optimization_hint with hir_array and "const_fold"
+Process called "translate_julia_to_hir" takes translator as Integer, node as Integer returns Integer:
+    If node is equal to 0:
+        Return 0
     End If
 
-    Note: Check array size for small array optimization
-    If length of elements is less than or equal to 32:
-        Call add_hir_optimization_hint with hir_array and "small_array"
+    Let kind be proc ast_node_type with node
+
+    If kind is equal to JParser.NODE_PROGRAM:
+        Return proc translate_program with translator, node
+    End If
+    If kind is equal to JParser.NODE_FUNCTION_DEF:
+        Return proc translate_function_def with translator, node
+    End If
+    If kind is equal to JParser.NODE_MACRO_DEF:
+        Return proc translate_macro_def with translator, node
+    End If
+    If kind is equal to JParser.NODE_STRUCT_DEF:
+        Return proc translate_struct_def with translator, node
+    End If
+    If kind is equal to JParser.NODE_ABSTRACT_TYPE:
+        Return proc translate_abstract_type with translator, node
+    End If
+    If kind is equal to JParser.NODE_MODULE_DEF:
+        Return proc translate_module_def with translator, node
+    End If
+    If kind is equal to JParser.NODE_ASSIGNMENT:
+        Return proc translate_assignment with translator, node
+    End If
+    If kind is equal to JParser.NODE_IF_STMT:
+        Return proc translate_if_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_FOR_STMT:
+        Return proc translate_for_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_WHILE_STMT:
+        Return proc translate_while_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_TRY_STMT:
+        Return proc translate_try_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_RETURN_STMT:
+        Return proc translate_return_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_BREAK_STMT:
+        Return proc translate_break_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_CONTINUE_STMT:
+        Return proc translate_continue_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_USING_STMT:
+        Return proc translate_using_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_IMPORT_STMT:
+        Return proc translate_import_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_EXPORT_STMT:
+        Return proc translate_export_stmt with translator, node
+    End If
+    If kind is equal to JParser.NODE_BINARY_OP:
+        Return proc translate_binary_op with translator, node
+    End If
+    If kind is equal to JParser.NODE_UNARY_OP:
+        Return proc translate_unary_op with translator, node
+    End If
+    If kind is equal to JParser.NODE_CALL:
+        Return proc translate_call with translator, node
+    End If
+    If kind is equal to JParser.NODE_INDEX:
+        Return proc translate_index with translator, node
+    End If
+    If kind is equal to JParser.NODE_DOT_ACCESS:
+        Return proc translate_dot_access with translator, node
+    End If
+    If kind is equal to JParser.NODE_TYPE_ANNOTATION:
+        Return proc translate_type_annotation with translator, node
+    End If
+    If kind is equal to JParser.NODE_PARAMETRIC_TYPE:
+        Return proc translate_parametric_type with translator, node
+    End If
+    If kind is equal to JParser.NODE_WHERE_CLAUSE:
+        Return proc translate_where_clause with translator, node
+    End If
+    If kind is equal to JParser.NODE_TERNARY:
+        Return proc translate_ternary with translator, node
+    End If
+    If kind is equal to JParser.NODE_BROADCAST:
+        Return proc translate_broadcast with translator, node
+    End If
+    If kind is equal to JParser.NODE_COMPREHENSION:
+        Return proc translate_comprehension with translator, node
+    End If
+    If kind is equal to JParser.NODE_GENERATOR:
+        Return proc translate_generator with translator, node
+    End If
+    If kind is equal to JParser.NODE_LAMBDA:
+        Return proc translate_lambda with translator, node
+    End If
+    If kind is equal to JParser.NODE_DO_BLOCK:
+        Return proc translate_do_block with translator, node
+    End If
+    If kind is equal to JParser.NODE_MACRO_CALL:
+        Return proc translate_macro_call with translator, node
+    End If
+    If kind is equal to JParser.NODE_QUOTE_EXPR:
+        Return proc translate_quote_expr with translator, node
+    End If
+    If kind is equal to JParser.NODE_NUMBER:
+        Return proc translate_number with translator, node
+    End If
+    If kind is equal to JParser.NODE_STRING:
+        Return proc translate_string with translator, node
+    End If
+    If kind is equal to JParser.NODE_CHAR:
+        Return proc translate_char with translator, node
+    End If
+    If kind is equal to JParser.NODE_SYMBOL:
+        Return proc translate_symbol with translator, node
+    End If
+    If kind is equal to JParser.NODE_TRUE:
+        Return proc translate_true with translator, node
+    End If
+    If kind is equal to JParser.NODE_FALSE:
+        Return proc translate_false with translator, node
+    End If
+    If kind is equal to JParser.NODE_NOTHING:
+        Return proc translate_nothing with translator, node
+    End If
+    If kind is equal to JParser.NODE_IDENTIFIER:
+        Return proc translate_identifier with translator, node
+    End If
+    If kind is equal to JParser.NODE_ARRAY:
+        Return proc translate_array with translator, node
+    End If
+    If kind is equal to JParser.NODE_TUPLE:
+        Return proc translate_tuple with translator, node
+    End If
+    If kind is equal to JParser.NODE_DICT:
+        Return proc translate_dict with translator, node
     End If
 
-    Note: Add general array construction hint
-    Call add_hir_optimization_hint with hir_array and "array_construction"
-End Process
-
-@Reasoning:
-After the full HIR module has been built, this pass runs Julia-specific
-analyses that need the complete module in hand: method specialisation
-opportunity analysis (cross-method call patterns), type stability analysis
-(which fields/locals have type-invariant assignments), and inlining
-candidate identification (small/leaf methods). Each sub-analysis attaches
-hints to existing nodes rather than mutating structure, so the optimiser can
-be re-run incrementally as more HIR is added (e.g. by additional source
-files in the same module).
-@End Reasoning
-Process called "optimize_julia_hir" that takes hir_module as HIRNode, ctx as JuliaToHIRContext returns Nothing:
-    Note: Perform post-translation HIR optimizations
-
-    Note: Add method specialization hints
-    Call analyze_method_specialization_opportunities with hir_module and ctx
-
-    Note: Add type stability information
-    Call analyze_type_stability with hir_module and ctx
-
-    Note: Mark functions for inlining
-    Call analyze_inlining_opportunities with hir_module and ctx
-
-    Note: Add memory layout hints
-    Call analyze_memory_layout_opportunities with hir_module and ctx
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "unknown_node"
+    proc set_dict_value with hir, "kind", kind
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
 End Process
 
 Note: ============================================================================
-Note: TYPE EXPRESSION TRANSLATION
+Note: TOP-LEVEL CONSTRUCTS
 Note: ============================================================================
 
 @Reasoning:
-Julia type expressions are themselves an AST sublanguage with bare names,
-parametric instantiations (Array{T,N}), unions (Union{T1,T2}), where-clause
-quantifiers (T where T<:Number), variadic types (Vararg{T,N}), and type
-parameter references. Each variety routes to a dedicated translator because
-the HIR representation diverges substantially: a bare name becomes a type
-reference, a union becomes a sum type, a where-clause becomes a constrained
-type expression. The Otherwise fallback returns the HIR Any type rather than
-nil so that downstream type-checking always has SOMETHING to compare against.
+NODE_PROGRAM is the parse_program / parse_block result: an ordered list
+of top-level statements stored as children. We lower to HIR "module"
+(or "block" for nested program nodes) with a "body" list containing
+translated children in declaration order. The top-level program is tagged
+"module" to match the universal-translation convention.
 @End Reasoning
-Process called "translate_julia_type_expression" that takes type_expr as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate Julia type expressions
+Process called "translate_program" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    If translator.current_module is equal to 0:
+        proc set_dict_value with hir, "node_type", "module"
+        proc set_dict_value with hir, "name", "julia_module"
+    Otherwise:
+        proc set_dict_value with hir, "node_type", "block"
+    End If
+    proc set_dict_value with hir, "line", proc ast_line with node
 
-    Match type_expr.type:
-        When "TypeName":
-            Return translate_julia_type_name with type_expr and ctx
-        When "ParametricType":
-            Return translate_julia_parametric_type with type_expr and ctx
-        When "UnionType":
-            Return translate_julia_union_type with type_expr and ctx
-        When "WhereType":
-            Return translate_julia_where_type with type_expr and ctx
-        When "VarargType":
-            Return translate_julia_vararg_type with type_expr and ctx
-        When "TypeParameter":
-            Return translate_julia_type_parameter_ref with type_expr and ctx
-        Otherwise:
-            Return create_hir_any_type with ctx.hir_builder
-    End Match
+    Let previous_module be translator.current_module
+    If translator.current_module is equal to 0:
+        Set translator.current_module to hir
+    End If
+
+    Let body be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_child_at with node, i
+        Let hir_child be proc translate_julia_to_hir with translator, child
+        proc list_append with body, hir_child
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "body", body
+
+    Set translator.current_module to previous_module
+    Return hir
 End Process
 
 @Reasoning:
-Simplest case of type-expression translation: a bare name like `Int64` or
-`String`. Wrapped in a dedicated helper so the type-expression dispatcher
-can call it uniformly alongside parametric/where/vararg cases.
+NODE_FUNCTION_DEF stores: function name in the value slot (offset 8),
+return-type-annotation in the left slot (offset 16), function body in
+the right slot (offset 24), and parameters as children. We lower to
+HIR "function" with name, parameters list, return_type, and body.
 @End Reasoning
+Process called "translate_function_def" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "function"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
 
-@Implementation:
-Pulls the name field and builds a single HIR type-reference node via
-create_hir_type_reference. No further resolution happens here — the HIR
-builder owns name->declaration binding.
-@End Implementation
+    Let previous_function be translator.current_function
+    Set translator.current_function to hir
 
-Process called "translate_julia_type_name" that takes type_expr as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate simple type name
+    Let params be proc create_hir_list
+    Let pcount be proc ast_child_count with node
+    Let i be 0
+    While i is less than pcount:
+        Let param be proc ast_child_at with node, i
+        Let hir_param be proc translate_julia_to_hir with translator, param
+        proc list_append with params, hir_param
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "parameters", params
 
-    Let type_name be type_expr.name
-    Return create_hir_type_reference with ctx.hir_builder and type_name
+    Let return_type_node be proc ast_left with node
+    If return_type_node is not equal to 0:
+        Let hir_rt be proc translate_julia_to_hir with translator, return_type_node
+        proc set_dict_value with hir, "return_type", hir_rt
+    End If
+
+    Let body_node be proc ast_right with node
+    If body_node is not equal to 0:
+        Let hir_body be proc translate_julia_to_hir with translator, body_node
+        proc set_dict_value with hir, "body", hir_body
+    End If
+
+    Set translator.current_function to previous_function
+    Return hir
 End Process
 
 @Reasoning:
-Parametric type translation must preserve both the base type name and the
-ordered list of type arguments because Julia's monomorphization and
-multiple dispatch both key on the full applied form. Array{Int64,2} and
-Array{Float64,2} produce distinct specialisations.
+NODE_MACRO_DEF mirrors NODE_FUNCTION_DEF (name in value slot, body in
+right slot, parameters as children) but is tagged is_macro=true so the
+destination emitter can route it to its macro/template expander where
+one exists.
 @End Reasoning
+Process called "translate_macro_def" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "macro"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "is_macro", "true"
+    proc set_dict_value with hir, "line", proc ast_line with node
 
-@Implementation:
-Reads .base_type (itself a JuliaIRNode with .name) and .type_parameters
-(list of type expressions). Builds a HIR parametric type with the base
-name and appends each translated parameter via add_hir_type_parameter,
-recursively translating parameters through translate_julia_type_expression
-so nested parametrics work correctly.
-@End Implementation
+    Let params be proc create_hir_list
+    Let pcount be proc ast_child_count with node
+    Let i be 0
+    While i is less than pcount:
+        Let param be proc ast_child_at with node, i
+        Let hir_param be proc translate_julia_to_hir with translator, param
+        proc list_append with params, hir_param
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "parameters", params
 
-Process called "translate_julia_parametric_type" that takes type_expr as JuliaIRNode, ctx as JuliaToHIRContext returns HIRNode:
-    Note: Translate parametric type like Array{Int64, 2}
-
-    Let base_type be type_expr.base_type
-    Let type_params be type_expr.type_parameters
-
-    Let hir_parametric_type be create_hir_parametric_type with ctx.hir_builder and base_type.name
-
-    For Each param in type_params:
-        Let hir_param be translate_julia_type_expression with param and ctx
-        Call add_hir_type_parameter with hir_parametric_type and hir_param
-    End For
-
-    Return hir_parametric_type
+    Let body_node be proc ast_right with node
+    If body_node is not equal to 0:
+        Let hir_body be proc translate_julia_to_hir with translator, body_node
+        proc set_dict_value with hir, "body", hir_body
+    End If
+    Return hir
 End Process
 
-Note: Entry point for Julia to HIR translation
 @Reasoning:
-Public, stable name for use by the translation driver. Hides the internal
-context-creating translate_julia_to_hir so callers do not need to know
-about JuliaToHIRContext.
+NODE_STRUCT_DEF stores the struct name in the value slot and fields as
+children. Each field is itself an ASTNode (typically an identifier or
+type-annotated identifier).
 @End Reasoning
+Process called "translate_struct_def" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "struct_definition"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
 
+    Let fields be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_child_at with node, i
+        Let hir_field be proc translate_julia_to_hir with translator, child
+        proc list_append with fields, hir_field
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "fields", fields
+    Return hir
+End Process
+
+@Reasoning:
+NODE_ABSTRACT_TYPE stores the abstract type name in the value slot and
+the optional supertype in the left slot. Julia's abstract types form a
+single-inheritance hierarchy.
+@End Reasoning
+Process called "translate_abstract_type" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "abstract_type"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let supertype_node be proc ast_left with node
+    If supertype_node is not equal to 0:
+        Let hir_super be proc translate_julia_to_hir with translator, supertype_node
+        proc set_dict_value with hir, "supertype", hir_super
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_MODULE_DEF stores the module name in the value slot and the module
+body as children (a sequence of definitions and statements).
+@End Reasoning
+Process called "translate_module_def" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "module"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let previous_module be translator.current_module
+    Set translator.current_module to hir
+
+    Let body be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let child be proc ast_child_at with node, i
+        Let hir_child be proc translate_julia_to_hir with translator, child
+        proc list_append with body, hir_child
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "body", body
+
+    Set translator.current_module to previous_module
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: STATEMENTS
+Note: ============================================================================
+
+@Reasoning:
+Assignment statements lower to HIR "assignment". Assignment in Julia is
+parsed as a low-precedence binary op (NODE_BINARY_OP with TOKEN_ASSIGN
+operator) but a few statement-position assignments are emitted as
+NODE_ASSIGNMENT directly. The HIR shape mirrors binary_op with target
+and value sub-nodes.
+@End Reasoning
+Process called "translate_assignment" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "assignment"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let left_node be proc ast_left with node
+    Let right_node be proc ast_right with node
+    Let hir_target be proc translate_julia_to_hir with translator, left_node
+    Let hir_value be proc translate_julia_to_hir with translator, right_node
+    proc set_dict_value with hir, "target", hir_target
+    proc set_dict_value with hir, "value", hir_value
+    Return hir
+End Process
+
+@Reasoning:
+NODE_IF_STMT stores condition/block pairs as alternating children. The
+first child is the if-condition; the second is the then-block. Optional
+elseif branches add condition/block pairs. An optional else block appears
+as a final child with no preceding condition (detected by checking child
+count parity: an even count means no bare else; an odd count means the
+last child is the else block).
+@End Reasoning
+Process called "translate_if_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "if_statement"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let count be proc ast_child_count with node
+    Let branches be proc create_hir_list
+
+    Note: Build a list of {condition, body} branch dicts then optionally
+    Note: an "else" body. Children alternate cond/body; if count is odd the
+    Note: trailing child is the bare else block.
+    Let pair_count be count divided by 2
+    Let i be 0
+    While i is less than pair_count:
+        Let cond_idx be i multiplied by 2
+        Let body_idx be cond_idx plus 1
+        Let cond_node be proc ast_child_at with node, cond_idx
+        Let body_node be proc ast_child_at with node, body_idx
+        Let branch be proc create_hir_dict
+        proc set_dict_value with branch, "node_type", "if_branch"
+        Let hir_cond be proc translate_julia_to_hir with translator, cond_node
+        Let hir_body be proc translate_julia_to_hir with translator, body_node
+        proc set_dict_value with branch, "condition", hir_cond
+        proc set_dict_value with branch, "body", hir_body
+        proc list_append with branches, branch
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "branches", branches
+
+    Note: Bare-else block if odd child count.
+    If pair_count multiplied by 2 is less than count:
+        Let else_node be proc ast_child_at with node, count minus 1
+        Let hir_else be proc translate_julia_to_hir with translator, else_node
+        proc set_dict_value with hir, "else_block", hir_else
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_FOR_STMT stores: loop variable as child 0, iterator expression as
+child 1, body block as child 2. We lower to HIR "for_loop" with
+iterator_variable, iterable, and body.
+@End Reasoning
+Process called "translate_for_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "for_loop"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let var_node be proc ast_child_at with node, 0
+    Let iter_node be proc ast_child_at with node, 1
+    Let body_node be proc ast_child_at with node, 2
+
+    Let hir_var be proc translate_julia_to_hir with translator, var_node
+    Let hir_iter be proc translate_julia_to_hir with translator, iter_node
+    Let hir_body be proc translate_julia_to_hir with translator, body_node
+    proc set_dict_value with hir, "iterator_variable", hir_var
+    proc set_dict_value with hir, "iterable", hir_iter
+    proc set_dict_value with hir, "body", hir_body
+    Return hir
+End Process
+
+@Reasoning:
+NODE_WHILE_STMT stores condition as child 0 and body as child 1. We
+lower to HIR "while_loop".
+@End Reasoning
+Process called "translate_while_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "while_loop"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let cond_node be proc ast_child_at with node, 0
+    Let body_node be proc ast_child_at with node, 1
+    Let hir_cond be proc translate_julia_to_hir with translator, cond_node
+    Let hir_body be proc translate_julia_to_hir with translator, body_node
+    proc set_dict_value with hir, "condition", hir_cond
+    proc set_dict_value with hir, "body", hir_body
+    Return hir
+End Process
+
+@Reasoning:
+NODE_TRY_STMT stores: try-body as child 0, optional catch-body as
+child 1, optional finally-body as child 2. The error binding (the
+exception variable in catch) is currently not separated from the
+catch body by the parser.
+@End Reasoning
+Process called "translate_try_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "try_statement"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let count be proc ast_child_count with node
+    If count is greater than 0:
+        Let try_body_node be proc ast_child_at with node, 0
+        Let hir_try be proc translate_julia_to_hir with translator, try_body_node
+        proc set_dict_value with hir, "body", hir_try
+    End If
+    If count is greater than 1:
+        Let catch_body_node be proc ast_child_at with node, 1
+        Let hir_catch be proc translate_julia_to_hir with translator, catch_body_node
+        proc set_dict_value with hir, "catch", hir_catch
+    End If
+    If count is greater than 2:
+        Let finally_body_node be proc ast_child_at with node, 2
+        Let hir_finally be proc translate_julia_to_hir with translator, finally_body_node
+        proc set_dict_value with hir, "finally", hir_finally
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_RETURN_STMT stores the optional return value in the right slot
+(offset 24). A null right slot means a bare `return` (returns nothing).
+@End Reasoning
+Process called "translate_return_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "return_statement"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let value_node be proc ast_right with node
+    If value_node is not equal to 0:
+        Let hir_value be proc translate_julia_to_hir with translator, value_node
+        proc set_dict_value with hir, "value", hir_value
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+break and continue are bare statements with no payload. We tag them
+distinctly so destination emitters can render the loop-control keyword
+in the target language's syntax.
+@End Reasoning
+Process called "translate_break_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "break_statement"
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_continue_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "continue_statement"
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+@Reasoning:
+using / import / export pull module symbols into scope. The parser
+stores the imported module name in the value slot for using/import, and
+exported symbol name in value slot for export. Children, when present,
+carry per-symbol detail (selective imports like `import Foo: bar, baz`).
+@End Reasoning
+Process called "translate_using_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "using_statement"
+    proc set_dict_value with hir, "module", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return proc append_children_as_symbols with translator, hir, node
+End Process
+
+Process called "translate_import_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "import_statement"
+    proc set_dict_value with hir, "module", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return proc append_children_as_symbols with translator, hir, node
+End Process
+
+Process called "translate_export_stmt" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "export_statement"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return proc append_children_as_symbols with translator, hir, node
+End Process
+
+@Reasoning:
+Helper that walks an import/using/export's children list, translates each
+as a HIR sub-node, and attaches the resulting list under the "symbols"
+key. Centralised so any future schema change to selective-import shape
+only edits one place.
+@End Reasoning
+Process called "append_children_as_symbols" takes translator as Integer, hir as Integer, node as Integer returns Integer:
+    Let count be proc ast_child_count with node
+    If count is greater than 0:
+        Let symbols be proc create_hir_list
+        Let i be 0
+        While i is less than count:
+            Let child be proc ast_child_at with node, i
+            Let hir_sym be proc translate_julia_to_hir with translator, child
+            proc list_append with symbols, hir_sym
+            Set i to i plus 1
+        End While
+        proc set_dict_value with hir, "symbols", symbols
+    End If
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: EXPRESSIONS
+Note: ============================================================================
+
+@Reasoning:
+NODE_BINARY_OP stores: operator token type in the value slot (offset 8),
+left operand in the left slot (offset 16), right operand in the right
+slot (offset 24). We translate to HIR "binary_op" preserving the token
+operator integer; the destination emitter resolves the integer back to
+the operator's source representation via its own token-type table.
+@End Reasoning
+Process called "translate_binary_op" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "binary_op"
+    proc set_dict_value with hir, "operator", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let left_node be proc ast_left with node
+    Let right_node be proc ast_right with node
+    Let hir_left be proc translate_julia_to_hir with translator, left_node
+    Let hir_right be proc translate_julia_to_hir with translator, right_node
+    proc set_dict_value with hir, "left", hir_left
+    proc set_dict_value with hir, "right", hir_right
+    Return hir
+End Process
+
+@Reasoning:
+NODE_UNARY_OP stores the operator token type at the value slot and the
+operand at the right slot (the parse_postfix path for ' and .' wraps
+the operand in the right slot specifically).
+@End Reasoning
+Process called "translate_unary_op" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "unary_op"
+    proc set_dict_value with hir, "operator", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let operand_node be proc ast_right with node
+    Let hir_operand be proc translate_julia_to_hir with translator, operand_node
+    proc set_dict_value with hir, "operand", hir_operand
+    Return hir
+End Process
+
+@Reasoning:
+NODE_CALL stores the callee expression at the left slot and arguments
+as children. We lower to HIR "call" with callee and arguments list.
+@End Reasoning
+Process called "translate_call" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "call"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let callee_node be proc ast_left with node
+    Let hir_callee be proc translate_julia_to_hir with translator, callee_node
+    proc set_dict_value with hir, "callee", hir_callee
+
+    Let args be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let arg_node be proc ast_child_at with node, i
+        Let hir_arg be proc translate_julia_to_hir with translator, arg_node
+        proc list_append with args, hir_arg
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "arguments", args
+    Return hir
+End Process
+
+@Reasoning:
+NODE_INDEX stores the indexed array at the left slot and indices as
+children. We lower to HIR "index_access" with array and indices list.
+@End Reasoning
+Process called "translate_index" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "index_access"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let array_node be proc ast_left with node
+    Let hir_array be proc translate_julia_to_hir with translator, array_node
+    proc set_dict_value with hir, "array", hir_array
+
+    Let indices be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let idx_node be proc ast_child_at with node, i
+        Let hir_idx be proc translate_julia_to_hir with translator, idx_node
+        proc list_append with indices, hir_idx
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "indices", indices
+    Return hir
+End Process
+
+@Reasoning:
+NODE_DOT_ACCESS stores the object in the left slot and the field
+identifier node in the right slot. We lower to HIR "field_access" with
+object and field name.
+@End Reasoning
+Process called "translate_dot_access" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "field_access"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let obj_node be proc ast_left with node
+    Let hir_obj be proc translate_julia_to_hir with translator, obj_node
+    proc set_dict_value with hir, "object", hir_obj
+
+    Let field_node be proc ast_right with node
+    If field_node is not equal to 0:
+        Let field_name be proc ast_value with field_node
+        proc set_dict_value with hir, "field", field_name
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_TYPE_ANNOTATION wraps an expression with its declared type. The
+parameter or expression is stored in the left slot; the type expression
+is stored in the right slot. We lower to HIR "type_annotation" with
+expression and type sub-nodes.
+@End Reasoning
+Process called "translate_type_annotation" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "type_annotation"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let expr_node be proc ast_left with node
+    Let type_node be proc ast_right with node
+    Let hir_expr be proc translate_julia_to_hir with translator, expr_node
+    Let hir_type be proc translate_julia_to_hir with translator, type_node
+    proc set_dict_value with hir, "expression", hir_expr
+    proc set_dict_value with hir, "type", hir_type
+    Return hir
+End Process
+
+@Reasoning:
+NODE_PARAMETRIC_TYPE stores the base type expression in the left slot
+and parameter type expressions as children. Lowered to HIR
+"parametric_type" with base and parameters list.
+@End Reasoning
+Process called "translate_parametric_type" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "parametric_type"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let base_node be proc ast_left with node
+    Let hir_base be proc translate_julia_to_hir with translator, base_node
+    proc set_dict_value with hir, "base", hir_base
+
+    Let params be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let p_node be proc ast_child_at with node, i
+        Let hir_p be proc translate_julia_to_hir with translator, p_node
+        proc list_append with params, hir_p
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "parameters", params
+    Return hir
+End Process
+
+@Reasoning:
+NODE_WHERE_CLAUSE constrains type parameters with bounds (where T <: Number).
+Stored shape: base expression in left slot, constraints as children.
+@End Reasoning
+Process called "translate_where_clause" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "where_clause"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let base_node be proc ast_left with node
+    Let hir_base be proc translate_julia_to_hir with translator, base_node
+    proc set_dict_value with hir, "expression", hir_base
+
+    Let constraints be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let c_node be proc ast_child_at with node, i
+        Let hir_c be proc translate_julia_to_hir with translator, c_node
+        proc list_append with constraints, hir_c
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "constraints", constraints
+    Return hir
+End Process
+
+@Reasoning:
+NODE_TERNARY stores condition / true-branch / false-branch as three
+children in declaration order. Lowered to HIR "ternary".
+@End Reasoning
+Process called "translate_ternary" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "ternary"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let cond_node be proc ast_child_at with node, 0
+    Let true_node be proc ast_child_at with node, 1
+    Let false_node be proc ast_child_at with node, 2
+    Let hir_cond be proc translate_julia_to_hir with translator, cond_node
+    Let hir_true be proc translate_julia_to_hir with translator, true_node
+    Let hir_false be proc translate_julia_to_hir with translator, false_node
+    proc set_dict_value with hir, "condition", hir_cond
+    proc set_dict_value with hir, "then_value", hir_true
+    proc set_dict_value with hir, "else_value", hir_false
+    Return hir
+End Process
+
+@Reasoning:
+NODE_BROADCAST stores the broadcast operation (e.g., .+, .*) as a unary
+wrapper around an expression. The operand is in the right slot.
+@End Reasoning
+Process called "translate_broadcast" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "broadcast"
+    proc set_dict_value with hir, "operator", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let operand_node be proc ast_right with node
+    Let hir_operand be proc translate_julia_to_hir with translator, operand_node
+    proc set_dict_value with hir, "operand", hir_operand
+    Return hir
+End Process
+
+@Reasoning:
+NODE_COMPREHENSION stores the template expression in the left slot and
+generators as children. Lowered to HIR "list_comprehension".
+@End Reasoning
+Process called "translate_comprehension" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "list_comprehension"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let template_node be proc ast_left with node
+    Let hir_template be proc translate_julia_to_hir with translator, template_node
+    proc set_dict_value with hir, "transform", hir_template
+
+    Let generators be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let g_node be proc ast_child_at with node, i
+        Let hir_g be proc translate_julia_to_hir with translator, g_node
+        proc list_append with generators, hir_g
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "generators", generators
+    Return hir
+End Process
+
+@Reasoning:
+NODE_GENERATOR represents one `for var in iterable` clause inside a
+comprehension. Variable in left slot, iterable in right slot.
+@End Reasoning
+Process called "translate_generator" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "generator"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let var_node be proc ast_left with node
+    Let iter_node be proc ast_right with node
+    Let hir_var be proc translate_julia_to_hir with translator, var_node
+    Let hir_iter be proc translate_julia_to_hir with translator, iter_node
+    proc set_dict_value with hir, "variable", hir_var
+    proc set_dict_value with hir, "iterable", hir_iter
+    Return hir
+End Process
+
+@Reasoning:
+NODE_LAMBDA stores parameters as children and body in the right slot.
+We lower to HIR "lambda".
+@End Reasoning
+Process called "translate_lambda" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "lambda"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let params be proc create_hir_list
+    Let pcount be proc ast_child_count with node
+    Let i be 0
+    While i is less than pcount:
+        Let param be proc ast_child_at with node, i
+        Let hir_param be proc translate_julia_to_hir with translator, param
+        proc list_append with params, hir_param
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "parameters", params
+
+    Let body_node be proc ast_right with node
+    If body_node is not equal to 0:
+        Let hir_body be proc translate_julia_to_hir with translator, body_node
+        proc set_dict_value with hir, "body", hir_body
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_DO_BLOCK represents a do-block (block-form lambda passed to a
+function call). Parameters in children, body in the right slot.
+@End Reasoning
+Process called "translate_do_block" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "do_block"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let params be proc create_hir_list
+    Let pcount be proc ast_child_count with node
+    Let i be 0
+    While i is less than pcount:
+        Let param be proc ast_child_at with node, i
+        Let hir_param be proc translate_julia_to_hir with translator, param
+        proc list_append with params, hir_param
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "parameters", params
+
+    Let body_node be proc ast_right with node
+    If body_node is not equal to 0:
+        Let hir_body be proc translate_julia_to_hir with translator, body_node
+        proc set_dict_value with hir, "body", hir_body
+    End If
+    Return hir
+End Process
+
+@Reasoning:
+NODE_MACRO_CALL stores the macro name (with leading @) in the value slot
+and macro arguments as children. We lower to HIR "macro_call".
+@End Reasoning
+Process called "translate_macro_call" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "macro_call"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let args be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let arg_node be proc ast_child_at with node, i
+        Let hir_arg be proc translate_julia_to_hir with translator, arg_node
+        proc list_append with args, hir_arg
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "arguments", args
+    Return hir
+End Process
+
+@Reasoning:
+NODE_QUOTE_EXPR stores the quoted expression in the right slot
+(see parse_primary for the `:expr` short form).
+@End Reasoning
+Process called "translate_quote_expr" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "quote_expression"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let inner_node be proc ast_right with node
+    If inner_node is not equal to 0:
+        Let hir_inner be proc translate_julia_to_hir with translator, inner_node
+        proc set_dict_value with hir, "expression", hir_inner
+    End If
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: LITERALS / IDENTIFIERS
+Note: ============================================================================
+
+@Reasoning:
+Each Julia literal lowers to a HIR "literal" dict carrying the source
+literal_kind tag and the raw value pointer (string lexeme as stored by
+the lexer). Distinct kinds let downstream backends re-emit in the
+destination language's syntax without re-parsing the value string.
+@End Reasoning
+Process called "translate_number" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "number"
+    proc set_dict_value with hir, "value", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_string" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "string"
+    proc set_dict_value with hir, "value", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_char" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "char"
+    proc set_dict_value with hir, "value", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_symbol" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "symbol"
+    proc set_dict_value with hir, "value", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_true" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "boolean"
+    proc set_dict_value with hir, "value", "true"
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_false" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "boolean"
+    proc set_dict_value with hir, "value", "false"
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Process called "translate_nothing" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "literal"
+    proc set_dict_value with hir, "literal_kind", "nothing"
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+@Reasoning:
+NODE_IDENTIFIER stores the variable name in the value slot. We lower to
+HIR "identifier"; downstream binding resolution happens in semantic.
+@End Reasoning
+Process called "translate_identifier" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "identifier"
+    proc set_dict_value with hir, "name", proc ast_value with node
+    proc set_dict_value with hir, "line", proc ast_line with node
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: COLLECTION LITERALS
+Note: ============================================================================
+
+@Reasoning:
+NODE_ARRAY stores elements as children. Lowered to HIR "array_literal".
+@End Reasoning
+Process called "translate_array" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "array_literal"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let elements be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let elem_node be proc ast_child_at with node, i
+        Let hir_elem be proc translate_julia_to_hir with translator, elem_node
+        proc list_append with elements, hir_elem
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "elements", elements
+    Return hir
+End Process
+
+@Reasoning:
+NODE_TUPLE stores tuple elements as children. Lowered to HIR "tuple".
+@End Reasoning
+Process called "translate_tuple" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "tuple"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let elements be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let i be 0
+    While i is less than count:
+        Let elem_node be proc ast_child_at with node, i
+        Let hir_elem be proc translate_julia_to_hir with translator, elem_node
+        proc list_append with elements, hir_elem
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "elements", elements
+    Return hir
+End Process
+
+@Reasoning:
+NODE_DICT stores key-value pairs as children where odd-indexed children
+are values and even-indexed children are keys. We rebuild this into a
+proper "pairs" list of {key, value} HIR dicts so destination emitters
+have a structurally clear view rather than an ordering convention.
+@End Reasoning
+Process called "translate_dict" takes translator as Integer, node as Integer returns Integer:
+    Let hir be proc create_hir_dict
+    proc set_dict_value with hir, "node_type", "dict_literal"
+    proc set_dict_value with hir, "line", proc ast_line with node
+
+    Let pairs be proc create_hir_list
+    Let count be proc ast_child_count with node
+    Let pair_count be count divided by 2
+    Let i be 0
+    While i is less than pair_count:
+        Let k_idx be i multiplied by 2
+        Let v_idx be k_idx plus 1
+        Let k_node be proc ast_child_at with node, k_idx
+        Let v_node be proc ast_child_at with node, v_idx
+        Let pair be proc create_hir_dict
+        proc set_dict_value with pair, "node_type", "dict_pair"
+        Let hir_k be proc translate_julia_to_hir with translator, k_node
+        Let hir_v be proc translate_julia_to_hir with translator, v_node
+        proc set_dict_value with pair, "key", hir_k
+        proc set_dict_value with pair, "value", hir_v
+        proc list_append with pairs, pair
+        Set i to i plus 1
+    End While
+    proc set_dict_value with hir, "pairs", pairs
+    Return hir
+End Process
+
+Note: ============================================================================
+Note: PUBLIC ENTRY POINT
+Note: ============================================================================
+
+@Reasoning:
+Public single-arg facade invoked by the translation dispatcher's
+LANG_JULIA arm. Wires the full source -> HIR pipeline: create_lexer
+builds the lexer state from the source string, tokenize tokenises into
+the flat token array (one EOF-terminated array of 40-byte JuliaToken
+records), create_parser wraps the tokens, parse_program walks them into
+an ASTNode tree rooted at NODE_PROGRAM, and translate_julia_to_hir lowers
+the tree into HIR.
+
+The parser's create_parser takes a token_count argument used only for
+bounds checking inside current_token; we pass a conservatively large
+value (the source length is a safe upper bound on token count since
+each token consumes at least one source character) so EOF detection
+falls to the parser's TOKEN_EOF comparison rather than this counter.
+@End Reasoning
 @Implementation:
-Single forwarding call into translate_julia_to_hir. Context creation,
-optimization passes, and dispatch-table population are all handled
-downstream.
+lexer = create_lexer(source); tokens = tokenize(lexer); parser =
+create_parser(tokens, source_length); ast_root = parse_program(parser);
+translator = create_julia_to_hir_translator(); return translate_julia_to_hir(
+translator, ast_root). On lexer/parser allocation failure the wrapper
+short-circuits to 0 so downstream stages don't see a partially-formed
+module.
 @End Implementation
+Process called "julia_to_hir_from_source" takes source_code as Integer returns Integer:
+    Let lexer be proc create_lexer from JLexer with source_code
+    If lexer is equal to 0:
+        Return 0
+    End If
 
-Process called "julia_to_hir" that takes julia_ast as JuliaIRNode returns HIRNode:
-    Return translate_julia_to_hir with julia_ast
+    Let tokens be proc tokenize from JLexer with lexer
+    If tokens is equal to 0:
+        Return 0
+    End If
+
+    Note: Use source length as a conservative upper bound on token count;
+    Note: the parser's current_token uses this for its bounds-check while
+    Note: TOKEN_EOF detection serves as the real terminator.
+    Let upper_bound be proc string_length from StringCore with source_code
+    Let parser be proc create_parser from JParser with tokens, upper_bound
+    If parser is equal to 0:
+        Return 0
+    End If
+
+    Let ast_root be proc parse_program from JParser with parser
+    If ast_root is equal to 0:
+        Return 0
+    End If
+
+    Let translator be proc create_julia_to_hir_translator
+    Return proc translate_julia_to_hir with translator, ast_root
+End Process
+
+@Reasoning:
+Dispatcher-facing entry; the LANG_JULIA arm of translation.runa may call
+either name depending on its dispatch table. Single-arg form takes the
+source string and runs the full pipeline.
+@End Reasoning
+Process called "julia_to_hir" takes source_code as Integer returns Integer:
+    Return proc julia_to_hir_from_source with source_code
 End Process
