@@ -75,26 +75,35 @@ Note: ════════════════════════�
 Note: Edge Construction and Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+The factory enforces the BifrostEdge invariant that every edge carries a complete
+producer/consumer triple plus a typed-payload tag at construction time. By taking
+the kind enum directly the call site can never elide the dependency classification
+that scheduling and alias analysis rely on, and metadata is intentionally left null
+to keep the 56-byte struct lean for graphs with millions of edges.
+@End Reasoning
+
 @Implementation:
-Creates a new BifrostEdge connecting source to destination with specified kind
-and data type. Allocates OWNED HEAP memory and initializes all fields.
-
-Algorithm:
-1. Allocate 56 bytes on OWNED HEAP for BifrostEdge structure
-2. Initialize discriminant to 0 (struct type)
-3. Set edge_id (unique identifier)
-4. Set source_node reference
-5. Set dest_node reference
-6. Set edge kind (DataFlow, Control, Memory, AntiDep, OutputDep)
-7. Set data_type reference (pointer to BifrostType)
-8. Initialize metadata to 0 (null - no metadata by default)
-9. Return pointer to allocated edge
-
-Memory Safety:
-- Caller must ensure source_node and dest_node are valid pointers
-- data_type must be valid BifrostType pointer (validated by caller)
-- metadata is optional (0 means no metadata)
+Allocates a 56-byte BifrostEdge on the OWNED HEAP tier, writes the struct
+discriminant (0), edge_id, source/destination node pointers, the EdgeKind
+discriminant via Match, the data_type pointer, and zero-initialises metadata.
+Layout.memory_set_int64 is used for each field so the layout matches the offset
+table documented in the BifrostEdge struct comment exactly.
 @End Implementation
+
+@Performance_Hints:
+O(1) heap allocation plus 7 64-bit stores; no I/O, no recursion. Hot path for
+graph construction so the EdgeKind Match should compile to a small dispatch
+table. Caller should batch creations within a single arena scope when possible
+to amortise allocator overhead.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED HEAP allocation, no capability requirements. Caller must supply validated
+source_node, dest_node, and data_type pointers - this routine performs no
+liveness or type-compatibility checks. metadata is intentionally null so no
+borrowed pointers are aliased into the new edge.
+@End Security_Scope
 
 Process called "create_edge" that takes
     edge_id as Integer,
@@ -146,19 +155,27 @@ Note: ════════════════════════�
 Note: Edge Source Node Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Allowing the source endpoint to be retargeted lets passes such as kernel fusion
+and op reordering rewire dataflow without destroying and rebuilding the edge,
+preserving the edge_id which downstream analyses key dependency maps on.
+@End Reasoning
+
 @Implementation:
-Updates the source node reference of an edge. The source node is the producer
-node in the data flow or dependency relationship.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Write new source_node pointer at offset 16
-3. No return value (mutation operation)
-
-Memory Safety:
-- Caller must ensure edge is valid BifrostEdge pointer
-- Caller must ensure new_source is valid BifrostNode pointer
+Performs a null-guard on the edge pointer, then writes the new source pointer
+at offset 16. Pure 64-bit store via Layout.memory_set_int64; no allocation or
+discriminant change.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one branch and one 64-bit store. Inlinable in tight rewrite loops.
+@End Performance_Hints
+
+@Security_Scope:
+Caller must ensure new_source points to a live BifrostNode; the helper does
+not validate node liveness. Null edge is tolerated as a no-op rather than a
+fault so cleanup paths can be uniformly written.
+@End Security_Scope
 
 Process called "set_edge_source" that takes edge as Integer, new_source as Integer returns Nothing:
     If edge is equal to 0:
@@ -169,18 +186,25 @@ Process called "set_edge_source" that takes edge as Integer, new_source as Integ
     Layout.memory_set_int64(edge, 16, new_source)
 End Process
 
+@Reasoning:
+Pure accessor that hides the offset-16 layout choice from analysis passes so the
+struct can be reorganised without touching every consumer that needs the producer
+endpoint.
+@End Reasoning
+
 @Implementation:
-Retrieves the source node reference from an edge. Returns 0 if edge is invalid.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Read source_node pointer from offset 16
-3. Return source node pointer
-
-Memory Safety:
-- Returns 0 for null edge (safe failure)
-- Caller must validate returned pointer before dereferencing
+Returns 0 for null edge pointers, otherwise reads the source_node pointer from
+offset 16 via Layout.memory_get_int64.
 @End Implementation
+
+@Performance_Hints:
+O(1) load. Trivially inlinable; compiles to a single mov in the optimised path.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returns 0 sentinel on null edge so def-use walkers do not need to
+guard before calling.
+@End Security_Scope
 
 Process called "get_edge_source" that takes edge as Integer returns Integer:
     If edge is equal to 0:
@@ -196,19 +220,25 @@ Note: ════════════════════════�
 Note: Edge Destination Node Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Retargeting the consumer side is required when peephole fusion redirects a
+downstream consumer or when verifier-level repair patches a stale edge. Keeping
+the operation in-place preserves edge_id-keyed bookkeeping in the graph index.
+@End Reasoning
+
 @Implementation:
-Updates the destination node reference of an edge. The destination node is the
-consumer node in the data flow or dependency relationship.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Write new dest_node pointer at offset 24
-3. No return value (mutation operation)
-
-Memory Safety:
-- Caller must ensure edge is valid BifrostEdge pointer
-- Caller must ensure new_dest is valid BifrostNode pointer
+Null-guards the edge pointer, then writes the new destination pointer at the
+offset-24 slot using Layout.memory_set_int64.
 @End Implementation
+
+@Performance_Hints:
+O(1); single branch plus single 64-bit store.
+@End Performance_Hints
+
+@Security_Scope:
+Caller must guarantee new_dest references a live BifrostNode; no liveness check
+here. Null edge is silently ignored to keep rewrite paths uniform.
+@End Security_Scope
 
 Process called "set_edge_dest" that takes edge as Integer, new_dest as Integer returns Nothing:
     If edge is equal to 0:
@@ -219,18 +249,23 @@ Process called "set_edge_dest" that takes edge as Integer, new_dest as Integer r
     Layout.memory_set_int64(edge, 24, new_dest)
 End Process
 
+@Reasoning:
+Symmetric to get_edge_source - hides the offset-24 layout decision so analyses
+can be authored against the consumer endpoint without binding to byte offsets.
+@End Reasoning
+
 @Implementation:
-Retrieves the destination node reference from an edge. Returns 0 if edge is invalid.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Read dest_node pointer from offset 24
-3. Return destination node pointer
-
-Memory Safety:
-- Returns 0 for null edge (safe failure)
-- Caller must validate returned pointer before dereferencing
+Returns 0 on null edge; otherwise reads the destination pointer from offset 24.
 @End Implementation
+
+@Performance_Hints:
+O(1) load, single 64-bit read; trivially inlinable.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Null-safe; caller must still validate the returned pointer before
+dereferencing it.
+@End Security_Scope
 
 Process called "get_edge_dest" that takes edge as Integer returns Integer:
     If edge is equal to 0:
@@ -246,19 +281,28 @@ Note: ════════════════════════�
 Note: Edge Kind Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+The kind drives scheduling, hazard-detection, and codegen barrier emission, so
+in-place reclassification is occasionally required (for example when memory
+analysis promotes a tentative DataFlow into a Memory dependency). Mutating in
+place keeps consumer indexes valid.
+@End Reasoning
+
 @Implementation:
-Updates the edge kind (DataFlow, Control, Memory, AntiDep, OutputDep). The edge
-kind determines how the compiler treats the dependency for scheduling and
-optimization purposes.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Convert EdgeKind enum to discriminant value (0-4)
-3. Write discriminant at offset 32
-
-Memory Safety:
-- Edge kind is stored as discriminant (0-4) for efficient comparison
+After null-guarding the edge, the EdgeKind enum is lowered to its discriminant
+(0=DataFlow .. 4=OutputDep) using a Match block and written at offset 32 with
+Layout.memory_set_int64.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one branch, one 5-way Match, one 64-bit store. Match compiles to a small
+jump table; safe for tight rewrite loops.
+@End Performance_Hints
+
+@Security_Scope:
+Pure metadata mutation; no aliasing concerns. The Match is exhaustive over
+EdgeKind so out-of-range discriminants cannot be written.
+@End Security_Scope
 
 Process called "set_edge_kind" that takes edge as Integer, new_kind as EdgeKind returns Nothing:
     If edge is equal to 0:
@@ -280,20 +324,29 @@ Process called "set_edge_kind" that takes edge as Integer, new_kind as EdgeKind 
     End Match
 End Process
 
+@Reasoning:
+Exposes the kind discriminant as the type-safe EdgeKind enum so passes can drive
+Match dispatch directly. Defensive defaulting to DataFlow on null or invalid
+discriminants keeps schedulers from crashing on partially-built graphs that the
+verifier has not yet examined.
+@End Reasoning
+
 @Implementation:
-Retrieves the edge kind as an EdgeKind enum. Converts discriminant to enum
-variant for type-safe access.
-
-Algorithm:
-1. Validate edge pointer is non-null (return DataFlow as safe default)
-2. Read discriminant from offset 32
-3. Map discriminant to EdgeKind variant (0→DataFlow, 1→Control, etc.)
-4. Return EdgeKind enum
-
-Memory Safety:
-- Returns DataFlow for null edge (safe default)
-- Invalid discriminants default to DataFlow (defensive programming)
+Returns DataFlow when the edge pointer is null. Otherwise reads the discriminant
+at offset 32 and maps 0..4 to DataFlow/Control/Memory/AntiDep/OutputDep with a
+linear If-chain, falling back to DataFlow for unrecognised values.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one load plus up to five compares. The discriminant compare cascade is
+shorter than a Match and stays in a few cache-resident instructions.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; null-safe; out-of-range discriminants are mapped to DataFlow rather
+than propagated, which is the safe choice for scheduling (treat as ordinary
+dataflow until verifier repairs the edge).
+@End Security_Scope
 
 Process called "get_edge_kind" that takes edge as Integer returns EdgeKind:
     If edge is equal to 0:
@@ -328,18 +381,25 @@ Note: ════════════════════════�
 Note: Edge Data Type Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Type refinement (e.g. promoting a generic vector edge to a concrete f32x4 after
+specialisation) requires retagging the payload type without re-allocating the
+edge. The setter keeps consumer indexes stable.
+@End Reasoning
+
 @Implementation:
-Updates the data type flowing through the edge. The data type is used for type
-checking, optimization, and code generation.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Write new data_type pointer at offset 40
-
-Memory Safety:
-- Caller must ensure new_type is valid BifrostType pointer
-- Type compatibility must be validated by caller (node output type must match edge type)
+Null-guards the edge pointer then writes the BifrostType pointer at offset 40.
 @End Implementation
+
+@Performance_Hints:
+O(1) store; safe to call in inner refinement loops.
+@End Performance_Hints
+
+@Security_Scope:
+Caller must guarantee new_type points to a live BifrostType; this routine does
+not check compatibility between the producer's output type and new_type - the
+verifier pass is responsible for that contract.
+@End Security_Scope
 
 Process called "set_edge_data_type" that takes edge as Integer, new_type as Integer returns Nothing:
     If edge is equal to 0:
@@ -350,19 +410,25 @@ Process called "set_edge_data_type" that takes edge as Integer, new_type as Inte
     Layout.memory_set_int64(edge, 40, new_type)
 End Process
 
+@Reasoning:
+Exposes the payload type for type-checking, kernel-fusion compatibility checks,
+and codegen. Layout-isolating accessor keeps consumers stable across struct
+reorganisation.
+@End Reasoning
+
 @Implementation:
-Retrieves the data type flowing through the edge. Returns 0 if edge is invalid
-or no type is set.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Read data_type pointer from offset 40
-3. Return BifrostType pointer
-
-Memory Safety:
-- Returns 0 for null edge (safe failure)
-- Caller must validate returned pointer before dereferencing
+Null-guards the edge pointer and returns the data_type pointer stored at offset
+40, or 0 when the edge is null.
 @End Implementation
+
+@Performance_Hints:
+O(1) load.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returned pointer may be 0 (unset) or a live BifrostType; caller must
+distinguish before dereferencing.
+@End Security_Scope
 
 Process called "get_edge_data_type" that takes edge as Integer returns Integer:
     If edge is equal to 0:
@@ -378,18 +444,27 @@ Note: ════════════════════════�
 Note: Edge Metadata Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Metadata is a sparse side-channel for optimisation hints (e.g. "speculative",
+"cross-device"), profiling counters, and verifier annotations. Attaching it to
+the edge rather than a global side table keeps locality for analyses that walk
+edges, and zero remains a valid "no metadata" sentinel.
+@End Reasoning
+
 @Implementation:
-Sets metadata annotation dictionary for the edge. Metadata can store optimization
-hints, debugging information, or other edge-specific attributes.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Write metadata dictionary pointer at offset 48
-
-Memory Safety:
-- metadata should be pointer to Dictionary[String, String]
-- 0 means no metadata (valid value)
+Null-guards the edge pointer then stores the metadata dictionary pointer at
+offset 48 with Layout.memory_set_int64.
 @End Implementation
+
+@Performance_Hints:
+O(1) store. Metadata is touched infrequently; not a hot path.
+@End Performance_Hints
+
+@Security_Scope:
+Caller owns the lifetime of the metadata dictionary; assigning a borrowed
+dictionary that is later freed will cause use-after-free in consumers. Pass 0
+to clear.
+@End Security_Scope
 
 Process called "set_edge_metadata" that takes edge as Integer, metadata as Integer returns Nothing:
     If edge is equal to 0:
@@ -400,19 +475,24 @@ Process called "set_edge_metadata" that takes edge as Integer, metadata as Integ
     Layout.memory_set_int64(edge, 48, metadata)
 End Process
 
+@Reasoning:
+Sparse-channel accessor. Returning 0 for both null-edge and unset-metadata cases
+gives consumers a uniform "no annotation" check.
+@End Reasoning
+
 @Implementation:
-Retrieves the metadata annotation dictionary from the edge. Returns 0 if no
-metadata is present.
-
-Algorithm:
-1. Validate edge pointer is non-null
-2. Read metadata pointer from offset 48
-3. Return metadata dictionary pointer (or 0 if none)
-
-Memory Safety:
-- Returns 0 for null edge or missing metadata (safe failure)
-- Caller must validate returned pointer before dereferencing
+Returns 0 on null edge; otherwise loads the metadata pointer from offset 48.
 @End Implementation
+
+@Performance_Hints:
+O(1) load. Off the hot edge-traversal path; only invoked by passes that consult
+hints.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returned pointer is borrowed - caller must not free it; the dictionary
+is owned by the edge's allocator scope.
+@End Security_Scope
 
 Process called "get_edge_metadata" that takes edge as Integer returns Integer:
     If edge is equal to 0:
@@ -428,24 +508,30 @@ Note: ════════════════════════�
 Note: Edge Debugging and Utilities
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Debug-only stringifier that materialises a stable, grep-friendly representation
+of every edge for verifier dumps and pass-pipeline logs. Hex-formatting node and
+type pointers preserves identity across runs while staying compact.
+@End Reasoning
+
 @Implementation:
-Generates a human-readable string representation of a BifrostEdge for debugging
-and logging purposes.
-
-Algorithm:
-1. Validate edge pointer is non-null (return "[NULL EDGE]")
-2. Read edge_id from offset 8
-3. Read source_node pointer from offset 16
-4. Read dest_node pointer from offset 24
-5. Read kind discriminant from offset 32 and convert to string
-6. Read data_type pointer from offset 40
-7. Construct debug string: "Edge #<id>: Node <src> -> Node <dest> (<kind>, type=<type>)"
-
-Output Format:
-- "Edge #42: Node 0x7f8a -> Node 0x7f9b (DataFlow, type=0x7fa0)"
-- "[NULL EDGE]" for null pointer
-
+Returns "[NULL EDGE]" for null. Otherwise reads edge_id, source, dest,
+kind_discriminant, and data_type fields, maps the discriminant to its kind name
+via a linear If-cascade, hex-encodes the three pointer fields, and concatenates
+into the canonical "Edge #id: Node src -> Node dest (kind, type=type)" form.
 @End Implementation
+
+@Performance_Hints:
+O(1) field reads plus O(L) string concatenation where L is the formatted length
+(~60 chars). Multiple intermediate String allocations - do not call inside
+inner-loop scheduling code; restrict to diagnostics.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; null-safe. No information-disclosure concerns since the output is
+intended for compiler-internal logs. Hex pointer values are leaked into strings,
+so callers should not forward edge_to_string output to untrusted sinks.
+@End Security_Scope
 
 Process called "edge_to_string" that takes edge as Integer returns String:
     If edge is equal to 0:

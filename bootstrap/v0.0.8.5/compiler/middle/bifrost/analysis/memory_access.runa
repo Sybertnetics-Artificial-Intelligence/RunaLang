@@ -96,51 +96,43 @@ Note: ================================================================
 Note: Access Pattern Classification
 Note: ================================================================
 
+@Reasoning
+Classifies memory access patterns for optimisation opportunities. The
+classification feeds GPU coalescing analysis, prefetch insertion, cache
+locality estimation, and shared-memory promotion decisions. Patterns are
+CONTIGUOUS (stride 1, best for caches/coalescing), STRIDED (regular
+stride > 1, predictable, may benefit from prefetch), RANDOM (irregular,
+poor locality), BROADCAST (constant address, use constant memory),
+GATHER (indirect read via index array), SCATTER (indirect write).
+@End Reasoning
+
+@Implementation
+Initialises an AccessPattern struct with default UNKNOWN / stride=1 /
+element_size=0 / is_aligned=false / is_coalesced=false. Reads the node
+op_kind; bails out for non-memory ops (op_kind != 40 Load and != 41
+Store). Extracts the address input node, fetches element_size via the
+node's data type. Calls classify_address_pattern on the address subgraph
+to get (pattern_type, stride), and writes them into the struct. Calls
+check_alignment to determine is_aligned. Sets is_coalesced when the
+pattern is CONTIGUOUS and the access is aligned. Returns the populated
+AccessPattern.
+@End Implementation
+
+@Performance_Hints
+O(depth_of_address_DAG) time; visits each address-computation node once
+via classify_address_pattern. Cold path during graph construction;
+becomes hot when called per memory op during coalescing analysis.
+Result is a small fixed-size struct so allocation pressure is minimal.
+@End Performance_Hints
+
+@Security_Scope
+Pure analysis on already-validated graph nodes; trusts upstream graph
+builders for node-kind invariants. No file I/O, no capability use.
+Untrusted graphs (e.g. deserialized from disk) must be verified by
+the upstream graph loader before calling this proc.
+@End Security_Scope
+
 Process called "analyze_access_pattern" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Classifies memory access patterns for optimization opportunities.
-
-    Patterns:
-    - CONTIGUOUS: Sequential access with stride=1 (best for caches/coalescing)
-    - STRIDED: Regular stride>1 (predictable, may benefit from prefetch)
-    - RANDOM: Irregular access (poor locality, hard to optimize)
-    - BROADCAST: Same value accessed by all threads (use constant memory)
-    - GATHER: Indirect reads via index array (scatter/gather instructions)
-    - SCATTER: Indirect writes via index array (requires atomics)
-
-    Analysis:
-    1. Examine the address computation for the memory operation
-    2. Determine if access is affine (base + constant*index)
-    3. Extract stride from affine form
-    4. Check for indirect indexing (gather/scatter)
-    5. Check for invariant address (broadcast)
-    @End Reasoning
-
-    @Implementation
-    1. Get node operation kind (Load or Store)
-    2. Get address computation subgraph
-    3. Analyze address expression for pattern
-    4. Classify as contiguous, strided, random, etc.
-    5. Compute stride and element size
-    6. Check alignment
-    7. Check coalescing potential
-    8. Return AccessPattern structure
-    @End Implementation
-
-    @Performance_Hints
-    O(depth_of_address_DAG) time; visits each address-computation node once
-    via classify_address_pattern. Cold path during graph construction;
-    becomes hot when called per memory op during coalescing analysis.
-    Result is a small fixed-size struct so allocation pressure is minimal.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis on already-validated graph nodes; trusts upstream graph
-    builders for node-kind invariants. No file I/O, no capability use.
-    Untrusted graphs (e.g. deserialized from disk) must be verified by
-    the upstream graph loader before calling this proc.
-    @End Security_Scope
-
     Let access_pattern be a value of type AccessPattern with
         pattern_type as ACCESS_UNKNOWN,
         stride as 1,
@@ -203,43 +195,34 @@ Process called "analyze_access_pattern" that takes graph as Integer, node as Int
     Return access_pattern
 End Process
 
+@Reasoning
+Classifies the address computation pattern used by analyze_access_pattern.
+Common patterns: base+index gives CONTIGUOUS (stride=1); base+index*stride
+gives STRIDED; base+array[index] gives GATHER/SCATTER (indirect);
+constant address gives BROADCAST; complex expressions give RANDOM. The
+classifier checks each pattern in order of specificity (constant first,
+affine next, indirect last) to avoid misclassifying.
+@End Reasoning
+
+@Implementation
+Calls Node.is_node_constant on the address; if true returns
+[ACCESS_BROADCAST, 0]. Calls extract_affine_form; if affine, returns
+[CONTIGUOUS or STRIDED based on coefficient, stride value]. Calls
+has_indirect_addressing; if true returns [GATHER/SCATTER]. Otherwise
+returns [ACCESS_RANDOM, 0]. Return value is a 2-element List.
+@End Implementation
+
+@Performance_Hints
+O(depth) where depth is the height of the address-computation DAG.
+Calls extract_affine_form (also O(depth)) and has_indirect_addressing.
+Integer-only arithmetic; no Float dependency.
+@End Performance_Hints
+
+@Security_Scope
+Pure analysis on validated graph nodes; no I/O, no mutation.
+@End Security_Scope
+
 Process called "classify_address_pattern" that takes graph as Integer, address_node as Integer returns Integer:
-    @Reasoning
-    Classifies the address computation pattern.
-
-    Common patterns:
-    - base + index → CONTIGUOUS (stride=1)
-    - base + index*stride → STRIDED
-    - base + array[index] → GATHER/SCATTER (indirect)
-    - constant → BROADCAST (invariant)
-    - complex expression → RANDOM
-
-    Detection:
-    - Check if address is constant (broadcast)
-    - Check for affine form: base + coeff*index
-    - Extract coefficient as stride
-    - Check for indirect indexing (load in address computation)
-    @End Reasoning
-
-    @Implementation
-    1. Check if address node is constant → BROADCAST
-    2. Check if address is affine (base + coeff*index)
-    3. If affine, extract stride (coeff), return CONTIGUOUS or STRIDED
-    4. Check for load operation in address → GATHER/SCATTER
-    5. Otherwise return RANDOM
-    6. Return list [pattern_type, stride]
-    @End Implementation
-
-    @Performance_Hints
-    O(depth) where depth is the height of the address-computation DAG.
-    Calls extract_affine_form (also O(depth)) and has_indirect_addressing.
-    Integer-only arithmetic; no Float dependency.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis on validated graph nodes; no I/O, no mutation.
-    @End Security_Scope
-
     Note: Check if address is constant (broadcast pattern)
     Let is_constant be proc is_node_constant from Node with address_node
     If is_constant is equal to true:
@@ -1200,6 +1183,29 @@ Process called "extract_affine_form" that takes graph as Integer, address_node a
     Return result
 End Process
 
+@Reasoning
+Detects whether the address computation contains an indirect load
+(scatter/gather pattern). Indirect addressing changes the access pattern
+classification from STRIDED/CONTIGUOUS to GATHER and disables coalescing
+on most GPUs. The detection is intentionally shallow - only checks the
+immediate address node - because the affine extractor handles deeper
+indirection.
+@End Reasoning
+
+@Implementation
+Reads the address_node's OpKind. Returns true if it equals 40 (Load),
+indicating the address is being computed via a memory load (indirect).
+Returns false otherwise.
+@End Implementation
+
+@Performance_Hints
+O(1) - single OpKind read.
+@End Performance_Hints
+
+@Security_Scope
+Pure read.
+@End Security_Scope
+
 Process called "has_indirect_addressing" that takes graph as Integer, address_node as Integer returns Boolean:
     Note: Check if address computation contains load operation
     Let op_kind be proc get_node_opkind from Node with address_node
@@ -1276,6 +1282,31 @@ Process called "check_alignment" that takes address_node as Integer, element_siz
 
     Return true
 End Process
+
+@Reasoning
+Computes the average reuse distance across an access sequence - the
+number of distinct intervening accesses between successive references
+to the same address. Reuse distance is the canonical metric for
+temporal locality; lower distances indicate better cache-hit prospects.
+@End Reasoning
+
+@Implementation
+Allocates reuse_distances and last_access Dicts. Walks the
+access_sequence; for each address, reads last_access[address]; if
+non-zero, computes distance = i - last_pos and stores it in
+reuse_distances. Always updates last_access[address] = i. After the
+walk, computes the average of all reuse_distances values and returns
+it. Returns 0 for an empty sequence.
+@End Implementation
+
+@Performance_Hints
+O(N) where N is the access_sequence length, plus O(N) Dict operations.
+Space O(unique addresses).
+@End Performance_Hints
+
+@Security_Scope
+Pure analysis on caller-owned data; no I/O.
+@End Security_Scope
 
 Process called "compute_reuse_distance" that takes access_sequence as Integer returns Integer:
     Note: Compute average reuse distance
@@ -1434,6 +1465,26 @@ Process called "compute_peak_memory_usage" that takes graph as Integer, nodes as
     Return peak
 End Process
 
+@Reasoning
+Filters a node list down to memory operations (Load and Store ops). Used
+by higher-level analyses (compute_memory_footprint, compute_bandwidth_requirement)
+that only need the memory-op subset.
+@End Reasoning
+
+@Implementation
+Allocates a fresh memory_ops List. Walks the input nodes list; for each
+node reads OpKind and appends it to memory_ops if it equals 40 (Load) or
+41 (Store). Returns memory_ops.
+@End Implementation
+
+@Performance_Hints
+O(N) where N is the input node count.
+@End Performance_Hints
+
+@Security_Scope
+Pure read; allocates one fresh List owned by caller.
+@End Security_Scope
+
 Process called "extract_memory_operations_from_nodes" that takes nodes as Integer returns Integer:
     Let memory_ops be proc create from List
 
@@ -1458,6 +1509,28 @@ Process called "extract_memory_operations_from_nodes" that takes nodes as Intege
     Return memory_ops
 End Process
 
+@Reasoning
+Tests whether the graph has linear (chain) structure - each node has at
+most one predecessor and one successor. Linear graphs are
+trivially-streamable and can benefit from streaming-memory hints in
+codegen.
+@End Reasoning
+
+@Implementation
+Walks Graph.get_all_nodes; for each node calls Graph.get_node_predecessors
+and Graph.get_node_successors. Returns false if any node has more than
+one predecessor or more than one successor. Returns true if every node
+satisfies the linear-chain constraint.
+@End Implementation
+
+@Performance_Hints
+O(V) - one pass over the node list with O(1) adjacency lookups.
+@End Performance_Hints
+
+@Security_Scope
+Pure read on graph state.
+@End Security_Scope
+
 Process called "check_linear_structure" that takes graph as Integer returns Boolean:
     Note: Check if graph is a linear chain
     Let all_nodes be proc get_all_nodes from Graph with graph
@@ -1479,6 +1552,26 @@ Process called "check_linear_structure" that takes graph as Integer returns Bool
 
     Return true
 End Process
+
+@Reasoning
+Tests whether a type pointer represents an array/aggregate type (Vector,
+Matrix, or Tensor). Used by memory-footprint and bandwidth analyses to
+decide whether to multiply through dimensions.
+@End Reasoning
+
+@Implementation
+Returns false for null type. Reads the discriminant at offset 0; returns
+true if it equals 2 (Vector), 3 (Matrix), or 5 (Tensor), false
+otherwise.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure read.
+@End Security_Scope
 
 Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
     If type_ptr is equal to 0:

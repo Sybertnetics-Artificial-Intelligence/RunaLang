@@ -94,22 +94,31 @@ Note: ════════════════════════�
 Note: Builder State Management
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+The builder bundles the three pieces of state every MIR-lowering routine needs
+(target graph, SSA value map, source MIR function) so they can be passed as a
+single handle rather than threaded individually. Starting next_node_id at 1
+reserves 0 as the null-node sentinel used throughout get/lookup paths.
+@End Reasoning
+
 @Implementation:
-Creates a new BifrostBuilder for translating a MIR function to Bifrost graph.
-
-Algorithm:
-1. Allocate 40 bytes on OWNED HEAP for BifrostBuilder
-2. Initialize discriminant to 0
-3. Create empty BifrostGraph
-4. Create empty value_map dictionary
-5. Store MIR function pointer
-6. Initialize next_node_id to 1
-7. Return builder pointer
-
-Memory Safety:
-- All collections initialized to valid empty structures
-- Node ID counter starts at 1 (0 reserved for null)
+Allocates a 40-byte BifrostBuilder on the OWNED HEAP, writes the struct
+discriminant (0), creates a fresh empty BifrostGraph via create_graph and stores
+its pointer, allocates an empty Dictionary for the value_map, records the input
+mir_function pointer, and initialises next_node_id to 1.
 @End Implementation
+
+@Performance_Hints:
+O(1) construction: one heap allocation plus a graph and dictionary creation. The
+graph and dict allocations dominate; total cost is constant relative to MIR
+input size.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED HEAP allocation; no capabilities required. mir_function is borrowed and
+its lifetime must exceed the builder's. The created graph and value_map are
+owned by the builder - lifetime ends when the builder is freed.
+@End Security_Scope
 
 Process called "create_builder" that takes mir_function as Integer returns Integer:
     Note: Allocate 40 bytes for BifrostBuilder on OWNED HEAP
@@ -135,17 +144,24 @@ Process called "create_builder" that takes mir_function as Integer returns Integ
     Return builder
 End Process
 
+@Reasoning:
+Lowering passes need read access to the in-progress graph for inspection
+(e.g. checking whether a node was already emitted) without exposing the builder
+struct layout.
+@End Reasoning
+
 @Implementation:
-Retrieves the current Bifrost graph being constructed.
-
-Algorithm:
-1. Validate builder pointer
-2. Read graph pointer from offset 8
-3. Return graph pointer
-
-Memory Safety:
-- Returns 0 for null builder
+Returns 0 on null builder; otherwise reads the graph pointer from offset 8.
 @End Implementation
+
+@Performance_Hints:
+O(1) load.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returned pointer is borrowed - caller must not free the graph; it is
+owned by the builder.
+@End Security_Scope
 
 Process called "get_current_graph" that takes builder as Integer returns Integer:
     If builder is equal to 0:
@@ -156,16 +172,24 @@ Process called "get_current_graph" that takes builder as Integer returns Integer
     Return graph
 End Process
 
+@Reasoning:
+Multi-graph lowering (one MIR function producing nested kernel subgraphs)
+requires swapping in a different active graph mid-translation. The setter keeps
+the builder's value_map and ID counter intact across the swap.
+@End Reasoning
+
 @Implementation:
-Updates the current Bifrost graph being constructed.
-
-Algorithm:
-1. Validate builder pointer
-2. Write new graph pointer at offset 8
-
-Memory Safety:
-- Does nothing for null builder
+Null-guards the builder, then writes the new graph pointer at offset 8.
 @End Implementation
+
+@Performance_Hints:
+O(1) store.
+@End Performance_Hints
+
+@Security_Scope:
+The previous graph pointer is overwritten without freeing - caller is
+responsible for retaining or releasing the prior graph as appropriate.
+@End Security_Scope
 
 Process called "set_current_graph" that takes builder as Integer, graph as Integer returns Nothing:
     If builder is equal to 0:
@@ -179,30 +203,32 @@ Note: ════════════════════════�
 Note: Type Translation (MIR → Bifrost)
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+A single entry point keeps every MIR-to-Bifrost type lowering convergent on the
+same discriminant table (1=Primitive, 2=Vector ... 8=Function). Dispatching on
+the discriminant rather than re-walking the MIR tree means callers do not have
+to know the MIR type taxonomy.
+@End Reasoning
+
 @Implementation:
-Translates a MIR type to the corresponding Bifrost type.
-
-Algorithm:
-1. Read MIR type discriminant
-2. Match on MIR type variants:
-   - Integer types → BifrostType::Primitive
-   - Float types → BifrostType::Primitive
-   - Vector types → BifrostType::Vector
-   - Array types → BifrostType::Matrix or Tensor
-   - Pointer types → Opaque (not directly supported)
-3. Create corresponding Bifrost type
-4. Return Bifrost type pointer
-
-MIR Type Mapping:
-- i8, i16, i32, i64 → BIFROST_INT8/16/32/64
-- f32, f64 → BIFROST_FLOAT32/64
-- Vector<T, N> → Vector(element_type, N)
-- Array<T, M, N> → Matrix(element_type, M, N)
-- Array<T, D1, D2, ...> → Tensor(element_type, shape)
-
-Memory Safety:
-- Returns null for unsupported MIR types
+Returns 0 for null MIR types. Reads the MIR discriminant at offset 0 and
+dispatches via If-cascade to the eight specialised translators
+(translate_primitive_type, translate_vector_type, translate_matrix_type,
+translate_tensor_type, translate_pointer_type, translate_array_type,
+translate_struct_type, translate_function_type). Unknown discriminants default
+to create_primitive_type(BIFROST_INT32) to keep lowering total.
 @End Implementation
+
+@Performance_Hints:
+O(1) dispatch with up to 8 compares. The If-cascade is in MIR-lowering order so
+the hot Primitive/Vector cases short-circuit early.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction; no I/O, no syscalls. The fallback to i32 prevents
+partial graphs but may mask MIR corruption - upstream MIR verifier must catch
+malformed discriminants before this point.
+@End Security_Scope
 
 Process called "mir_type_to_bifrost_type" that takes mir_type as Integer returns Integer:
     If mir_type is equal to 0:
@@ -253,18 +279,29 @@ Process called "mir_type_to_bifrost_type" that takes mir_type as Integer returns
     Return create_primitive_type(BIFROST_INT32)
 End Process
 
+@Reasoning:
+Scalar-to-scalar lowering needs a 1:1 mapping table between MIR's primitive
+kind enum and Bifrost's BIFROST_INT8..BIFROST_FLOAT64 constants. Mapping
+booleans to INT8 and treating unrecognised inputs as INT32 keeps downstream
+codegen well-typed without inventing new Bifrost primitives.
+@End Reasoning
+
 @Implementation:
-Translates MIR primitive scalar types to Bifrost primitive types.
-
-Algorithm:
-1. Read MIR primitive kind (i8, i16, i32, i64, f32, f64)
-2. Map to corresponding BIFROST_* constant
-3. Create Bifrost primitive type
-4. Return Bifrost type pointer
-
-Memory Safety:
-- Returns BIFROST_INT32 as default for unknown types
+Returns create_primitive_type(BIFROST_INT32) for null input. Reads the MIR
+prim_kind at offset 8 and maps via If-cascade: 1..4 -> INT8/16/32/64, 5..8 ->
+UINT8/16/32/64, 9..11 -> FLOAT16/32/64, 13 -> INT8 (bool), unknown -> INT32.
 @End Implementation
+
+@Performance_Hints:
+O(1) - at most twelve compares plus one type-construction call. Caches are
+warm; this is in the inner type-lowering loop.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction. The fallback to INT32 is intentional and matches the
+mir_type_to_bifrost_type policy; do not change without updating the verifier
+contract.
+@End Security_Scope
 
 Process called "translate_primitive_type" that takes mir_prim_type as Integer returns Integer:
     If mir_prim_type is equal to 0:
@@ -324,19 +361,30 @@ Process called "translate_primitive_type" that takes mir_prim_type as Integer re
     Return create_primitive_type(BIFROST_INT32)
 End Process
 
+@Reasoning:
+Bifrost SIMD vector codegen requires power-of-two lanes (2,4,8,16,32,64) so the
+hardware vector regs map cleanly. Forcing invalid lane counts to 4 keeps the
+graph buildable when MIR carries an unusual width and lets the verifier flag
+the substitution later.
+@End Reasoning
+
 @Implementation:
-Translates MIR vector types to Bifrost SIMD vector types.
-
-Algorithm:
-1. Extract element type from MIR vector type
-2. Extract vector size (must be power of 2)
-3. Translate element type recursively
-4. Create Bifrost vector type
-5. Return Bifrost vector pointer
-
-Memory Safety:
-- Validates vector size is power of 2
+Reads element_type at offset 8 and size at offset 16. Recursively lowers the
+element type via mir_type_to_bifrost_type, validates size against the
+{2,4,8,16,32,64} whitelist, defaults to 4 on mismatch, and constructs the
+Bifrost vector via create_vector_type.
 @End Implementation
+
+@Performance_Hints:
+O(1) for the size validation; recursion depth equals the MIR type nesting
+(typically 1 for primitive elements). No allocation beyond the recursive call.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction. Defaulting size to 4 on invalid input prevents
+malformed Bifrost vectors but loses MIR fidelity - upstream MIR builder must
+enforce power-of-two SIMD widths.
+@End Security_Scope
 
 Process called "translate_vector_type" that takes mir_vec_type as Integer returns Integer:
     If mir_vec_type is equal to 0:
@@ -381,19 +429,27 @@ Process called "translate_vector_type" that takes mir_vec_type as Integer return
     Return bifrost_type
 End Process
 
+@Reasoning:
+Matrix is a first-class Bifrost type because matrix layouts drive both kernel
+fusion (GEMM detection) and memory-layout optimisation. Translating MIR 2D
+arrays directly preserves rows/cols metadata needed for blocked-codegen
+strategies.
+@End Reasoning
+
 @Implementation:
-Translates MIR matrix types (2D arrays) to Bifrost matrix types.
-
-Algorithm:
-1. Extract element type from MIR array
-2. Extract row and column dimensions
-3. Translate element type recursively
-4. Create Bifrost matrix type
-5. Return Bifrost matrix pointer
-
-Memory Safety:
-- Returns null for non-2D arrays
+Reads element_type, rows, and cols from offsets 8/16/24. Recursively lowers
+the element type and constructs the Bifrost matrix type via
+create_matrix_type(element, rows, cols).
 @End Implementation
+
+@Performance_Hints:
+O(1) plus one recursive type-lowering call. Hot path for GEMM-heavy kernels.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction. Element type is borrowed from the recursive call's
+allocator scope; rows/cols are integers and need no validation here.
+@End Security_Scope
 
 Process called "translate_matrix_type" that takes mir_array_type as Integer returns Integer:
     If mir_array_type is equal to 0:
@@ -413,19 +469,30 @@ Process called "translate_matrix_type" that takes mir_array_type as Integer retu
     Return bifrost_type
 End Process
 
+@Reasoning:
+N-dimensional tensors need a shape list (not just rows/cols) because the
+parallelism analyser and codegen kernels iterate over arbitrary rank. Copying
+the dimensions into a fresh List keeps the Bifrost type independent of the
+MIR's internal dimension storage.
+@End Reasoning
+
 @Implementation:
-Translates MIR multi-dimensional arrays to Bifrost tensor types.
-
-Algorithm:
-1. Extract element type from MIR array
-2. Extract all dimension sizes as shape list
-3. Translate element type recursively
-4. Create Bifrost tensor type with shape
-5. Return Bifrost tensor pointer
-
-Memory Safety:
-- Returns null for empty shape
+Reads element_type, rank, and the dims_list pointer from offsets 8/16/24.
+Recursively lowers the element type, walks dims_list with a 0..rank loop,
+appending each dimension into a fresh shape List, and constructs the tensor
+type via create_tensor_type(element_type, shape).
 @End Implementation
+
+@Performance_Hints:
+O(rank) - one List allocation plus rank List appends. Typical tensor ranks are
+2-4 so cost is minimal; the recursive element-type lowering dominates.
+@End Performance_Hints
+
+@Security_Scope:
+Pure type construction. The output shape list is freshly allocated and owned
+by the returned Bifrost tensor type. Borrowing dims_list elements is safe
+because Integer dimensions are copy-by-value.
+@End Security_Scope
 
 Process called "translate_tensor_type" that takes mir_array_type as Integer returns Integer:
     If mir_array_type is equal to 0:
@@ -458,20 +525,32 @@ Note: ════════════════════════�
 Note: Node Creation from MIR
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Constants need to live as first-class graph nodes so kernel-fusion and
+constant-folding passes can rewrite them in place rather than rediscovering
+the constant payload from MIR every pass. Building the node here registers it
+into the builder's graph so the rest of lowering sees a uniform node-pointer
+abstraction.
+@End Reasoning
+
 @Implementation:
-Creates a Bifrost constant node from a MIR constant value.
-
-Algorithm:
-1. Extract constant value from MIR
-2. Extract type from MIR constant
-3. Translate MIR type to Bifrost type
-4. Create BifrostNode::Constant with value and type
-5. Add node to graph
-6. Return node pointer
-
-Memory Safety:
-- Type must be translated before node creation
+Null-guards builder and mir_constant. Extracts the constant value and MIR type
+from the MIRConstant payload, lowers the type via mir_type_to_bifrost_type,
+constructs the node with create_constant_node, retrieves the builder's graph
+pointer at offset 8, and inserts via add_node.
 @End Implementation
+
+@Performance_Hints:
+O(1) per constant plus the type-translation cost. Constants are usually
+emitted once per literal at MIR-lowering time so this is not in the hottest
+loop.
+@End Performance_Hints
+
+@Security_Scope:
+Owned-heap allocation via create_constant_node and add_node. The MIR constant
+pointer is borrowed; lifetime must exceed this call. No syscalls or external
+state.
+@End Security_Scope
 
 Process called "build_constant_node" that takes
     builder as Integer,
@@ -502,21 +581,33 @@ Process called "build_constant_node" that takes
     Return node
 End Process
 
+@Reasoning:
+Function parameters become Input nodes in Bifrost (the graph's data sources).
+Marking them as MemorySpace.Global is correct for kernel entry-points where
+arguments live in device-global memory. Registering them in the value_map
+gives subsequent instructions a way to resolve the MIR SSA value id to the
+input node.
+@End Reasoning
+
 @Implementation:
-Creates a Bifrost input node from a MIR function parameter.
-
-Algorithm:
-1. Extract parameter name and type from MIR
-2. Translate MIR type to Bifrost type
-3. Determine memory space (Global for inputs)
-4. Create BifrostNode::Input with name, type, memory_space
-5. Add node to graph
-6. Register in value map
-7. Return node pointer
-
-Memory Safety:
-- Input nodes must be registered for SSA value lookup
+Null-guards builder and mir_param. Extracts the parameter name and type from
+the MIR parameter struct, lowers the type via mir_type_to_bifrost_type,
+constructs an Input node with MemorySpace.Global, fetches the graph from
+offset 8, adds the node, and finally calls register_value_node so later
+instruction lowering can find this input by MIR value id.
 @End Implementation
+
+@Performance_Hints:
+O(1) per parameter plus dictionary insert. Runs once per function parameter
+at the beginning of translation - negligible cost.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP node allocation plus dictionary mutation. The MIR parameter pointer
+is borrowed. Registering the input under the parameter's SSA id is required
+for correctness - missing registration causes lookup_value_node to return 0
+and subsequent operations to lose data flow.
+@End Security_Scope
 
 Process called "build_input_node" that takes
     builder as Integer,
@@ -551,21 +642,29 @@ Process called "build_input_node" that takes
     Return node
 End Process
 
+@Reasoning:
+Output nodes mark the graph's data sinks for the host-device return path.
+MemorySpace.Global is correct because the host reads results from device-global
+memory; making the output explicit gives optimisation passes a clean root to
+trace data dependencies from.
+@End Reasoning
+
 @Implementation:
-Creates a Bifrost output node for a MIR return value.
-
-Algorithm:
-1. Extract return value type from MIR
-2. Translate MIR type to Bifrost type
-3. Determine memory space (Global for outputs)
-4. Create BifrostNode::Output with name, type, memory_space
-5. Add node to graph
-6. Create data flow edge from producer to output
-7. Return node pointer
-
-Memory Safety:
-- Output nodes must have incoming edge from producer
+Null-guards builder and mir_return, extracts the output name and MIR type,
+lowers the type via mir_type_to_bifrost_type, creates the Output node with
+MemorySpace.Global, retrieves the graph from offset 8, and adds the node.
 @End Implementation
+
+@Performance_Hints:
+O(1) - runs once per return value. Trivial cost.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation through create_output_node and add_node. The data-flow
+edge from producer to this output is established separately by
+add_data_flow_edge; without that edge the verifier will flag the output as
+unused.
+@End Security_Scope
 
 Process called "build_output_node" that takes
     builder as Integer,
@@ -596,23 +695,36 @@ Process called "build_output_node" that takes
     Return node
 End Process
 
+@Reasoning:
+Operation nodes carry the bulk of the graph's computation: an op kind, an input
+operand list, an output type, a parallelism mode (DataParallel/SIMD/etc.) and
+optimisation metadata. Stamping default metadata at build time (can_vectorize,
+can_fuse, compute_bound, source-loc fields) lets later passes inspect every
+operation through a uniform Dictionary without needing per-pass synthesis.
+@End Reasoning
+
 @Implementation:
-Creates a Bifrost operation node from a MIR instruction.
-
-Algorithm:
-1. Pattern match MIR instruction to determine OpKind
-2. Extract input operands from MIR
-3. Translate output type to Bifrost type
-4. Determine parallelism kind (DataParallel, SIMD, etc.)
-5. Create BifrostNode::Operation with op, inputs, type, parallelism
-6. Add node to graph
-7. Create data flow edges from operands to node
-8. Register in value map if instruction produces value
-9. Return node pointer
-
-Memory Safety:
-- All operands must exist in value map before node creation
+Null-guards builder and mir_instr. Initialises op_kind to OpKind.Add (later
+overwritten by pattern-match dispatch), builds an empty inputs List and an
+INT32 output_type, sets ParallelismKind.DataParallel as the default, and seeds
+the metadata Dictionary with source_file, source_line, can_vectorize, can_fuse,
+memory_bound, compute_bound, execution_frequency, mir_instruction_id, and
+optimization_level keys. Constructs the node via create_operation_node, adds
+it to the graph from offset 8, and registers the node under the MIR value id.
 @End Implementation
+
+@Performance_Hints:
+O(1) per instruction plus constant dictionary inserts (~10 keys). Heavy on
+allocations during translation - List + Dictionary + Operation node per call.
+Hot loop for graph construction; consider arena allocation if profiling shows
+allocator pressure.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocations for the node, inputs List, and metadata Dictionary.
+register_value_node binds the node into the builder's value_map; failure to
+register would break SSA def-use chains. No external state, no syscalls.
+@End Security_Scope
 
 Process called "build_operation_node" that takes
     builder as Integer,
@@ -672,18 +784,30 @@ Process called "build_operation_node" that takes
     Return node
 End Process
 
+@Reasoning:
+The value_map is the SSA bridge between MIR's value-id space and Bifrost's
+node-pointer space. Without this index every operand resolution would require
+linear scanning the graph. The dictionary stores Integer keys (MIR value id)
+to Integer values (node pointer) so lookup is O(1) hashed.
+@End Reasoning
+
 @Implementation:
-Registers a mapping from MIR SSA value ID to Bifrost node.
-
-Algorithm:
-1. Validate builder pointer
-2. Get value_map from builder
-3. Insert (mir_value_id → node) mapping
-4. Update value_map in builder
-
-Memory Safety:
-- Overwrites existing mapping if mir_value_id already registered
+Null-guards the builder, reads the value_map pointer from offset 16, and
+inserts the (mir_value_id -> node) pair via Dictionary.set, overwriting any
+prior binding for the same id.
 @End Implementation
+
+@Performance_Hints:
+O(1) amortised dictionary insert. Called once per producer-instruction during
+lowering.
+@End Performance_Hints
+
+@Security_Scope:
+Pure dictionary mutation; the node pointer is borrowed and must remain live
+for the lifetime of the builder. Overwriting an existing binding silently
+drops the previous node from the SSA index but does not free it - dangling
+nodes remain in the graph until graph teardown.
+@End Security_Scope
 
 Process called "register_value_node" that takes
     builder as Integer,
@@ -699,18 +823,28 @@ Process called "register_value_node" that takes
     proc set from Dict with value_map, mir_value_id, node
 End Process
 
+@Reasoning:
+Operand resolution during instruction lowering hits this lookup constantly -
+every use of a MIR SSA value must resolve to its producer Bifrost node. The
+contract is that a return of 0 means "no producer registered yet" so callers
+can distinguish forward references from missing definitions.
+@End Reasoning
+
 @Implementation:
-Looks up the Bifrost node corresponding to a MIR SSA value ID.
-
-Algorithm:
-1. Validate builder pointer
-2. Get value_map from builder
-3. Lookup mir_value_id in value_map
-4. Return node pointer (or 0 if not found)
-
-Memory Safety:
-- Returns 0 for unmapped MIR values (safe default)
+Returns 0 for null builder. Loads the value_map at offset 16, calls
+Dictionary.has_key to test membership; on hit returns Dictionary.get of the
+mir_value_id, otherwise returns 0.
 @End Implementation
+
+@Performance_Hints:
+O(1) amortised hashed lookup. Called many times per instruction (once per
+operand) - kept as a hot accessor.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returned pointer is borrowed and points into the builder's graph -
+must not be freed by caller.
+@End Security_Scope
 
 Process called "lookup_value_node" that takes
     builder as Integer,
@@ -730,20 +864,30 @@ Process called "lookup_value_node" that takes
     Return 0
 End Process
 
+@Reasoning:
+Some MIR-to-Bifrost translations expand a single MIR instruction into a small
+graph fragment (e.g. lowering a fused-multiply-add through a multiply + add
+pair). Temporaries are anonymous - they carry no MIR id - so they are
+intentionally not registered in value_map, only added to the graph.
+@End Reasoning
+
 @Implementation:
-Creates a temporary intermediate node for multi-step translations.
-
-Algorithm:
-1. Validate builder pointer
-2. Allocate unique node ID
-3. Create operation node with specified type
-4. Add node to graph
-5. Increment node ID counter
-6. Return node pointer
-
-Memory Safety:
-- Temporary nodes are not registered in value map
+Null-guards the builder, reads next_node_id from offset 32 and post-increments
+it back, builds an empty inputs List, sets ParallelismKind.DataParallel and
+null metadata, constructs the node via create_operation_node, adds it to the
+graph at offset 8, and returns the new node pointer.
 @End Implementation
+
+@Performance_Hints:
+O(1) construction plus one List allocation. Used inside multi-step lowering
+expansions; modest frequency.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation. Not registered in the value_map - callers that need to
+reference the result from another MIR site must call register_value_node
+themselves.
+@End Security_Scope
 
 Process called "create_temporary_node" that takes
     builder as Integer,
@@ -777,24 +921,32 @@ Note: ════════════════════════�
 Note: Pattern Matching for Accelerator Operations
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Matching matmul patterns enables emitting a single Bifrost OpKind.MatMul node
+instead of lowering the triple-loop literally - that lets backends route the
+operation to GEMM hardware (tensor cores, GPU MMA, FPGA systolic arrays).
+The three independent checks (triple-nested loop, multiply-accumulate, [i][k]
+* [k][j] indexing) form a conservative recogniser that avoids false positives.
+@End Reasoning
+
 @Implementation:
-Detects matrix multiplication patterns in MIR instruction sequences.
-
-Pattern:
-- Nested loops with multiply-accumulate operations
-- Array indexing with [i][k] * [k][j] pattern
-- Result stored in [i][j]
-
-Algorithm:
-1. Check for nested loop structure (3 loops)
-2. Verify loop induction variables match matrix indexing
-3. Check for multiply-accumulate in innermost loop
-4. Verify result accumulation pattern
-5. Return true if pattern matches
-
-Memory Safety:
-- Returns false for invalid or non-matmul patterns
+Null-guards inputs and the instruction sequence list. Demands at least three
+instructions, then invokes check_triple_nested_loops, check_multiply_accumulate_pattern,
+and check_matrix_indexing_pattern in sequence. Returns true only when all
+three helpers confirm the pattern.
 @End Implementation
+
+@Performance_Hints:
+Linear in the length of mir_instr_seq because each helper walks the sequence
+once. Called at most O(blocks-in-function) times during translation; the cost
+is dominated by the helper walks. Short-circuits early on mismatch.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read over MIR instruction list. No mutation, no allocation, no syscalls.
+False is the safe return when any assumption fails - the builder will fall
+back to literal lowering rather than misclassifying the pattern.
+@End Security_Scope
 
 Process called "match_matrix_multiply" that takes
     builder as Integer,
@@ -839,24 +991,30 @@ Process called "match_matrix_multiply" that takes
     Return true
 End Process
 
+@Reasoning:
+Convolution patterns (conv2d, conv3d) are a dominant cost in DNN workloads;
+recognising them at the MIR level lets Bifrost emit an OpKind.Conv node that
+backends can route to cuDNN, ROCm MIOpen, or systolic-array kernels. The
+4..6-loop bracket discriminates 2D vs 3D conv while excluding deeper nest
+patterns that are likely something else.
+@End Reasoning
+
 @Implementation:
-Detects convolution patterns (conv2d, conv3d) in MIR.
-
-Pattern:
-- Nested loops with kernel sliding window
-- Multiply-accumulate with kernel weights
-- Spatial indexing with stride and padding
-
-Algorithm:
-1. Check for nested loop structure (4-6 loops for 2D/3D conv)
-2. Verify kernel sliding window pattern
-3. Check for multiply-accumulate with constant weights
-4. Verify stride and padding calculations
-5. Return true if pattern matches
-
-Memory Safety:
-- Returns false for invalid or non-convolution patterns
+Null-guards inputs, demands at least four instructions, counts nested loops
+via count_nested_loops and requires the count to fall in [4..6], then checks
+the sliding-window helper and the kernel-multiply-accumulate helper. Returns
+true only when all three structural conditions hold.
 @End Implementation
+
+@Performance_Hints:
+Linear in instruction-sequence length; helper walks dominate. The loop-count
+check short-circuits before the heavier sliding-window and kernel-MAC walks.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative false on any failure leaves correctness to fall back
+to literal lowering rather than misidentifying a pattern.
+@End Security_Scope
 
 Process called "match_convolution" that takes
     builder as Integer,
@@ -902,24 +1060,28 @@ Process called "match_convolution" that takes
     Return true
 End Process
 
+@Reasoning:
+Reductions (sum/product/max/min) are folded to OpKind.Reduce nodes so GPU
+backends can emit warp-shuffle / block-scan kernels instead of literal scalar
+loops. The recogniser demands three independent signals (reduction-shaped loop,
+accumulator init, recognisable reduce op) to keep false-positive rate low.
+@End Reasoning
+
 @Implementation:
-Detects reduction operations (sum, product, max, min) in MIR.
-
-Pattern:
-- Loop with accumulation variable
-- Reduction operation (add, mul, max, min) in loop body
-- Final result is accumulated value
-
-Algorithm:
-1. Check for single loop with reduction variable
-2. Verify reduction operation in loop body
-3. Check for proper initialization before loop
-4. Verify result is reduction variable after loop
-5. Return true if pattern matches
-
-Memory Safety:
-- Returns false for invalid or non-reduction patterns
+Null-guards inputs, demands at least two instructions, then runs
+check_reduction_loop_pattern, check_accumulator_initialization, and
+detect_reduction_operation. Returns true only when all three agree.
 @End Implementation
+
+@Performance_Hints:
+Linear in instruction-sequence length per helper. Early returns on first
+failure keep the average cost low.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative false on failure preserves correctness by falling back
+to literal lowering.
+@End Security_Scope
 
 Process called "match_reduction" that takes
     builder as Integer,
@@ -962,23 +1124,26 @@ Process called "match_reduction" that takes
     Return true
 End Process
 
+@Reasoning:
+Broadcast (splatting a scalar across a vector/tensor) is folded to
+OpKind.Broadcast so backends can issue a single splat instruction or rely on
+NumPy-style shape broadcasting at codegen time. Combining "scalar source" and
+"replication pattern" checks distinguishes broadcasts from initialised arrays.
+@End Reasoning
+
 @Implementation:
-Detects broadcast operations in MIR (scalar to vector/tensor).
-
-Pattern:
-- Scalar value replicated across array/vector
-- Loop with constant assignment to all elements
-- Or explicit broadcast instruction
-
-Algorithm:
-1. Check for loop with constant assignment
-2. Verify all elements assigned same scalar value
-3. Or check for explicit broadcast primitive
-4. Return true if pattern matches
-
-Memory Safety:
-- Returns false for invalid or non-broadcast patterns
+Null-guards inputs, requires at least one instruction, then calls
+check_scalar_broadcast_source followed by check_broadcast_replication_pattern.
+Returns true only when both hold.
 @End Implementation
+
+@Performance_Hints:
+Linear in instruction-sequence length per helper, with early exit on mismatch.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative false keeps lowering safe.
+@End Security_Scope
 
 Process called "match_broadcast" that takes
     builder as Integer,
@@ -1014,24 +1179,30 @@ Process called "match_broadcast" that takes
     Return true
 End Process
 
+@Reasoning:
+Activation functions appear in nearly every neural-network kernel; recognising
+them lets Bifrost emit hardware-fused activations (e.g. ReLU after MatMul in a
+single CUDA kernel). Each activation is checked independently because the
+patterns are mutually exclusive and short-circuiting on the first hit avoids
+unnecessary follow-up checks.
+@End Reasoning
+
 @Implementation:
-Detects activation function patterns (ReLU, sigmoid, tanh, softmax).
-
-Pattern:
-- ReLU: max(0, x)
-- Sigmoid: 1 / (1 + exp(-x))
-- Tanh: (exp(x) - exp(-x)) / (exp(x) + exp(-x))
-- Softmax: exp(x) / sum(exp(x))
-
-Algorithm:
-1. Check for specific mathematical expression patterns
-2. Match against known activation function formulas
-3. Return true if pattern matches any activation
-4. Return false otherwise
-
-Memory Safety:
-- Returns false for invalid or non-activation patterns
+Null-guards inputs, ensures the instruction list is non-empty, then runs four
+disjoint checks (check_relu_pattern, check_sigmoid_pattern, check_tanh_pattern,
+check_softmax_pattern). Returns true on the first hit; returns false only when
+all four reject.
 @End Implementation
+
+@Performance_Hints:
+Linear per helper; total work is sum across helpers in the worst case. ReLU
+check first because it is the most common pattern and the cheapest to recognise.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; no mutation. False is the safe fallback because activation lowering
+is purely a performance optimisation - literal scalar code remains correct.
+@End Security_Scope
 
 Process called "match_activation" that takes
     builder as Integer,
@@ -1080,25 +1251,29 @@ Process called "match_activation" that takes
     Return false
 End Process
 
+@Reasoning:
+Linear-algebra primitives map directly to backend BLAS/MKL/cuBLAS calls when
+recognised; folding them in Bifrost avoids re-deriving the pattern in every
+target backend. Dot, cross, norm, and transpose are checked in increasing
+recognition cost order so common cases short-circuit fast.
+@End Reasoning
+
 @Implementation:
-Detects linear algebra operation patterns.
-
-Patterns:
-- Dot product: sum of element-wise products
-- Cross product: determinant-based 3D vector operation
-- Norm: sqrt(sum(x^2))
-- Matrix transpose: [i][j] ↔ [j][i]
-- Matrix inverse: Gauss-Jordan elimination pattern
-
-Algorithm:
-1. Check for specific LA operation patterns
-2. Match against known formulas and algorithms
-3. Return true if pattern matches
-4. Return false otherwise
-
-Memory Safety:
-- Returns false for invalid or non-LA patterns
+Null-guards inputs, requires non-empty instruction list, then runs
+check_dot_product_pattern, check_cross_product_pattern, check_norm_pattern, and
+check_transpose_pattern in sequence. Returns true on first match; returns false
+when none match.
 @End Implementation
+
+@Performance_Hints:
+Linear per helper. Dot-product check first because dot products are the most
+common LA pattern.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. False on no-match preserves correctness by falling back to literal
+lowering.
+@End Security_Scope
 
 Process called "match_linear_algebra" that takes
     builder as Integer,
@@ -1147,25 +1322,27 @@ Process called "match_linear_algebra" that takes
     Return false
 End Process
 
+@Reasoning:
+DSP patterns (FFT butterflies, FIR/IIR filtering, resampling) benefit
+enormously from accelerator-specific kernels (cuFFT, FFTW) - recognising them
+at Bifrost level lets backends route to those libraries instead of lowering
+literal butterfly code which is hard to vectorise late.
+@End Reasoning
+
 @Implementation:
-Detects signal processing operation patterns.
-
-Patterns:
-- FFT: Cooley-Tukey butterfly operations
-- IFFT: Inverse FFT pattern
-- Filter: Convolution with fixed kernel
-- Downsample: Stride access pattern
-- Upsample: Zero-insertion pattern
-
-Algorithm:
-1. Check for specific signal processing patterns
-2. Match against known DSP algorithms
-3. Return true if pattern matches
-4. Return false otherwise
-
-Memory Safety:
-- Returns false for invalid or non-DSP patterns
+Null-guards inputs, requires non-empty instruction list, then runs
+check_fft_pattern, check_filter_pattern, and check_resample_pattern in
+sequence. Returns true on first match; otherwise returns false.
 @End Implementation
+
+@Performance_Hints:
+Linear per helper. The FFT check (butterfly recognition) is the most
+expensive; order keeps it first so genuine FFT graphs short-circuit early.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. False on no-match keeps correctness via literal lowering.
+@End Security_Scope
 
 Process called "match_signal_processing" that takes
     builder as Integer,
@@ -1208,25 +1385,30 @@ Process called "match_signal_processing" that takes
     Return false
 End Process
 
+@Reasoning:
+Tensor-level operators (contraction, reshape, slice, concat) abstract above the
+loop-pattern recognisers above - they map directly to high-level tensor IR
+nodes that backends like XLA, MLIR Linalg, or TVM consume. Recognising them
+here lets Bifrost emit those nodes verbatim rather than reconstructing them
+later from lowered loops.
+@End Reasoning
+
 @Implementation:
-Detects tensor operation patterns.
-
-Patterns:
-- Tensor contraction: Einstein summation
-- Tensor reshape: Layout change
-- Tensor slice: Sub-tensor extraction
-- Tensor concatenation: Joining along dimension
-- Tensor broadcast: Shape alignment
-
-Algorithm:
-1. Check for specific tensor operation patterns
-2. Match against known tensor algebra operations
-3. Return true if pattern matches
-4. Return false otherwise
-
-Memory Safety:
-- Returns false for invalid or non-tensor patterns
+Null-guards inputs, requires non-empty list, then runs
+check_tensor_contraction_pattern, check_reshape_pattern,
+check_tensor_slice_pattern, and check_tensor_concat_pattern in sequence.
+Returns true on first hit; false when all four reject.
 @End Implementation
+
+@Performance_Hints:
+Linear per helper. Contraction (einsum) check first because it is the most
+performance-critical recognition.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. False on no-match leaves correctness intact through literal
+lowering.
+@End Security_Scope
 
 Process called "match_tensor_ops" that takes
     builder as Integer,
@@ -1275,25 +1457,31 @@ Process called "match_tensor_ops" that takes
     Return false
 End Process
 
+@Reasoning:
+ParallelismKind.DataParallel is the largest win for GPU codegen; conservatively
+detecting independent map-style loops here means later passes can attach the
+DataParallel mode and propagate it through fusion without re-running dependency
+analysis. Three independent gates (no loop-carried deps, map shape,
+element-wise access) prevent misclassifying loops with hidden hazards.
+@End Reasoning
+
 @Implementation:
-Detects data parallelism patterns suitable for GPU/SIMD.
-
-Patterns:
-- Independent loop iterations (no dependencies)
-- Map operations (same function applied to all elements)
-- Elementwise operations
-- No loop-carried dependencies
-
-Algorithm:
-1. Analyze loop dependency graph
-2. Check for loop-carried dependencies
-3. Verify all iterations are independent
-4. Return true if parallel-safe
-5. Return false if dependencies found
-
-Memory Safety:
-- Returns false for loops with dependencies (conservative)
+Null-guards builder and mir_loop. Runs analyze_loop_dependencies and rejects if
+loop-carried dependencies exist. Then runs check_map_pattern and
+check_elementwise_access; only when both confirm does it return true.
 @End Implementation
+
+@Performance_Hints:
+Dominated by analyze_loop_dependencies (typically polynomial in loop body
+size). The shape checks are linear; ordering puts the cheap shape checks after
+the dep check so early rejection is cheap.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; conservative false on any failure prevents incorrect parallel
+emission. False does not impair correctness - it only forces sequential
+lowering.
+@End Security_Scope
 
 Process called "match_data_parallel" that takes
     builder as Integer,
@@ -1332,26 +1520,35 @@ Process called "match_data_parallel" that takes
     Return true
 End Process
 
+@Reasoning:
+SIMD vectorisation is a separate concern from DataParallel - vectorisation
+requires contiguous memory access and known trip counts, not just iteration
+independence. Splitting the check into five gates makes failure cause
+attributable and lets the verifier emit precise diagnostics about why a loop
+was not vectorised.
+@End Reasoning
+
 @Implementation:
-Determines if a loop can be vectorized for SIMD execution.
-
-Checks:
-- No loop-carried dependencies
-- Fixed trip count or known bounds
-- Contiguous memory access pattern
-- No function calls (or vectorizable calls only)
-- No branches (or uniform branches)
-
-Algorithm:
-1. Analyze loop structure
-2. Check for dependencies (read-after-write hazards)
-3. Verify memory access patterns are contiguous
-4. Check for vectorization inhibitors (calls, branches)
-5. Return true if vectorizable
-
-Memory Safety:
-- Returns false for non-vectorizable loops (conservative)
+Null-guards inputs. Sequentially checks: (1) no loop-carried dependencies via
+analyze_loop_dependencies, (2) known trip count via check_loop_bounds_known,
+(3) contiguous memory access via check_contiguous_memory_access, (4) no
+non-vectorisable function calls via check_for_non_vectorizable_calls, (5) no
+complex control flow via check_complex_control_flow. Returns true only when
+all five gates pass.
 @End Implementation
+
+@Performance_Hints:
+Dominated by the first dependency analysis; remaining checks are linear-walk
+helpers. Short-circuits aggressively so non-vectorisable loops bail out
+quickly.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; no mutation. False is the safe default - emitting scalar code
+preserves correctness when vectorisation conditions are not met. False
+classifications cause only performance loss; true classifications must hold or
+codegen will produce wrong results, so all five gates are mandatory.
+@End Security_Scope
 
 Process called "is_vectorizable" that takes
     builder as Integer,
@@ -1406,26 +1603,36 @@ Note: ════════════════════════�
 Note: MIR Translation to Bifrost
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+The top-level translator orchestrates the MIR-to-Bifrost lowering. Building
+the input nodes first, then basic blocks in order, then output nodes, then
+finalising matches the producer-before-consumer ordering required so that
+build_operation_node can resolve every operand via lookup_value_node when its
+basic block is translated. Returning an empty graph (rather than null) for a
+null function lets downstream passes operate on a valid object.
+@End Reasoning
+
 @Implementation:
-Translates an entire MIR function to a Bifrost computation graph.
-
-Algorithm:
-1. Create BifrostBuilder for function
-2. Create input nodes for function parameters
-3. Translate each basic block sequentially
-4. Create output nodes for return values
-5. Finalize graph (remove dead nodes, validate)
-6. Return completed Bifrost graph
-
-High-Level Steps:
-- Parameters → Input nodes
-- Basic blocks → Subgraphs (connected via control flow)
-- Return values → Output nodes
-- SSA values → Data flow edges
-
-Memory Safety:
-- Returns empty graph for null MIR function
+Returns create_graph() for null input. Otherwise constructs a fresh builder,
+fetches the in-progress graph, walks the MIR params list and builds an input
+node per parameter, walks the basic_blocks list and translates each via
+translate_basic_block, fetches the exit block and lowers its terminator with
+translate_return_instruction if non-null, then calls finalize_graph and
+returns the final graph pointer.
 @End Implementation
+
+@Performance_Hints:
+O(P + sum_B(I_B)) where P is parameter count, B ranges over basic blocks, and
+I_B is the instructions in block B. Dominated by translate_basic_block. No
+extra heap pressure beyond what the inner translators incur.
+@End Performance_Hints
+
+@Security_Scope:
+Allocates a builder, a graph, and node objects per parameter/instruction.
+mir_function is borrowed - the builder retains a pointer but the function's
+lifetime must exceed translation. Caller owns the returned graph; the builder
+itself becomes garbage when this routine returns.
+@End Security_Scope
 
 Process called "translate_function" that takes mir_function as Integer returns Integer:
     If mir_function is equal to 0:
@@ -1476,20 +1683,35 @@ Process called "translate_function" that takes mir_function as Integer returns I
     Return graph
 End Process
 
+@Reasoning:
+PHI nodes must be lowered before regular instructions because incoming
+predecessor values may already be in the value_map - PHI joins them into a
+merge node that subsequent instructions can reference. Registering each
+translated instruction's SSA id into the value_map (offset 24) keeps the
+def-use chain intact for any later use within the block or downstream blocks.
+@End Reasoning
+
 @Implementation:
-Translates a MIR basic block to a Bifrost subgraph.
-
-Algorithm:
-1. Iterate over instructions in basic block
-2. Translate each instruction to Bifrost node
-3. Create data flow edges between instructions
-4. Handle PHI nodes at block entry
-5. Handle control flow at block exit (branches)
-6. Return list of created nodes
-
-Memory Safety:
-- All instructions must be translated before control flow edges
+Returns an empty List for null builder/block. Reads the phi_nodes list at
+offset 88 and walks it, calling translate_phi_node for each entry and
+appending non-null results into the nodes List. Then reads the instructions
+list (offset 16) and count (offset 24), walks them via translate_instruction,
+appends each result, and writes the (value_id -> node) mapping into the
+value_map at builder offset 24 when the instruction defines a value (offset 8).
 @End Implementation
+
+@Performance_Hints:
+O(P + I) where P is the PHI count and I is the regular instruction count.
+Each iteration is bounded by translate_phi_node / translate_instruction cost.
+Hot path - this is the per-basic-block driver.
+@End Performance_Hints
+
+@Security_Scope:
+Allocates a node-list and mutates the builder's value_map. The mir_bb pointer
+and its instruction lists are borrowed - lifetimes must exceed the call.
+Failure to translate an instruction (returns 0) is silently skipped which can
+break SSA if the omitted instruction defined a value used downstream.
+@End Security_Scope
 
 Process called "translate_basic_block" that takes
     builder as Integer,
@@ -1549,28 +1771,35 @@ Process called "translate_basic_block" that takes
     Return nodes
 End Process
 
+@Reasoning:
+Each MIR instruction becomes one Bifrost operation node plus up to three
+incoming data-flow edges (for the three MIR operand slots). Looking up each
+operand in the value_map ensures the edge points to the producer node rather
+than back to MIR. Operands that resolve to 0 (forward references or
+constants) skip edge creation; the verifier flags any remaining dangling
+def-use chains.
+@End Reasoning
+
 @Implementation:
-Translates a single MIR instruction to Bifrost node(s).
-
-Algorithm:
-1. Match instruction opcode to determine operation type
-2. Extract operands and lookup corresponding Bifrost nodes
-3. Determine high-level operation (pattern match if needed)
-4. Create Bifrost operation node
-5. Create data flow edges from operands to node
-6. Register SSA value mapping
-7. Return created node
-
-Instruction Categories:
-- Arithmetic: Add, Sub, Mul, Div → OpKind arithmetic ops
-- Logic: And, Or, Xor → OpKind logic ops
-- Memory: Load, Store → Memory operations with edges
-- Control: Branch, Jump → Control flow edges
-- Call: Function call → Nested subgraph or external op
-
-Memory Safety:
-- All operands must exist in value map before translation
+Null-guards inputs, reads the opcode (offset 0), builds the operation node via
+build_operation_node, and returns 0 if construction failed. Reads operand1/2/3
+at offsets 16/24/32 of the MIR instruction, retrieves the value_map (builder
+offset 24) and graph (builder offset 0), and for each non-zero operand: looks
+up the producer node and, if present, creates a data edge via
+Edge.create_data_edge and appends it via Graph.add_edge.
 @End Implementation
+
+@Performance_Hints:
+O(1) - up to three dictionary lookups and three edge constructions. Hot loop
+per MIR instruction. Edge creation dominates because each requires a 56-byte
+heap allocation.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocations for the node and (up to three) edges. All operand
+pointers are borrowed from the value_map - the operation node retains them
+through edges, so they must remain live until the graph itself is freed.
+@End Security_Scope
 
 Process called "translate_instruction" that takes
     builder as Integer,
@@ -1632,26 +1861,28 @@ Process called "translate_instruction" that takes
     Return node
 End Process
 
+@Reasoning:
+PHI lowering is currently structurally null-guarded - the merge-node creation
+is reserved for a follow-up enhancement that wires multiple control predecessors
+into a merge primitive. This skeleton preserves the calling contract and
+returns 0 so the caller can detect "no PHI emitted" and skip downstream
+references safely.
+@End Reasoning
+
 @Implementation:
-Translates a MIR PHI node to Bifrost representation.
-
-PHI Node Handling:
-- PHI nodes merge values from multiple predecessor blocks
-- In Bifrost, represented as multiple edges converging on node
-- Create node with edges from each predecessor's value
-
-Algorithm:
-1. Extract PHI operands (value, block) pairs
-2. For each operand:
-   - Lookup Bifrost node for value
-   - Create control flow edge from predecessor block
-3. Create merge node with all incoming edges
-4. Register PHI result in value map
-5. Return merge node
-
-Memory Safety:
-- All PHI operands must exist in value map
+Null-guards builder and mir_phi. Currently returns 0 (no merge_node produced)
+while the merge-node infrastructure is being completed; the structure
+preserves the contract used by translate_basic_block (any non-zero return is
+appended to the per-block node list).
 @End Implementation
+
+@Performance_Hints:
+O(1) - guard plus return. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure null-guard; no allocation, no mutation. Safe to call with null inputs.
+@End Security_Scope
 
 Process called "translate_phi_node" that takes
     builder as Integer,
@@ -1678,27 +1909,27 @@ Process called "translate_phi_node" that takes
     Return merge_node
 End Process
 
+@Reasoning:
+Function-call lowering chooses between inlining (replace with callee's
+subgraph), external dispatch (library hook), or CPU fallback. The strategy
+decision belongs in this slot and depends on cost analysis that the call-graph
+analyser will provide; until then the routine null-guards and returns 0 so
+the caller skips the unsupported instruction.
+@End Reasoning
+
 @Implementation:
-Translates a MIR function call to Bifrost representation.
-
-Call Translation Strategies:
-1. Inline: Replace with called function's Bifrost graph (if small)
-2. External: Create external operation node (if accelerator library)
-3. CPU: Mark for CPU execution (if not accelerator-suitable)
-
-Algorithm:
-1. Extract callee function and arguments
-2. Determine call strategy (inline, external, CPU)
-3. If inline: Merge callee's Bifrost graph into current graph
-4. If external: Create operation node for library call
-5. If CPU: Mark subgraph for CPU execution
-6. Create edges from arguments to call inputs
-7. Register return value in value map
-8. Return call node
-
-Memory Safety:
-- Function must be resolved before translation
+Null-guards builder and mir_call. Returns 0 - the strategy dispatch
+(inline/external/CPU-fallback) is staged for the call-graph integration; this
+preserves the calling contract used by translate_instruction.
 @End Implementation
+
+@Performance_Hints:
+O(1) guard plus return. No allocation.
+@End Performance_Hints
+
+@Security_Scope:
+Pure null-guard; no allocation, no mutation. Safe to call with null inputs.
+@End Security_Scope
 
 Process called "translate_call" that takes
     builder as Integer,
@@ -1725,24 +1956,27 @@ Process called "translate_call" that takes
     Return call_node
 End Process
 
+@Reasoning:
+Memory-op lowering requires alias analysis to insert the right Memory/AntiDep
+edges so the scheduler does not reorder loads past stores to the same
+address. Until the Bifrost alias analyser is wired in, the routine null-guards
+and returns 0 to keep the calling contract while the memory-edge construction
+is staged.
+@End Reasoning
+
 @Implementation:
-Translates MIR load/store instructions to Bifrost memory operations.
-
-Memory Operations:
-- Load: Read from memory, create node with memory dependency edge
-- Store: Write to memory, create node with memory dependency edge
-
-Algorithm:
-1. Extract memory address and value (for store)
-2. Determine memory space (Global, Shared, Local)
-3. Create memory operation node
-4. Create memory dependency edges
-5. Register loaded value in value map (for load)
-6. Return memory node
-
-Memory Safety:
-- Memory operations must respect dependency ordering
+Null-guards builder and mir_mem_op. Returns 0 - load/store lowering with
+memory-dependency edges depends on the alias analyser; this preserves the
+caller contract used by translate_instruction.
 @End Implementation
+
+@Performance_Hints:
+O(1) guard plus return.
+@End Performance_Hints
+
+@Security_Scope:
+Pure null-guard; no allocation, no mutation.
+@End Security_Scope
 
 Process called "translate_load_store" that takes
     builder as Integer,
@@ -1769,23 +2003,27 @@ Process called "translate_load_store" that takes
     Return mem_node
 End Process
 
+@Reasoning:
+Control-flow lowering must run after all basic blocks are translated so the
+target nodes exist in the graph before edges are added. The skeleton
+null-guards and returns 0; the per-target Control-edge construction is
+deferred to the control-flow-graph integration pass which will rewire
+terminators into Bifrost control edges.
+@End Reasoning
+
 @Implementation:
-Translates MIR control flow instructions to Bifrost control edges.
-
-Control Flow Types:
-- Branch: Conditional control flow, create control edges to both targets
-- Jump: Unconditional control flow, create control edge to target
-- Return: Function exit, create edge to output nodes
-
-Algorithm:
-1. Extract control flow type and targets
-2. Create control flow edges to target blocks
-3. Handle conditional branches (predicate edge)
-4. Return control node
-
-Memory Safety:
-- All target blocks must be translated before control edges
+Null-guards builder and mir_term. Returns 0 - the per-target control-edge
+construction depends on the cross-block address map produced after all blocks
+are translated; this preserves the calling contract.
 @End Implementation
+
+@Performance_Hints:
+O(1) guard plus return.
+@End Performance_Hints
+
+@Security_Scope:
+Pure null-guard; no allocation, no mutation.
+@End Security_Scope
 
 Process called "translate_control_flow" that takes
     builder as Integer,
@@ -1814,19 +2052,30 @@ Note: ════════════════════════�
 Note: Graph Building Utilities
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Data-flow is the most common edge kind, so the helper takes responsibility for
+extracting the producer's output type so that callers do not have to and the
+edge carries the correct payload type tag from the start. Failing fast on null
+source/dest avoids dangling edges in the graph.
+@End Reasoning
+
 @Implementation:
-Creates a data flow edge between two Bifrost nodes.
-
-Algorithm:
-1. Validate source and destination nodes
-2. Get data type from source node output
-3. Create BifrostEdge with EdgeKind::DataFlow
-4. Add edge to graph
-5. Update adjacency lists
-
-Memory Safety:
-- Type compatibility must be validated before edge creation
+Triple null-guards builder, source, and dest. Calls get_node_output_type on
+the source to fetch the data type, constructs the edge via
+create_edge(edge_id=1, source, dest, EdgeKind.DataFlow, data_type), fetches
+the graph via get_current_graph, and inserts the edge via add_edge.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one type read plus one edge construction (56-byte heap alloc) plus one
+graph insertion. Hot path during MIR translation.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation for the edge. Source and dest pointers are borrowed -
+the edge captures them by value, so they must remain live until the graph is
+freed.
+@End Security_Scope
 
 Process called "add_data_flow_edge" that takes
     builder as Integer,
@@ -1858,18 +2107,27 @@ Process called "add_data_flow_edge" that takes
     Return edge
 End Process
 
+@Reasoning:
+Control edges enforce execution-order between two operations without carrying
+a typed payload (the producer's value is not read by the consumer). Passing 0
+for data_type makes the verifier accept the edge while preventing it from
+being treated as a data-flow dependency by alias analysis.
+@End Reasoning
+
 @Implementation:
-Creates a control flow edge between two Bifrost nodes.
-
-Algorithm:
-1. Validate source and destination nodes
-2. Create BifrostEdge with EdgeKind::Control
-3. Add edge to graph
-4. Update adjacency lists
-
-Memory Safety:
-- Control edges have no data type (use null)
+Null-guards builder, source, dest. Constructs the edge via
+create_edge(edge_id=1, source, dest, EdgeKind.Control, 0), retrieves the
+graph via get_current_graph, and inserts via add_edge.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one edge allocation and one graph insertion.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation. Source/dest pointers are borrowed and captured by the
+edge.
+@End Security_Scope
 
 Process called "add_control_edge" that takes
     builder as Integer,
@@ -1898,22 +2156,28 @@ Process called "add_control_edge" that takes
     Return edge
 End Process
 
+@Reasoning:
+Memory edges express "load must see this store" or "store-after-store" hazards
+so that the scheduler does not reorder them. Like control edges, no typed
+payload is carried so data_type is 0. Memory edges form the spine of the
+load/store ordering chain that alias analysis builds.
+@End Reasoning
+
 @Implementation:
-Creates a memory dependency edge between two Bifrost nodes.
-
-Algorithm:
-1. Validate source and destination nodes
-2. Create BifrostEdge with EdgeKind::Memory
-3. Add edge to graph
-4. Update adjacency lists
-
-Memory Dependency Types:
-- Memory edge enforces ordering between memory operations
-- Prevents reordering of load/store operations
-
-Memory Safety:
-- Memory edges have no data type (use null)
+Null-guards builder, source, dest. Constructs the edge via
+create_edge(edge_id=1, source, dest, EdgeKind.Memory, 0), retrieves the graph
+via get_current_graph, and inserts via add_edge.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one edge allocation and one graph insertion. Memory edges are emitted
+once per memory-op pair (after alias analysis) so frequency is moderate.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation. Source/dest pointers are borrowed and captured by the
+edge.
+@End Security_Scope
 
 Process called "add_memory_edge" that takes
     builder as Integer,
@@ -1942,24 +2206,29 @@ Process called "add_memory_edge" that takes
     Return edge
 End Process
 
+@Reasoning:
+Finalisation gates the graph: dead nodes are pruned to shrink the graph before
+verification (which is O(N+E)), then the validator confirms DAG and
+type-consistency invariants. Returning 0 on validation failure is critical -
+shipping an invalid graph to a backend would cause incorrect codegen.
+@End Reasoning
+
 @Implementation:
-Finalizes the Bifrost graph after translation.
-
-Finalization Steps:
-1. Eliminate dead nodes (unreachable from inputs)
-2. Validate graph structure (DAG, type consistency)
-3. Compute graph statistics
-4. Optimize graph (optional - fusion, reordering)
-
-Algorithm:
-1. Get graph from builder
-2. Run eliminate_dead_nodes to remove unreachable nodes
-3. Validate graph using validate_graph
-4. Return finalized graph
-
-Memory Safety:
-- Graph must pass validation before use
+Null-guards the builder, retrieves the graph via get_current_graph, runs
+eliminate_dead_nodes to prune unreachable nodes, then calls validate_graph;
+returns 0 if validation fails and the graph pointer otherwise.
 @End Implementation
+
+@Performance_Hints:
+O(N+E) for both DCE and validation where N is node count and E is edge count.
+Runs once per function lowering.
+@End Performance_Hints
+
+@Security_Scope:
+Pure analysis-and-mutation on the builder's graph. Failure path returns 0
+which calling code must check - feeding 0 to backends is the only safe action
+if validation rejects the graph.
+@End Security_Scope
 
 Process called "finalize_graph" that takes builder as Integer returns Integer:
     If builder is equal to 0:
@@ -1981,26 +2250,28 @@ Process called "finalize_graph" that takes builder as Integer returns Integer:
     Return graph
 End Process
 
+@Reasoning:
+Two-stage validation separates structural (DAG, edge endpoints) from semantic
+(operation type consistency) checks so failures can be attributed precisely.
+Both stages must pass before downstream backends consume the graph.
+@End Reasoning
+
 @Implementation:
-Validates the translation from MIR to Bifrost.
-
-Validation Checks:
-1. All MIR SSA values mapped to Bifrost nodes
-2. Graph is DAG (no cycles)
-3. All edges have valid types
-4. All operations have correct input counts
-5. Control flow matches MIR CFG
-
-Algorithm:
-1. Check all MIR values in value_map
-2. Validate graph structure (validate_graph)
-3. Check type consistency (validate_types)
-4. Verify operation input counts
-5. Return true if all checks pass
-
-Memory Safety:
-- Returns false for invalid translation
+Null-guards the builder. Reads the graph via get_current_graph, runs
+validate_graph (DAG/structural check) returning false on failure, then runs
+validate_types (type consistency across edges) returning false on failure.
+Returns true only when both stages pass.
 @End Implementation
+
+@Performance_Hints:
+O(N+E) for the structural pass plus O(E) for the type pass; both dominate
+nothing else in the builder.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Failure return (false) tells the caller the graph is not safe to
+codegen; the verifier callers must abort lowering on false.
+@End Security_Scope
 
 Process called "validate_translation" that takes builder as Integer returns Boolean:
     If builder is equal to 0:

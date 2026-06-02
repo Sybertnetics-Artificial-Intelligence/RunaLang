@@ -64,36 +64,41 @@ Note: ================================================================
 Note: Code Generation - Top Level
 Note: ================================================================
 
+@Reasoning
+generate_opencl_code is the top-level entry point that lowers a Bifrost
+graph to a complete OpenCL C source string. The output is structured into
+pragmas, extensions, typedefs, kernel function, and host setup comments so
+the result can be cleanly partitioned by callers. Traversal is in
+topological order so operations are emitted with all operands already
+declared.
+@End Reasoning
+
+@Implementation
+Creates an empty StringMod buffer. Appends in order:
+1. Pragmas via generate_opencl_pragmas(opencl_version).
+2. Extensions via generate_opencl_extensions(opencl_version).
+3. Type definitions via generate_type_definitions(graph).
+4. The kernel function via generate_kernel_function(graph, kernel_name,
+   opencl_version).
+5. Host-side setup comments via generate_host_setup_comments(graph,
+   kernel_name).
+Each section is separated by "\n\n". Returns the buffer converted to
+String via StringMod.to_string.
+@End Implementation
+
+@Performance_Hints
+O(V+E) where V and E are the graph's node and edge counts. Dominated by
+generate_kernel_function. String concatenation is amortised by the
+StringMod buffer.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; reads the graph and produces a fresh String owned by
+caller. No syscalls, no host execution - this routine emits source code,
+not running compute.
+@End Security_Scope
+
 Process called "generate_opencl_code" that takes graph as Integer, kernel_name as String, opencl_version as Integer returns String:
-    @Reasoning
-    Generates complete OpenCL C code from Bifrost graph.
-
-    Output structure:
-    1. OpenCL pragmas and version directives
-    2. Extension declarations
-    3. Type definitions
-    4. Helper device functions
-    5. Kernel function (__kernel)
-    6. Host-side setup comments
-
-    Algorithm:
-    - Traverse graph in topological order
-    - Emit OpenCL code for each operation
-    - Handle address spaces (__global, __local, __constant, __private)
-    - Generate kernel signature with proper qualifiers
-    @End Reasoning
-
-    @Implementation
-    1. Generate OpenCL version pragmas
-    2. Generate extension declarations
-    3. Generate type definitions
-    4. Generate helper functions
-    5. Generate kernel function
-    6. Generate host-side setup documentation
-    7. Combine into complete OpenCL source
-    8. Return OpenCL code string
-    @End Implementation
-
     Let opencl_code be proc create from StringMod
 
     Note: Add OpenCL version pragma
@@ -123,23 +128,28 @@ Process called "generate_opencl_code" that takes graph as Integer, kernel_name a
     Return proc to_string from StringMod with opencl_code
 End Process
 
+@Reasoning
+generate_opencl_pragmas emits the #pragma OPENCL EXTENSION directives
+needed by the kernel. Version 2.0+ also enables int64 atomics. fp64 is
+emitted for all versions because Bifrost typically uses double precision.
+@End Reasoning
+
+@Implementation
+Allocates a fresh StringMod buffer. If opencl_version >= OPENCL_2_0,
+appends three pragmas (cl_khr_fp64, cl_khr_int64_base_atomics,
+cl_khr_int64_extended_atomics). Otherwise appends only cl_khr_fp64.
+Converts the buffer to String and returns it.
+@End Implementation
+
+@Performance_Hints
+O(1) - a small constant number of string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. Output is a String owned by caller.
+@End Security_Scope
+
 Process called "generate_opencl_pragmas" that takes opencl_version as Integer returns String:
-    @Reasoning
-    Generates OpenCL version pragmas and compiler directives.
-
-    OpenCL versions:
-    - 1.2: Most compatible, widely supported
-    - 2.0: Adds SVM, pipes, generic address space
-    - 3.0: Modular extensions, backward compatible
-    @End Reasoning
-
-    @Implementation
-    1. Determine version string
-    2. Generate #pragma OPENCL EXTENSION
-    3. Add FP64 support if needed
-    4. Return pragma directives
-    @End Implementation
-
     Let pragmas be proc create from StringMod
 
     If opencl_version is greater than or equal to OPENCL_2_0:
@@ -152,6 +162,26 @@ Process called "generate_opencl_pragmas" that takes opencl_version as Integer re
 
     Return proc to_string from StringMod with pragmas
 End Process
+
+@Reasoning
+Emits OpenCL-version-conditional comments documenting which feature set the
+kernel is targeting (SVM and generic address space at 2.0+, compatibility
+mode at 1.2).
+@End Reasoning
+
+@Implementation
+Creates an empty StringMod buffer. Appends a generic header comment, then a
+version-specific comment line (2.0+ vs 1.2). Returns the StringMod buffer
+as a String.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
 
 Process called "generate_opencl_extensions" that takes opencl_version as Integer returns String:
     Let extensions be proc create from StringMod
@@ -166,6 +196,28 @@ Process called "generate_opencl_extensions" that takes opencl_version as Integer
 
     Return proc to_string from StringMod with extensions
 End Process
+
+@Reasoning
+Emits OpenCL C typedef aliases (uchar, ushort, uint, ulong) so the rest of
+the generated code can use these names without relying on the host
+toolchain's typedefs. These names map 1:1 to OpenCL built-in types and are
+consistent across NVIDIA, AMD, and Intel implementations.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends a comment header followed by four
+typedef declarations (uchar, ushort, uint, ulong). Returns the buffer as a
+String. The graph parameter is reserved for future per-graph type
+specialisation.
+@End Implementation
+
+@Performance_Hints
+O(1) - four string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
 
 Process called "generate_type_definitions" that takes graph as Integer returns String:
     Let typedefs be proc create from StringMod
@@ -184,39 +236,33 @@ Note: ================================================================
 Note: Kernel Generation
 Note: ================================================================
 
+@Reasoning
+generate_kernel_function emits the actual OpenCL __kernel definition: the
+signature with address-space-qualified parameters (__global, __local),
+work-item index computation, local memory declarations, the body lowered
+from the graph, and a final barrier. Combining these into a single producer
+keeps the kernel structure consistent across graphs.
+@End Reasoning
+
+@Implementation
+Allocates a kernel_code StringMod buffer. Appends "__kernel void " plus
+kernel_name, then calls generate_kernel_parameters to fill the parameter
+list, generate_work_item_index_computation for the get_global_id setup,
+generate_local_memory_declarations for any __local buffers, and
+generate_kernel_body for the actual operation emission. Wraps everything
+in the function body. Returns the kernel as a String.
+@End Implementation
+
+@Performance_Hints
+O(V+E) where V and E are the graph sizes. Dominated by the inner body
+emission.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. The output is a String owned by caller; no syscalls.
+@End Security_Scope
+
 Process called "generate_kernel_function" that takes graph as Integer, kernel_name as String, opencl_version as Integer returns String:
-    @Reasoning
-    Generates OpenCL __kernel function.
-
-    Kernel structure:
-    __kernel void kernel_name(__global const float* input,
-                             __global float* output,
-                             __local float* local_mem,
-                             int size) {
-        // Work-item index computation
-        // Local memory declarations
-        // Kernel body (operations)
-        // Synchronization (barrier)
-    }
-
-    Algorithm:
-    - Compute work-group dimensions
-    - Generate parameter list with address spaces
-    - Generate local memory declarations
-    - Generate kernel body from graph
-    - Add synchronization points
-    @End Reasoning
-
-    @Implementation
-    1. Generate kernel signature with __kernel qualifier
-    2. Generate work-item index computation
-    3. Generate bounds checking
-    4. Generate local memory usage
-    5. Traverse graph and emit operations
-    6. Add barrier synchronization
-    7. Return complete kernel code
-    @End Implementation
-
     Let kernel_code be proc create from StringMod
 
     Note: Generate kernel signature
@@ -246,25 +292,32 @@ Process called "generate_kernel_function" that takes graph as Integer, kernel_na
     Return proc to_string from StringMod with kernel_code
 End Process
 
+@Reasoning
+generate_kernel_parameters scans the graph's Input and Output nodes and
+emits an OpenCL parameter list with the correct address-space qualifiers
+(__global for buffers, __local for shared memory, scalar for size). The
+order matches the host-side launch convention so the host does not need
+extra binding logic.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer. Walks Graph.get_all_nodes and emits, for each
+Input node (NodeType 1), a "__global const TYPE* input_i" parameter, and
+for each Output node (NodeType 2), a "__global TYPE* output_i" parameter.
+After all I/O nodes, appends "__local float* local_mem" and "int size" as
+the trailing parameters. Commas and newlines separate parameters.
+@End Implementation
+
+@Performance_Hints
+O(N) where N is graph node count - one pass over Graph.get_all_nodes plus
+constant trailing parameters.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; emits a String with the parameter list.
+@End Security_Scope
+
 Process called "generate_kernel_parameters" that takes graph as Integer returns String:
-    @Reasoning
-    Generates OpenCL kernel parameters with address space qualifiers.
-
-    OpenCL address spaces:
-    - __global: Device memory (large, slow)
-    - __local: On-chip shared memory (small, fast)
-    - __constant: Read-only cached memory
-    - __private: Register memory (fastest)
-    @End Reasoning
-
-    @Implementation
-    1. Get input and output nodes from graph
-    2. Generate __global parameters for buffers
-    3. Add __local parameter for shared memory
-    4. Add scalar parameters (size)
-    5. Return parameter list string
-    @End Implementation
-
     Let params be proc create from StringMod
 
     Note: Get input and output nodes
@@ -326,26 +379,29 @@ Process called "generate_kernel_parameters" that takes graph as Integer returns 
     Return proc to_string from StringMod with params
 End Process
 
+@Reasoning
+Emits OpenCL's standard work-item index preamble (get_global_id,
+get_local_id, get_group_id) plus the gid-bounds-check that prevents
+out-of-range work-items from executing kernel body. This pattern is
+recognised by every OpenCL implementation as the canonical setup.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer. Appends a comment header followed by four C
+statements: "int gid = get_global_id(0);", "int lid = get_local_id(0);",
+"int group_id = get_group_id(0);", and "if (gid >= size) return;".
+Returns the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(1) - constant number of string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
+
 Process called "generate_work_item_index_computation" that takes nothing returns String:
-    @Reasoning
-    Generates OpenCL work-item index computation.
-
-    OpenCL index functions:
-    - get_global_id(0): Global work-item index
-    - get_local_id(0): Local work-item index within work-group
-    - get_group_id(0): Work-group index
-    - get_global_size(0): Total number of work-items
-    - get_local_size(0): Work-group size
-    - get_num_groups(0): Number of work-groups
-    @End Reasoning
-
-    @Implementation
-    1. Generate global ID computation
-    2. Add bounds checking
-    3. Optionally add local ID for shared memory
-    4. Return index code
-    @End Implementation
-
     Let code be proc create from StringMod
 
     proc append from StringMod with code, "    // Compute global work-item index\n"
@@ -357,24 +413,30 @@ Process called "generate_work_item_index_computation" that takes nothing returns
     Return proc to_string from StringMod with code
 End Process
 
+@Reasoning
+Local memory in OpenCL is on-chip per-compute-unit storage shared by all
+work-items in a work-group. Today it is passed in via the kernel parameter
+local_mem rather than declared inline; this routine emits a documentation
+comment so the generated kernel makes the intent visible.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends two comment lines noting that
+local memory is available via the kernel parameter and the typical size
+budget (1024 bytes for 256 floats). Returns the buffer as a String. The
+graph parameter is reserved for future per-graph local-memory budget
+analysis.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
+
 Process called "generate_local_memory_declarations" that takes graph as Integer returns String:
-    @Reasoning
-    Generates __local memory declarations for work-group shared memory.
-
-    Local memory:
-    - Shared by all work-items in a work-group
-    - Typically 16-64 KB per compute unit
-    - Much faster than global memory
-    - Requires barrier() for synchronization
-    @End Reasoning
-
-    @Implementation
-    1. Analyze graph for local memory needs
-    2. Local memory is passed as kernel parameter
-    3. Document usage
-    4. Return declarations
-    @End Implementation
-
     Let code be proc create from StringMod
 
     proc append from StringMod with code, "    // Local memory available via kernel parameter\n"
@@ -383,24 +445,33 @@ Process called "generate_local_memory_declarations" that takes graph as Integer 
     Return proc to_string from StringMod with code
 End Process
 
+@Reasoning
+generate_kernel_body lowers the graph's operation nodes to OpenCL C
+statements in topological order, recording per-node output variable names
+in a Dict so emit_operation_code can resolve operand references on later
+nodes. Topological order guarantees every operand has been emitted before
+its consumer.
+@End Reasoning
+
+@Implementation
+Allocates a body StringMod buffer. Runs Graph.topological_sort to get the
+node order. Creates a var_names Dict for SSA-to-C-variable mapping. Walks
+the sorted node list and calls emit_operation_code(node, var_names, i,
+opencl_version) for each node, appending the returned code into the body
+buffer. Returns the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(V) topological sort plus O(per-node) emission cost. The total kernel
+body is linear in graph size.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; allocates and owns one Dict and one StringMod
+buffer. No external state.
+@End Security_Scope
+
 Process called "generate_kernel_body" that takes graph as Integer, opencl_version as Integer returns String:
-    @Reasoning
-    Generates kernel body by traversing graph in topological order.
-
-    For each operation:
-    - Emit OpenCL code for the operation
-    - Handle memory accesses with proper address spaces
-    - Add synchronization if needed (barrier)
-    @End Reasoning
-
-    @Implementation
-    1. Get topological ordering
-    2. For each node:
-       - Emit OpenCL code for operation
-       - Track variable names
-    3. Return complete kernel body
-    @End Implementation
-
     Let body be proc create from StringMod
 
     Note: Get topological sort
@@ -427,26 +498,37 @@ Note: ================================================================
 Note: Operation Code Emission
 Note: ================================================================
 
+@Reasoning
+emit_operation_code is the dispatcher that maps Bifrost OpKind discriminants
+to concrete OpenCL C expressions. Each variant produces a typed declaration
+of var_i and assigns the appropriate expression (arithmetic, activation,
+intrinsic). Variable naming is index-based to keep symbols collision-free
+across kernels.
+@End Reasoning
+
+@Implementation
+Allocates a code StringMod buffer. Reads the node's OpKind. Builds a
+result_var_name as "var_" + index and registers (node -> name) in
+var_names. Maps the node's output type to its OpenCL C type. Then
+dispatches by op_kind: 0-4 emit binary arithmetic (Add/Sub/Mul/Div/Mod);
+20-22 emit activation functions (ReLU as max(0.0f, x), Sigmoid as 1.0/(1.0+exp(-x)),
+Tanh via tanh()); 30-32 emit math intrinsics (Exp/Log/Sqrt). Each variant
+fetches operand variable names via get_input_variable and writes the
+C-style declaration to the code buffer.
+@End Implementation
+
+@Performance_Hints
+O(1) per node - one Dict insert plus a fixed number of string appends per
+opcode. The full dispatch table is a linear If-cascade but bounded to ~50
+opcodes.
+@End Performance_Hints
+
+@Security_Scope
+Mutates the caller-owned var_names Dict. Returns a freshly allocated String.
+Pure code generation; no syscalls.
+@End Security_Scope
+
 Process called "emit_operation_code" that takes node as Integer, var_names as Integer, index as Integer, opencl_version as Integer returns String:
-    @Reasoning
-    Emits OpenCL code for a single operation.
-
-    Operation mapping:
-    - Add → result = a + b
-    - MatrixMultiply → Manual loop or clBLAS call
-    - ReLU → result = max(0.0f, input)
-    - Load/Store → memory access with coalescing
-    - Atomic → atomic_add, atomic_max, etc.
-    @End Reasoning
-
-    @Implementation
-    1. Get operation kind
-    2. Get input variables
-    3. Emit appropriate OpenCL code
-    4. Register output variable
-    5. Return code string
-    @End Implementation
-
     Let code be proc create from StringMod
 
     Let op_kind be proc get_node_opkind from Node with node
@@ -997,30 +1079,35 @@ Note: ================================================================
 Note: Host-Side Setup Documentation
 Note: ================================================================
 
+@Reasoning
+Embeds a complete OpenCL host-side setup recipe (9 stages from platform
+selection through resource cleanup) as a C-style comment block in the
+emitted kernel source. Putting the recipe next to the kernel keeps
+host-side launch code discoverable by anyone reading the generated source.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends a C-style block comment ("/* ...
+*/") that walks the OpenCL API call sequence: clGetPlatformIDs ->
+clGetDeviceIDs -> clCreateContext -> clCreateCommandQueue ->
+clCreateProgramWithSource -> clBuildProgram -> clCreateKernel (with
+kernel_name interpolated) -> clCreateBuffer (input/output/local) ->
+clEnqueueWriteBuffer -> clSetKernelArg (four args) -> clEnqueueNDRangeKernel
+-> clEnqueueReadBuffer -> clRelease* cleanup. Returns the buffer as a
+String.
+@End Implementation
+
+@Performance_Hints
+O(1) - constant number of string appends, regardless of graph size. The
+emitted comment is a fixed template.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. The graph parameter is unused today but reserved
+for per-graph customisation (e.g. emitting per-buffer sizes).
+@End Security_Scope
+
 Process called "generate_host_setup_comments" that takes graph as Integer, kernel_name as String returns String:
-    @Reasoning
-    Generates documentation for host-side OpenCL setup.
-
-    OpenCL host-side setup requires:
-    1. Get platform and device
-    2. Create context
-    3. Create command queue
-    4. Compile kernel from source
-    5. Create buffers
-    6. Set kernel arguments
-    7. Enqueue kernel execution
-    8. Read results
-    @End Reasoning
-
-    @Implementation
-    1. Generate platform/device selection code
-    2. Generate context/queue creation
-    3. Generate kernel compilation
-    4. Generate buffer allocation
-    5. Generate kernel execution
-    6. Return complete documentation
-    @End Implementation
-
     Let comments be proc create from StringMod
 
     proc append from StringMod with comments, "/*\n"
@@ -1081,28 +1168,35 @@ Note: ================================================================
 Note: Type Mapping
 Note: ================================================================
 
+@Reasoning
+Maps a Bifrost type pointer to the OpenCL C type name used in kernel
+declarations. Primitives map to char / short / int / long / float / double
+based on the primitive kind; Vector types translate to OpenCL's
+SoA-style float2/float4/float8/float16 vector tags when the lane count
+matches, otherwise to pointer types; Matrix and Tensor lower to float*
+because OpenCL has no first-class matrix type.
+@End Reasoning
+
+@Implementation
+Returns "void" if bifrost_type is 0. Reads the discriminant. For Primitive
+(0) reads prim_kind and returns char/short/int/long/float/double via
+direct comparisons, falling back to "int" on unknown. For Vector (2) reads
+element_type and lane count, calls map_primitive_to_opencl on the element,
+and concatenates "2"/"3"/"4"/"8"/"16" for the known lane widths or appends
+"*" for unsupported widths. Matrix (3) and Tensor (5) both return
+"float*". Unknown discriminants return "float".
+@End Implementation
+
+@Performance_Hints
+O(1) - a bounded If-cascade plus at most one string concatenation.
+@End Performance_Hints
+
+@Security_Scope
+Pure read; returns interned string literals or freshly concatenated
+strings owned by caller.
+@End Security_Scope
+
 Process called "map_bifrost_type_to_opencl" that takes bifrost_type as Integer returns String:
-    @Reasoning
-    Maps Bifrost types to OpenCL types.
-
-    Mappings:
-    - Primitive INT8 → char
-    - Primitive INT32 → int
-    - Primitive FLOAT32 → float
-    - Primitive FLOAT64 → double
-    - Vector<float, 2> → float2
-    - Vector<float, 4> → float4
-    - Vector<float, 8> → float8
-    - Vector<float, 16> → float16
-    - Matrix → float* (pointer)
-    @End Reasoning
-
-    @Implementation
-    1. Get type discriminant
-    2. Map to appropriate OpenCL type
-    3. Return OpenCL type string
-    @End Implementation
-
     If bifrost_type is equal to 0:
         Return "void"
     End If
@@ -1177,6 +1271,28 @@ Process called "map_bifrost_type_to_opencl" that takes bifrost_type as Integer r
     Return "float"
 End Process
 
+@Reasoning
+Helper for map_bifrost_type_to_opencl that turns a raw primitive kind code
+into the OpenCL C scalar type name. Kept separate so Vector lowering can
+call it without re-implementing the cascade.
+@End Reasoning
+
+@Implementation
+Returns "char" for kind 0 (INT8), "int" for kind 2 (INT32), "float" for
+kind 6 (FLOAT32), "double" for kind 7 (FLOAT64). Returns "float" as the
+safe fallback for any other kind code (intentionally narrower than
+map_bifrost_type_to_opencl which handles short/long; this helper is
+optimised for the vector-component path where float dominates).
+@End Implementation
+
+@Performance_Hints
+O(1) - up to four compares.
+@End Performance_Hints
+
+@Security_Scope
+Pure read; returns interned string literals.
+@End Security_Scope
+
 Process called "map_primitive_to_opencl" that takes prim_kind as Integer returns String:
     If prim_kind is equal to 0:
         Return "char"
@@ -1198,22 +1314,31 @@ Note: ================================================================
 Note: Helper Functions
 Note: ================================================================
 
+@Reasoning
+Resolves an operand reference during emit_operation_code to its OpenCL C
+variable name. Graph inputs (no var_names entry) return the canonical
+"input_0[gid]" indexed-buffer access; intermediate values return the
+var_i name registered when their producing node was emitted.
+@End Reasoning
+
+@Implementation
+Returns "0.0f" if inputs is null or index is out of range (safe constant).
+Reads the input_edge at inputs[index], fetches the source node via
+Edge.get_edge_source, then queries var_names Dict for the producing
+node's name; returns the name on hit, "input_0[gid]" on miss (graph
+inputs that have not been added to var_names).
+@End Implementation
+
+@Performance_Hints
+O(1) - one List.get plus one Dict.get.
+@End Performance_Hints
+
+@Security_Scope
+Pure read on caller-owned data structures. Returns a borrowed String from
+var_names (callers must not free).
+@End Security_Scope
+
 Process called "get_input_variable" that takes inputs as Integer, index as Integer, var_names as Integer returns String:
-    @Reasoning
-    Retrieves the OpenCL variable name for an input edge.
-
-    For graph inputs, generates input buffer access: input_N[gid]
-    For intermediate values, returns the variable name: var_M
-    @End Reasoning
-
-    @Implementation
-    1. Check if inputs list is valid
-    2. Check if index is in bounds
-    3. Get input edge and source node
-    4. Look up variable name in dictionary
-    5. Return variable name or input buffer access
-    @End Implementation
-
     If inputs is equal to 0:
         Return "0.0f"
     End If
@@ -1234,24 +1359,31 @@ Process called "get_input_variable" that takes inputs as Integer, index as Integ
     Return var_name
 End Process
 
+@Reasoning
+Emits a commented stub showing how to call clGetDeviceInfo for the three
+most useful device capabilities (max compute units, max work-group size,
+local memory size). Commenting them out keeps the generated kernel header
+portable while documenting the lookup signatures.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends six commented C lines that
+declare local variables (cl_uint maxComputeUnits, size_t
+maxWorkGroupSize, cl_ulong localMemSize) and the corresponding
+clGetDeviceInfo calls with the right CL_DEVICE_* token constants. Returns
+the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(1) - a small fixed number of string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; output is commented C source that does not execute
+unless the host project uncomments it.
+@End Security_Scope
+
 Process called "generate_opencl_device_query" that takes nothing returns String:
-    @Reasoning
-    Generates code to query OpenCL device capabilities.
-
-    Device queries provide:
-    - Maximum compute units
-    - Maximum work-group size
-    - Local memory size
-    - Global memory size
-    - Device extensions
-    @End Reasoning
-
-    @Implementation
-    1. Generate clGetDeviceInfo calls
-    2. Query relevant device parameters
-    3. Return query code
-    @End Implementation
-
     Let code be proc create from StringMod
 
     proc append from StringMod with code, "// Query device capabilities:\n"

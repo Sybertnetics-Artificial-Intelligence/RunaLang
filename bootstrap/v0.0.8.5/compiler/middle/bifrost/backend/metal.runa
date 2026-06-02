@@ -54,36 +54,32 @@ Note: ================================================================
 Note: Code Generation - Top Level
 Note: ================================================================
 
+@Reasoning
+generate_metal_code is the Metal-Shading-Language counterpart to
+generate_opencl_code. It assembles a complete .metal source string from a
+Bifrost graph: stdlib includes, the metal namespace using directive, type
+definitions, the kernel function, and host-side setup comments. Apple's
+Metal toolchain treats the namespace and stdlib includes as required
+boilerplate so emitting them first keeps the output buildable.
+@End Reasoning
+
+@Implementation
+Allocates a metal_code StringMod buffer. Appends sections in order: Metal
+includes via generate_metal_includes, the "using namespace metal;"
+directive, type definitions via generate_type_definitions, the kernel via
+generate_kernel_function, and host setup via generate_host_setup_comments.
+Sections are separated by "\n\n". Returns the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(V+E) dominated by the kernel-function emission; other sections are O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. Output is a String owned by caller; no syscalls.
+@End Security_Scope
+
 Process called "generate_metal_code" that takes graph as Integer, kernel_name as String returns String:
-    @Reasoning
-    Generates complete Metal Shading Language code from Bifrost graph.
-
-    Output structure:
-    1. Metal includes (#include <metal_stdlib>)
-    2. Namespace declarations (using namespace metal;)
-    3. Type definitions and helper structs
-    4. Helper device functions
-    5. Kernel function (kernel)
-    6. Host-side buffer setup comments
-
-    Algorithm:
-    - Traverse graph in topological order
-    - Emit Metal code for each operation
-    - Handle address spaces (device, threadgroup, constant, thread)
-    - Generate kernel signature with proper attributes
-    @End Reasoning
-
-    @Implementation
-    1. Generate Metal includes
-    2. Generate namespace declarations
-    3. Generate type definitions
-    4. Generate helper functions
-    5. Generate kernel function
-    6. Generate host-side setup comments
-    7. Combine into complete Metal source
-    8. Return Metal code string
-    @End Implementation
-
     Let metal_code be proc create from StringMod
 
     Note: Add Metal includes
@@ -111,6 +107,27 @@ Process called "generate_metal_code" that takes graph as Integer, kernel_name as
     Return proc to_string from StringMod with metal_code
 End Process
 
+@Reasoning
+Emits the canonical Metal stdlib includes (metal_stdlib, metal_compute,
+metal_math, metal_atomic). Including all four covers compute kernels,
+math intrinsics, and atomic operations that downstream kernel code may
+require, so emitting them unconditionally is safer than per-pass tracking.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends four #include directives:
+metal_stdlib, metal_compute, metal_math, metal_atomic. Returns the
+buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(1) - four string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
+
 Process called "generate_metal_includes" that takes nothing returns String:
     Let includes be proc create from StringMod
 
@@ -121,6 +138,28 @@ Process called "generate_metal_includes" that takes nothing returns String:
 
     Return proc to_string from StringMod with includes
 End Process
+
+@Reasoning
+Defines the ComputeParams struct used to pass the kernel's data-size scalar
+in a single buffer binding. Metal's calling convention favours packing
+scalar parameters into a constant struct rather than passing them as
+individual constants.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends a "// Type definitions" comment,
+a "struct ComputeParams { uint size; };" declaration. Returns the buffer
+as a String. The graph parameter is reserved for future per-graph struct
+generation (e.g. if more scalar parameters are needed).
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
 
 Process called "generate_type_definitions" that takes graph as Integer returns String:
     Let typedefs be proc create from StringMod
@@ -138,41 +177,34 @@ Note: ================================================================
 Note: Kernel Generation
 Note: ================================================================
 
+@Reasoning
+Emits the actual Metal "kernel void" function: signature with
+[[buffer(N)]]-tagged parameters, the three thread-position parameters
+(grid / threadgroup / threadgroup-position), bounds check, threadgroup
+memory declarations, and the lowered graph body. Combining these into
+one producer keeps the kernel shape consistent across graphs and matches
+Metal's compute-pipeline calling convention.
+@End Reasoning
+
+@Implementation
+Allocates a kernel_code StringMod buffer. Emits "kernel void " plus
+kernel_name plus "(". Calls generate_kernel_parameters to emit buffer
+parameters, then appends the three thread-position parameters (gid /
+tid / threadgroup_id) with their Metal attributes. Closes the signature
+with ") {". Appends generate_bounds_check, then
+generate_threadgroup_memory_declarations, then generate_kernel_body.
+Closes with "}". Returns the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(V+E) dominated by generate_kernel_body. Signature and prelude are O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. Caller owns the returned String.
+@End Security_Scope
+
 Process called "generate_kernel_function" that takes graph as Integer, kernel_name as String returns String:
-    @Reasoning
-    Generates Metal compute kernel function.
-
-    Kernel structure:
-    kernel void kernel_name(device float* input [[buffer(0)]],
-                           device float* output [[buffer(1)]],
-                           constant ComputeParams& params [[buffer(2)]],
-                           uint gid [[thread_position_in_grid]],
-                           uint tid [[thread_position_in_threadgroup]],
-                           uint threadgroup_id [[threadgroup_position_in_grid]]) {
-        // Bounds checking
-        // Threadgroup memory declarations
-        // Kernel body (operations)
-        // Synchronization (threadgroup_barrier)
-    }
-
-    Algorithm:
-    - Compute threadgroup dimensions
-    - Generate parameter list with buffer indices
-    - Generate threadgroup memory declarations
-    - Generate kernel body from graph
-    - Add synchronization points
-    @End Reasoning
-
-    @Implementation
-    1. Generate kernel signature with attributes
-    2. Generate thread position parameters
-    3. Generate bounds checking
-    4. Generate threadgroup memory declarations
-    5. Traverse graph and emit operations
-    6. Add synchronization barriers
-    7. Return complete kernel code
-    @End Implementation
-
     Let kernel_code be proc create from StringMod
 
     Note: Generate kernel signature
@@ -208,24 +240,31 @@ Process called "generate_kernel_function" that takes graph as Integer, kernel_na
     Return proc to_string from StringMod with kernel_code
 End Process
 
+@Reasoning
+Metal binds buffers by index via the [[buffer(N)]] attribute. Generated
+parameters use "device TYPE*" for read/write buffers, "constant TYPE&"
+for read-only structs (size, params), and "threadgroup TYPE*" for shared
+memory. Maintaining buffer indices in order means host-side binding code
+can use linear cl-style argument indices.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer. Walks Graph.get_all_nodes; for each Input
+node emits a "device const TYPE* input_i [[buffer(N)]]" entry, for each
+Output emits a "device TYPE* output_i [[buffer(N)]]" entry, advancing the
+buffer index N for each. Finishes with a "constant ComputeParams& params
+[[buffer(N)]]" entry. Returns the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(N) where N is the graph node count.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
+
 Process called "generate_kernel_parameters" that takes graph as Integer returns String:
-    @Reasoning
-    Generates Metal kernel parameters with buffer binding indices.
-
-    Metal uses [[buffer(N)]] attributes to bind buffers.
-    Parameters have address space qualifiers:
-    - device float* for input/output buffers
-    - constant ComputeParams& for constants
-    - threadgroup float* for shared memory
-    @End Reasoning
-
-    @Implementation
-    1. Get input and output nodes from graph
-    2. Generate buffer parameters with indices
-    3. Add constant parameter for size
-    4. Return parameter list string
-    @End Implementation
-
     Let params be proc create from StringMod
 
     Note: Get input and output nodes
@@ -279,6 +318,27 @@ Process called "generate_kernel_parameters" that takes graph as Integer returns 
     Return proc to_string from StringMod with params
 End Process
 
+@Reasoning
+Bounds check prevents Metal work items beyond the buffer size from
+executing the kernel body and reading out of bounds. Apple's compute
+pipeline launches in multiples of the threadgroup size so the launch grid
+typically exceeds the actual data size.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends a comment and an "if (gid >=
+params.size) return;" statement. Returns the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. The emitted check is critical for memory safety in
+the generated kernel.
+@End Security_Scope
+
 Process called "generate_bounds_check" that takes nothing returns String:
     Let code be proc create from StringMod
 
@@ -287,6 +347,28 @@ Process called "generate_bounds_check" that takes nothing returns String:
 
     Return proc to_string from StringMod with code
 End Process
+
+@Reasoning
+Threadgroup memory is Metal's name for the per-compute-unit shared memory
+visible to all threads in a threadgroup. Emitting an inline declaration
+(typically "threadgroup float shared[256];") gives the kernel a stable
+on-chip scratch space without requiring an extra buffer binding.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends a comment header and a
+"threadgroup float shared_data[256];" declaration. Returns the buffer
+as a String. The graph parameter is reserved for per-graph sizing of the
+shared array based on actual usage.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation.
+@End Security_Scope
 
 Process called "generate_threadgroup_memory_declarations" that takes graph as Integer returns String:
     @Reasoning
@@ -315,24 +397,29 @@ Process called "generate_threadgroup_memory_declarations" that takes graph as In
     Return proc to_string from StringMod with code
 End Process
 
+@Reasoning
+Walks the graph in topological order and lowers each operation node to a
+Metal C++ statement. Maintains a var_names Dict that maps each node to its
+result variable name so emit_operation_code can resolve operand references
+on subsequent nodes.
+@End Reasoning
+
+@Implementation
+Allocates a body StringMod buffer. Calls Graph.topological_sort to get
+the schedule. Creates a fresh var_names Dict. Iterates the sorted list
+and for each node calls emit_operation_code(node, var_names, i), appending
+the result into body. Returns body as a String.
+@End Implementation
+
+@Performance_Hints
+O(V) topo sort plus per-node emission cost. Linear in graph size.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; owns one Dict and one StringMod buffer.
+@End Security_Scope
+
 Process called "generate_kernel_body" that takes graph as Integer returns String:
-    @Reasoning
-    Generates kernel body by traversing graph in topological order.
-
-    For each operation:
-    - Emit Metal code for the operation
-    - Handle memory accesses with proper address spaces
-    - Add synchronization if needed (threadgroup_barrier)
-    @End Reasoning
-
-    @Implementation
-    1. Get topological ordering
-    2. For each node:
-       - Emit Metal code for operation
-       - Track variable names
-    3. Return complete kernel body
-    @End Implementation
-
     Let body be proc create from StringMod
 
     Note: Get topological sort
@@ -359,26 +446,36 @@ Note: ================================================================
 Note: Operation Code Emission
 Note: ================================================================
 
+@Reasoning
+emit_operation_code is the Metal-side dispatcher mirroring the OpenCL
+backend's: maps Bifrost OpKind discriminants to Metal Shading Language
+expressions. Variable naming is index-based ("var_i") to avoid symbol
+collisions. The dispatch covers arithmetic, activations, and math
+intrinsics.
+@End Reasoning
+
+@Implementation
+Allocates a code StringMod buffer. Reads node OpKind. Builds
+result_var_name as "var_" + index, registers (node -> name) in var_names,
+maps the node's output type to a Metal C++ type via
+map_bifrost_type_to_metal. Dispatches by op_kind: 0-3 emit binary
+arithmetic (+,-,*,/); 20-22 emit activations (ReLU via max, Sigmoid via
+1.0/(1.0+exp(-x)), Tanh via tanh()); 30-32 emit math intrinsics
+(Exp/Log/Sqrt). Each branch emits a typed C++ declaration that assigns
+the result expression.
+@End Implementation
+
+@Performance_Hints
+O(1) per node - one Dict insert plus a bounded number of string appends
+per opcode.
+@End Performance_Hints
+
+@Security_Scope
+Mutates the caller-owned var_names Dict. Returns a freshly allocated
+String.
+@End Security_Scope
+
 Process called "emit_operation_code" that takes node as Integer, var_names as Integer, index as Integer returns String:
-    @Reasoning
-    Emits Metal code for a single operation.
-
-    Operation mapping:
-    - Add → result = a + b
-    - MatrixMultiply → metal::simd_matrix operations
-    - ReLU → result = max(0.0f, input)
-    - Load/Store → memory access with address spaces
-    - Atomic operations → atomic_fetch_add, atomic_store, etc.
-    @End Reasoning
-
-    @Implementation
-    1. Get operation kind
-    2. Get input variables
-    3. Emit appropriate Metal code
-    4. Register output variable
-    5. Return code string
-    @End Implementation
-
     Let code be proc create from StringMod
 
     Let op_kind be proc get_node_opkind from Node with node
@@ -852,28 +949,35 @@ Note: ================================================================
 Note: Host-Side Setup Documentation
 Note: ================================================================
 
+@Reasoning
+Embeds a complete Metal host-side setup recipe (5 stages from MTLDevice
+creation through result readback) in Swift/Objective-C as a C-style
+comment block inside the .metal source. Keeps the host-launch boilerplate
+discoverable adjacent to the kernel.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends a block comment that walks the
+Metal API sequence: MTLCreateSystemDefaultDevice -> makeCommandQueue ->
+makeLibrary(source:) -> makeFunction(name:) with kernel_name interpolated
+-> makeComputePipelineState -> makeBuffer for input/output/params ->
+makeCommandBuffer / makeComputeCommandEncoder -> setComputePipelineState ->
+setBuffer (three bindings) -> dispatchThreadgroups with explicit
+threadsPerThreadgroup and computed threadgroupCount -> endEncoding ->
+commit -> waitUntilCompleted -> outputBuffer.contents() read-back. Returns
+the buffer as a String.
+@End Implementation
+
+@Performance_Hints
+O(1) - the recipe is a fixed template.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; the graph parameter is reserved for future per-graph
+customisation.
+@End Security_Scope
+
 Process called "generate_host_setup_comments" that takes graph as Integer, kernel_name as String returns String:
-    @Reasoning
-    Generates documentation for host-side Metal setup.
-
-    Metal host-side setup requires:
-    1. Create MTLDevice
-    2. Compile shader to MTLLibrary
-    3. Create MTLComputePipelineState
-    4. Create MTLCommandQueue
-    5. Create MTLBuffer objects
-    6. Encode compute commands
-    7. Commit and wait for completion
-    @End Reasoning
-
-    @Implementation
-    1. Generate device creation comments
-    2. Generate pipeline state creation
-    3. Generate buffer allocation
-    4. Generate command encoding
-    5. Return complete documentation
-    @End Implementation
-
     Let comments be proc create from StringMod
 
     proc append from StringMod with comments, "/*\n"
@@ -924,26 +1028,33 @@ Note: ================================================================
 Note: Type Mapping
 Note: ================================================================
 
+@Reasoning
+Maps a Bifrost type to its Metal C++ type name. Primitives lower to
+char/short/int/long/float/double; Vectors lower to Metal's
+float2/float3/float4 tags when the lane count fits, otherwise to pointer
+types; Matrix and Tensor lower to float*. Mirrors map_bifrost_type_to_opencl
+with Metal-specific spellings.
+@End Reasoning
+
+@Implementation
+Returns "void" for null type. Reads the discriminant. For Primitive (0)
+returns char / short / int / long for INT8/16/32/64 and float / double for
+FLOAT32/64; falls back to "int". For Vector (2) reads element_type and
+size, maps the element via map_primitive_to_metal, concatenates "2"/"3"/"4"
+or appends "*" for unsupported sizes. Matrix (3) and Tensor (5) return
+"float*". Unknown discriminants return "float".
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure read; returns interned string literals or freshly concatenated
+strings owned by caller.
+@End Security_Scope
+
 Process called "map_bifrost_type_to_metal" that takes bifrost_type as Integer returns String:
-    @Reasoning
-    Maps Bifrost types to Metal types.
-
-    Mappings:
-    - Primitive INT8 → char
-    - Primitive INT32 → int
-    - Primitive FLOAT32 → float
-    - Primitive FLOAT64 → double
-    - Vector<float, 2> → float2
-    - Vector<float, 4> → float4
-    - Matrix → float* (pointer)
-    @End Reasoning
-
-    @Implementation
-    1. Get type discriminant
-    2. Map to appropriate Metal type
-    3. Return Metal type string
-    @End Implementation
-
     If bifrost_type is equal to 0:
         Return "void"
     End If
@@ -1012,6 +1123,26 @@ Process called "map_bifrost_type_to_metal" that takes bifrost_type as Integer re
     Return "float"
 End Process
 
+@Reasoning
+Helper for map_bifrost_type_to_metal that turns a raw primitive kind code
+into the Metal scalar type name. Used by Vector lowering to avoid
+re-implementing the cascade.
+@End Reasoning
+
+@Implementation
+Returns "char" for INT8 (kind 0), "int" for INT32 (kind 2), "float" for
+FLOAT32 (kind 6), "double" for FLOAT64 (kind 7), and "float" as the
+fallback default.
+@End Implementation
+
+@Performance_Hints
+O(1).
+@End Performance_Hints
+
+@Security_Scope
+Pure read; returns interned string literals.
+@End Security_Scope
+
 Process called "map_primitive_to_metal" that takes prim_kind as Integer returns String:
     If prim_kind is equal to 0:
         Return "char"
@@ -1033,22 +1164,30 @@ Note: ================================================================
 Note: Helper Functions
 Note: ================================================================
 
+@Reasoning
+Resolves an operand reference to its Metal variable name during
+emit_operation_code. Graph inputs (no var_names entry) get the canonical
+indexed-buffer access "input_0[gid]"; intermediate values get their
+"var_i" name registered when their producing node was emitted.
+@End Reasoning
+
+@Implementation
+Returns "0.0f" for null inputs or out-of-range index. Reads inputs[index]
+as the edge, calls Edge.get_edge_source to fetch the producer node, then
+queries var_names Dict for the producer's name; returns the name on hit,
+"input_0[gid]" on miss.
+@End Implementation
+
+@Performance_Hints
+O(1) - one List.get plus one Dict.get.
+@End Performance_Hints
+
+@Security_Scope
+Pure read. Returned String is either an interned literal or a borrowed
+String from var_names.
+@End Security_Scope
+
 Process called "get_input_variable" that takes inputs as Integer, index as Integer, var_names as Integer returns String:
-    @Reasoning
-    Retrieves the Metal variable name for an input edge.
-
-    For graph inputs, generates input buffer access: input_N[gid]
-    For intermediate values, returns the variable name: var_M
-    @End Reasoning
-
-    @Implementation
-    1. Check if inputs list is valid
-    2. Check if index is in bounds
-    3. Get input edge and source node
-    4. Look up variable name in dictionary
-    5. Return variable name or input buffer access
-    @End Implementation
-
     If inputs is equal to 0:
         Return "0.0f"
     End If
@@ -1069,33 +1208,33 @@ Process called "get_input_variable" that takes inputs as Integer, index as Integ
     Return var_name
 End Process
 
+@Reasoning
+Emits a commented stub showing Metal's atomic_*_explicit family
+(fetch_add, fetch_max, etc.) with memory_order hints. Atomics are used by
+the kernel for reduction sinks and shared counters; documenting the call
+pattern in-source keeps the available API surface visible without forcing
+the compiler to commit to a specific atomic op until the graph requires
+one.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends commented example lines showing
+atomic_fetch_add_explicit on an atomic_int with memory_order_relaxed and
+atomic_fetch_max_explicit on an atomic_float. Returns the buffer as a
+String. Full per-graph atomic generation is staged for the
+atomic-reduction lowering pass.
+@End Implementation
+
+@Performance_Hints
+O(1) - constant string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation; the emitted comments document atomic semantics but
+do not execute any atomic instruction.
+@End Security_Scope
+
 Process called "generate_metal_atomic_operations" that takes graph as Integer returns String:
-    @Reasoning
-    Generates Metal atomic operation code for thread-safe operations.
-
-    Metal atomics:
-    - atomic_fetch_add_explicit
-    - atomic_fetch_sub_explicit
-    - atomic_fetch_max_explicit
-    - atomic_fetch_min_explicit
-    - atomic_store_explicit
-    - atomic_load_explicit
-
-    Memory orders:
-    - memory_order_relaxed (fastest, no synchronization)
-    - memory_order_acquire (load synchronization)
-    - memory_order_release (store synchronization)
-    - memory_order_acq_rel (both)
-    - memory_order_seq_cst (strongest)
-    @End Reasoning
-
-    @Implementation
-    1. Scan graph for atomic operations
-    2. Generate appropriate atomic_* calls
-    3. Include memory_order specifications
-    4. Return atomic code
-    @End Implementation
-
     Let code be proc create from StringMod
 
     proc append from StringMod with code, "// Example atomic operations:\n"
@@ -1105,29 +1244,30 @@ Process called "generate_metal_atomic_operations" that takes graph as Integer re
     Return proc to_string from StringMod with code
 End Process
 
+@Reasoning
+Emits commented examples of Metal's SIMD-group reduction functions
+(simd_sum, simd_max, simd_prefix_exclusive_sum). Apple's GPUs expose a
+32-wide SIMD group that completes reductions in a single instruction;
+this stub documents the API for the reduction-lowering pass.
+@End Reasoning
+
+@Implementation
+Allocates a StringMod buffer and appends three commented example calls
+(simd_sum, simd_max, simd_prefix_exclusive_sum). Returns the buffer as
+a String. Full per-graph SIMD lowering is staged for the
+reduction-lowering pass which will substitute the right simd_ call based
+on the reduction's OpKind.
+@End Implementation
+
+@Performance_Hints
+O(1) - constant string appends.
+@End Performance_Hints
+
+@Security_Scope
+Pure code generation. Output is commented documentation only.
+@End Security_Scope
+
 Process called "generate_metal_simd_operations" that takes graph as Integer returns String:
-    @Reasoning
-    Generates Metal SIMD (Single Instruction Multiple Data) operations.
-
-    Metal SIMD functions:
-    - simd_sum: Sum across SIMD group
-    - simd_max: Maximum across SIMD group
-    - simd_min: Minimum across SIMD group
-    - simd_prefix_exclusive_sum: Exclusive prefix sum
-    - simd_prefix_inclusive_sum: Inclusive prefix sum
-    - simd_broadcast: Broadcast value to all lanes
-    - simd_shuffle: Permute values across lanes
-
-    SIMD group size is typically 32 threads on Apple GPUs.
-    @End Reasoning
-
-    @Implementation
-    1. Scan graph for reduction operations
-    2. Generate appropriate simd_* calls
-    3. Handle SIMD group size
-    4. Return SIMD code
-    @End Implementation
-
     Let code be proc create from StringMod
 
     proc append from StringMod with code, "// Example SIMD operations:\n"

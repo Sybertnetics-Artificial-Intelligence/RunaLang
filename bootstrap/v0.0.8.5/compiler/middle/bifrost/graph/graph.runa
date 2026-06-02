@@ -99,26 +99,33 @@ Note: ════════════════════════�
 Note: Graph Construction
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+The BifrostGraph holds two ID-keyed dictionaries (node_id_map, edge_id_map)
+alongside the node and edge lists, and two adjacency dictionaries (node_inputs,
+node_outputs). Pre-allocating all six collections at construction means every
+later add_node / add_edge call is allocation-cheap and never has to deal with
+a sentinel null collection. ID counters start at 1 so 0 stays available as
+"no such node/edge".
+@End Reasoning
+
 @Implementation:
-Creates an empty BifrostGraph with initialized data structures.
-
-Algorithm:
-1. Allocate 72 bytes on OWNED HEAP for BifrostGraph
-2. Initialize discriminant to 0 (struct type)
-3. Create empty List for nodes
-4. Create empty List for edges
-5. Create empty Dict for node_inputs adjacency list
-6. Create empty Dict for node_outputs adjacency list
-7. Create empty Dict for node_id_map (ID → pointer lookup)
-8. Create empty Dict for edge_id_map (ID → pointer lookup)
-9. Initialize next_node_id to 1 (0 reserved for null)
-10. Initialize next_edge_id to 1 (0 reserved for null)
-11. Return graph pointer
-
-Memory Safety:
-- All collections initialized to valid empty structures
-- ID counters start at 1 to avoid confusion with null pointers
+Allocates 72 bytes on the OWNED HEAP, writes the struct discriminant (0),
+constructs six empty containers (two Lists for nodes/edges, four Dicts for
+node_inputs / node_outputs / node_id_map / edge_id_map), stores each at its
+offset slot (8/16/24/32/40/48), and initialises next_node_id and next_edge_id
+to 1 at offsets 56 and 64 respectively.
 @End Implementation
+
+@Performance_Hints:
+O(1) plus six container constructions. Container constructors dominate; the
+graph struct itself is a constant 72-byte allocation. Called once per
+function lowering.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP allocation; six embedded collections are owned by the graph and
+will be freed together when the graph is freed. No capability requirements.
+@End Security_Scope
 
 Process called "create_graph" that takes nothing returns Integer:
     Note: Allocate 72 bytes for BifrostGraph on OWNED HEAP
@@ -160,25 +167,34 @@ Process called "create_graph" that takes nothing returns Integer:
     Return graph
 End Process
 
+@Reasoning:
+Every node insertion needs three index updates kept in lockstep (nodes list,
+node_id_map, and the two adjacency-list slots) so later queries don't have to
+guard against missing entries. Initialising empty input/output edge lists at
+insertion time amortises the allocator cost and means add_edge can append
+without first checking whether the slot exists.
+@End Reasoning
+
 @Implementation:
-Adds a node to the graph with a unique ID. The node is registered in the node
-list, ID map, and adjacency lists are initialized.
-
-Algorithm:
-1. Validate graph and node pointers are non-null
-2. Allocate unique node ID from next_node_id counter
-3. Set node's ID field (if not already set)
-4. Add node pointer to nodes list
-5. Register node ID → pointer mapping in node_id_map
-6. Initialize empty input edge list in node_inputs adjacency
-7. Initialize empty output edge list in node_outputs adjacency
-8. Increment next_node_id counter
-9. Return assigned node ID
-
-Memory Safety:
-- Node ID uniqueness guaranteed by atomic counter
-- Adjacency lists initialized to prevent null dereferences
+Null-guards graph and node. Reads next_node_id from offset 56, appends the
+node into the nodes List (offset 8), registers the (id -> node) pair in
+node_id_map (offset 40), creates empty edge Lists and stores them under the
+node pointer in node_inputs (offset 24) and node_outputs (offset 32), then
+increments next_node_id and returns the allocated id.
 @End Implementation
+
+@Performance_Hints:
+O(1) amortised - one List append, three Dict inserts, two empty-List
+allocations. The two extra List allocations make this heavier than a pure
+List.append, but they save a branch on every future add_edge.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP mutation; the node pointer is borrowed by the graph (lifetime
+must exceed graph). The two new empty Lists are owned by the graph's
+adjacency dicts. ID allocation is monotonic so duplicates are impossible
+within a single graph.
+@End Security_Scope
 
 Process called "add_node" that takes graph as Integer, node as Integer returns Integer:
     If graph is equal to 0:
@@ -220,24 +236,35 @@ Process called "add_node" that takes graph as Integer, node as Integer returns I
     Return node_id
 End Process
 
+@Reasoning:
+A node cannot be removed cleanly without first removing every incident edge -
+otherwise the adjacency dicts of the other endpoints would carry dangling
+references. The "edges first, then node" ordering preserves the invariant
+that for every edge in the edges list, both endpoints are present in the
+nodes list.
+@End Reasoning
+
 @Implementation:
-Removes a node from the graph. All incident edges (incoming and outgoing) are
-also removed to maintain graph consistency.
-
-Algorithm:
-1. Validate graph and node pointers
-2. Get all incoming edges from node_inputs[node]
-3. Get all outgoing edges from node_outputs[node]
-4. Remove each incident edge using remove_edge
-5. Remove node from nodes list
-6. Remove node from node_id_map
-7. Remove node from node_inputs adjacency
-8. Remove node from node_outputs adjacency
-
-Memory Safety:
-- All references to node are removed (no dangling pointers)
-- Incident edges cleaned up before node removal
+Null-guards graph and node. Reads node_inputs (offset 24) and node_outputs
+(offset 32). If node_inputs has an entry for the node, walks each incoming
+edge and calls remove_edge; same for node_outputs. Removes the node from the
+nodes List, then linearly scans the nodes list to locate the stale id-map
+entry (since the node may have had multiple IDs) and removes it from
+node_id_map. Finally clears the node_inputs and node_outputs entries.
 @End Implementation
+
+@Performance_Hints:
+O(E_node + N) where E_node is the count of incident edges and N is the total
+node count (because of the linear node_id_map cleanup loop). Not a hot path -
+node removal happens in fusion / DCE rather than steady-state lowering.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP mutation across five containers. The node pointer remains live
+because the graph doesn't own it - callers manage node lifetime. Incident
+edges are removed but their structs are not freed by remove_edge; the graph
+loses its references but the edge memory is reclaimed at graph teardown.
+@End Security_Scope
 
 Process called "remove_node" that takes graph as Integer, node as Integer returns Nothing:
     If graph is equal to 0:
@@ -296,25 +323,36 @@ Process called "remove_node" that takes graph as Integer, node as Integer return
     Dict.remove(node_outputs, node)
 End Process
 
+@Reasoning:
+Adding an edge atomically updates four data structures: edges list, edge_id_map,
+the source node's output list, and the destination node's input list. Doing
+all four together preserves the graph's adjacency-invariant - any structure
+that lists an edge must agree with the source/dest endpoints recorded on the
+edge itself.
+@End Reasoning
+
 @Implementation:
-Adds an edge to the graph, connecting source node to destination node. Updates
-adjacency lists to maintain graph structure.
-
-Algorithm:
-1. Validate graph and edge pointers
-2. Get source and destination nodes from edge
-3. Allocate unique edge ID from next_edge_id counter
-4. Add edge pointer to edges list
-5. Register edge ID → pointer mapping in edge_id_map
-6. Add edge to source node's output edges (node_outputs[source].append(edge))
-7. Add edge to destination node's input edges (node_inputs[dest].append(edge))
-8. Increment next_edge_id counter
-9. Return assigned edge ID
-
-Memory Safety:
-- Edge ID uniqueness guaranteed by atomic counter
-- Adjacency lists updated atomically
+Null-guards graph and edge. Reads next_edge_id at offset 64. Calls
+get_edge_source and get_edge_dest; returns 0 if either is null (edge with
+broken endpoints is rejected). Appends the edge into the edges List (offset
+16), registers the (id -> edge) pair in edge_id_map (offset 48), appends the
+edge into the source's output list (via node_outputs at source) and the dest's
+input list (via node_inputs at dest), then increments next_edge_id and returns
+the allocated id.
 @End Implementation
+
+@Performance_Hints:
+O(1) amortised - one List append, three Dict gets, two List appends inside
+the adjacency dicts. Hot path during graph construction.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP mutation across four containers. Edge is borrowed; the graph
+captures the pointer. Endpoints must already exist in the graph's adjacency
+dicts (call add_node first) - missing entries cause Dict.get to return null
+and the append to silently fail; this routine assumes the caller respects
+that ordering.
+@End Security_Scope
 
 Process called "add_edge" that takes graph as Integer, edge as Integer returns Integer:
     If graph is equal to 0:
@@ -363,21 +401,33 @@ Process called "add_edge" that takes graph as Integer, edge as Integer returns I
     Return edge_id
 End Process
 
+@Reasoning:
+Reversing add_edge requires removing the edge from the source's output list,
+the destination's input list, the global edges list, and the edge_id_map.
+The endpoint lookups happen first because once the edges list is mutated the
+edge's endpoints are no longer needed; doing them in the cleanest order keeps
+the symmetric invariant with add_edge.
+@End Reasoning
+
 @Implementation:
-Removes an edge from the graph. Updates adjacency lists to remove all references.
-
-Algorithm:
-1. Validate graph and edge pointers
-2. Get source and destination nodes from edge
-3. Remove edge from source node's output edges (node_outputs[source])
-4. Remove edge from destination node's input edges (node_inputs[dest])
-5. Remove edge from edges list
-6. Remove edge from edge_id_map
-
-Memory Safety:
-- All references to edge are removed (no dangling pointers)
-- Adjacency lists updated atomically
+Null-guards graph and edge. Reads source/dest from the edge (early-returns on
+either being null). Removes the edge from the source's output list in
+node_outputs (offset 32) and the dest's input list in node_inputs (offset 24)
+when those entries exist. Removes the edge from the edges List (offset 16),
+then scans the edges list to locate the stale edge_id_map entry and removes
+it from edge_id_map (offset 48).
 @End Implementation
+
+@Performance_Hints:
+O(E_global) due to the linear edge_id_map cleanup walk; the adjacency removes
+are O(|edges-at-endpoint|). Not a hot path - edge removal happens in DCE,
+fusion, and rewrite passes.
+@End Performance_Hints
+
+@Security_Scope:
+OWNED-HEAP mutation. Edge struct memory is not freed here - the graph drops
+its references and reclaims at graph teardown.
+@End Security_Scope
 
 Process called "remove_edge" that takes graph as Integer, edge as Integer returns Nothing:
     If graph is equal to 0:
@@ -433,17 +483,24 @@ Note: ════════════════════════�
 Note: Graph Queries
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Reading node count via the list length keeps the count consistent with the
+nodes list itself - no separate counter to drift. Schedulers and statistics
+pass the count to bound array sizes and progress prints.
+@End Reasoning
+
 @Implementation:
-Returns the number of nodes in the graph.
-
-Algorithm:
-1. Validate graph pointer
-2. Get nodes list from graph
-3. Return length of nodes list
-
-Memory Safety:
-- Returns 0 for null graph (safe default)
+Returns 0 for null graph. Loads the nodes List at offset 8 and returns
+List.length.
 @End Implementation
+
+@Performance_Hints:
+O(1) - one load plus one list-length read.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "get_node_count" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -455,17 +512,23 @@ Process called "get_node_count" that takes graph as Integer returns Integer:
     Return count
 End Process
 
+@Reasoning:
+Edge count is read from the edges-list length for the same drift-free reason
+as get_node_count. Verification and statistics consume this value.
+@End Reasoning
+
 @Implementation:
-Returns the number of edges in the graph.
-
-Algorithm:
-1. Validate graph pointer
-2. Get edges list from graph
-3. Return length of edges list
-
-Memory Safety:
-- Returns 0 for null graph (safe default)
+Returns 0 for null graph. Loads the edges List at offset 16 and returns
+List.length.
 @End Implementation
+
+@Performance_Hints:
+O(1).
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "get_edge_count" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -477,18 +540,27 @@ Process called "get_edge_count" that takes graph as Integer returns Integer:
     Return count
 End Process
 
+@Reasoning:
+Linear-scan membership is acceptable here because validation passes use this
+sparingly and the more common "by-id" lookup goes through node_id_map (O(1)).
+Looking up by raw pointer is the cheap option when callers already have the
+node pointer in hand.
+@End Reasoning
+
 @Implementation:
-Checks if a node exists in the graph by searching the nodes list.
-
-Algorithm:
-1. Validate graph and node pointers
-2. Get nodes list from graph
-3. Linear search for node pointer in list
-4. Return true if found, false otherwise
-
-Memory Safety:
-- Returns false for null inputs (safe default)
+Null-guards graph and node. Loads the nodes List, walks each entry with a
+while loop, and returns true as soon as a pointer match is found. Returns
+false after the full scan.
 @End Implementation
+
+@Performance_Hints:
+O(N) linear scan where N is node count. Avoid in inner loops - prefer
+get_node(id) when the id is available.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "has_node" that takes graph as Integer, node as Integer returns Boolean:
     If graph is equal to 0:
@@ -512,18 +584,23 @@ Process called "has_node" that takes graph as Integer, node as Integer returns B
     Return false
 End Process
 
+@Reasoning:
+Mirror of has_node - linear by-pointer scan for edges. Used by validation
+passes that already have the edge pointer.
+@End Reasoning
+
 @Implementation:
-Checks if an edge exists in the graph by searching the edges list.
-
-Algorithm:
-1. Validate graph and edge pointers
-2. Get edges list from graph
-3. Linear search for edge pointer in list
-4. Return true if found, false otherwise
-
-Memory Safety:
-- Returns false for null inputs (safe default)
+Null-guards graph and edge. Loads the edges List, walks it with a while loop,
+returning true on the first match and false after exhausting the list.
 @End Implementation
+
+@Performance_Hints:
+O(E) linear scan. Use get_edge(id) for O(1) lookups when id is available.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "has_edge" that takes graph as Integer, edge as Integer returns Boolean:
     If graph is equal to 0:
@@ -547,18 +624,24 @@ Process called "has_edge" that takes graph as Integer, edge as Integer returns B
     Return false
 End Process
 
+@Reasoning:
+ID-keyed access is the fast path during translation - the builder hands out
+ids and later passes resolve back to node pointers via the node_id_map kept
+in lockstep by add_node and remove_node.
+@End Reasoning
+
 @Implementation:
-Retrieves a node by its unique ID using the node_id_map for O(1) lookup.
-
-Algorithm:
-1. Validate graph pointer
-2. Get node_id_map from graph
-3. Lookup node_id in map
-4. Return node pointer (or 0 if not found)
-
-Memory Safety:
-- Returns 0 for null graph or missing ID (safe default)
+Returns 0 for null graph. Reads node_id_map at offset 40, tests Dict.has_key,
+and returns Dict.get on hit; returns 0 on miss.
 @End Implementation
+
+@Performance_Hints:
+O(1) hashed lookup. Hot accessor for value-map resolution.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Returned pointer is borrowed from the node-storage of the graph.
+@End Security_Scope
 
 Process called "get_node" that takes graph as Integer, node_id as Integer returns Integer:
     If graph is equal to 0:
@@ -574,18 +657,23 @@ Process called "get_node" that takes graph as Integer, node_id as Integer return
     Return 0
 End Process
 
+@Reasoning:
+Symmetric counterpart to get_node. Edge id is used by passes that record
+dependencies by id (e.g. metadata side-tables) instead of pointer.
+@End Reasoning
+
 @Implementation:
-Retrieves an edge by its unique ID using the edge_id_map for O(1) lookup.
-
-Algorithm:
-1. Validate graph pointer
-2. Get edge_id_map from graph
-3. Lookup edge_id in map
-4. Return edge pointer (or 0 if not found)
-
-Memory Safety:
-- Returns 0 for null graph or missing ID (safe default)
+Returns 0 for null graph. Reads edge_id_map at offset 48, tests Dict.has_key,
+returns Dict.get on hit; returns 0 on miss.
 @End Implementation
+
+@Performance_Hints:
+O(1) hashed lookup.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "get_edge" that takes graph as Integer, edge_id as Integer returns Integer:
     If graph is equal to 0:
@@ -601,18 +689,27 @@ Process called "get_edge" that takes graph as Integer, edge_id as Integer return
     Return 0
 End Process
 
+@Reasoning:
+The node_inputs adjacency dict gives O(1) "what edges feed this node?"
+queries for def-use walks. Returning a fresh empty list for missing entries
+lets callers use a uniform List interface without branching on null.
+@End Reasoning
+
 @Implementation:
-Returns the list of incoming edges for a node using the node_inputs adjacency list.
-
-Algorithm:
-1. Validate graph and node pointers
-2. Get node_inputs adjacency dictionary
-3. Lookup node in dictionary
-4. Return list of incoming edge pointers (or empty list if not found)
-
-Memory Safety:
-- Returns empty list for null inputs or missing node (safe default)
+Returns a fresh empty list for null graph or null node. Reads node_inputs at
+offset 24, tests for the node key, returns the stored list on hit; otherwise
+returns a freshly constructed empty list.
 @End Implementation
+
+@Performance_Hints:
+O(1) hashed lookup. Empty-list construction is the only non-trivial cost on
+the miss path - callers that test count first via List.length amortise it.
+@End Performance_Hints
+
+@Security_Scope:
+Returned list on hit is BORROWED - mutating it directly will affect the
+graph's adjacency state. Callers must use this only for read iteration.
+@End Security_Scope
 
 Process called "get_node_inputs" that takes graph as Integer, node as Integer returns Integer:
     If graph is equal to 0:
@@ -631,18 +728,24 @@ Process called "get_node_inputs" that takes graph as Integer, node as Integer re
     Return List.create()
 End Process
 
+@Reasoning:
+Symmetric to get_node_inputs - O(1) "what edges leave this node?" needed by
+forward-walks (use-def, dominator trees) and by add_edge's symmetric update.
+@End Reasoning
+
 @Implementation:
-Returns the list of outgoing edges for a node using the node_outputs adjacency list.
-
-Algorithm:
-1. Validate graph and node pointers
-2. Get node_outputs adjacency dictionary
-3. Lookup node in dictionary
-4. Return list of outgoing edge pointers (or empty list if not found)
-
-Memory Safety:
-- Returns empty list for null inputs or missing node (safe default)
+Returns a fresh empty list for null graph or null node. Reads node_outputs at
+offset 32, tests for the node key, returns the stored list on hit; returns a
+fresh empty list otherwise.
 @End Implementation
+
+@Performance_Hints:
+O(1) hashed lookup.
+@End Performance_Hints
+
+@Security_Scope:
+Returned list on hit is BORROWED; read-only iteration only.
+@End Security_Scope
 
 Process called "get_node_outputs" that takes graph as Integer, node as Integer returns Integer:
     If graph is equal to 0:
@@ -661,20 +764,30 @@ Process called "get_node_outputs" that takes graph as Integer, node as Integer r
     Return List.create()
 End Process
 
+@Reasoning:
+Returning the unique-predecessor node set (not edge set) is what schedulers
+and dominance computations want. De-duplicating inline is cheaper than
+returning duplicates and asking callers to filter, and the typical fan-in is
+small enough that the inner linear search stays cheap.
+@End Reasoning
+
 @Implementation:
-Returns the list of predecessor nodes (sources of incoming edges).
-
-Algorithm:
-1. Validate graph and node pointers
-2. Get incoming edges using get_node_inputs
-3. For each incoming edge, extract source node using get_edge_source
-4. Collect unique predecessor nodes in list
-5. Return list of predecessor node pointers
-
-Memory Safety:
-- Returns empty list for null inputs or missing node (safe default)
-- Handles duplicate edges (same predecessor may have multiple edges to node)
+Returns a fresh empty list for null graph or null node. Iterates the
+node_inputs adjacency list via get_node_inputs; for each edge, fetches
+get_edge_source and, if non-null, runs an inner linear scan over the
+predecessors list to skip duplicates before appending.
 @End Implementation
+
+@Performance_Hints:
+O(D^2) where D is the in-degree, because of the inner de-duplication scan.
+Acceptable since the typical in-degree is small (1..4). Replace with a Set
+when in-degree grows.
+@End Performance_Hints
+
+@Security_Scope:
+Returns a FRESH list owned by the caller. Pointer entries are borrowed and
+point into the graph's node storage.
+@End Security_Scope
 
 Process called "get_node_predecessors" that takes graph as Integer, node as Integer returns Integer:
     If graph is equal to 0:
@@ -713,20 +826,24 @@ Process called "get_node_predecessors" that takes graph as Integer, node as Inte
     Return predecessors
 End Process
 
+@Reasoning:
+Symmetric to get_node_predecessors. Returns the unique successor node set
+for use by forward-traversal (BFS, DFS, topological sort, dominance).
+@End Reasoning
+
 @Implementation:
-Returns the list of successor nodes (destinations of outgoing edges).
-
-Algorithm:
-1. Validate graph and node pointers
-2. Get outgoing edges using get_node_outputs
-3. For each outgoing edge, extract destination node using get_edge_dest
-4. Collect unique successor nodes in list
-5. Return list of successor node pointers
-
-Memory Safety:
-- Returns empty list for null inputs or missing node (safe default)
-- Handles duplicate edges (same successor may have multiple edges from node)
+Returns a fresh empty list for null graph or null node. Walks the outgoing
+edge list from get_node_outputs, fetches get_edge_dest for each, and uses an
+inner linear scan to suppress duplicates before appending.
 @End Implementation
+
+@Performance_Hints:
+O(D^2) on out-degree D. Same trade-off as get_node_predecessors.
+@End Performance_Hints
+
+@Security_Scope:
+Returns a FRESH list owned by the caller; pointer entries are borrowed.
+@End Security_Scope
 
 Process called "get_node_successors" that takes graph as Integer, node as Integer returns Integer:
     If graph is equal to 0:
@@ -769,29 +886,33 @@ Note: ════════════════════════�
 Note: Graph Traversal Algorithms
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Kahn's algorithm is the right choice for Bifrost because we want an
+execution-order list (useful for scheduling) AND a cycle detector in the same
+pass. Bifrost graphs are required to be DAGs - returning an empty list on
+cycle gives downstream passes a single "valid DAG?" check (compare lengths)
+without needing a separate has_cycle invocation.
+@End Reasoning
+
 @Implementation:
-Performs topological sorting using Kahn's algorithm. Returns a list of nodes in
-execution order such that for every edge (u, v), u appears before v.
-
-Algorithm (Kahn's Algorithm):
-1. Compute in-degree for each node (number of incoming edges)
-2. Initialize queue with all nodes that have in-degree 0 (roots)
-3. While queue is not empty:
-   a. Dequeue node u
-   b. Append u to sorted result list
-   c. For each successor v of u:
-      - Decrement in-degree of v
-      - If in-degree of v becomes 0, enqueue v
-4. If sorted list contains all nodes, return sorted list
-5. Otherwise, graph has a cycle (return empty list)
-
-Time Complexity: O(V + E) where V = nodes, E = edges
-Space Complexity: O(V) for in-degree map and queue
-
-Memory Safety:
-- Returns empty list for null graph or cyclic graph
-- Allocates new list for sorted result
+Returns an empty list on null graph. Builds an in_degree Dict by counting
+each node's incoming edges via get_node_inputs. Initialises a queue with all
+zero-in-degree nodes. Repeatedly dequeues a node u, appends it to the sorted
+result, walks u's successors (via get_node_successors), decrements their
+in-degree counters, and enqueues any that reach zero. After the queue
+drains, compares the result length to the node count: equal means the sort
+succeeded, otherwise a cycle exists and an empty list is returned.
 @End Implementation
+
+@Performance_Hints:
+O(V+E). Space O(V) for the in_degree dict and queue. List.remove_at(queue, 0)
+is O(|queue|) - if profiling shows it dominates, swap to a true queue.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph state plus auxiliary allocations (in_degree dict, queue,
+result list). All allocations are freed when the caller releases the result.
+@End Security_Scope
 
 Process called "topological_sort" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -861,18 +982,26 @@ Process called "topological_sort" that takes graph as Integer returns Integer:
     Return List.create()
 End Process
 
+@Reasoning:
+Reverse topological order is needed for some backward analyses (live-out,
+reverse dataflow). Composing on top of topological_sort keeps the cycle-
+detection contract identical so callers only need one error path.
+@End Reasoning
+
 @Implementation:
-Performs reverse topological sorting (reverse post-order from DFS). Returns nodes
-in reverse execution order.
-
-Algorithm:
-1. Perform topological_sort to get forward order
-2. Reverse the resulting list
-3. Return reversed list
-
-Memory Safety:
-- Returns empty list for null graph or cyclic graph
+Returns empty list on null graph. Runs topological_sort and walks the result
+back-to-front, appending each entry into a new reversed list.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) for the underlying sort plus O(V) for the reverse walk. One extra
+allocation for the reversed list - replace with in-place reverse if profiling
+demands.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read of the forward topological sort. Returned list is freshly owned.
+@End Security_Scope
 
 Process called "reverse_topological_sort" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -894,26 +1023,28 @@ Process called "reverse_topological_sort" that takes graph as Integer returns In
     Return reversed
 End Process
 
+@Reasoning:
+Preorder DFS visits nodes before their subgraphs, so it is the right
+traversal for tasks that want to act on a node first (e.g. labelling,
+collecting source-line metadata before descending into a subtree). The
+recursion is bounded by graph depth - Bifrost graphs are typically shallow
+relative to their breadth so the recursion stack stays small.
+@End Reasoning
+
 @Implementation:
-Performs depth-first search preorder traversal starting from a given node.
-Preorder means node is visited BEFORE its children.
-
-Algorithm:
-1. Initialize visited set to track visited nodes
-2. Initialize result list for traversal order
-3. Call recursive DFS helper:
-   a. Mark current node as visited
-   b. Add node to result list (PREORDER - visit before children)
-   c. For each unvisited successor, recursively DFS
-4. Return result list
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for visited set and recursion stack
-
-Memory Safety:
-- Returns empty list for null graph or node
-- Uses visited set to prevent infinite loops
+Returns empty list on null graph or null start_node. Allocates a visited Set
+and result List, then calls dfs_preorder_helper to perform the actual walk.
 @End Implementation
+
+@Performance_Hints:
+O(V+E). Stack depth equals the longest path from start_node. Visited Set
+prevents re-traversal of reconvergent paths.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; allocations are visited Set and result List. Both freed at caller
+discretion.
+@End Security_Scope
 
 Process called "dfs_preorder" that takes graph as Integer, start_node as Integer returns Integer:
     If graph is equal to 0:
@@ -932,16 +1063,26 @@ Process called "dfs_preorder" that takes graph as Integer, start_node as Integer
     Return result
 End Process
 
-@Implementation:
-Recursive helper for DFS preorder traversal.
+@Reasoning:
+The helper splits recursion from the top-level dfs_preorder so the caller
+need not own the visited set and result list. Storing visited in a Set
+guarantees O(1) hit testing while the result List preserves traversal order.
+@End Reasoning
 
-Algorithm:
-1. Mark current node as visited
-2. Add node to result (PREORDER - visit before children)
-3. Get successors of current node
-4. For each successor:
-   - If not visited, recursively call helper
+@Implementation:
+Adds node to the visited Set, appends to result (preorder visit), fetches
+get_node_successors, walks each successor and recurses for unvisited ones.
 @End Implementation
+
+@Performance_Hints:
+O(degree) per call; total O(V+E) across the recursion. Recursion depth equals
+longest path length.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the caller-owned visited Set and result List; both are passed in by
+reference. No external state.
+@End Security_Scope
 
 Process called "dfs_preorder_helper" that takes
     graph as Integer,
@@ -969,26 +1110,26 @@ Process called "dfs_preorder_helper" that takes
     End While
 End Process
 
+@Reasoning:
+Postorder DFS visits children first, then parent - ideal for accumulating
+results bottom-up (height computation, reverse-postorder schedules, SSA
+phi insertion). Reversing a postorder gives a valid topological order, which
+is occasionally cheaper than running Kahn for ad-hoc scheduling.
+@End Reasoning
+
 @Implementation:
-Performs depth-first search postorder traversal starting from a given node.
-Postorder means node is visited AFTER its children.
-
-Algorithm:
-1. Initialize visited set to track visited nodes
-2. Initialize result list for traversal order
-3. Call recursive DFS helper:
-   a. Mark current node as visited
-   b. For each unvisited successor, recursively DFS
-   c. Add node to result list (POSTORDER - visit after children)
-4. Return result list
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for visited set and recursion stack
-
-Memory Safety:
-- Returns empty list for null graph or node
-- Uses visited set to prevent infinite loops
+Returns empty list on null inputs. Allocates a visited Set and a result List,
+then calls dfs_postorder_helper to walk the subgraph rooted at start_node.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) with recursion depth equal to longest path. Same trade-offs as
+dfs_preorder.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "dfs_postorder" that takes graph as Integer, start_node as Integer returns Integer:
     If graph is equal to 0:
@@ -1007,16 +1148,24 @@ Process called "dfs_postorder" that takes graph as Integer, start_node as Intege
     Return result
 End Process
 
-@Implementation:
-Recursive helper for DFS postorder traversal.
+@Reasoning:
+Symmetric to dfs_preorder_helper but appends after recursing - that single
+re-ordering is the difference between pre- and post-order.
+@End Reasoning
 
-Algorithm:
-1. Mark current node as visited
-2. Get successors of current node
-3. For each successor:
-   - If not visited, recursively call helper
-4. Add node to result (POSTORDER - visit after children)
+@Implementation:
+Marks node visited, fetches successors, recurses for each unvisited
+successor, and appends the node to result after all children have been
+processed.
 @End Implementation
+
+@Performance_Hints:
+O(degree) per call.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates caller-owned visited Set and result List.
+@End Security_Scope
 
 Process called "dfs_postorder_helper" that takes
     graph as Integer,
@@ -1044,30 +1193,28 @@ Process called "dfs_postorder_helper" that takes
     List.append(result, node)
 End Process
 
+@Reasoning:
+BFS gives shortest-distance ordering from start - useful for level-aware
+optimisation (e.g. when fusion needs to operate within a depth window). It
+also avoids the stack-depth concerns of DFS for very deep graphs.
+@End Reasoning
+
 @Implementation:
-Performs breadth-first search traversal starting from a given node. BFS visits
-nodes level by level (all nodes at distance k before any node at distance k+1).
-
-Algorithm:
-1. Initialize visited set to track visited nodes
-2. Initialize result list for traversal order
-3. Initialize queue with start node
-4. Mark start node as visited
-5. While queue is not empty:
-   a. Dequeue node u
-   b. Add u to result list
-   c. For each unvisited successor v of u:
-      - Mark v as visited
-      - Enqueue v
-6. Return result list
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for visited set and queue
-
-Memory Safety:
-- Returns empty list for null graph or node
-- Uses visited set to prevent revisiting
+Returns empty list on null inputs. Allocates a visited Set, result List, and
+queue List. Seeds the queue with start_node and marks it visited. In the main
+loop, dequeues from index 0, appends to result, fetches successors, and
+enqueues each unvisited successor while marking it visited.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) time and space. List.remove_at(queue, 0) is O(|queue|); for large
+graphs replace with a circular buffer if profiling demands.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; three allocations (visited, result, queue). All freed at caller
+discretion.
+@End Security_Scope
 
 Process called "bfs" that takes graph as Integer, start_node as Integer returns Integer:
     If graph is equal to 0:
@@ -1109,23 +1256,26 @@ Process called "bfs" that takes graph as Integer, start_node as Integer returns 
     Return result
 End Process
 
+@Reasoning:
+Root nodes (no predecessors) are entry-points for topological sort and for
+traversal that starts from inputs. Returning them as a list lets schedulers
+process multiple disjoint subgraphs in parallel.
+@End Reasoning
+
 @Implementation:
-Finds all root nodes in the graph (nodes with no incoming edges).
-
-Algorithm:
-1. Validate graph pointer
-2. Get all nodes from graph
-3. For each node:
-   - Get incoming edges count
-   - If count is 0, add to roots list
-4. Return roots list
-
-Time Complexity: O(V)
-Space Complexity: O(V) for roots list
-
-Memory Safety:
-- Returns empty list for null graph
+Returns an empty list for null graph. Walks the nodes List and tests each
+node's incoming-edge count via get_node_inputs + List.length; if zero,
+appends to the roots list.
 @End Implementation
+
+@Performance_Hints:
+O(V) - one length check per node. The List.length on each adjacency entry is
+O(1) so the overall cost stays linear.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Result list is freshly owned by caller; entries are borrowed.
+@End Security_Scope
 
 Process called "find_roots" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -1150,23 +1300,25 @@ Process called "find_roots" that takes graph as Integer returns Integer:
     Return roots
 End Process
 
+@Reasoning:
+Leaf nodes (no successors) are graph sinks - Output nodes and side-effect
+operations that have no further consumers. Schedulers use the leaf set as
+the start point for reverse-topological traversal.
+@End Reasoning
+
 @Implementation:
-Finds all leaf nodes in the graph (nodes with no outgoing edges).
-
-Algorithm:
-1. Validate graph pointer
-2. Get all nodes from graph
-3. For each node:
-   - Get outgoing edges count
-   - If count is 0, add to leaves list
-4. Return leaves list
-
-Time Complexity: O(V)
-Space Complexity: O(V) for leaves list
-
-Memory Safety:
-- Returns empty list for null graph
+Returns an empty list for null graph. Walks the nodes List and tests each
+node's outgoing-edge count via get_node_outputs + List.length; if zero,
+appends to the leaves list.
 @End Implementation
+
+@Performance_Hints:
+O(V).
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. Result list freshly owned by caller.
+@End Security_Scope
 
 Process called "find_leaves" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -1191,21 +1343,24 @@ Process called "find_leaves" that takes graph as Integer returns Integer:
     Return leaves
 End Process
 
+@Reasoning:
+Reachability from a node is the basis for dead-code elimination (anything
+unreachable from inputs can be deleted) and for subgraph isolation. Reusing
+dfs_preorder keeps semantics aligned with the preorder traversal.
+@End Reasoning
+
 @Implementation:
-Finds all nodes reachable from a given start node using DFS.
-
-Algorithm:
-1. Validate graph and start node pointers
-2. Initialize visited set
-3. Perform DFS from start node to collect all reachable nodes
-4. Return list of reachable nodes
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for visited set
-
-Memory Safety:
-- Returns empty list for null graph or node
+Returns empty list on null inputs. Delegates to dfs_preorder which performs
+the DFS walk and returns the reachable-node list directly.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) via dfs_preorder. No extra allocation beyond what dfs_preorder needs.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "get_reachable_nodes" that takes graph as Integer, start_node as Integer returns Integer:
     If graph is equal to 0:
@@ -1224,24 +1379,27 @@ Note: ════════════════════════�
 Note: Graph Validation Algorithms
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Bifrost requires DAG inputs (cycles would let schedulers deadlock and would
+break SSA def-use chains). Piggybacking on topological_sort gives the
+DAG-or-not answer in one O(V+E) pass instead of running has_cycle separately.
+@End Reasoning
+
 @Implementation:
-Checks if the graph is a Directed Acyclic Graph (DAG) by attempting topological sort.
-If topological sort succeeds (returns all nodes), the graph is a DAG.
-
-Algorithm:
-1. Validate graph pointer
-2. Perform topological sort
-3. Count sorted nodes
-4. Count total nodes
-5. If counts match, graph is DAG (return true)
-6. Otherwise, graph has cycle (return false)
-
-Time Complexity: O(V + E)
-Space Complexity: O(V)
-
-Memory Safety:
-- Returns false for null graph (safe default)
+Returns false for null graph. Runs topological_sort and compares the result
+length to get_node_count - if they match every node was scheduled, so the
+graph is acyclic.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) via topological_sort. Cheaper than running has_cycle separately when
+the caller has not already computed a sort.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. The intermediate sort list is dropped immediately after the
+length comparison.
+@End Security_Scope
 
 Process called "is_dag" that takes graph as Integer returns Boolean:
     If graph is equal to 0:
@@ -1259,29 +1417,28 @@ Process called "is_dag" that takes graph as Integer returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+Three-colour DFS is the canonical O(V+E) cycle detector that handles
+disconnected components by restarting at every White node. Returning early
+on the first cycle keeps the cost low when the graph is corrupt.
+@End Reasoning
+
 @Implementation:
-Detects if the graph contains any cycles using depth-first search with three-color
-marking: White (unvisited), Gray (visiting), Black (visited).
-
-Algorithm (DFS with Coloring):
-1. Initialize color map: 0=White (unvisited), 1=Gray (visiting), 2=Black (visited)
-2. For each node:
-   - If White, start DFS from node
-3. DFS recursive check:
-   a. Mark node as Gray (currently visiting)
-   b. For each successor:
-      - If successor is Gray, cycle detected (back edge)
-      - If successor is White, recursively DFS successor
-      - If successor is Black, already processed (no cycle via this edge)
-   c. Mark node as Black (finished visiting)
-4. Return true if cycle found, false otherwise
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for color map and recursion stack
-
-Memory Safety:
-- Returns false for null graph (safe default - empty graph has no cycles)
+Returns false for null graph. Reads the nodes list, builds a color Dict
+initialised to 0 (White) for every node, then iterates the nodes list - for
+each still-White node it invokes has_cycle_dfs and returns true on the first
+cycle found. Returns false after exhausting all nodes.
 @End Implementation
+
+@Performance_Hints:
+O(V+E). Recursion depth equals longest DFS path; tail-friendly for shallow
+Bifrost DAGs.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph state; allocates a color Dict that is freed when this
+routine returns.
+@End Security_Scope
 
 Process called "has_cycle" that takes graph as Integer returns Boolean:
     If graph is equal to 0:
@@ -1317,21 +1474,26 @@ Process called "has_cycle" that takes graph as Integer returns Boolean:
     Return false
 End Process
 
+@Reasoning:
+The Gray-equals-on-current-path invariant is the only signal three-colour DFS
+needs to detect cycles: an edge to a Gray node is a back-edge by definition.
+Recursive structure mirrors the colour state machine.
+@End Reasoning
+
 @Implementation:
-Recursive DFS helper for cycle detection using three-color marking.
-
-Algorithm:
-1. Mark current node as Gray (1 - currently visiting)
-2. For each successor:
-   - If successor is Gray (1), back edge detected → cycle exists
-   - If successor is White (0), recursively check successor
-3. Mark current node as Black (2 - finished visiting)
-4. Return true if cycle found, false otherwise
-
-Back Edge Detection:
-- Gray node means it's in current DFS path (ancestor)
-- Edge to Gray node creates cycle: node → ... → successor → ... → node
+Marks the input node Gray (1). Walks each successor, reads the successor's
+colour from the Dict; Gray returns true immediately (cycle found); White
+recurses and propagates true on any nested cycle. After the successor loop
+the node is marked Black (2) and false is returned.
 @End Implementation
+
+@Performance_Hints:
+O(degree) per call; total O(V+E) across recursion.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the caller-owned color Dict.
+@End Security_Scope
 
 Process called "has_cycle_dfs" that takes
     graph as Integer,
@@ -1373,22 +1535,29 @@ Process called "has_cycle_dfs" that takes
     Return false
 End Process
 
+@Reasoning:
+Returning the offending cycle (not just a Boolean) is what error messages
+need: the verifier dumps the cycle path so the user can see exactly which
+nodes form the loop. Builds a parent Dict alongside the color Dict so the
+DFS helper can reconstruct the path on detection.
+@End Reasoning
+
 @Implementation:
-Finds and returns a cycle path if the graph contains a cycle. Returns empty list
-if no cycle exists.
-
-Algorithm:
-1. Use DFS with coloring to detect cycle
-2. When back edge is found (edge to Gray node), reconstruct cycle path
-3. Backtrack from current node to Gray ancestor to build cycle
-4. Return cycle path as list of nodes
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for path reconstruction
-
-Memory Safety:
-- Returns empty list for null graph or acyclic graph
+Returns empty list for null graph. Reads the nodes list; initialises color
+and parent Dicts (each node mapped to 0). Walks the nodes list - for each
+White node, invokes find_cycle_dfs, returning its result if non-empty.
+Returns an empty list when no cycle is found.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) worst case. The parent Dict adds O(V) memory over has_cycle but no
+extra time beyond the DFS itself.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph state; allocates color and parent Dicts plus the cycle
+result list. Result list owned by caller.
+@End Security_Scope
 
 Process called "find_cycle" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -1427,23 +1596,30 @@ Process called "find_cycle" that takes graph as Integer returns Integer:
     Return List.create()
 End Process
 
+@Reasoning:
+On back-edge detection, walking the parent chain from the current node back
+to the Gray ancestor gives a concrete cycle path that can be printed for
+diagnostics. Parent pointers are recorded as the DFS descends so the chain
+is always available.
+@End Reasoning
+
 @Implementation:
-Recursive DFS helper for finding cycle path.
-
-Algorithm:
-1. Mark current node as Gray
-2. For each successor:
-   - Record parent relationship
-   - If successor is Gray, reconstruct cycle path from parent chain
-   - If successor is White, recursively search
-3. Mark current node as Black
-4. Return cycle path if found
-
-Path Reconstruction:
-- When back edge (u → v where v is Gray) found:
-  - Start from u and follow parent pointers until reaching v
-  - This gives the cycle path
+Marks the node Gray. Walks successors; before each step records the parent
+pointer (succ -> node). When a Gray successor is seen, builds a cycle list
+by walking parent links from the current node until reaching the Gray
+ancestor and returns it. White successors recurse; non-empty returns
+propagate upward. Marks the node Black before returning an empty list when
+no cycle was found.
 @End Implementation
+
+@Performance_Hints:
+O(degree) per call; path reconstruction is O(cycle_length).
+@End Performance_Hints
+
+@Security_Scope:
+Mutates caller-owned color and parent Dicts; allocates the cycle list on
+detection.
+@End Security_Scope
 
 Process called "find_cycle_dfs" that takes
     graph as Integer,
@@ -1497,29 +1673,32 @@ Process called "find_cycle_dfs" that takes
     Return List.create()
 End Process
 
+@Reasoning:
+The validator is the gatekeeper before backends consume the graph. The
+checks are ordered to fail fast: cycles are the cheapest and most catastrophic
+failure, then dangling endpoints, then type consistency (the most expensive
+per-edge check). Returning false on any single failure prevents broken graphs
+from reaching codegen.
+@End Reasoning
+
 @Implementation:
-Validates the entire graph for consistency and correctness.
-
-Checks:
-1. Graph is a DAG (no cycles)
-2. All edge source/dest nodes exist in graph
-3. Adjacency lists are consistent with edge list
-4. No duplicate edges
-5. All node IDs are unique
-6. Type compatibility on all edges
-
-Algorithm:
-1. Check graph is DAG using is_dag
-2. Validate all edges have valid source/dest nodes
-3. Validate adjacency lists match edge list
-4. Validate types on all edges using validate_types
-5. Return true if all checks pass, false otherwise
-
-Time Complexity: O(V + E)
-
-Memory Safety:
-- Returns false for null graph or invalid graph
+Returns false for null graph. Runs is_dag; on failure returns false.
+Walks the edges list (offset 16), reads source and dest from each edge via
+get_edge_source / get_edge_dest, returns false if either is null or if has_node
+rejects the endpoint. Finally runs validate_types and returns its result.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) for is_dag plus O(E times V) worst case for the per-edge has_node scan
+(E edges, each calling O(V) linear node lookup). For large graphs this could
+be O(V+E) by
+keying off node_id_map - acceptable for current graph sizes.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. False return MUST abort lowering - feeding an invalid graph to
+codegen produces wrong code or crashes.
+@End Security_Scope
 
 Process called "validate_graph" that takes graph as Integer returns Boolean:
     If graph is equal to 0:
@@ -1570,24 +1749,27 @@ Process called "validate_graph" that takes graph as Integer returns Boolean:
     Return true
 End Process
 
+@Reasoning:
+Type consistency between an edge's data_type tag and its source node's output
+type is the type-system invariant that codegen relies on - emitting the wrong
+SIMD width or float vs. int would silently produce wrong results. One linear
+sweep is enough since every edge can be checked independently.
+@End Reasoning
+
 @Implementation:
-Validates type compatibility across all edges. Checks that each edge's data type
-matches the source node's output type.
-
-Algorithm:
-1. Validate graph pointer
-2. For each edge:
-   - Get edge data type
-   - Get source node's output type
-   - Check types are compatible using types_compatible from node.runa
-   - If incompatible, return false
-3. Return true if all edges have compatible types
-
-Time Complexity: O(E)
-
-Memory Safety:
-- Returns false for null graph or type mismatches
+Returns false for null graph. Walks the edges list (offset 16), and for each
+edge: reads its data type, the source pointer, the source's output type, and
+runs types_compatible. Returns false on the first mismatch.
 @End Implementation
+
+@Performance_Hints:
+O(E) - one compatibility check per edge. types_compatible is constant-time
+for primitive types and linear in tensor rank for shaped types.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. False return is a hard rejection - downstream lowering must abort.
+@End Security_Scope
 
 Process called "validate_types" that takes graph as Integer returns Boolean:
     If graph is equal to 0:
@@ -1615,29 +1797,28 @@ Process called "validate_types" that takes graph as Integer returns Boolean:
     Return true
 End Process
 
+@Reasoning:
+Per-node validation supports incremental verification during graph rewrites -
+a pass that adds or modifies a single node can re-verify just the affected
+node and its incident edges instead of running the full validate_graph pass.
+@End Reasoning
+
 @Implementation:
-Validates a single node for correctness.
-
-Checks:
-1. Node pointer is non-null
-2. Node exists in graph
-3. Node has valid type
-4. All input edges have valid types
-5. All output edges have valid types
-
-Algorithm:
-1. Validate node pointer
-2. Check node exists in graph using has_node
-3. Get node type and validate it's non-null
-4. Get input edges and validate each
-5. Get output edges and validate each
-6. Return true if all checks pass
-
-Time Complexity: O(degree(node))
-
-Memory Safety:
-- Returns false for null graph or node
+Returns false for null inputs. Confirms the node is registered via has_node,
+then reads get_node_output_type and returns false if it is null. Walks the
+input edges (get_node_inputs) and output edges (get_node_outputs) and
+validates each via validate_edge; returns false on any rejection.
 @End Implementation
+
+@Performance_Hints:
+O(degree(node)) for incident-edge validation plus the cost of the inner
+validate_edge calls. Cheap for incremental checks.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read. False return signals the node violates a graph invariant; callers
+must not use the node further until the issue is repaired.
+@End Security_Scope
 
 Process called "validate_node" that takes graph as Integer, node as Integer returns Boolean:
     If graph is equal to 0:
@@ -1688,29 +1869,28 @@ Process called "validate_node" that takes graph as Integer, node as Integer retu
     Return true
 End Process
 
+@Reasoning:
+Edge validation enforces the four invariants every edge must hold: edge is
+registered, both endpoints are non-null and registered, and the payload
+type matches the producer's output type.
+@End Reasoning
+
 @Implementation:
-Validates a single edge for correctness.
-
-Checks:
-1. Edge pointer is non-null
-2. Edge exists in graph
-3. Source and destination nodes exist and are valid
-4. Edge data type is compatible with source node output type
-5. Edge is registered in both source and destination adjacency lists
-
-Algorithm:
-1. Validate edge pointer
-2. Check edge exists in graph using has_edge
-3. Get source and dest nodes, validate they exist
-4. Check type compatibility
-5. Verify edge in adjacency lists
-6. Return true if all checks pass
-
-Time Complexity: O(degree(source) + degree(dest))
-
-Memory Safety:
-- Returns false for null graph or edge
+Returns false on null inputs. Calls has_edge to confirm registration, reads
+source and dest via get_edge_source / get_edge_dest, returns false if either
+is null. Calls has_node on each endpoint, returns false on either rejection.
+Reads the edge's data_type and source's output_type, runs types_compatible,
+and returns false on mismatch.
 @End Implementation
+
+@Performance_Hints:
+O(V) worst case due to has_node's linear scan. Acceptable for ad-hoc
+verification.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "validate_edge" that takes graph as Integer, edge as Integer returns Boolean:
     If graph is equal to 0:
@@ -1763,25 +1943,28 @@ Note: ════════════════════════�
 Note: Graph Analysis Algorithms
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Node depth (max distance from any root) is the foundation for level-aware
+scheduling and for prioritising fusion candidates that share the same depth.
+Computing it once via DP on the topological order is far cheaper than
+re-deriving depth from each root with separate BFS calls.
+@End Reasoning
+
 @Implementation:
-Computes the depth (longest path from any root) for each node using dynamic
-programming on the topologically sorted graph.
-
-Algorithm:
-1. Perform topological sort to get processing order
-2. Initialize depths dictionary with all nodes at depth 0
-3. For each root node, set depth to 0
-4. Process nodes in topological order:
-   - For each node, compute max(predecessor_depths) + 1
-   - Store result in depths dictionary
-5. Return depths dictionary
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for depths map
-
-Memory Safety:
-- Returns empty dictionary for null graph or cyclic graph
+Returns empty Dict for null graph. Runs topological_sort; returns empty Dict
+on cycle (sort returns empty). Initialises a depths Dict with all nodes mapped
+to 0. Walks the sorted order: for each node, fetches predecessors, takes the
+maximum predecessor depth, and writes node depth = max+1 (or 0 if the node has
+no predecessors). Returns the populated depths Dict.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) time, O(V) space. Each predecessor is visited exactly once.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph state; returned Dict owned by caller.
+@End Security_Scope
 
 Process called "compute_depths" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -1836,25 +2019,26 @@ Process called "compute_depths" that takes graph as Integer returns Integer:
     Return depths
 End Process
 
+@Reasoning:
+Node height (max distance to any leaf) is the symmetric counterpart of depth.
+It is needed by backward-flow analyses and to estimate latency from a node to
+the graph's outputs. Reverse-topological DP yields it in one pass.
+@End Reasoning
+
 @Implementation:
-Computes the height (longest path to any leaf) for each node using dynamic
-programming on the reverse topologically sorted graph.
-
-Algorithm:
-1. Perform reverse topological sort (leaves first)
-2. Initialize heights dictionary with all nodes at height 0
-3. For each leaf node, set height to 0
-4. Process nodes in reverse topological order:
-   - For each node, compute max(successor_heights) + 1
-   - Store result in heights dictionary
-5. Return heights dictionary
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for heights map
-
-Memory Safety:
-- Returns empty dictionary for null graph or cyclic graph
+Returns empty Dict for null graph. Runs reverse_topological_sort; returns empty
+Dict on cycle. Initialises heights to 0 for every node, then walks the reverse
+order computing height = max(successor heights) + 1 (or 0 for leaves with no
+successors).
 @End Implementation
+
+@Performance_Hints:
+O(V+E) time, O(V) space.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read.
+@End Security_Scope
 
 Process called "compute_heights" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -1909,29 +2093,30 @@ Process called "compute_heights" that takes graph as Integer returns Integer:
     Return heights
 End Process
 
+@Reasoning:
+The critical path is the longest chain of dependencies through the graph - the
+schedule lower bound. Identifying it lets the scheduler prioritise nodes on
+that path to minimise overall latency, and lets fusion passes avoid breaking
+the path.
+@End Reasoning
+
 @Implementation:
-Finds the critical path (longest weighted path) in the DAG using dynamic programming.
-Returns list of nodes in the critical path.
-
-Algorithm (Dynamic Programming on DAG):
-1. Perform topological sort for processing order
-2. Initialize distance[node] = 0 for all nodes (longest path from roots)
-3. Initialize parent[node] = null for path reconstruction
-4. Process nodes in topological order:
-   - For each node u and each successor v:
-     - If distance[u] + weight(u→v) > distance[v]:
-       - Update distance[v] = distance[u] + weight(u→v)
-       - Set parent[v] = u
-5. Find node with maximum distance (end of critical path)
-6. Backtrack using parent pointers to reconstruct path
-7. Return critical path as list of nodes
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for distance and parent maps
-
-Memory Safety:
-- Returns empty list for null graph or cyclic graph
+Returns empty list for null graph. Topo-sorts; returns empty on cycle.
+Initialises distance and parent Dicts. Walks the topological order: for each
+node u, for each successor v, if distance(u)+1 > distance(v), updates
+distance(v) and sets parent(v)=u (weight=1 today; weighted edges can be added
+later). After DP, scans for the max-distance node and backtracks parent
+pointers to reconstruct the path, then reverses to root-to-leaf order.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) for the DP plus O(V) for max-search plus O(|path|) for the
+reconstruction. Total O(V+E). Two Dict allocations.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; result list owned by caller.
+@End Security_Scope
 
 Process called "find_critical_path" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -2033,12 +2218,29 @@ Algorithm (Cooper-Harvey-Kennedy):
 3. Build immediate dominator map from dominator sets
 
 Time Complexity: O(V * E) worst case, typically converges in 2-3 iterations
-Space Complexity: O(V²) for dominator sets
+Space Complexity: O(V^2) for dominator sets
 
 Memory Safety:
 - Returns empty dictionary for null graph
 - Handles graphs with no entry node
 @End Implementation
+
+@Reasoning:
+Dominators are used by code motion (you can hoist a node above its dominator
+without changing semantics) and by control-equivalence reasoning in fusion.
+The iterative Cooper-Harvey-Kennedy formulation is correct for non-reducible
+graphs and converges quickly on Bifrost DAGs.
+@End Reasoning
+
+@Performance_Hints:
+O(V*E) worst case in the iterative loop; typical convergence is 2-3 iterations
+for DAGs. Memory is O(V^2) for full dominator sets. Replace with the
+near-linear Lengauer-Tarjan algorithm if graphs exceed a few thousand nodes.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph; returned Dict and embedded Lists are owned by caller.
+@End Security_Scope
 
 Process called "compute_dominators" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -2147,31 +2349,28 @@ Process called "compute_dominators" that takes graph as Integer returns Integer:
     Return dominators
 End Process
 
+@Reasoning:
+Bifrost graphs are DAGs in normal operation, but during in-progress rewrites a
+fusion pass can temporarily introduce cycles - SCC detection lets the verifier
+spot and refuse the broken graph. Tarjan's single-pass algorithm reports SCCs
+in reverse-topological order which is convenient for the verifier's reporting.
+@End Reasoning
+
 @Implementation:
-Finds strongly connected components using Tarjan's algorithm.
-
-Note: For DAGs, each node is its own SCC (trivial component).
-This implementation detects SCCs for general directed graphs.
-
-Algorithm (Tarjan's Algorithm):
-1. Initialize index counter and stack
-2. For each unvisited node, run Tarjan DFS:
-   a. Assign index and lowlink to node
-   b. Push node onto stack
-   c. For each successor:
-      - If unvisited, recursively visit
-      - If on stack, update lowlink
-   d. If node is SCC root (index == lowlink):
-      - Pop stack until node is reached
-      - All popped nodes form one SCC
-3. Return list of SCCs (each SCC is list of nodes)
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for stack and index maps
-
-Memory Safety:
-- Returns list of single-node SCCs for null graph or DAG
+Returns empty list for null graph. Allocates sccs list, traversal stack, and
+three Dicts (index_map, lowlink_map, on_stack_map) plus current_index counter.
+Walks the nodes list, invoking tarjan_strongconnect on every unindexed node;
+the helper pushes/pops the stack and emits SCCs into the sccs list.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) - single DFS pass. Stack and three Dicts each O(V) space.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; SCC result list owned by caller, each SCC sublist owned by the
+outer list.
+@End Security_Scope
 
 Process called "find_strongly_connected_components" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -2205,6 +2404,31 @@ Process called "find_strongly_connected_components" that takes graph as Integer 
 
     Return sccs
 End Process
+
+@Reasoning:
+The recursive worker keeps the index/lowlink/on-stack state explicit so the
+outer driver can resume after a recursion completes. Lowlink minimisation on
+back-edges is the heart of Tarjan's correctness argument.
+@End Reasoning
+
+@Implementation:
+Sets index_map(node)=current_index and lowlink_map(node)=current_index, then
+increments current_index. Pushes node onto stack and marks it on_stack. Walks
+each successor: if unindexed, recurses then updates lowlink_map(node) with
+min(self, succ.lowlink); if indexed and on_stack, updates lowlink_map(node)
+with min(self, succ.index). After walking, if lowlink == index the node is an
+SCC root - pops the stack until node reappears, creates an SCC list, and
+appends it to sccs. Returns the updated current_index.
+@End Implementation
+
+@Performance_Hints:
+Amortised O(degree) per call; total O(V+E) across the full Tarjan run. Each
+edge is examined once, each node is pushed/popped once.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates caller-owned sccs list, stack, and three Dicts. No external state.
+@End Security_Scope
 
 Note: Helper process for Tarjan's algorithm recursive DFS
 Process called "tarjan_strongconnect" that takes
@@ -2289,23 +2513,26 @@ Process called "tarjan_strongconnect" that takes
     Return current_index
 End Process
 
+@Reasoning:
+Transitive closure pre-computes "can node u reach node v?" for every pair so
+later queries (e.g. for fusion legality "do these two share a dependency
+ancestor?") are O(1) lookups instead of fresh DFS runs. Memory is quadratic
+so callers should free it promptly.
+@End Reasoning
+
 @Implementation:
-Computes the transitive closure of the graph. Returns a dictionary mapping each
-node to the set of all reachable nodes.
-
-Algorithm:
-1. Initialize closure dictionary
-2. For each node:
-   - Perform DFS to find all reachable nodes
-   - Store reachable set in closure[node]
-3. Return closure dictionary
-
-Time Complexity: O(V * (V + E))
-Space Complexity: O(V²) for closure map
-
-Memory Safety:
-- Returns empty dictionary for null graph
+Returns empty Dict for null graph. Walks every node and stores its
+get_reachable_nodes result under the node key in the closure Dict.
 @End Implementation
+
+@Performance_Hints:
+O(V*(V+E)) time, O(V^2) space. Reuse across passes amortises the cost; for
+giant graphs prefer per-query DFS.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; closure Dict and the embedded reachable lists are owned by caller.
+@End Security_Scope
 
 Process called "compute_transitive_closure" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -2328,24 +2555,30 @@ Process called "compute_transitive_closure" that takes graph as Integer returns 
     Return closure
 End Process
 
+@Reasoning:
+Subgraph extraction is the foundation of kernel-extraction passes: pick a
+region of the graph (typically the body of a recognised matmul or conv) and
+clone it into its own BifrostGraph so a backend can lower that region as a
+single kernel.
+@End Reasoning
+
 @Implementation:
-Extracts a subgraph containing only the specified nodes and edges between them.
-
-Algorithm:
-1. Create new empty graph
-2. For each node in node_set:
-   - Add node to new graph
-3. For each edge in original graph:
-   - If both source and dest are in node_set:
-     - Add edge to new graph
-4. Return new subgraph
-
-Time Complexity: O(V' + E') where V' and E' are subgraph sizes
-Space Complexity: O(V' + E') for new graph
-
-Memory Safety:
-- Returns empty graph for null graph or empty node set
+Returns a fresh empty graph for null inputs. Allocates a new graph via
+create_graph. Walks the original nodes list; if a node is in node_set, calls
+add_node on the subgraph. Walks the edges list; only adds an edge when both
+its source and dest are in node_set (cross-boundary edges are dropped).
 @End Implementation
+
+@Performance_Hints:
+O(V+E) where V and E are original graph sizes. Set.contains is O(1) for a
+hashed set; with a list-backed set this becomes O(V*V_set).
+@End Performance_Hints
+
+@Security_Scope:
+Reads original graph; allocates a fresh subgraph owned by caller. Original
+node and edge pointers are SHARED between the two graphs - removing from one
+must not free the other's references.
+@End Security_Scope
 
 Process called "get_subgraph" that takes graph as Integer, node_set as Integer returns Integer:
     If graph is equal to 0:
@@ -2395,25 +2628,28 @@ Process called "get_subgraph" that takes graph as Integer, node_set as Integer r
     Return subgraph
 End Process
 
+@Reasoning:
+Graph merging is used when several subgraphs (one per MIR basic block) need
+to be combined into a single function-level graph for cross-block fusion.
+Null-tolerant inputs let callers pass partial collections without branching.
+@End Reasoning
+
 @Implementation:
-Merges two graphs into a single graph. The resulting graph contains all nodes
-and edges from both input graphs.
-
-Algorithm:
-1. Create new empty graph
-2. Add all nodes from graph1
-3. Add all nodes from graph2
-4. Add all edges from graph1
-5. Add all edges from graph2
-6. Return merged graph
-
-Time Complexity: O(V1 + V2 + E1 + E2)
-Space Complexity: O(V1 + V2 + E1 + E2) for new graph
-
-Memory Safety:
-- Returns empty graph if both inputs are null
-- Returns copy of valid graph if one input is equal to 0
+Allocates a fresh merged graph via create_graph. If graph1 is non-null, walks
+its nodes and edges lists, calling add_node and add_edge for each. Same for
+graph2. Returns the merged graph.
 @End Implementation
+
+@Performance_Hints:
+O(V1+V2+E1+E2) - each item is added once. Two passes (one per input) keep
+the implementation simple at the cost of one extra loop.
+@End Performance_Hints
+
+@Security_Scope:
+Node and edge pointers are SHARED with the inputs. Callers must not free
+either input graph while the merged graph is in use, or the merged graph will
+contain dangling pointers.
+@End Security_Scope
 
 Process called "merge_graphs" that takes graph1 as Integer, graph2 as Integer returns Integer:
     Let merged be create_graph()
@@ -2463,29 +2699,32 @@ Process called "merge_graphs" that takes graph1 as Integer, graph2 as Integer re
     Return merged
 End Process
 
+@Reasoning:
+Deep cloning is essential when a pass needs to experiment with rewrites
+without committing them (compare cost before and after fusion). The
+old-to-new node map is critical: cloned edges must point at cloned nodes,
+not at the originals, otherwise the graph would be a hybrid.
+@End Reasoning
+
 @Implementation:
-Creates a deep copy of the entire graph with all nodes and edges.
-
-Algorithm:
-1. Create new empty graph
-2. Create node cloning map (old node → new node)
-3. For each node in original graph:
-   - Clone node using clone_node from node.runa
-   - Add cloned node to new graph
-   - Record mapping in cloning map
-4. For each edge in original graph:
-   - Clone edge
-   - Update source/dest references using cloning map
-   - Add cloned edge to new graph
-5. Return cloned graph
-
-Time Complexity: O(V + E)
-Space Complexity: O(V + E) for cloned graph and cloning map
-
-Memory Safety:
-- Returns empty graph for null graph
-- All cloned nodes and edges are independent of originals
+Returns a fresh empty graph for null input. Allocates the cloned graph and a
+node_map Dict. Walks the original nodes: calls clone_node for each, adds the
+clone to the cloned graph, and records old->new in node_map. Walks original
+edges: looks up new_source / new_dest via node_map, reads kind and data_type
+from the old edge, calls create_edge with new endpoints, copies metadata via
+set_edge_metadata, and adds via add_edge.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) plus the per-node clone cost. One Dict allocation for node_map.
+@End Performance_Hints
+
+@Security_Scope:
+Allocates fresh node and edge structs owned by the cloned graph; cloned graph
+and originals share no pointers. Metadata Dict pointers are SHARED on copy -
+caller must not mutate metadata via either graph if it could affect the
+other.
+@End Security_Scope
 
 Process called "clone_graph" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -2541,34 +2780,31 @@ Process called "clone_graph" that takes graph as Integer returns Integer:
     Return cloned
 End Process
 
+@Reasoning:
+Aggregating common graph metrics into a single Dict avoids forcing every
+caller (verifier, pass-pipeline log, diagnostics output) to re-derive the
+same numbers. Keys are stable strings so consumers can pull what they need
+without coordinating on ordering.
+@End Reasoning
+
 @Implementation:
-Computes various statistics about the graph for analysis and debugging.
-
-Statistics Computed:
-- Node count
-- Edge count
-- Root count (nodes with no incoming edges)
-- Leaf count (nodes with no outgoing edges)
-- Maximum depth (longest path from roots)
-- Maximum height (longest path to leaves)
-- Average in-degree
-- Average out-degree
-- Is DAG (acyclic)
-
-Algorithm:
-1. Compute node and edge counts
-2. Find roots and leaves
-3. Compute depths and heights
-4. Calculate average degrees
-5. Check if DAG
-6. Return dictionary with all statistics
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for intermediate computations
-
-Memory Safety:
-- Returns empty dictionary for null graph
+Returns empty Dict for null graph. Allocates the stats Dict. Computes
+node_count and edge_count via the get_*_count helpers, root_count and
+leaf_count via find_roots / find_leaves, then walks the nodes list scanning
+compute_depths and compute_heights to find max_depth and max_height. Records
+avg_degree as edge_count/node_count when node_count>0. Calls is_dag and
+stores 1/0. All values are inserted via Dict.set with string keys.
 @End Implementation
+
+@Performance_Hints:
+O(V+E) dominated by compute_depths and compute_heights (each is V+E). Multiple
+Dict allocations for the intermediate maps. Not in hot loops - only called by
+verifier and diagnostic code.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph; returned stats Dict owned by caller.
+@End Security_Scope
 
 Process called "graph_statistics" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -2637,23 +2873,32 @@ Note: ════════════════════════�
 Note: Graph Transformation and Optimization
 Note: ═══════════════════════════════════════════════════════════════════════════
 
+@Reasoning:
+Dead-code elimination shrinks the graph before downstream analyses run -
+unreachable nodes consume memory and dilute statistics, and may confuse
+verifiers. The reachable-from-any-root criterion is safe because legitimate
+Bifrost computation always flows from Input/Constant roots.
+@End Reasoning
+
 @Implementation:
-Eliminates dead nodes (unreachable from roots) from the graph.
-
-Algorithm:
-1. Find all root nodes
-2. For each root, collect all reachable nodes using DFS
-3. Build set of all reachable nodes
-4. Remove all nodes not in reachable set
-5. Return modified graph
-
-Time Complexity: O(V + E)
-Space Complexity: O(V) for reachable set
-
-Memory Safety:
-- Modifies graph in place
-- Does nothing for null graph
+Returns immediately for null graph. Calls find_roots and runs
+get_reachable_nodes from each root, unioning the results into a reachable
+Set. Walks the nodes list collecting every node NOT in reachable into a
+to_remove list, then walks to_remove calling remove_node on each (deferring
+removal avoids invalidating the iteration cursor on the nodes list).
 @End Implementation
+
+@Performance_Hints:
+O(V+E) for the reachability sweep plus O(D*N) for remove_node calls where D
+is the dead-node count and N is the total node count (remove_node's id-map
+cleanup is linear). For typical graphs D is small so the total cost stays
+near O(V+E).
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the graph in place. Dead-node memory is not freed - only the graph's
+references are cleared; reclamation happens at graph teardown.
+@End Security_Scope
 
 Process called "eliminate_dead_nodes" that takes graph as Integer returns Nothing:
     If graph is equal to 0:
@@ -2703,25 +2948,32 @@ Process called "eliminate_dead_nodes" that takes graph as Integer returns Nothin
     End While
 End Process
 
+@Reasoning:
+Subgraph inlining is the lowering step for calls that the call-graph analysis
+decided to expand: the callee's BifrostGraph replaces the call node, with
+edges re-targeted so the original predecessors/successors connect to the
+subgraph's roots/leaves.
+@End Reasoning
+
 @Implementation:
-Inlines a subgraph into the main graph, replacing a target node.
-
-Algorithm:
-1. Validate graph, target node, and subgraph
-2. Redirect target's input edges to subgraph input nodes
-3. Redirect subgraph output edges to target's successors
-4. Add all subgraph nodes to main graph
-5. Add all subgraph edges to main graph
-6. Remove target node from main graph
-7. Return modified graph
-
-Time Complexity: O(V_sub + E_sub + degree(target))
-Space Complexity: O(1)
-
-Memory Safety:
-- Does nothing for null inputs
-- Maintains graph consistency
+Null-guards graph, target_node, and subgraph. Finds subgraph roots and
+leaves. Retargets each of target_node's input edges to the first subgraph
+root via set_edge_dest, and each of target_node's output edges from the first
+subgraph leaf via set_edge_source. Walks the subgraph's nodes and edges
+lists, calling add_node and add_edge to absorb them into the main graph.
+Finally calls remove_node on the target.
 @End Implementation
+
+@Performance_Hints:
+O(V_sub + E_sub + degree(target)) - linear in subgraph size plus the target's
+edge count.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the main graph in place. The subgraph's nodes and edges become owned
+by the main graph (their pointers are now reachable from the main graph's
+collections); callers must not free the subgraph after inlining.
+@End Security_Scope
 
 Process called "inline_subgraph" that takes
     graph as Integer,
@@ -2793,36 +3045,40 @@ Process called "inline_subgraph" that takes
     remove_node(graph, target_node)
 End Process
 
+@Reasoning:
+Node fusion is the most important Bifrost optimisation - it collapses
+element-wise producer/consumer pairs into a single composite kernel,
+eliminating intermediate buffer materialisation and cutting memory bandwidth.
+The legality checks (both are Operation discriminant 3, op-pair is in the
+fusible whitelist, and they are connected by an edge) prevent fusing across
+unrelated ops or non-element-wise ops.
+@End Reasoning
+
 @Implementation:
-Fuses compatible nodes into a single composite operation.
-
-Algorithm:
-1. Validate both nodes are Operation nodes
-2. Check if operations are fusible (element-wise, same shape)
-3. Verify producer-consumer relationship (node1 output feeds node2)
-4. Create composite node with fused operation
-5. Redirect input edges from node1 to composite
-6. Redirect output edges from node2 to composite
-7. Remove original nodes
-8. Return composite node
-
-Fusible Operations:
-- Element-wise arithmetic: Add, Subtract, Multiply, Divide
-- Element-wise activations: ReLU, Sigmoid, Tanh
-- Element-wise compare: Equal, NotEqual, LessThan, etc.
-- Patterns like: (x * alpha + beta) fuses multiply and add
-
-Non-Fusible Operations:
-- Matrix operations (MatrixMultiply, MatrixTranspose)
-- Reductions (ReduceSum, ReduceMax)
-- Convolutions (require different memory patterns)
-
-Time Complexity: O(degree(node1) + degree(node2))
-Space Complexity: O(1) excluding composite node
-
-Memory Safety:
-- Returns 0 for null inputs or incompatible nodes
+Triple null-guards graph, node1, node2. Reads discriminants from each node
+(offset 0) and returns 0 if either is not 3 (Operation). Reads op kinds from
+offset 8. Calls check_operations_fusible and check_edge_exists; returns 0 on
+either rejection. Reads node1's output_type (offset 24), parallelism (32),
+and metadata (40) for inheritance. Merges the two input lists via
+merge_input_lists. Allocates a 48-byte composite node, writes discriminant=3,
+op=op1, the merged inputs, and the inherited type/parallelism/metadata.
+Redirects incoming edges via redirect_incoming_edges(node1->composite) and
+outgoing via redirect_outgoing_edges(node2->composite). Adds the composite
+to the graph and removes node1 and node2.
 @End Implementation
+
+@Performance_Hints:
+O(degree(node1) + degree(node2)) for the edge redirection plus the cost of
+remove_node for the two originals. Hot path in the fusion optimisation pass;
+the early null/discriminant/fusibility checks short-circuit quickly when the
+candidate is not fusible.
+@End Performance_Hints
+
+@Security_Scope:
+Mutates the graph: allocates a new composite node, redirects edges, removes
+two nodes. The metadata pointer is COPIED (shared) from node1 to the
+composite - if node1's metadata Dict is freed, the composite would dangle.
+@End Security_Scope
 
 Process called "fuse_nodes" that takes
     graph as Integer,
@@ -2908,39 +3164,37 @@ Process called "fuse_nodes" that takes
     Return composite
 End Process
 
+@Reasoning:
+Node splitting is the inverse of fusion - a complex composite operation
+(BatchNorm, FullyConnected) gets decomposed into primitive nodes so that
+backends without library-level support for the composite can still emit
+correct code via the primitives. The pass is selective so primitive ops like
+Add stay atomic.
+@End Reasoning
+
 @Implementation:
-Splits a complex node into multiple simpler operations.
-
-Algorithm:
-1. Read node operation kind
-2. Decompose based on operation type:
-   - MatrixMultiply → Row×Column multiply-accumulate chains
-   - Convolve2D → Sliding window + multiply-accumulate patterns
-   - FFT → Butterfly operations with twiddle factors
-   - BatchNorm → Subtract mean, divide stddev, scale, shift
-   - LayerNorm → Similar to BatchNorm per layer
-   - FullyConnected → MatrixMultiply + Bias addition
-3. Create nodes for each primitive operation
-4. Wire edges to maintain correct data flow
-5. Return list of decomposed nodes
-
-Decomposable Operations:
-- FullyConnected → MatrixMultiply + Add (bias)
-- BatchNorm → Subtract, Divide, Multiply, Add
-- LayerNorm → ReduceMean, Subtract, ReduceMean (variance), Divide, Multiply, Add
-- Convolve2D (simple) → Nested loops of Multiply + Add
-
-Non-Decomposable Operations:
-- Primitive arithmetic (Add, Multiply, etc.) - already atomic
-- Hardware intrinsics (better left as-is for accelerator)
-
-Time Complexity: O(k * degree(node)) where k is decomposition factor
-Space Complexity: O(k) for k decomposed nodes
-
-Memory Safety:
-- Returns empty list for null inputs
-- Returns singleton list for non-decomposable operations
+Returns an empty list on null inputs. Reads the node discriminant; if not 3
+(Operation), returns a singleton list containing the original node. Reads
+the op_kind from offset 8 and calls check_operation_decomposable; if false,
+returns the original as a singleton. Otherwise dispatches by op_kind: for
+FullyConnected (kind 42) emits a MatrixMultiply (kind 15) + Add (kind 0)
+pair, threading the matmul output into the add's input list; for BatchNorm
+(kind 38) emits Subtract(1), Divide(3), Multiply(2), Add(0) - one per
+algorithmic step. Each new node is appended to the decomposed list which is
+returned.
 @End Implementation
+
+@Performance_Hints:
+O(k * degree(node)) where k is the decomposition factor (typically 2-4).
+Each new node is a fresh allocation; k+1 List allocations for the per-stage
+input lists and the result.
+@End Performance_Hints
+
+@Security_Scope:
+Allocates fresh nodes that the caller is expected to wire into the graph;
+this routine returns the new nodes but does NOT add them to the graph or
+redirect edges - that is the caller's responsibility.
+@End Security_Scope
 
 Process called "split_node" that takes graph as Integer, node as Integer returns Integer:
     If graph is equal to 0:
@@ -3039,32 +3293,35 @@ Process called "split_node" that takes graph as Integer, node as Integer returns
     Return decomposed
 End Process
 
+@Reasoning:
+Bifrost's scheduler can produce many valid topological orderings; choosing
+one that maximises cache locality (consumers right after producers, repeated
+producers staying hot) reduces memory traffic dramatically on CPU and
+GPU-with-cache targets. The hot-window heuristic (last CACHE_WINDOW_SIZE
+nodes) is a simple LRU proxy that costs O(1) per check.
+@End Reasoning
+
 @Implementation:
-Reorders nodes in the graph to improve memory locality and cache performance.
-
-Algorithm (Cache-Aware Greedy Scheduling):
-1. Start with topological sort to establish execution order constraints
-2. Apply greedy scheduling with cache locality heuristics:
-   a. Track "hot" nodes (recently scheduled, likely in cache)
-   b. When selecting next node to schedule:
-      - Prefer nodes whose inputs are hot (cache hits)
-      - Prefer nodes that produce values for other ready nodes
-      - Prefer nodes with smaller memory footprints
-3. Maintain ready queue of nodes with all dependencies satisfied
-4. Schedule nodes to maximize cache reuse
-
-Locality Heuristics:
-- Producer-consumer fusion: schedule consumer immediately after producer
-- Data reuse: prioritize nodes that reuse recent data
-- Memory footprint: prefer nodes with smaller intermediate buffers
-- Parallelism: balance locality with ILP (instruction-level parallelism)
-
-Time Complexity: O(V * log V + E)
-Space Complexity: O(V) for scheduling state
-
-Memory Safety:
-- Returns empty list for null graph
+Returns empty list on null/empty graph. Phase 1: builds an in_degree Dict by
+counting predecessors. Phase 2: initialises the ready_queue with all
+zero-in-degree nodes. Phase 3 (greedy scheduling): while the queue is
+non-empty, calls select_best_node_for_locality (which scores candidates
+against the hot_nodes window of CACHE_WINDOW_SIZE=8 recently scheduled
+nodes), appends the chosen node to scheduled and to hot_nodes, evicts the
+oldest hot entry if the window overflows, removes the node from the
+ready_queue, and decrements in-degrees of its successors, enqueuing any that
+reach zero. Returns the scheduled list.
 @End Implementation
+
+@Performance_Hints:
+O(V * (W + degree)) where W is the cache window size (8) and degree is the
+average successor count - effectively O(V+E) since W is a small constant.
+select_best_node_for_locality dominates per-iteration cost.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read on graph; returned schedule List owned by caller.
+@End Security_Scope
 
 Process called "reorder_for_locality" that takes graph as Integer returns Integer:
     If graph is equal to 0:
@@ -3144,33 +3401,40 @@ Process called "reorder_for_locality" that takes graph as Integer returns Intege
     Return scheduled
 End Process
 
+@Reasoning:
+Multi-device execution requires splitting a graph across k accelerators while
+minimising cross-device data transfer (edge cuts) and balancing load. The
+greedy approach with a 10x weighting on edge cuts vs load imbalance favours
+communication minimisation over perfect load balance - the right trade-off
+when interconnect bandwidth is the bottleneck.
+@End Reasoning
+
 @Implementation:
-Partitions the graph into subgraphs for multi-device execution using
-balanced greedy partitioning.
-
-Algorithm (Greedy Balanced Partitioning):
-1. Initialize k empty partitions with load counters
-2. Perform topological sort to maintain execution order
-3. For each node in topological order:
-   a. Compute edge-cut cost for each partition
-      - Prefer partitions that already contain node's predecessors
-      - Prefer partitions with lighter load (balance constraint)
-   b. Assign node to partition with minimum cost
-   c. Update partition load
-4. Distribute edges based on node assignments
-5. Track cross-partition edges for communication
-
-Goals:
-- Minimize edge cuts (cross-partition communication)
-- Balance computational load across partitions
-- Respect data dependencies (preserve topological order)
-
-Time Complexity: O(V * k + E) where k is number of partitions
-Space Complexity: O(V + E) for k subgraphs
-
-Memory Safety:
-- Returns empty list for null graph or invalid partition count
+Returns empty list on null graph or num_partitions <= 0. Allocates a
+partitions list, partition_loads list, and node_to_partition Dict. Creates k
+empty subgraphs and initialises load counters to 0. Topo-sorts the input.
+For each node in topo order, scans each candidate partition computing
+(edge_cut_cost * 10 + load_imbalance) where load_imbalance is
+|current_load - avg_load|; selects the partition with the minimum total
+cost, assigns the node, and bumps the load counter. After all nodes are
+placed, walks the edges list and adds each edge to its source's partition;
+cross-partition edges therefore remain in the source partition (callers can
+detect them by comparing endpoint partitions).
 @End Implementation
+
+@Performance_Hints:
+O(V * k + E). k iterations per node make the assignment loop dominant when
+k is large; for k > 8 consider clustering nodes by predecessor partition
+before the scan.
+@End Performance_Hints
+
+@Security_Scope:
+Reads input graph; allocates k subgraphs (each via create_graph) and a
+node_to_partition Dict. Nodes and edges are SHARED between the input graph
+and the per-partition subgraphs - removing from any partition leaves the
+others' references intact but the input graph still owns the underlying
+storage.
+@End Security_Scope
 
 Process called "partition_graph" that takes
     graph as Integer,
@@ -3277,21 +3541,32 @@ Process called "partition_graph" that takes
     Return partitions
 End Process
 
+@Reasoning:
+A full string dump of a Bifrost graph is the canonical diagnostic artefact
+for verifier failures and pass-pipeline traces. Including node and edge
+counts in the header lets log scrapers extract size metrics without
+re-parsing the body.
+@End Reasoning
+
 @Implementation:
-Generates a debug string representation of the entire graph.
-
-Algorithm:
-1. Build header with graph statistics
-2. List all nodes with their types and connections
-3. List all edges with their kinds and types
-4. Return formatted string
-
-Time Complexity: O(V + E)
-Space Complexity: O(V + E) for string
-
-Memory Safety:
-- Returns "[NULL GRAPH]" for null graph
+Returns "[NULL GRAPH]" for null graph. Builds the header string with
+"BifrostGraph {" then "  Nodes: <n>" and "  Edges: <m>" via String.concatenate
+of String.from_int(get_node_count) / get_edge_count. Walks the nodes list
+appending each node's description, then walks the edges list appending each
+edge's description (using edge_to_string).
 @End Implementation
+
+@Performance_Hints:
+O(V+E) string concatenations; each concatenation is O(L) in the cumulative
+length so the overall cost is O((V+E)^2) in the worst case. Restrict to
+diagnostic paths; do not call in hot loops.
+@End Performance_Hints
+
+@Security_Scope:
+Pure read; output contains node and edge pointer values (hex-formatted via
+the inner edge_to_string). Do not forward to untrusted sinks - pointer
+disclosure could aid attackers.
+@End Security_Scope
 
 Process called "graph_to_string" that takes graph as Integer returns String:
     If graph is equal to 0:
