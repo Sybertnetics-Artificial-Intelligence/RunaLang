@@ -37,47 +37,30 @@ Constant ILLEGAL_REGISTERS as Integer is 3           Note: Exceeds register limi
 Constant ILLEGAL_DIVERGENCE as Integer is 4          Note: Control flow divergence
 
 Note: ================================================================
-Note: Fixed-Point Scale (PPM = Parts Per Million)
-Note: ================================================================
-Note: Stage1 of the bootstrap chain does not yet implement floating-point
-Note: literals or runtime float arithmetic (v0.0.8.6 work). All speedup
-Note: factors are therefore represented as fixed-point integers in PPM,
-Note: where 1_000_000 represents the floating-point value 1.0.
-Note:
-Note: Convention for speedup values:
-Note:   PPM_ONE        == 1_000_000   (== 1.0x speedup, i.e. no benefit)
-Note:   2 * PPM_ONE    == 2_000_000   (== 2.0x speedup)
-Note:   12 * PPM_ONE/10 == 1_200_000  (== 1.2x speedup)
-Note: ================================================================
-
-Constant PPM_ONE as Integer is 1000000
-Constant PPM_ZERO as Integer is 0
-
-Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
 
 Type called "FusionCandidate":
-    node1 as Integer                     Note: First node to fuse
-    node2 as Integer                     Note: Second node to fuse
-    fusion_type as Integer               Note: FUSION_* constant
-    estimated_benefit_ppm as Integer     Note: Estimated speedup in PPM (PPM_ONE == 1x)
-    is_legal as Boolean                  Note: Whether fusion is legal
-    illegality_reason as Integer         Note: ILLEGAL_* constant if not legal
+    node1 as Integer                Note: First node to fuse
+    node2 as Integer                Note: Second node to fuse
+    fusion_type as Integer          Note: FUSION_* constant
+    estimated_benefit as Float      Note: Estimated speedup (1.0 = no benefit, 2.0 = 2x)
+    is_legal as Boolean             Note: Whether fusion is legal
+    illegality_reason as Integer    Note: ILLEGAL_* constant if not legal
 End Type
 
 Type called "FusionGroup":
-    nodes as Integer                     Note: List of nodes to fuse into single kernel
-    fusion_type as Integer               Note: Type of fusion
-    memory_saved as Integer              Note: Bytes of memory traffic saved
-    estimated_speedup_ppm as Integer     Note: Expected speedup in PPM
+    nodes as Integer                Note: List of nodes to fuse into single kernel
+    fusion_type as Integer          Note: Type of fusion
+    memory_saved as Integer         Note: Bytes of memory traffic saved
+    estimated_speedup as Float      Note: Expected speedup factor
 End Type
 
 Type called "FusionCostModel":
-    memory_bandwidth_mbs as Integer      Note: Memory bandwidth in MB/s (integer)
-    compute_throughput_mflops as Integer Note: Compute throughput in MFLOPS
-    launch_overhead_ns as Integer        Note: Kernel launch overhead in nanoseconds
-    register_pressure_limit as Integer   Note: Max registers per thread
+    memory_bandwidth_gbs as Float   Note: Memory bandwidth in GB/s
+    compute_throughput_gflops as Float Note: Compute throughput in GFLOPS
+    launch_overhead_us as Float     Note: Kernel launch overhead in microseconds
+    register_pressure_limit as Integer Note: Max registers per thread
 End Type
 
 Note: ================================================================
@@ -144,7 +127,7 @@ Process called "identify_fusion_candidates" that takes graph as Integer returns 
                     node1 as node,
                     node2 as succ,
                     fusion_type as FUSION_PRODUCER_CONSUMER,
-                    estimated_benefit_ppm as benefit,
+                    estimated_benefit as benefit,
                     is_legal as true,
                     illegality_reason as LEGAL
 
@@ -172,7 +155,7 @@ Process called "identify_fusion_candidates" that takes graph as Integer returns 
                     node1 as node,
                     node2 as sibling,
                     fusion_type as FUSION_ELEMENT_WISE,
-                    estimated_benefit_ppm as ew_benefit,
+                    estimated_benefit as ew_benefit,
                     is_legal as true,
                     illegality_reason as LEGAL
 
@@ -200,7 +183,7 @@ Process called "identify_fusion_candidates" that takes graph as Integer returns 
                         node1 as producer,
                         node2 as node,
                         fusion_type as FUSION_REDUCTION,
-                        estimated_benefit_ppm as red_benefit,
+                        estimated_benefit as red_benefit,
                         is_legal as true,
                         illegality_reason as LEGAL
 
@@ -468,55 +451,37 @@ Note: ================================================================
 Note: Cost-Benefit Analysis
 Note: ================================================================
 
-Process called "compute_fusion_benefit" that takes graph as Integer, candidate as Integer, cost_model as Integer returns Integer:
+Process called "compute_fusion_benefit" that takes graph as Integer, candidate as Integer, cost_model as Integer returns Float:
     @Reasoning
-    Computes expected speedup from fusion, expressed as a PPM-scaled integer
-    (PPM_ONE == 1.0x speedup, 2_000_000 == 2.0x, etc).
+    Computes expected speedup from fusion.
 
     Benefits:
-    - Eliminate intermediate memory stores/loads.
-    - Better register locality.
-    - Reduced kernel launch overhead.
-    - Improved instruction-level parallelism.
+    - Eliminate intermediate memory stores/loads
+    - Better register locality
+    - Reduced kernel launch overhead
+    - Improved instruction-level parallelism
 
     Costs:
-    - Increased register pressure (may cause spills).
-    - Reduced occupancy (fewer concurrent threads).
-    - Larger kernel (instruction cache pressure).
+    - Increased register pressure (may cause spills)
+    - Reduced occupancy (fewer concurrent threads)
+    - Larger kernel (instruction cache pressure)
 
-    Model (entirely in integer ns/byte domain):
-      time_before_ns = estimate_execution_time_separate(...)
-      time_saved_ns  = memory_saved_bytes * 1_000_000 / bw_mbs (since
-                       bw_mbs = MB/s == bytes per microsecond * (1_048_576 / 1_000_000) ≈
-                       bytes per microsecond after binary/decimal MB normalization;
-                       we use the simpler conversion bytes / (bw_mbs * 1024 * 1024) seconds,
-                       converted to nanoseconds by *1_000_000_000).
-      time_after_ns  = time_before_ns - time_saved_ns - launch_overhead_ns
-      speedup_ppm    = (time_before_ns * PPM_ONE) / time_after_ns,
-                       clamped to [PPM_ONE, 4 * PPM_ONE].
+    Model:
+    - Compute memory traffic saved
+    - Estimate execution time before/after
+    - Return speedup ratio
     @End Reasoning
 
     @Implementation
-    1. Read node1, node2, fusion_type from candidate descriptor.
-    2. Compute memory_saved = intermediate_bytes * 2 (one store + one load).
-    3. Compute time_saved_ns from memory_saved and cost model bw_mbs.
-    4. time_after_ns = max(1, time_before_ns - time_saved_ns - launch_ns).
-    5. speedup_ppm = time_before_ns * PPM_ONE / time_after_ns.
-    6. Clamp to [PPM_ONE, 4 * PPM_ONE].
+    1. Compute memory traffic saved
+    2. Estimate execution time without fusion
+    3. Estimate execution time with fusion
+    4. Return speedup = time_before / time_after
     @End Implementation
-
-    @Performance_Hints
-    O(1) per candidate after the underlying estimate_execution_time_separate
-    cost (also O(1)). Integer-only arithmetic in PPM domain.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis. Cost model is caller-provided and trusted to contain
-    valid Integer bandwidth and overhead values.
-    @End Security_Scope
 
     Let node1 be proc memory_get_int64 from Layout with candidate, 0
     Let node2 be proc memory_get_int64 from Layout with candidate, 8
+    Let fusion_type be proc memory_get_int64 from Layout with candidate, 16
 
     Note: Compute memory traffic saved (intermediate buffer eliminated)
     Let intermediate_type be proc get_node_output_type from Node with node1
@@ -525,46 +490,38 @@ Process called "compute_fusion_benefit" that takes graph as Integer, candidate a
     Note: For producer-consumer, save 1 store + 1 load
     Let memory_saved be intermediate_bytes multiplied by 2
 
-    Note: Get memory bandwidth (MB/s) and launch overhead (ns) from cost model
-    Let bandwidth_mbs be proc memory_get_int64 from Layout with cost_model, 0
-    Let launch_overhead_ns be proc memory_get_int64 from Layout with cost_model, 16
+    Note: Get memory bandwidth from cost model
+    Let bandwidth_gbs be proc memory_get_float64 from Layout with cost_model, 0
 
-    Note: time_saved_ns ≈ memory_saved / (bw_mbs * 1_048_576) seconds
-    Note:                = memory_saved * 1_000_000_000 / (bw_mbs * 1_048_576) ns
-    Note:                ≈ memory_saved * 953 / bw_mbs        (953 ≈ 1e9/1_048_576)
-    Let time_saved_ns be 0
-    If bandwidth_mbs is greater than 0:
-        Let scaled be memory_saved multiplied by 953
-        Set time_saved_ns to scaled divided by bandwidth_mbs
+    Note: Compute time saved from memory elimination
+    Let memory_saved_float be proc int_to_float from Math with memory_saved
+    Let bandwidth_bs be bandwidth_gbs multiplied by 1000000000.0
+    Let time_saved_s be memory_saved_float divided by bandwidth_bs
+
+    Note: Estimate original execution time
+    Let time_before be estimate_execution_time_separate(graph, node1, node2, cost_model)
+
+    Note: Estimate fused execution time
+    Let time_after be time_before minus time_saved_s
+
+    Note: Add kernel launch overhead savings
+    Let launch_overhead_us be proc memory_get_float64 from Layout with cost_model, 16
+    Let launch_overhead_s be launch_overhead_us divided by 1000000.0
+    Set time_after to time_after minus launch_overhead_s
+
+    Note: Compute speedup
+    Let speedup be time_before divided by time_after
+
+    Note: Cap speedup at reasonable maximum
+    If speedup is greater than 4.0:
+        Set speedup to 4.0
     End If
 
-    Note: Estimate original execution time (ns) for both nodes separately
-    Let time_before_ns be estimate_execution_time_separate(graph, node1, node2, cost_model)
-
-    Note: Fused execution: remove intermediate memory traffic + one kernel launch
-    Let time_after_ns be time_before_ns minus time_saved_ns
-    Set time_after_ns to time_after_ns minus launch_overhead_ns
-    If time_after_ns is less than 1:
-        Set time_after_ns to 1
-    End If
-    If time_before_ns is less than 1:
-        Set time_before_ns to 1
+    If speedup is less than 1.0:
+        Set speedup to 1.0
     End If
 
-    Note: speedup_ppm = (time_before * PPM_ONE) / time_after
-    Let scaled_before be time_before_ns multiplied by PPM_ONE
-    Let speedup_ppm be scaled_before divided by time_after_ns
-
-    Note: Clamp to [PPM_ONE, 4 * PPM_ONE]
-    Let max_speedup_ppm be PPM_ONE multiplied by 4
-    If speedup_ppm is greater than max_speedup_ppm:
-        Set speedup_ppm to max_speedup_ppm
-    End If
-    If speedup_ppm is less than PPM_ONE:
-        Set speedup_ppm to PPM_ONE
-    End If
-
-    Return speedup_ppm
+    Return speedup
 End Process
 
 Process called "estimate_memory_traffic_reduction" that takes graph as Integer, fusion_group as Integer returns Integer:
@@ -732,12 +689,8 @@ Process called "create_fused_node" that takes graph as Integer, node1 as Integer
     Let op1 be proc get_node_opkind from Node with node1
     Let op2 be proc get_node_opkind from Node with node2
 
-    Note: Create fused operation kind. We adopt the convention that a fused
-    Note: kernel inherits the OpKind of its terminal (output-producing)
-    Note: operation, and records the producer's OpKind in metadata. This
-    Note: keeps backends that pattern-match on OpKind correct (they see the
-    Note: terminal op) while letting downstream passes inspect metadata to
-    Note: reason about the fused producer.
+    Note: Create fused operation (for now, use second operation)
+    Note: Real implementation would create FusedOp variant
     Let fused_op be op2
 
     Note: Get output type from final operation
@@ -749,12 +702,10 @@ Process called "create_fused_node" that takes graph as Integer, node1 as Integer
     Note: Add to graph
     proc add_node from Graph with graph, fused_node
 
-    Note: Set metadata recording fusion (including the producer OpKind
-    Note: so backends/passes can recover the fused producer).
+    Note: Set metadata recording fusion
     Let metadata be proc create from Dict
     proc set from Dict with metadata, "fused", "true"
     proc set from Dict with metadata, "fusion_type", fusion_type
-    proc set from Dict with metadata, "fused_producer_op", op1
     proc set_node_metadata from Node with fused_node, metadata
 
     Return fused_node
@@ -824,24 +775,24 @@ Process called "optimize_kernel_fusion" that takes graph as Integer, cost_model 
             Return total_fusions
         End If
 
-        Note: Compute benefits (PPM-scaled). Field offset 24 holds estimated_benefit_ppm.
+        Note: Compute benefits
         Let j be 0
         While j is less than legal_count:
             Set candidate to proc get from List with legal_candidates, j
-            Let benefit_ppm be compute_fusion_benefit(graph, candidate, cost_model)
-            proc memory_set_int64 from Layout with candidate, 24, benefit_ppm
+            Let benefit be compute_fusion_benefit(graph, candidate, cost_model)
+            Set candidate.estimated_benefit to benefit
             Set j to j plus 1
         End While
 
-        Note: Sort by benefit_ppm (descending)
+        Note: Sort by benefit (descending)
         Let sorted_candidates be sort_by_benefit(legal_candidates)
 
         Note: Apply best fusion
         Let best_candidate be proc get from List with sorted_candidates, 0
-        Let best_benefit_ppm be proc memory_get_int64 from Layout with best_candidate, 24
+        Set benefit to proc memory_get_float64 from Layout with best_candidate, 24
 
-        Note: Only apply if beneficial (speedup > 1.1x == 1_100_000 PPM)
-        If best_benefit_ppm is less than 1100000:
+        Note: Only apply if beneficial (speedup > 1.1)
+        If benefit is less than 1.1:
             Return total_fusions
         End If
 
@@ -878,31 +829,9 @@ Process called "is_producer_consumer_candidate" that takes graph as Integer, pro
     Return false
 End Process
 
-Process called "estimate_producer_consumer_benefit" that takes graph as Integer, producer as Integer, consumer as Integer returns Integer:
-    @Reasoning
-    Estimates producer-consumer fusion benefit as a PPM-scaled speedup.
-    The benefit model is:
-      speedup_ppm = PPM_ONE + (memory_saved * PPM_ONE / total_memory),
-    clamped to [PPM_ONE, 2 * PPM_ONE]. The 2x ceiling reflects the
-    empirical upper bound of producer-consumer fusion in published
-    GPU/accelerator literature when only memory traffic is removed.
-    @End Reasoning
-
-    @Implementation
-    1. Compute intermediate buffer bytes from the producer's output type.
-    2. memory_saved = 2 * intermediate_bytes (one store + one load eliminated).
-    3. total_memory = compute_total_memory_traffic(graph, producer, consumer).
-    4. ratio_ppm = memory_saved * PPM_ONE / total_memory (when > 0).
-    5. speedup_ppm = PPM_ONE + ratio_ppm, clamped to 2 * PPM_ONE.
-    @End Implementation
-
-    @Performance_Hints
-    O(1) plus compute_total_memory_traffic (O(|inputs|)). Integer math only.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis on validated graph nodes.
-    @End Security_Scope
+Process called "estimate_producer_consumer_benefit" that takes graph as Integer, producer as Integer, consumer as Integer returns Float:
+    Note: Estimate benefit from eliminating intermediate buffer
+    Note: Benefit = memory traffic saved / total memory traffic
 
     Let intermediate_type be proc get_node_output_type from Node with producer
     Let intermediate_size be proc get_type_size_bytes from Node with intermediate_type
@@ -913,24 +842,16 @@ Process called "estimate_producer_consumer_benefit" that takes graph as Integer,
     Note: Compute total memory traffic
     Let total_memory be compute_total_memory_traffic(graph, producer, consumer)
 
-    Let ratio_ppm be 0
-    If total_memory is greater than 0:
-        Let scaled be memory_saved multiplied by PPM_ONE
-        Set ratio_ppm to scaled divided by total_memory
+    Note: Benefit ratio (conservative: 1.2x to 2.0x typical)
+    Let benefit_ratio be proc int_to_float from Math with memory_saved divided by Math.int_to_float(total_memory)
+    Let speedup be 1.0 plus benefit_ratio
+
+    Note: Cap at 2.0x
+    If speedup is greater than 2.0:
+        Set speedup to 2.0
     End If
 
-    Let speedup_ppm be PPM_ONE plus ratio_ppm
-
-    Note: Cap at 2.0x == 2 * PPM_ONE
-    Let max_ppm be PPM_ONE multiplied by 2
-    If speedup_ppm is greater than max_ppm:
-        Set speedup_ppm to max_ppm
-    End If
-    If speedup_ppm is less than PPM_ONE:
-        Set speedup_ppm to PPM_ONE
-    End If
-
-    Return speedup_ppm
+    Return speedup
 End Process
 
 Process called "find_siblings_at_depth" that takes graph as Integer, sorted_nodes as Integer, node as Integer, index as Integer returns Integer:
@@ -986,98 +907,25 @@ Process called "is_element_wise_candidate" that takes graph as Integer, node1 as
     Return same_space
 End Process
 
-Process called "estimate_element_wise_benefit" that takes graph as Integer, node1 as Integer, node2 as Integer returns Integer:
-    @Reasoning
-    Element-wise fusion saves one kernel launch and improves cache locality
-    by issuing both ops within a single iteration space. Empirically this
-    yields 1.1x to 1.3x. We pick the midpoint (1.2x == 1_200_000 PPM) as
-    the static benefit and let the downstream cost model refine it.
-    @End Reasoning
+Process called "estimate_element_wise_benefit" that takes graph as Integer, node1 as Integer, node2 as Integer returns Float:
+    Note: Element-wise fusion benefit from reduced launch overhead
+    Note: Typical benefit: 1.1x to 1.3x
 
-    @Implementation
-    Return 1_200_000 (== 1.2x speedup in PPM).
-    @End Implementation
+    Note: Base benefit from launch overhead elimination
+    Let base_benefit be 1.2
 
-    @Performance_Hints
-    O(1). Constant return.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure function. No graph access; the arguments are advisory only.
-    @End Security_Scope
-
-    Return 1200000
+    Return base_benefit
 End Process
 
 Process called "is_reduction_node" that takes node as Integer returns Boolean:
-    @Reasoning
-    A reduction node folds an iteration space down by a binary associative
-    operator (sum, product, min, max). In Bifrost's OpKind enum, the
-    reduction-capable scalar arithmetic ops are Add (0), Multiply (2),
-    Max (50, extended), and Min (51, extended). A node is a "reduction"
-    iff it is one of these op kinds AND its output type rank is lower
-    than its input type rank (i.e. it collapses a dimension).
-    @End Reasoning
-
-    @Implementation
-    1. Read the node's OpKind.
-    2. Reject if the OpKind is not Add/Mul/Max/Min.
-    3. Compare output type discriminant to input type discriminant: if
-       output is a scalar (primitive == 1) but the first input is a
-       vector/matrix/tensor (>= 2), this is a reduction.
-    @End Implementation
-
-    @Performance_Hints
-    O(1): two type-discriminant reads and a few comparisons.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure predicate over node descriptors. No mutation.
-    @End Security_Scope
-
     Let op_kind be proc get_node_opkind from Node with node
 
-    Let is_assoc be false
-    If op_kind is equal to 0:
-        Set is_assoc to true
-    End If
-    If op_kind is equal to 2:
-        Set is_assoc to true
-    End If
-    If op_kind is equal to 50:
-        Set is_assoc to true
-    End If
-    If op_kind is equal to 51:
-        Set is_assoc to true
-    End If
-    If is_assoc is equal to false:
-        Return false
-    End If
+    Note: Check for reduction operations
+    Note: Sum reduction, product, max, min, etc.
+    Note: OpKind values from node.runa
 
-    Let inputs be proc get_node_inputs from Node with node
-    Let in_count be proc length from List with inputs
-    If in_count is equal to 0:
-        Return false
-    End If
-    Let first_input be proc get from List with inputs, 0
-    Let input_type be proc get_edge_data_type from Edge with first_input
-    Let output_type be proc get_node_output_type from Node with node
-    If input_type is equal to 0:
-        Return false
-    End If
-    If output_type is equal to 0:
-        Return false
-    End If
-
-    Note: Discriminant: Primitive=1, Vector=2, Matrix=3, Texture=4, Tensor=5
-    Let in_kind be proc memory_get_int64 from Layout with input_type, 0
-    Let out_kind be proc memory_get_int64 from Layout with output_type, 0
-
-    If out_kind is equal to 1:
-        If in_kind is greater than or equal to 2:
-            Return true
-        End If
-    End If
+    Note: Simplified check for common reductions
+    Note: Real implementation would check specific OpKind values
     Return false
 End Process
 
@@ -1103,28 +951,13 @@ Process called "is_reduction_fusion_candidate" that takes graph as Integer, prod
     Return false
 End Process
 
-Process called "estimate_reduction_fusion_benefit" that takes graph as Integer, producer as Integer, reduction as Integer returns Integer:
-    @Reasoning
-    Map-reduce fusion eliminates an entire intermediate array materialization
-    and converts two passes over the data into one. Empirical speedup ranges
-    1.5x to 2.5x in published GPU literature; we anchor at 1.8x (midpoint
-    weighted toward the typical case where the producer's output is bounded
-    by the reduction's input bandwidth).
-    @End Reasoning
+Process called "estimate_reduction_fusion_benefit" that takes graph as Integer, producer as Integer, reduction as Integer returns Float:
+    Note: Reduction fusion eliminates intermediate array
+    Note: Typical benefit: 1.5x to 2.5x
 
-    @Implementation
-    Return 1_800_000 PPM (== 1.8x speedup).
-    @End Implementation
+    Let base_benefit be 1.8
 
-    @Performance_Hints
-    O(1). Constant return.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure function. Arguments are advisory; no graph access required.
-    @End Security_Scope
-
-    Return 1800000
+    Return base_benefit
 End Process
 
 Note: ================================================================
@@ -1148,46 +981,8 @@ Process called "is_transitive_predecessor" that takes graph as Integer, node1 as
 End Process
 
 Process called "has_other_dependencies" that takes graph as Integer, node1 as Integer, node2 as Integer returns Boolean:
-    @Reasoning
-    Returns true iff there is any path from node1 to node2 that does NOT
-    go through the direct edge between them. If such a path exists,
-    fusing node1 and node2 would violate that path's ordering constraint.
-
-    Concretely: walk node1's successors (excluding node2) and ask whether
-    any of them can reach node2 transitively. If yes, there is a
-    "shadow" dependency we must respect.
-    @End Reasoning
-
-    @Implementation
-    1. Get node1's direct successors.
-    2. For each successor != node2, check is_transitive_predecessor(succ, node2).
-    3. Return true on the first hit.
-    @End Implementation
-
-    @Performance_Hints
-    O(S * (V + E)) where S = direct successors of node1 and V/E are the
-    reachable subgraph. Bounded in practice by graph radius.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure graph analysis. No mutation.
-    @End Security_Scope
-
-    Let successors be proc get_node_successors from Graph with graph, node1
-    Let succ_count be proc length from List with successors
-
-    Let i be 0
-    While i is less than succ_count:
-        Let succ be proc get from List with successors, i
-        If succ is not equal to node2:
-            Let reaches be is_transitive_predecessor(graph, succ, node2)
-            If reaches is equal to true:
-                Return true
-            End If
-        End If
-        Set i to i plus 1
-    End While
-
+    Note: Check if there are other dependencies besides direct edge
+    Note: Simplified: assume no other dependencies
     Return false
 End Process
 
@@ -1207,83 +1002,9 @@ Process called "are_nodes_independent" that takes graph as Integer, node1 as Int
 End Process
 
 Process called "does_node_dominate" that takes graph as Integer, dominator as Integer, node as Integer returns Boolean:
-    @Reasoning
-    Classical dominance: `dominator` dominates `node` iff every path from
-    any graph root to `node` passes through `dominator`. We implement
-    this by computing the set of nodes reachable from each root WITHOUT
-    going through `dominator`; if `node` appears in any such set, then
-    `dominator` does not dominate `node`.
-
-    On a DAG with R roots and E edges this is O(R * (V + E)). For the
-    bounded Bifrost subgraphs we operate on (typically << 1000 nodes)
-    this is exact and fast.
-    @End Reasoning
-
-    @Implementation
-    1. Trivially dominate self.
-    2. Get all roots via Graph.find_roots.
-    3. For each root, compute reachable set excluding `dominator`.
-    4. If `node` is reachable from any root without `dominator`, return false.
-    5. Otherwise return true.
-    @End Implementation
-
-    @Performance_Hints
-    O(R * (V + E)) where R = number of roots, V = nodes, E = edges. BFS
-    visit per node with dictionary-backed visited set.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure graph traversal. No mutation, no I/O.
-    @End Security_Scope
-
-    If dominator is equal to node:
-        Return true
-    End If
-
-    Let roots be proc find_roots from Graph with graph
-    If roots is equal to 0:
-        Return is_transitive_predecessor(graph, dominator, node)
-    End If
-
-    Let root_count be proc length from List with roots
-    Let r be 0
-    While r is less than root_count:
-        Let root be proc get from List with roots, r
-        Note: BFS from root, treating `dominator` as a barrier.
-        Let visited be proc create from Dict
-        Let queue be proc create from List
-        proc append from List with queue, root
-        proc set from Dict with visited, root, 1
-
-        Let head be 0
-        Let qlen be proc length from List with queue
-        While head is less than qlen:
-            Let cur be proc get from List with queue, head
-            Set head to head plus 1
-            If cur is not equal to dominator:
-                If cur is equal to node:
-                    Return false
-                End If
-                Let succs be proc get_node_successors from Graph with graph, cur
-                Let sc be proc length from List with succs
-                Let s be 0
-                While s is less than sc:
-                    Let succ be proc get from List with succs, s
-                    Let was_visited be proc get from Dict with visited, succ
-                    If was_visited is equal to 0:
-                        proc set from Dict with visited, succ, 1
-                        proc append from List with queue, succ
-                    End If
-                    Set s to s plus 1
-                End While
-            End If
-            Set qlen to proc length from List with queue
-        End While
-
-        Set r to r plus 1
-    End While
-
-    Return true
+    Note: Check if dominator dominates node (all paths to node pass through dominator)
+    Note: Simplified: use reachability as approximation
+    Return is_transitive_predecessor(graph, dominator, node)
 End Process
 
 Process called "compute_node_working_set" that takes graph as Integer, node as Integer returns Integer:
@@ -1310,73 +1031,14 @@ Process called "compute_node_working_set" that takes graph as Integer, node as I
 End Process
 
 Process called "estimate_register_usage" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Estimates register pressure for a single Bifrost node. The model accounts
-    for: (a) input operand registers, (b) output register, (c) intermediate
-    temporaries based on op kind, and (d) extra registers for vector/matrix
-    types that occupy multiple physical registers per element.
-
-    The op-kind multiplier reflects that arithmetic ops use 1 temp, matrix
-    ops use ~16 temps for tiling, and conv/FFT use ~32 for kernel state.
-    The type multiplier expands by element count for vectors (4 elements
-    typical) and even more for matrices/tensors when register-blocking.
-    @End Reasoning
-
-    @Implementation
-    1. count = inputs * 2 + 2 (output) + base_temps(op_kind).
-    2. Apply type multiplier from get_type_alignment / element_count where
-       applicable; otherwise apply 1x.
-    3. Return clamped to >= 1.
-    @End Implementation
-
-    @Performance_Hints
-    O(1): a few range checks on OpKind and a single type-discriminant read.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis. Graph node fields are caller-validated.
-    @End Security_Scope
+    Note: Estimate register usage for node
+    Note: Simplified: use input count + output count
 
     Let inputs be proc get_node_inputs from Node with node
     Let input_count be proc length from List with inputs
 
-    Let op_kind be proc get_node_opkind from Node with node
-    Let base_temps be 4
-    Note: Matrix ops (OpKind 6..9): use 16 temps for tiling
-    If op_kind is greater than or equal to 6:
-        If op_kind is less than or equal to 9:
-            Set base_temps to 16
-        End If
-    End If
-    Note: Conv/FFT ops (OpKind 13..18): 32 temps for kernel state
-    If op_kind is greater than or equal to 13:
-        If op_kind is less than or equal to 18:
-            Set base_temps to 32
-        End If
-    End If
-
-    Let registers be input_count multiplied by 2
-    Set registers to registers plus 2
-    Set registers to registers plus base_temps
-
-    Note: Vector-type expansion. Discriminant Vector=2 widens by 4x.
-    Let output_type be proc get_node_output_type from Node with node
-    If output_type is not equal to 0:
-        Let kind be proc memory_get_int64 from Layout with output_type, 0
-        If kind is equal to 2:
-            Set registers to registers multiplied by 4
-        End If
-        If kind is equal to 3:
-            Set registers to registers multiplied by 8
-        End If
-        If kind is equal to 5:
-            Set registers to registers multiplied by 16
-        End If
-    End If
-
-    If registers is less than 1:
-        Set registers to 1
-    End If
+    Note: Assume 2 registers per input, 2 for output, 4 for temporaries
+    Let registers be input_count multiplied by 2 plus 2 plus 4
 
     Return registers
 End Process
@@ -1405,60 +1067,8 @@ Process called "has_control_edge_between" that takes graph as Integer, node1 as 
 End Process
 
 Process called "compute_loop_nesting_depth" that takes graph as Integer, node as Integer returns Integer:
-    @Reasoning
-    Computes the loop-nesting depth of a Bifrost node by counting how many
-    times the node appears inside a cycle in the dependency graph. In
-    pure-DAG Bifrost IR (the baseline), the depth is 0; if the graph
-    has recurrence/loop annotations (NodeType >= 3 reserved for loop
-    constructs), each enclosing loop increments depth by 1.
-
-    Without explicit loop nodes the iteration space is encoded in the
-    output type's shape (Vector/Matrix/Tensor); each rank-1 dimension
-    contributes one nesting level. So we compute the rank of the node's
-    output type and treat that as nesting depth.
-    @End Reasoning
-
-    @Implementation
-    1. Get output type discriminant.
-    2. Map: Primitive(1) -> 0, Vector(2) -> 1, Matrix(3) -> 2,
-            Texture(4) -> 2, Tensor(5) -> n (read rank).
-    3. Default to 0 for unknown types.
-    @End Implementation
-
-    @Performance_Hints
-    O(1): a single type-discriminant read and a rank lookup.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis. Reads type layout fields.
-    @End Security_Scope
-
-    Let output_type be proc get_node_output_type from Node with node
-    If output_type is equal to 0:
-        Return 0
-    End If
-
-    Let kind be proc memory_get_int64 from Layout with output_type, 0
-    If kind is equal to 1:
-        Return 0
-    End If
-    If kind is equal to 2:
-        Return 1
-    End If
-    If kind is equal to 3:
-        Return 2
-    End If
-    If kind is equal to 4:
-        Return 2
-    End If
-    If kind is equal to 5:
-        Note: Tensor: shape rank stored at offset 16 (per node.runa convention)
-        Let rank be proc memory_get_int64 from Layout with output_type, 16
-        If rank is less than 0:
-            Return 0
-        End If
-        Return rank
-    End If
+    Note: Compute loop nesting depth
+    Note: Simplified: return 0 (no loops)
     Return 0
 End Process
 
@@ -1466,112 +1076,43 @@ Note: ================================================================
 Note: Helper Functions - Cost Model
 Note: ================================================================
 
-Process called "estimate_execution_time_separate" that takes graph as Integer, node1 as Integer, node2 as Integer, cost_model as Integer returns Integer:
-    @Reasoning
-    Estimates the combined wall-clock execution time (in nanoseconds) of
-    running node1 and node2 as two separate kernels:
-        time_ns = compute_time_ns + memory_time_ns + 2 * launch_ns
-    Returned as Integer (nanoseconds) because stage1 has no Float support.
+Process called "estimate_execution_time_separate" that takes graph as Integer, node1 as Integer, node2 as Integer, cost_model as Integer returns Float:
+    Note: Estimate execution time for separate kernels
+    Note: time = compute_time + memory_time + 2 * launch_overhead
 
-    Compute time uses an Amdahl-friendly nominal of 1_000_000 ns (== 1 ms)
-    per node. Memory time models the per-node output byte traffic at the
-    cost-model's bandwidth_mbs (MB/s). Launch overhead is read from the
-    cost model in ns and applied twice (one per kernel).
-    @End Reasoning
+    Note: Estimate compute time (simplified: 1ms per operation)
+    Let compute_time be 0.001 plus 0.001
 
-    @Implementation
-    1. compute_ns = 2 * 1_000_000 (two 1ms ops).
-    2. memory_ns = (node1_bytes + node2_bytes) * 953 / bandwidth_mbs
-       (953 ≈ 1e9/1_048_576 ns per byte per MB/s).
-    3. launch_ns_total = 2 * launch_overhead_ns from cost_model.
-    4. Return compute_ns + memory_ns + launch_ns_total.
-    @End Implementation
+    Note: Estimate memory time
+    Let node1_size be proc get_type_size_bytes from Node with Node.get_node_output_type(node1 )
+    Let node2_size be proc get_type_size_bytes from Node with Node.get_node_output_type(node2 )
 
-    @Performance_Hints
-    O(1): a fixed number of integer ops + cost-model field reads.
-    @End Performance_Hints
+    Let bandwidth_gbs be proc memory_get_float64 from Layout with cost_model, 0
+    Let bandwidth_bs be bandwidth_gbs multiplied by 1000000000.0
 
-    @Security_Scope
-    Pure analysis. Cost-model fields are caller-supplied and trusted.
-    @End Security_Scope
+    Let node1_size_float be proc int_to_float from Math with node1_size
+    Let node2_size_float be proc int_to_float from Math with node2_size
 
-    Let compute_ns be 2000000
+    Let memory_time be (node1_size_float plus node2_size_float) divided by bandwidth_bs
 
-    Let out_type_1 be proc get_node_output_type from Node with node1
-    Let out_type_2 be proc get_node_output_type from Node with node2
-    Let node1_size be proc get_type_size_bytes from Node with out_type_1
-    Let node2_size be proc get_type_size_bytes from Node with out_type_2
+    Note: Add launch overhead
+    Let launch_overhead_us be proc memory_get_float64 from Layout with cost_model, 16
+    Let launch_overhead_s be launch_overhead_us divided by 1000000.0
+    Let launch_time be launch_overhead_s multiplied by 2.0
 
-    Let bandwidth_mbs be proc memory_get_int64 from Layout with cost_model, 0
-    Let memory_ns be 0
-    If bandwidth_mbs is greater than 0:
-        Let total_bytes be node1_size plus node2_size
-        Let scaled be total_bytes multiplied by 953
-        Set memory_ns to scaled divided by bandwidth_mbs
-    End If
+    Let total_time be compute_time plus memory_time plus launch_time
 
-    Let launch_overhead_ns be proc memory_get_int64 from Layout with cost_model, 16
-    Let launch_ns_total be launch_overhead_ns multiplied by 2
-
-    Let total_ns be compute_ns plus memory_ns
-    Set total_ns to total_ns plus launch_ns_total
-    Return total_ns
+    Return total_time
 End Process
 
 Process called "compute_total_memory_traffic" that takes graph as Integer, node1 as Integer, node2 as Integer returns Integer:
-    @Reasoning
-    Computes the actual memory traffic (bytes) of running node1 and node2
-    as separate kernels. Each node reads every input edge's data type and
-    writes its output type, so total traffic = sum of input bytes +
-    output bytes for both nodes.
+    Note: Compute total memory traffic for both nodes
+    Let node1_size be proc get_type_size_bytes from Node with Node.get_node_output_type(node1 )
+    Let node2_size be proc get_type_size_bytes from Node with Node.get_node_output_type(node2 )
 
-    This is exact (no approximation) and matches what the GPU memory
-    controller will observe modulo cache effects (which the cost model
-    intentionally ignores at the IR level).
-    @End Reasoning
-
-    @Implementation
-    1. For each node, sum the byte sizes of all incoming edge data types.
-    2. Add the node's output byte size.
-    3. Return the sum across both nodes.
-    @End Implementation
-
-    @Performance_Hints
-    O(|inputs(node1)| + |inputs(node2)|). Constant-bounded in practice.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis. Reads only type-size and edge metadata.
-    @End Security_Scope
-
-    Let out_type_1 be proc get_node_output_type from Node with node1
-    Let out_type_2 be proc get_node_output_type from Node with node2
-    Let out_size_1 be proc get_type_size_bytes from Node with out_type_1
-    Let out_size_2 be proc get_type_size_bytes from Node with out_type_2
-
-    Let total be out_size_1 plus out_size_2
-
-    Let inputs1 be proc get_node_inputs from Node with node1
-    Let in_count_1 be proc length from List with inputs1
-    Let i be 0
-    While i is less than in_count_1:
-        Let edge1 be proc get from List with inputs1, i
-        Let in_type be proc get_edge_data_type from Edge with edge1
-        Let in_size be proc get_type_size_bytes from Node with in_type
-        Set total to total plus in_size
-        Set i to i plus 1
-    End While
-
-    Let inputs2 be proc get_node_inputs from Node with node2
-    Let in_count_2 be proc length from List with inputs2
-    Let j be 0
-    While j is less than in_count_2:
-        Let edge2 be proc get from List with inputs2, j
-        Let in_type2 be proc get_edge_data_type from Edge with edge2
-        Let in_size2 be proc get_type_size_bytes from Node with in_type2
-        Set total to total plus in_size2
-        Set j to j plus 1
-    End While
+    Note: Each node: read inputs + write output
+    Note: Simplified: assume 2x data size
+    Let total be (node1_size plus node2_size) multiplied by 2
 
     Return total
 End Process
@@ -1599,31 +1140,7 @@ Process called "filter_legal_candidates" that takes candidates as Integer return
 End Process
 
 Process called "sort_by_benefit" that takes candidates as Integer returns Integer:
-    @Reasoning
-    Bubble-sorts the candidate list by estimated_benefit_ppm (Integer, field
-    offset 24 in FusionCandidate) in descending order so callers consume
-    the most beneficial fusion first. Bubble sort is acceptable here
-    because the candidate list is bounded by O(graph_nodes) and the
-    benefit-driven greedy fusion only consumes one candidate per outer
-    loop iteration, making per-pass sort cost O(n^2) over an already
-    small n.
-    @End Reasoning
-
-    @Implementation
-    1. Clone the candidate list.
-    2. Bubble-sort by benefit_ppm at offset 24, descending.
-    3. Return sorted list.
-    @End Implementation
-
-    @Performance_Hints
-    O(N^2) bubble sort over N candidates. N is typically small per
-    optimization pass (the candidate set is the pairs of fusable nodes).
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure sort. Operates on caller-provided list; produces a new sorted clone.
-    @End Security_Scope
-
+    Note: Simple bubble sort by estimated_benefit (descending)
     Let sorted be proc clone from List with candidates
     Let n be proc length from List with sorted
 
@@ -1634,11 +1151,11 @@ Process called "sort_by_benefit" that takes candidates as Integer returns Intege
             Let cand1 be proc get from List with sorted, j
             Let cand2 be proc get from List with sorted, j plus 1
 
-            Let benefit1_ppm be proc memory_get_int64 from Layout with cand1, 24
-            Let benefit2_ppm be proc memory_get_int64 from Layout with cand2, 24
+            Let benefit1 be proc memory_get_float64 from Layout with cand1, 24
+            Let benefit2 be proc memory_get_float64 from Layout with cand2, 24
 
-            If benefit1_ppm is less than benefit2_ppm:
-                Note: Swap (descending order)
+            If benefit1 is less than benefit2:
+                Note: Swap
                 proc set from List with sorted, j, cand2
                 proc set from List with sorted, j plus 1, cand1
             End If

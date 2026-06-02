@@ -36,24 +36,6 @@ Constant MEMORY_LOCAL as Integer is 2            Note: Thread-local registers (f
 Constant MEMORY_CONSTANT as Integer is 3         Note: Read-only, cached, broadcast
 
 Note: ================================================================
-Note: Fixed-Point Scale (PPM = Parts Per Million)
-Note: ================================================================
-Note: Stage1 (v0.0.8.4.5.3.5) of the bootstrap chain does not yet implement
-Note: floating-point literals or runtime float arithmetic. The Float type
-Note: support is scheduled for v0.0.8.6. Until that lands, all fractional
-Note: ratios in the Bifrost analysis passes are represented as fixed-point
-Note: integers in parts-per-million (PPM), where 1_000_000 == 1.0.
-Note:
-Note: PPM example values:
-Note:   PPM_ONE        == 1_000_000  (== 1.0)
-Note:   PPM_HALF       == 500_000    (== 0.5)
-Note:   PPM_TENTH      == 100_000    (== 0.1)
-Note: ================================================================
-
-Constant PPM_ONE as Integer is 1000000
-Constant PPM_ZERO as Integer is 0
-
-Note: ================================================================
 Note: Type Definitions
 Note: ================================================================
 
@@ -73,17 +55,17 @@ Type called "MemoryFootprint":
 End Type
 
 Type called "LocalityInfo":
-    spatial_locality_ppm as Integer  Note: 0..1_000_000 PPM, higher is better
-    temporal_locality_ppm as Integer Note: 0..1_000_000 PPM, higher is better
-    cache_reuse_distance as Integer  Note: Average reuse distance in accesses
-    working_set_size as Integer      Note: Working set size in bytes
+    spatial_locality as Float       Note: 0.0-1.0, higher is better
+    temporal_locality as Float      Note: 0.0-1.0, higher is better
+    cache_reuse_distance as Integer Note: Average reuse distance in accesses
+    working_set_size as Integer     Note: Working set size in bytes
 End Type
 
 Type called "CoalescingInfo":
-    is_coalesced as Boolean              Note: Whether accesses coalesce
-    coalescing_factor_ppm as Integer     Note: 0..1_000_000 PPM, 1_000_000 is perfect
-    wasted_transactions as Integer       Note: Number of wasted memory transactions
-    optimal_transactions as Integer      Note: Minimum possible transactions
+    is_coalesced as Boolean         Note: Whether accesses coalesce
+    coalescing_factor as Float      Note: 0.0-1.0, 1.0 is perfect
+    wasted_transactions as Integer  Note: Number of wasted memory transactions
+    optimal_transactions as Integer Note: Minimum possible transactions
 End Type
 
 Type called "BankConflictInfo":
@@ -96,43 +78,51 @@ Note: ================================================================
 Note: Access Pattern Classification
 Note: ================================================================
 
-@Reasoning
-Classifies memory access patterns for optimisation opportunities. The
-classification feeds GPU coalescing analysis, prefetch insertion, cache
-locality estimation, and shared-memory promotion decisions. Patterns are
-CONTIGUOUS (stride 1, best for caches/coalescing), STRIDED (regular
-stride > 1, predictable, may benefit from prefetch), RANDOM (irregular,
-poor locality), BROADCAST (constant address, use constant memory),
-GATHER (indirect read via index array), SCATTER (indirect write).
-@End Reasoning
-
-@Implementation
-Initialises an AccessPattern struct with default UNKNOWN / stride=1 /
-element_size=0 / is_aligned=false / is_coalesced=false. Reads the node
-op_kind; bails out for non-memory ops (op_kind != 40 Load and != 41
-Store). Extracts the address input node, fetches element_size via the
-node's data type. Calls classify_address_pattern on the address subgraph
-to get (pattern_type, stride), and writes them into the struct. Calls
-check_alignment to determine is_aligned. Sets is_coalesced when the
-pattern is CONTIGUOUS and the access is aligned. Returns the populated
-AccessPattern.
-@End Implementation
-
-@Performance_Hints
-O(depth_of_address_DAG) time; visits each address-computation node once
-via classify_address_pattern. Cold path during graph construction;
-becomes hot when called per memory op during coalescing analysis.
-Result is a small fixed-size struct so allocation pressure is minimal.
-@End Performance_Hints
-
-@Security_Scope
-Pure analysis on already-validated graph nodes; trusts upstream graph
-builders for node-kind invariants. No file I/O, no capability use.
-Untrusted graphs (e.g. deserialized from disk) must be verified by
-the upstream graph loader before calling this proc.
-@End Security_Scope
-
 Process called "analyze_access_pattern" that takes graph as Integer, node as Integer returns Integer:
+    @Reasoning
+    Classifies memory access patterns for optimization opportunities.
+
+    Patterns:
+    - CONTIGUOUS: Sequential access with stride=1 (best for caches/coalescing)
+    - STRIDED: Regular stride>1 (predictable, may benefit from prefetch)
+    - RANDOM: Irregular access (poor locality, hard to optimize)
+    - BROADCAST: Same value accessed by all threads (use constant memory)
+    - GATHER: Indirect reads via index array (scatter/gather instructions)
+    - SCATTER: Indirect writes via index array (requires atomics)
+
+    Analysis:
+    1. Examine the address computation for the memory operation
+    2. Determine if access is affine (base + constant*index)
+    3. Extract stride from affine form
+    4. Check for indirect indexing (gather/scatter)
+    5. Check for invariant address (broadcast)
+    @End Reasoning
+
+    @Implementation
+    1. Get node operation kind (Load or Store)
+    2. Get address computation subgraph
+    3. Analyze address expression for pattern
+    4. Classify as contiguous, strided, random, etc.
+    5. Compute stride and element size
+    6. Check alignment
+    7. Check coalescing potential
+    8. Return AccessPattern structure
+    @End Implementation
+
+    @Performance_Hints
+    O(depth_of_address_DAG) time; visits each address-computation node once
+    via classify_address_pattern. Cold path during graph construction;
+    becomes hot when called per memory op during coalescing analysis.
+    Result is a small fixed-size struct so allocation pressure is minimal.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure analysis on already-validated graph nodes; trusts upstream graph
+    builders for node-kind invariants. No file I/O, no capability use.
+    Untrusted graphs (e.g. deserialized from disk) must be verified by
+    the upstream graph loader before calling this proc.
+    @End Security_Scope
+
     Let access_pattern be a value of type AccessPattern with
         pattern_type as ACCESS_UNKNOWN,
         stride as 1,
@@ -195,34 +185,43 @@ Process called "analyze_access_pattern" that takes graph as Integer, node as Int
     Return access_pattern
 End Process
 
-@Reasoning
-Classifies the address computation pattern used by analyze_access_pattern.
-Common patterns: base+index gives CONTIGUOUS (stride=1); base+index*stride
-gives STRIDED; base+array[index] gives GATHER/SCATTER (indirect);
-constant address gives BROADCAST; complex expressions give RANDOM. The
-classifier checks each pattern in order of specificity (constant first,
-affine next, indirect last) to avoid misclassifying.
-@End Reasoning
-
-@Implementation
-Calls Node.is_node_constant on the address; if true returns
-[ACCESS_BROADCAST, 0]. Calls extract_affine_form; if affine, returns
-[CONTIGUOUS or STRIDED based on coefficient, stride value]. Calls
-has_indirect_addressing; if true returns [GATHER/SCATTER]. Otherwise
-returns [ACCESS_RANDOM, 0]. Return value is a 2-element List.
-@End Implementation
-
-@Performance_Hints
-O(depth) where depth is the height of the address-computation DAG.
-Calls extract_affine_form (also O(depth)) and has_indirect_addressing.
-Integer-only arithmetic; no Float dependency.
-@End Performance_Hints
-
-@Security_Scope
-Pure analysis on validated graph nodes; no I/O, no mutation.
-@End Security_Scope
-
 Process called "classify_address_pattern" that takes graph as Integer, address_node as Integer returns Integer:
+    @Reasoning
+    Classifies the address computation pattern.
+
+    Common patterns:
+    - base + index → CONTIGUOUS (stride=1)
+    - base + index*stride → STRIDED
+    - base + array[index] → GATHER/SCATTER (indirect)
+    - constant → BROADCAST (invariant)
+    - complex expression → RANDOM
+
+    Detection:
+    - Check if address is constant (broadcast)
+    - Check for affine form: base + coeff*index
+    - Extract coefficient as stride
+    - Check for indirect indexing (load in address computation)
+    @End Reasoning
+
+    @Implementation
+    1. Check if address node is constant → BROADCAST
+    2. Check if address is affine (base + coeff*index)
+    3. If affine, extract stride (coeff), return CONTIGUOUS or STRIDED
+    4. Check for load operation in address → GATHER/SCATTER
+    5. Otherwise return RANDOM
+    6. Return list [pattern_type, stride]
+    @End Implementation
+
+    @Performance_Hints
+    O(depth) where depth is the height of the address-computation DAG.
+    Calls extract_affine_form (also O(depth)) and has_indirect_addressing.
+    Integer-only arithmetic on the address subgraph.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure analysis on validated graph nodes; no I/O, no mutation.
+    @End Security_Scope
+
     Note: Check if address is constant (broadcast pattern)
     Let is_constant be proc is_node_constant from Node with address_node
     If is_constant is equal to true:
@@ -309,22 +308,9 @@ Process called "detect_memory_coalescing" that takes graph as Integer, memory_op
     6. Return CoalescingInfo structure
     @End Implementation
 
-    @Performance_Hints
-    O(N * depth_of_address_DAG) where N = |memory_ops|. Each op invokes
-    analyze_access_pattern. Hot path for any GPU-bound kernel analysis.
-    The PPM-based coalescing factor uses integer math only, so it adds
-    no floating-point dependency to stage1.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis. Reads graph + node metadata; emits a fresh result
-    struct. No system capability use. Assumes the caller has already
-    validated that memory_ops contains only nodes from `graph`.
-    @End Security_Scope
-
     Let coalescing_info be a value of type CoalescingInfo with
         is_coalesced as true,
-        coalescing_factor_ppm as PPM_ONE,
+        coalescing_factor as 1.0,
         wasted_transactions as 0,
         optimal_transactions as 0
 
@@ -390,20 +376,14 @@ Process called "detect_memory_coalescing" that takes graph as Integer, memory_op
     Let wasted be total_transactions minus optimal_transactions
     proc memory_set_int64 from Layout with coalescing_info, 16, wasted
 
-    Note: Compute coalescing factor as PPM (parts per million).
-    Note: factor_ppm = (optimal * 1_000_000) / total, clamped to [0, PPM_ONE].
-    Let factor_ppm be PPM_ONE
+    Note: Compute coalescing factor
+    Let factor be 1.0
     If total_transactions is greater than 0:
-        Let optimal_scaled be optimal_transactions multiplied by PPM_ONE
-        Set factor_ppm to optimal_scaled divided by total_transactions
-        If factor_ppm is greater than PPM_ONE:
-            Set factor_ppm to PPM_ONE
-        End If
-        If factor_ppm is less than 0:
-            Set factor_ppm to 0
-        End If
+        Let optimal_float be proc int_to_float from Math with optimal_transactions
+        Let total_float be proc int_to_float from Math with total_transactions
+        Set factor to optimal_float divided by total_float
     End If
-    proc memory_set_int64 from Layout with coalescing_info, 8, factor_ppm
+    proc memory_set_int64 from Layout with coalescing_info, 8, factor
 
     Return coalescing_info
 End Process
@@ -438,22 +418,9 @@ Process called "compute_cache_locality" that takes graph as Integer, memory_ops 
     6. Return LocalityInfo structure
     @End Implementation
 
-    @Performance_Hints
-    O(N) memory ops with O(1) dict operations per op for cache-line set
-    bucketing. Reuse-distance pass is O(N) plus dict size for unique
-    address tracking. Locality info structs are reused via integer fields
-    only (no Float dependency).
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis on validated graph nodes. No mutation of `graph`. Caller
-    is responsible for ensuring memory_ops contains only Load (40) and
-    Store (41) nodes from `graph`.
-    @End Security_Scope
-
     Let locality_info be a value of type LocalityInfo with
-        spatial_locality_ppm as PPM_ZERO,
-        temporal_locality_ppm as PPM_ZERO,
+        spatial_locality as 0.0,
+        temporal_locality as 0.0,
         cache_reuse_distance as 0,
         working_set_size as 0
 
@@ -469,22 +436,8 @@ Process called "compute_cache_locality" that takes graph as Integer, memory_ops 
     While i is less than op_count:
         Let mem_op be proc get from List with memory_ops, i
 
-        Note: Address abstraction: prefer the address-producing input edge's
-        Note: source node when available (matches how analyze_access_pattern
-        Note: extracts the address expression). When no input edge is present
-        Note: (rare; only constants or graph-roots), fall back to the
-        Note: operation node identity itself which is a stable abstract
-        Note: address suitable for set-based cache-line bucketing.
-        Let mem_op_inputs be proc get_node_inputs from Node with mem_op
-        Let mem_op_in_count be proc length from List with mem_op_inputs
+        Note: Get accessed address (simplified - use node pointer as proxy)
         Let address be mem_op
-        If mem_op_in_count is greater than 0:
-            Let mem_op_addr_edge be proc get from List with mem_op_inputs, 0
-            Set address to proc get_edge_source from Edge with mem_op_addr_edge
-            If address is equal to 0:
-                Set address to mem_op
-            End If
-        End If
 
         Note: Track unique addresses for working set
         proc set from Dict with unique_addresses, address, 1
@@ -501,34 +454,25 @@ Process called "compute_cache_locality" that takes graph as Integer, memory_ops 
         Set i to i plus 1
     End While
 
-    Note: Compute spatial locality as PPM. The fraction here is
-    Note: (unique_cache_lines / total_accesses). Lower fractions indicate
-    Note: higher spatial locality (more accesses falling within already-touched
-    Note: cache lines), so we invert the raw ratio to keep "higher = better".
+    Note: Compute spatial locality
     Let unique_line_count be proc size from Dict with unique_cache_lines
     Let total_accesses be op_count
 
-    Let spatial_ppm be PPM_ONE
+    Let spatial be 1.0
     If total_accesses is greater than 0:
-        Let unique_scaled be unique_line_count multiplied by PPM_ONE
-        Let raw_ratio_ppm be unique_scaled divided by total_accesses
-        If raw_ratio_ppm is greater than PPM_ONE:
-            Set raw_ratio_ppm to PPM_ONE
-        End If
-        Set spatial_ppm to PPM_ONE minus raw_ratio_ppm
-        If spatial_ppm is less than 0:
-            Set spatial_ppm to 0
-        End If
+        Let unique_float be proc int_to_float from Math with unique_line_count
+        Let total_float be proc int_to_float from Math with total_accesses
+        Set spatial to unique_float divided by total_float
     End If
-    proc memory_set_int64 from Layout with locality_info, 0, spatial_ppm
+    proc memory_set_int64 from Layout with locality_info, 0, spatial
 
-    Note: Compute temporal locality (PPM) from reuse distance
+    Note: Compute temporal locality from reuse distance
     Let reuse_info be compute_reuse_distance(access_sequence)
     Let avg_reuse_distance be proc get from List with reuse_info, 0
-    Let temporal_ppm be proc get from List with reuse_info, 1
+    Let temporal be proc get from List with reuse_info, 1
 
     proc memory_set_int64 from Layout with locality_info, 16, avg_reuse_distance
-    proc memory_set_int64 from Layout with locality_info, 8, temporal_ppm
+    proc memory_set_int64 from Layout with locality_info, 8, temporal
 
     Note: Compute working set size
     Let working_set_size be proc size from Dict with unique_addresses multiplied by 8
@@ -564,15 +508,6 @@ Process called "detect_shared_memory_opportunity" that takes graph as Integer, m
     5. Return true if shared memory beneficial
     @End Implementation
 
-    @Performance_Hints
-    Wraps compute_cache_locality so cost is dominated by that pass.
-    Threshold check uses integer comparison only (PPM-domain).
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure predicate. No I/O, no mutation. Trusts graph node validity.
-    @End Security_Scope
-
     Note: Compute locality info
     Let locality be compute_cache_locality(graph, memory_ops)
 
@@ -594,11 +529,11 @@ Process called "detect_shared_memory_opportunity" that takes graph as Integer, m
         Return false
     End If
 
-    Note: Check temporal locality (high reuse). PPM_HALF == 500_000 == 0.5.
-    Let temporal_locality_ppm be proc memory_get_int64 from Layout with locality, 8
-    Let locality_threshold_ppm be 500000
+    Note: Check temporal locality (high reuse)
+    Let temporal_locality be proc memory_get_float64 from Layout with locality, 8
+    Let locality_threshold be 0.5
 
-    If temporal_locality_ppm is greater than locality_threshold_ppm:
+    If temporal_locality is greater than locality_threshold:
         Return true
     End If
 
@@ -633,15 +568,6 @@ Process called "analyze_bank_conflicts" that takes graph as Integer, shared_mem_
     4. Compute conflict degree (serialization factor)
     5. Return BankConflictInfo structure
     @End Implementation
-
-    @Performance_Hints
-    O(N * 32) for N memory ops (32 = warp size). Hot path for GPU code
-    generation analyses; uses integer modulo arithmetic only.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis on validated nodes; no I/O, no mutation.
-    @End Security_Scope
 
     Let conflict_info be a value of type BankConflictInfo with
         has_conflicts as false,
@@ -746,15 +672,6 @@ Process called "compute_memory_footprint" that takes graph as Integer, nodes as 
     5. Return MemoryFootprint structure
     @End Implementation
 
-    @Performance_Hints
-    O(N) for the buffer-size pass plus the cost of compute_peak_memory_usage
-    (also O(N)). All integer arithmetic.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure analysis. No I/O. Caller trusts graph node validity.
-    @End Security_Scope
-
     Let footprint be a value of type MemoryFootprint with
         total_bytes as 0,
         reads_bytes as 0,
@@ -835,15 +752,6 @@ Process called "infer_memory_space" that takes graph as Integer, node as Integer
     5. Return memory space constant
     @End Implementation
 
-    @Performance_Hints
-    O(successors) per node for the SHARED-memory heuristic; otherwise O(1).
-    Hot path during code generation.
-    @End Performance_Hints
-
-    @Security_Scope
-    Pure inference. No I/O, no graph mutation.
-    @End Security_Scope
-
     Note: Check if node is constant
     Let is_constant be proc is_node_constant from Node with node
     If is_constant is equal to true:
@@ -863,16 +771,11 @@ Process called "infer_memory_space" that takes graph as Integer, node as Integer
         End If
     End If
 
-    Note: Check for sharing opportunity (high reuse, fits in shared mem).
-    Note: Reuse is approximated as the consumer count of this node: a value
-    Note: read by 4+ consumers is amortizing the cost of copying it into
-    Note: shared memory across enough reads to make the copy profitable.
-    Note: This is the standard "reuse > 1/x" heuristic from GPU literature
-    Note: applied with x=4 to match the cost ratio between a coalesced
-    Note: global load (single transaction per warp) and a shared-memory
-    Note: hit (free after the initial copy).
+    Note: Check for sharing opportunity (high reuse, fits in shared mem)
     Let shared_mem_limit be 49152
     If type_size is less than shared_mem_limit:
+        Note: Would need full reuse analysis here
+        Note: Simplified: check if used by multiple nodes
         Let users be proc get_node_successors from Graph with graph, node
         Let user_count be proc length from List with users
 
@@ -930,12 +833,11 @@ Process called "detect_streaming_pattern" that takes graph as Integer, nodes as 
 
     Note: Analyze locality
     Let locality be compute_cache_locality(graph, memory_ops)
-    Let temporal_locality_ppm be proc memory_get_int64 from Layout with locality, 8
+    Let temporal_locality be proc memory_get_float64 from Layout with locality, 8
 
-    Note: Streaming has low temporal locality (data used once).
-    Note: 0.3 in PPM == 300_000.
-    Let streaming_threshold_ppm be 300000
-    If temporal_locality_ppm is greater than streaming_threshold_ppm:
+    Note: Streaming has low temporal locality (data used once)
+    Let streaming_threshold be 0.3
+    If temporal_locality is greater than streaming_threshold:
         Return false
     End If
 
@@ -956,15 +858,9 @@ Process called "detect_streaming_pattern" that takes graph as Integer, nodes as 
         Set i to i plus 1
     End While
 
-    Note: Most nodes should process arrays for streaming.
-    Note: ratio_ppm = (array_count * 1_000_000) / node_count; threshold 700_000 == 0.7.
-    Let array_ratio_ppm be 0
-    If node_count is greater than 0:
-        Let scaled be array_count multiplied by PPM_ONE
-        Set array_ratio_ppm to scaled divided by node_count
-    End If
-    Let streaming_ratio_threshold_ppm be 700000
-    If array_ratio_ppm is greater than streaming_ratio_threshold_ppm:
+    Note: Most nodes should process arrays for streaming
+    Let array_ratio be proc int_to_float from Math with array_count divided by Math.int_to_float(node_count)
+    If array_ratio is greater than 0.7:
         Return true
     End If
 
@@ -1024,18 +920,14 @@ Note: ================================================================
 Note: Bandwidth Estimation
 Note: ================================================================
 
-Process called "compute_bandwidth_requirement" that takes graph as Integer, nodes as Integer returns Integer:
+Process called "compute_bandwidth_requirement" that takes graph as Integer, nodes as Integer returns Float:
     @Reasoning
     Estimates memory bandwidth required for computation.
 
     Formula:
-    - Bandwidth (MB/s) = Total bytes transferred / Execution time (seconds)
+    - Bandwidth (GB/s) = Total bytes transferred / Execution time
     - Total bytes = Reads + Writes
     - Execution time estimated from operation count and throughput
-
-    Result is returned in MB/s as an Integer to preserve precision until the
-    v0.0.8.6 Float type lands. Callers wanting GB/s can divide by 1024 (binary)
-    or 1000 (decimal).
 
     Uses:
     - Determine if computation is memory-bound
@@ -1045,10 +937,9 @@ Process called "compute_bandwidth_requirement" that takes graph as Integer, node
 
     @Implementation
     1. Compute memory footprint (total reads + writes)
-    2. Estimate execution time from operation counts (milliseconds)
-    3. Calculate bandwidth_bytes_per_sec = (total_bytes * 1000) / time_ms
-    4. Convert to MB/s by dividing by 1_048_576 (1024 * 1024) for binary MB
-    5. Return bandwidth in MB/s
+    2. Estimate execution time from operation counts
+    3. Calculate bandwidth = bytes / time
+    4. Return bandwidth in GB/s
     @End Implementation
 
     Note: Compute memory footprint
@@ -1057,22 +948,19 @@ Process called "compute_bandwidth_requirement" that takes graph as Integer, node
     Let writes be proc memory_get_int64 from Layout with footprint, 16
     Let total_bytes be reads plus writes
 
-    Note: Estimate execution time in milliseconds
+    Note: Estimate execution time
+    Let node_count be proc length from List with nodes
     Let estimated_time_ms be estimate_execution_time(nodes)
 
-    If estimated_time_ms is less than or equal to 0:
-        Note: Zero/negative time means an unmeasurable burst; surface as 0 MB/s
-        Note: rather than dividing by zero. Caller can treat as "unknown".
-        Return 0
-    End If
+    Note: Convert to seconds
+    Let estimated_time_s be proc int_to_float from Math with estimated_time_ms divided by 1000.0
 
-    Note: Bandwidth in bytes/second = (total_bytes * 1000) / time_ms.
-    Note: Convert to MB/s by dividing by 1_048_576.
-    Let bytes_per_sec be total_bytes multiplied by 1000
-    Set bytes_per_sec to bytes_per_sec divided by estimated_time_ms
-    Let bandwidth_mbs be bytes_per_sec divided by 1048576
+    Note: Compute bandwidth in GB/s
+    Let bytes_float be proc int_to_float from Math with total_bytes
+    Let bandwidth_bs be bytes_float divided by estimated_time_s
+    Let bandwidth_gbs be bandwidth_bs divided by 1000000000.0
 
-    Return bandwidth_mbs
+    Return bandwidth_gbs
 End Process
 
 Note: ================================================================
@@ -1080,133 +968,40 @@ Note: Helper Functions
 Note: ================================================================
 
 Process called "extract_affine_form" that takes graph as Integer, address_node as Integer returns Integer:
-    @Reasoning
-    Extracts the affine form of an address expression: addr = base + stride * index.
-    In Bifrost's graph IR, an address node is affine iff it is one of:
-      (a) An Input/Constant node: stride = 0 (broadcast).
-      (b) An Add node with one Constant operand and one Input/induction
-          variable operand: stride = 1 (contiguous).
-      (c) A Multiply node with a Constant scale: stride = constant.
-      (d) An Add whose right operand is a Multiply(const, IV): stride = const.
-
-    For non-affine forms (e.g. a Load in the address chain, i.e. gather/
-    scatter via indirection), we return is_affine=false. The caller
-    treats that as RANDOM/GATHER/SCATTER per classify_address_pattern.
-    @End Reasoning
-
-    @Implementation
-    1. If the node is Constant (NodeType 0) or Input (NodeType 1): return [true, 0].
-    2. If OpKind is Add (0) with at least 2 inputs, examine inputs:
-       - If one is a Multiply(C, X) form, extract stride C from that.
-       - Otherwise stride = 1.
-    3. If OpKind is Multiply (2) with a constant first input, return [true, const_value].
-    4. Otherwise return [false, 1].
-    @End Implementation
+    Note: Simplified affine extraction
+    Note: Real implementation would analyze arithmetic operations
+    Note: Return [is_affine (bool), stride]
 
     Let result be proc create from List
-
-    If address_node is equal to 0:
-        proc append from List with result, false
-        proc append from List with result, 1
-        Return result
-    End If
-
-    Let node_type be proc get_node_type from Node with address_node
-    Note: Constant (0) or Input (1): pure broadcast, stride 0
-    If node_type is equal to 0:
-        proc append from List with result, true
-        proc append from List with result, 0
-        Return result
-    End If
-    If node_type is equal to 1:
-        proc append from List with result, true
-        proc append from List with result, 0
-        Return result
-    End If
-
-    Let op_kind be proc get_node_opkind from Node with address_node
-    Let addr_inputs be proc get_node_inputs from Node with address_node
-    Let in_count be proc length from List with addr_inputs
-
-    Note: Add (OpKind 0) with two operands: base + index*stride form
-    If op_kind is equal to 0:
-        If in_count is greater than or equal to 2:
-            Let left_edge be proc get from List with addr_inputs, 0
-            Let right_edge be proc get from List with addr_inputs, 1
-            Let left_src be proc get_edge_source from Edge with left_edge
-            Let right_src be proc get_edge_source from Edge with right_edge
-
-            Let right_op be proc get_node_opkind from Node with right_src
-            Note: If right operand is Multiply, try to extract its constant scale
-            If right_op is equal to 2:
-                Let mul_inputs be proc get_node_inputs from Node with right_src
-                Let mul_in_count be proc length from List with mul_inputs
-                If mul_in_count is greater than or equal to 2:
-                    Let mul_left_edge be proc get from List with mul_inputs, 0
-                    Let mul_left_src be proc get_edge_source from Edge with mul_left_edge
-                    Let mul_left_type be proc get_node_type from Node with mul_left_src
-                    If mul_left_type is equal to 0:
-                        Note: Constant scale at offset 8 of constant payload
-                        Let const_stride be proc memory_get_int64 from Layout with mul_left_src, 8
-                        proc append from List with result, true
-                        proc append from List with result, const_stride
-                        Return result
-                    End If
-                End If
-            End If
-
-            Note: Plain base + index, stride = 1
-            proc append from List with result, true
-            proc append from List with result, 1
-            Return result
-        End If
-    End If
-
-    Note: Multiply (OpKind 2) with a constant scale
-    If op_kind is equal to 2:
-        If in_count is greater than or equal to 2:
-            Let mul_e0 be proc get from List with addr_inputs, 0
-            Let mul_s0 be proc get_edge_source from Edge with mul_e0
-            Let mul_t0 be proc get_node_type from Node with mul_s0
-            If mul_t0 is equal to 0:
-                Let stride0 be proc memory_get_int64 from Layout with mul_s0, 8
-                proc append from List with result, true
-                proc append from List with result, stride0
-                Return result
-            End If
-        End If
-    End If
-
-    Note: Not provably affine
-    proc append from List with result, false
+    proc append from List with result, true
     proc append from List with result, 1
     Return result
 End Process
 
-@Reasoning
-Detects whether the address computation contains an indirect load
-(scatter/gather pattern). Indirect addressing changes the access pattern
-classification from STRIDED/CONTIGUOUS to GATHER and disables coalescing
-on most GPUs. The detection is intentionally shallow - only checks the
-immediate address node - because the affine extractor handles deeper
-indirection.
-@End Reasoning
-
-@Implementation
-Reads the address_node's OpKind. Returns true if it equals 40 (Load),
-indicating the address is being computed via a memory load (indirect).
-Returns false otherwise.
-@End Implementation
-
-@Performance_Hints
-O(1) - single OpKind read.
-@End Performance_Hints
-
-@Security_Scope
-Pure read.
-@End Security_Scope
-
 Process called "has_indirect_addressing" that takes graph as Integer, address_node as Integer returns Boolean:
+    @Reasoning
+    Detects whether the address computation contains an indirect load
+    (scatter/gather pattern). Indirect addressing changes the access pattern
+    classification from STRIDED/CONTIGUOUS to GATHER and disables coalescing
+    on most GPUs. The detection is intentionally shallow - only checks the
+    immediate address node - because the affine extractor handles deeper
+    indirection.
+    @End Reasoning
+
+    @Implementation
+    Reads the address_node's OpKind. Returns true if it equals 40 (Load),
+    indicating the address is being computed via a memory load (indirect).
+    Returns false otherwise.
+    @End Implementation
+
+    @Performance_Hints
+    O(1) - single OpKind read.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
     Note: Check if address computation contains load operation
     Let op_kind be proc get_node_opkind from Node with address_node
 
@@ -1218,97 +1013,38 @@ Process called "has_indirect_addressing" that takes graph as Integer, address_no
 End Process
 
 Process called "check_alignment" that takes address_node as Integer, element_size as Integer returns Boolean:
-    @Reasoning
-    An address is aligned to element_size iff every term in its affine form
-    contributes a multiple of element_size. We require:
-      (a) The base (and any non-stride term) is a Constant divisible by
-          element_size, or an Input we have to trust (Input parameters
-          are always required to be element-aligned per Bifrost's
-          ABI contract — declared on the kernel entry point).
-      (b) The stride (if present) is a multiple of element_size.
-
-    Without inter-procedural analysis we treat Inputs as aligned by
-    contract and verify only the constant components we can see.
-    @End Reasoning
-
-    @Implementation
-    1. If element_size <= 0, alignment is trivially undefined; return false.
-    2. If element_size is not itself a power-of-2, accelerator alignment
-       is not generally satisfiable; return false.
-    3. Extract the affine form via extract_affine_form.
-    4. If non-affine: not aligned.
-    5. Otherwise check stride % element_size == 0. Base alignment is
-       guaranteed by Input/Constant nodes (Inputs by ABI; Constants we
-       can check directly when they appear as base).
-    @End Implementation
-
-    If element_size is less than or equal to 0:
-        Return false
-    End If
-
-    If is_power_of_two(element_size) is equal to false:
-        Return false
-    End If
-
-    Let affine_info be extract_affine_form(0, address_node)
-    Let is_affine be proc get from List with affine_info, 0
-    If is_affine is equal to false:
-        Return false
-    End If
-
-    Let stride be proc get from List with affine_info, 1
-
-    Note: stride must be a multiple of element_size for aligned access
-    If stride is less than 0:
-        Return false
-    End If
-    Let stride_remainder be stride modulo by element_size
-    If stride_remainder is not equal to 0:
-        Return false
-    End If
-
-    Note: For Constant base nodes we can additionally verify divisibility.
-    Let base_type be proc get_node_type from Node with address_node
-    If base_type is equal to 0:
-        Let base_value be proc memory_get_int64 from Layout with address_node, 8
-        If base_value is less than 0:
-            Return false
-        End If
-        Let base_remainder be base_value modulo by element_size
-        If base_remainder is not equal to 0:
-            Return false
-        End If
-    End If
-
+    Note: Simplified alignment check
+    Note: Real implementation would analyze address arithmetic
+    Note: Assume aligned for now
     Return true
 End Process
 
-@Reasoning
-Computes the average reuse distance across an access sequence - the
-number of distinct intervening accesses between successive references
-to the same address. Reuse distance is the canonical metric for
-temporal locality; lower distances indicate better cache-hit prospects.
-@End Reasoning
-
-@Implementation
-Allocates reuse_distances and last_access Dicts. Walks the
-access_sequence; for each address, reads last_access[address]; if
-non-zero, computes distance = i - last_pos and stores it in
-reuse_distances. Always updates last_access[address] = i. After the
-walk, computes the average of all reuse_distances values and returns
-it. Returns 0 for an empty sequence.
-@End Implementation
-
-@Performance_Hints
-O(N) where N is the access_sequence length, plus O(N) Dict operations.
-Space O(unique addresses).
-@End Performance_Hints
-
-@Security_Scope
-Pure analysis on caller-owned data; no I/O.
-@End Security_Scope
-
 Process called "compute_reuse_distance" that takes access_sequence as Integer returns Integer:
+    @Reasoning
+    Computes the average reuse distance across an access sequence - the
+    number of distinct intervening accesses between successive references
+    to the same address. Reuse distance is the canonical metric for
+    temporal locality; lower distances indicate better cache-hit prospects.
+    @End Reasoning
+
+    @Implementation
+    Allocates reuse_distances and last_access Dicts. Walks the
+    access_sequence; for each address, reads last_access[address]; if
+    non-zero, computes distance = i - last_pos and stores it in
+    reuse_distances. Always updates last_access[address] = i. After the
+    walk, computes the average of all reuse_distances values and returns
+    it. Returns 0 for an empty sequence.
+    @End Implementation
+
+    @Performance_Hints
+    O(N) where N is the access_sequence length, plus O(N) Dict operations.
+    Space O(unique addresses).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure analysis on caller-owned data; no I/O.
+    @End Security_Scope
+
     Note: Compute average reuse distance
     Let reuse_distances be proc create from Dict
     Let last_access be proc create from Dict
@@ -1341,7 +1077,7 @@ Process called "compute_reuse_distance" that takes access_sequence as Integer re
     If count is equal to 0:
         Let result be proc create from List
         proc append from List with result, 0
-        proc append from List with result, PPM_ZERO
+        proc append from List with result, 0.0
         Return result
     End If
 
@@ -1357,135 +1093,62 @@ Process called "compute_reuse_distance" that takes access_sequence as Integer re
 
     Let avg_distance be total_distance divided by count
 
-    Note: Compute temporal locality as PPM (inverse of distance, normalized).
-    Note: temporal_ppm = PPM_ONE - (avg_distance * PPM_ONE / max_distance), floored at 0.
+    Note: Compute temporal locality (inverse of distance, normalized)
     Let max_distance be 1000
-    Let scaled_distance be avg_distance multiplied by PPM_ONE
-    Let distance_ppm be scaled_distance divided by max_distance
-    Let temporal_ppm be PPM_ONE minus distance_ppm
-    If temporal_ppm is less than 0:
-        Set temporal_ppm to 0
-    End If
-    If temporal_ppm is greater than PPM_ONE:
-        Set temporal_ppm to PPM_ONE
+    Let temporal be 1.0 minus (proc int_to_float from Math with avg_distance divided by proc int_to_float from Math with max_distance)
+    If temporal is less than 0.0:
+        Set temporal to 0.0
     End If
 
     Set result to proc create from List
     proc append from List with result, avg_distance
-    proc append from List with result, temporal_ppm
+    proc append from List with result, temporal
     Return result
 End Process
 
 Process called "compute_peak_memory_usage" that takes graph as Integer, nodes as Integer returns Integer:
-    @Reasoning
-    Computes the peak simultaneous live memory across the node list using a
-    classical liveness-based sweep. For each node in topological order:
-      * Walking value comes alive at definition.
-      * It dies after its last consumer use.
-    The peak is the maximum sum of byte sizes of live values at any point.
-
-    This is the standard SSA-style liveness peak computation; on a DAG of
-    N nodes it runs in O(N * avg_successors). The result is a tight upper
-    bound on resident memory at any execution point of the kernel.
-    @End Reasoning
-
-    @Implementation
-    1. Iterate nodes in given (topological) order.
-    2. Maintain a `live` dictionary mapping node -> remaining_consumer_count.
-    3. At each step:
-         (a) Add new node's size to current_live_bytes and record it.
-         (b) For each input, decrement its remaining counter; if it hits
-             zero, subtract its size from current_live_bytes.
-       Track max current_live_bytes seen.
-    @End Implementation
+    Note: Simplified peak usage calculation
+    Note: Real implementation would perform liveness analysis
 
     Let node_count be proc length from List with nodes
-    If node_count is equal to 0:
-        Return 0
-    End If
+    Let total be 0
 
-    Let remaining_uses be proc create from Dict
-    Let node_size be proc create from Dict
-
-    Note: First pass: precompute sizes and use counts.
     Let i be 0
     While i is less than node_count:
         Let node be proc get from List with nodes, i
-        Let out_type be proc get_node_output_type from Node with node
-        Let size be proc get_type_size_bytes from Node with out_type
-        proc set from Dict with node_size, node, size
-
-        Let succs be proc get_node_successors from Graph with graph, node
-        Let succ_count be proc length from List with succs
-        proc set from Dict with remaining_uses, node, succ_count
+        Let output_type be proc get_node_output_type from Node with node
+        Let size be proc get_type_size_bytes from Node with output_type
+        Set total to total plus size
         Set i to i plus 1
     End While
 
-    Note: Second pass: sweep liveness in order.
-    Let current_live be 0
-    Let peak be 0
-
-    Set i to 0
-    While i is less than node_count:
-        Let node2 be proc get from List with nodes, i
-        Let size2 be proc get from Dict with node_size, node2
-        Set current_live to current_live plus size2
-
-        If current_live is greater than peak:
-            Set peak to current_live
-        End If
-
-        Note: Visit each input edge; the source's remaining_uses decreases.
-        Let in_edges be proc get_node_inputs from Node with node2
-        Let in_count be proc length from List with in_edges
-        Let k be 0
-        While k is less than in_count:
-            Let in_edge be proc get from List with in_edges, k
-            Let src be proc get_edge_source from Edge with in_edge
-            Let prev_remaining be proc get from Dict with remaining_uses, src
-            If prev_remaining is greater than 0:
-                Let new_remaining be prev_remaining minus 1
-                proc set from Dict with remaining_uses, src, new_remaining
-                If new_remaining is equal to 0:
-                    Let src_size be proc get from Dict with node_size, src
-                    If src_size is greater than 0:
-                        Set current_live to current_live minus src_size
-                        If current_live is less than 0:
-                            Set current_live to 0
-                        End If
-                    End If
-                End If
-            End If
-            Set k to k plus 1
-        End While
-
-        Set i to i plus 1
-    End While
+    Note: Peak is approximately 50% of total (rough estimate)
+    Let peak be total divided by 2
 
     Return peak
 End Process
 
-@Reasoning
-Filters a node list down to memory operations (Load and Store ops). Used
-by higher-level analyses (compute_memory_footprint, compute_bandwidth_requirement)
-that only need the memory-op subset.
-@End Reasoning
-
-@Implementation
-Allocates a fresh memory_ops List. Walks the input nodes list; for each
-node reads OpKind and appends it to memory_ops if it equals 40 (Load) or
-41 (Store). Returns memory_ops.
-@End Implementation
-
-@Performance_Hints
-O(N) where N is the input node count.
-@End Performance_Hints
-
-@Security_Scope
-Pure read; allocates one fresh List owned by caller.
-@End Security_Scope
-
 Process called "extract_memory_operations_from_nodes" that takes nodes as Integer returns Integer:
+    @Reasoning
+    Filters a node list down to memory operations (Load and Store ops). Used
+    by higher-level analyses (compute_memory_footprint, compute_bandwidth_requirement)
+    that only need the memory-op subset.
+    @End Reasoning
+
+    @Implementation
+    Allocates a fresh memory_ops List. Walks the input nodes list; for each
+    node reads OpKind and appends it to memory_ops if it equals 40 (Load) or
+    41 (Store). Returns memory_ops.
+    @End Implementation
+
+    @Performance_Hints
+    O(N) where N is the input node count.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read; allocates one fresh List owned by caller.
+    @End Security_Scope
+
     Let memory_ops be proc create from List
 
     Let node_count be proc length from List with nodes
@@ -1509,29 +1172,29 @@ Process called "extract_memory_operations_from_nodes" that takes nodes as Intege
     Return memory_ops
 End Process
 
-@Reasoning
-Tests whether the graph has linear (chain) structure - each node has at
-most one predecessor and one successor. Linear graphs are
-trivially-streamable and can benefit from streaming-memory hints in
-codegen.
-@End Reasoning
-
-@Implementation
-Walks Graph.get_all_nodes; for each node calls Graph.get_node_predecessors
-and Graph.get_node_successors. Returns false if any node has more than
-one predecessor or more than one successor. Returns true if every node
-satisfies the linear-chain constraint.
-@End Implementation
-
-@Performance_Hints
-O(V) - one pass over the node list with O(1) adjacency lookups.
-@End Performance_Hints
-
-@Security_Scope
-Pure read on graph state.
-@End Security_Scope
-
 Process called "check_linear_structure" that takes graph as Integer returns Boolean:
+    @Reasoning
+    Tests whether the graph has linear (chain) structure - each node has at
+    most one predecessor and one successor. Linear graphs are
+    trivially-streamable and can benefit from streaming-memory hints in
+    codegen.
+    @End Reasoning
+
+    @Implementation
+    Walks Graph.get_all_nodes; for each node calls Graph.get_node_predecessors
+    and Graph.get_node_successors. Returns false if any node has more than
+    one predecessor or more than one successor. Returns true if every node
+    satisfies the linear-chain constraint.
+    @End Implementation
+
+    @Performance_Hints
+    O(V) - one pass over the node list with O(1) adjacency lookups.
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read on graph state.
+    @End Security_Scope
+
     Note: Check if graph is a linear chain
     Let all_nodes be proc get_all_nodes from Graph with graph
     Let node_count be proc length from List with all_nodes
@@ -1553,27 +1216,27 @@ Process called "check_linear_structure" that takes graph as Integer returns Bool
     Return true
 End Process
 
-@Reasoning
-Tests whether a type pointer represents an array/aggregate type (Vector,
-Matrix, or Tensor). Used by memory-footprint and bandwidth analyses to
-decide whether to multiply through dimensions.
-@End Reasoning
-
-@Implementation
-Returns false for null type. Reads the discriminant at offset 0; returns
-true if it equals 2 (Vector), 3 (Matrix), or 5 (Tensor), false
-otherwise.
-@End Implementation
-
-@Performance_Hints
-O(1).
-@End Performance_Hints
-
-@Security_Scope
-Pure read.
-@End Security_Scope
-
 Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
+    @Reasoning
+    Tests whether a type pointer represents an array/aggregate type (Vector,
+    Matrix, or Tensor). Used by memory-footprint and bandwidth analyses to
+    decide whether to multiply through dimensions.
+    @End Reasoning
+
+    @Implementation
+    Returns false for null type. Reads the discriminant at offset 0; returns
+    true if it equals 2 (Vector), 3 (Matrix), or 5 (Tensor), false
+    otherwise.
+    @End Implementation
+
+    @Performance_Hints
+    O(1).
+    @End Performance_Hints
+
+    @Security_Scope
+    Pure read.
+    @End Security_Scope
+
     If type_ptr is equal to 0:
         Return false
     End If
@@ -1595,103 +1258,56 @@ Process called "is_array_type" that takes type_ptr as Integer returns Boolean:
 End Process
 
 Process called "estimate_execution_time" that takes nodes as Integer returns Integer:
-    @Reasoning
-    Estimates total execution time (milliseconds) of a node list as the
-    sum of per-node nominal cycle costs converted to milliseconds.
-    The cycle costs come from the same OpKind-keyed table used elsewhere
-    in Bifrost (arithmetic = 1, vector = 10, matrix = 100, conv/FFT = 500,
-    memory = 50). At a nominal 1 GHz clock those map directly to ns;
-    we sum and divide by 1_000_000 to get milliseconds.
-    @End Reasoning
-
-    @Implementation
-    1. Walk each node; accumulate the matching OpKind cycle cost.
-    2. Convert total cycles to milliseconds (cycles / 1_000_000).
-    3. Clamp to >= 1 ms so downstream callers never see zero time.
-    @End Implementation
-
+    Note: Simplified execution time estimation
+    Note: Assume 1ms per node
     Let node_count be proc length from List with nodes
-    Let total_cycles be 0
-
-    Let i be 0
-    While i is less than node_count:
-        Let n be proc get from List with nodes, i
-        Let op_kind be proc get_node_opkind from Node with n
-
-        Let cycles be 10
-        If op_kind is greater than or equal to 0:
-            If op_kind is less than or equal to 5:
-                Set cycles to 1
-            End If
-        End If
-        If op_kind is greater than or equal to 6:
-            If op_kind is less than or equal to 9:
-                Set cycles to 100
-            End If
-        End If
-        If op_kind is greater than or equal to 10:
-            If op_kind is less than or equal to 12:
-                Set cycles to 10
-            End If
-        End If
-        If op_kind is greater than or equal to 13:
-            If op_kind is less than or equal to 18:
-                Set cycles to 500
-            End If
-        End If
-        If op_kind is greater than or equal to 34:
-            If op_kind is less than or equal to 41:
-                Set cycles to 50
-            End If
-        End If
-
-        Set total_cycles to total_cycles plus cycles
-        Set i to i plus 1
-    End While
-
-    Note: Convert cycles at 1 GHz nominal clock to milliseconds.
-    Let time_ms be total_cycles divided by 1000000
-    If time_ms is less than 1:
-        Set time_ms to 1
-    End If
+    Let time_ms be node_count multiplied by 1
 
     Return time_ms
 End Process
 
 Process called "is_power_of_two" that takes n as Integer returns Boolean:
-    @Reasoning
-    True iff n > 0 and n has exactly one bit set. We prove this by
-    repeated halving: n is a power of two iff dividing by 2 always yields
-    an exact quotient until we reach 1. Equivalent to the classical
-    `n & (n - 1) == 0` bit-trick, expressed without a native bitwise-and
-    primitive (stage1 codegen lacks it for Integer expressions).
-    @End Reasoning
-
-    @Implementation
-    1. Reject n <= 0.
-    2. Repeatedly halve n. If n is odd at any step other than the
-       terminal value of 1, return false.
-    3. Cap iterations at 64 to bound the loop on 64-bit operands.
-    @End Implementation
-
     If n is less than or equal to 0:
         Return false
     End If
 
-    Let x be n
-    Let iterations be 0
-    While x is greater than 1:
-        Let remainder be x modulo by 2
-        If remainder is not equal to 0:
-            Return false
+    Note: Check if n is power of 2 using bitwise trick: n bitwise and (n-1) == 0
+    Let n_minus_1 be n minus 1
+    Let bitwise_and be n modulo by 2
+    If bitwise_and is equal to 0:
+        If n_minus_1 modulo by 2 is not equal to 0:
+            Return true
         End If
-        Set x to x divided by 2
-        Set iterations to iterations plus 1
-        If iterations is greater than 64:
-            Note: Safety cap; should never trigger for 64-bit Integers.
-            Return false
-        End If
-    End While
+    End If
 
-    Return true
+    Note: Simplified check for common powers of 2
+    If n is equal to 1:
+        Return true
+    End If
+    If n is equal to 2:
+        Return true
+    End If
+    If n is equal to 4:
+        Return true
+    End If
+    If n is equal to 8:
+        Return true
+    End If
+    If n is equal to 16:
+        Return true
+    End If
+    If n is equal to 32:
+        Return true
+    End If
+    If n is equal to 64:
+        Return true
+    End If
+    If n is equal to 128:
+        Return true
+    End If
+    If n is equal to 256:
+        Return true
+    End If
+
+    Return false
 End Process
